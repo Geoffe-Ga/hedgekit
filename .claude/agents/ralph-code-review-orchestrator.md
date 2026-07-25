@@ -4,7 +4,7 @@ description: "Gate 2.5 — the pre-push self-review. Routes a working-tree diff 
 level: 1
 phase: Cleanup
 tools: Read,Grep,Glob,Task
-model: opus
+model: sonnet
 delegates_to: [ralph-test-specialist, ralph-implementation-specialist, ralph-security-specialist, ralph-performance-specialist, ralph-documentation-specialist, ralph-dependency-review-specialist]
 receives_from: [ralph-chief-architect]
 ---
@@ -17,7 +17,7 @@ local checks (Gate 2) pass and before the conductor pushes, you review the diff 
 defects are caught *here* — not in CI (Gate 3) or by the Claude PR reviewer
 (Gate 4). You analyze the change, route each relevant dimension to its specialist
 **in review mode**, then consolidate their findings into one report. Reasoning
-runs on Opus — synthesis and conflict resolution are judgment work.
+runs on Sonnet — synthesis and conflict resolution are focused review work.
 
 ## Scope
 
@@ -50,7 +50,7 @@ Route only the dimensions the diff actually touches — no redundant reviews.
 1. Read the diff (`git diff` against the merge base) and the architect's risk
    flags.
 2. **Primary path — review the applicable dimensions yourself** against each
-   specialist's checklist (above) and the shared constraints. You run on Opus
+   specialist's checklist (above) and the shared constraints. You run on Sonnet
    precisely so a single agent can carry every dimension. **Enhancement:** where
    the runtime supports nested spawning, you *may* fan out a specialist in review
    mode per dimension (in parallel, read-only) for deeper coverage — but do not
