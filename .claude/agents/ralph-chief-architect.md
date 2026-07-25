@@ -4,7 +4,7 @@ description: "Strategic brain of a Ralph tick. Select to architect a single back
 level: 0
 phase: Plan
 tools: Read,Grep,Glob,Task
-model: opus
+model: fable
 delegates_to: [ralph-test-specialist, ralph-implementation-specialist, ralph-security-specialist, ralph-performance-specialist, ralph-documentation-specialist, ralph-dependency-review-specialist, ralph-code-review-orchestrator]
 receives_from: []
 ---
@@ -18,6 +18,29 @@ backlog issue, you decide *how* it should be built and *who* should build it,
 then hand a concrete plan back to the conductor (`scripts/ralph/PROMPT.md`, run by
 `.claude/commands/ralph-tick.md`). You do **not** write code, tests, or docs —
 you read, reason, and dispatch.
+
+## Model & fallback
+
+You run on **Fable** (`model: fable` in this file's frontmatter). Planning is the
+highest-leverage decision in a tick — one wrong design compounds across every
+specialist that executes it — so the architect gets the strongest judgment-driven
+model. Every other write-agent runs on **Opus**.
+
+Fable capacity is metered separately from Opus, so a tick must **degrade, never
+stall**, when Fable credits run out and a dispatch to this agent fails to launch:
+
+1. **In-session (preferred).** The conductor re-dispatches immediately with a
+   per-invocation model override — `Agent(subagent_type: ralph-chief-architect,
+   model: "opus")`. A per-invocation `model` outranks this file's frontmatter, so
+   no file edit is needed and the tick continues on Opus.
+2. **For the rest of the run.** Flip the pin once, so later ticks skip the failing
+   Fable attempt entirely: `./scripts/ralph/architect-model.sh opus` (and
+   `./scripts/ralph/architect-model.sh fable` to restore). With no argument the
+   script prints the current pin.
+
+Falling back is a **capacity** decision, never a weakened gate: an Opus architect
+plans to the same standard, and every rule in
+[`shared/house-rules.md`](shared/house-rules.md) applies unchanged.
 
 ## Scope
 

@@ -21,13 +21,13 @@ graph under a conductor is identical:
 
 ```
 ralph-tick (fleet ORCHESTRATOR — worker pool: reconcile · serialized-merge · lazy-sync · refill)
-  └─ ralph-worker × up to 4 . L1  fable   per-issue CONDUCTOR in an isolated worktree
-       ├─ ralph-chief-architect ..... L0  opus    plan + ordered dispatch list (no code)
-       ├─ ralph-test-specialist ..... L2  fable   Gate 1 RED: failing tests          ─┐
-       ├─ implementation-spec.  L2  fable   Gate 1 GREEN + Refactor             │ run per
+  └─ ralph-worker × up to 4 . L1  opus    per-issue CONDUCTOR in an isolated worktree
+       ├─ ralph-chief-architect ..... L0  fable   plan + ordered dispatch list (no code)
+       ├─ ralph-test-specialist ..... L2  opus    Gate 1 RED: failing tests          ─┐
+       ├─ implementation-spec.  L2  opus    Gate 1 GREEN + Refactor             │ run per
        ├─ ralph-security-specialist . L2  opus    harden auth/JWT/CORS/input/DB       │ the
-       ├─ performance-spec. ... L2  fable   profile/optimize hot paths          │ architect's
-       ├─ documentation-spec. . L2  fable   docstrings/READMEs/ADRs             │ dispatch
+       ├─ performance-spec. ... L2  opus    profile/optimize hot paths          │ architect's
+       ├─ documentation-spec. . L2  opus    docstrings/READMEs/ADRs             │ dispatch
        ├─ dependency-review ... L2  haiku   deps/pins/licenses (read-only)      │ list
        └─ code-review-orch. ... L1  sonnet  Gate 2.5 pre-push self-review      ─┘
 ```
@@ -62,32 +62,54 @@ specialists are leaf workers that do their own work and do not sub-delegate.
 
 ## Model tiers (role-based policy)
 
-Model assignment follows **role, not history** (owner directive, 2026-07-21):
+Model assignment follows **role, not history** (owner directive, 2026-07-24):
 
 | Role | Model | Agents |
 | --- | --- | --- |
-| Planning / architecture | **opus** | `ralph-chief-architect` |
-| Security hardening (Opus exception) | **opus** | `ralph-security-specialist` |
+| Planning / architecture | **fable** | `ralph-chief-architect` |
+| Implementation (writes code) | **opus** | `ralph-worker`, `ralph-implementation-specialist`, `ralph-test-specialist`, `ralph-performance-specialist`, `ralph-documentation-specialist` |
+| Security hardening | **opus** | `ralph-security-specialist` |
 | Review (review-only) | **sonnet** | `ralph-code-review-orchestrator` |
-| Implementation (writes code) | **fable** | `ralph-worker`, `ralph-implementation-specialist`, `ralph-test-specialist`, `ralph-performance-specialist`, `ralph-documentation-specialist` |
 | Quick mechanical checks | **haiku** | `ralph-dependency-review-specialist` |
 
-**Opus** for the highest-leverage reasoning role, `ralph-chief-architect`, and for
-security work, `ralph-security-specialist`. Planning is the highest-leverage decision
-in a tick — one wrong design compounds across every specialist that executes it —
-so the architect runs on the strongest judgment-driven model. Security stays on
-Opus **by owner directive** rather than moving to Fable with the other code
-writers: Fable's safety classifiers target **cyber/bio** content, so legitimate
-hardening work can trip a false-positive refusal — Opus avoids that failure mode.
+The aliases are what the frontmatter carries, and they resolve to the current
+frontier of each line: `fable` → Claude Fable 5, `opus` → Claude Opus 5.
 
-**Fable** for every other agent that writes code: `ralph-worker` (it applies fixes
+**Fable** for exactly one seat: `ralph-chief-architect`. Planning is the
+highest-leverage decision in a tick — one wrong design compounds across every
+specialist that executes it — so the architect gets the strongest
+judgment-driven model. Fable also prefers **less-prescriptive prompts** (state the
+goal and constraints, not step-by-step scaffolding), which is how that agent's
+definition is written.
+
+**Opus** for every agent that writes code — `ralph-worker` (it applies fixes
 directly, not just conducts), `ralph-implementation-specialist`,
-`ralph-test-specialist`, `ralph-performance-specialist`, and
-`ralph-documentation-specialist`. Dual-role specialists — the Gate-1 code
-writers that also serve as Gate-2.5 dimension reviewers — keep a single definition
-and run their assigned model in both roles; there are no reviewer-variant files.
-Fable prefers **less-prescriptive prompts** (state the goal and constraints, not
-step-by-step scaffolding).
+`ralph-test-specialist`, `ralph-performance-specialist`,
+`ralph-documentation-specialist` — and for `ralph-security-specialist`. Security
+would be the one seat to keep off Fable regardless: Fable's safety classifiers
+target **cyber/bio** content, so legitimate hardening work can trip a
+false-positive refusal. Dual-role specialists — the Gate-1 code writers that also
+serve as Gate-2.5 dimension reviewers — keep a single definition and run their
+assigned model in both roles; there are no reviewer-variant files.
+
+### Fable fallback (out of credits)
+
+Fable capacity is metered separately from Opus, and Claude Code has no per-agent
+fallback *chain* — a subagent's model resolves from `CLAUDE_CODE_SUBAGENT_MODEL`,
+then the per-invocation `model` parameter, then this frontmatter. So when Fable
+credits run out and an architect dispatch fails to launch, the tick **degrades to
+Opus rather than stalling**, by changing one of those inputs:
+
+1. **In-session (preferred).** The conductor re-dispatches immediately with a
+   per-invocation override — `Agent(subagent_type: ralph-chief-architect,
+   model: "opus")`. It outranks the frontmatter, so no file changes.
+2. **For the rest of the run.** Flip the pin once so later ticks skip the failing
+   Fable attempt: `./scripts/ralph/architect-model.sh opus`
+   (`... fable` restores it; no argument prints the current pin).
+
+Falling back is a **capacity** decision, never a weakened gate — an Opus architect
+plans to the same standard, and every rule in
+[`shared/house-rules.md`](house-rules.md) applies unchanged.
 
 **Sonnet** for the review-only synthesis role: `ralph-code-review-orchestrator`.
 

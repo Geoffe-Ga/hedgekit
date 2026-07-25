@@ -4,7 +4,7 @@ description: "Profiles and optimizes performance-sensitive code — N+1 queries,
 level: 2
 phase: Implementation,Cleanup
 tools: Read,Write,Edit,Grep,Glob
-model: fable
+model: opus
 delegates_to: []
 receives_from: [ralph-chief-architect, ralph-code-review-orchestrator]
 ---

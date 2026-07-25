@@ -4,7 +4,7 @@ description: "One parallel worker of the Ralph fleet. Select to drive a SINGLE a
 level: 1
 phase: Build
 tools: Read,Write,Edit,Grep,Glob,Bash,Task
-model: fable
+model: opus
 delegates_to: [ralph-chief-architect, ralph-test-specialist, ralph-implementation-specialist, ralph-security-specialist, ralph-performance-specialist, ralph-documentation-specialist, ralph-dependency-review-specialist, ralph-code-review-orchestrator]
 receives_from: []
 ---
@@ -58,6 +58,9 @@ So, concretely:
 - Read the issue (`gh issue view "$RALPH_ISSUE" --comments`) and the house rules
   (`CLAUDE.md`, `AGENTS.md`).
 - Spawn **ralph-chief-architect** for the plan + ordered dispatch list + risk flags.
+  It is the one agent pinned to `fable`; if that dispatch fails for want of Fable
+  credits, re-dispatch it with `model: "opus"` rather than stalling your issue
+  (see `.claude/agents/shared/README.md` → *Fable fallback*).
 - Run its specialists **sequentially** inside your worktree: `ralph-test-specialist`
   (Gate 1 RED) → `ralph-implementation-specialist` (Gate 1 GREEN + refactor) → only the
   cross-cutting specialists the architect flagged.
