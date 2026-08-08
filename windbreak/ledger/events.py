@@ -1279,6 +1279,57 @@ class ProviderVoteRecorded(Event):
         _derive_typed_event(self, payload)
 
 
+@dataclass(frozen=True)
+class ResearchBudgetHalted(Event):
+    """Records a fail-closed research halt on a budget ceiling (issue #339).
+
+    Appended by the scheduler's PAPER composition root when the always-on loop's
+    :class:`~windbreak.forecast.budget.ResearchBudget` refuses to spend: either
+    the UTC day's cumulative research budget is exhausted, or one forecast's
+    research cost strictly exceeds the per-forecast ceiling. The halt is the
+    durable audit record that research stopped *and why*, so an operator can
+    tell a budget halt apart from a quiet loop. Like every concrete event its
+    ``event_type`` is the literal class name ``"ResearchBudgetHalted"``, derived
+    via :func:`_derive_typed_event`, and every payload leaf is int/str -- never
+    a float, never ``None``.
+
+    Attributes:
+        market_ticker: The breaching forecast's market ticker for a
+            ``"per_forecast"`` halt, or ``""`` for a ``"per_day"`` halt, which
+            is not attributable to any single market -- never ``None``, matching
+            this module's inapplicable-string convention (see
+            :class:`ProviderVoteRecorded` ``failure_code``).
+        halt_kind: Which ceiling halted research: ``"per_day"`` or
+            ``"per_forecast"``.
+        utc_day: The halt's UTC calendar day, as an ISO ``YYYY-MM-DD`` string;
+            the same key the budget buckets spend under.
+        spent_micros: For a ``"per_day"`` halt, the day's cumulative spend at
+            the halt; for a ``"per_forecast"`` halt, the single breaching
+            forecast's research cost. In micros.
+        budget_micros: The ceiling that was breached, in micros.
+    """
+
+    market_ticker: str
+    halt_kind: str
+    utc_day: str
+    spent_micros: int
+    budget_micros: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "market_ticker": self.market_ticker,
+            "halt_kind": self.halt_kind,
+            "utc_day": self.utc_day,
+            "spent_micros": self.spent_micros,
+            "budget_micros": self.budget_micros,
+        }
+        _derive_typed_event(self, payload)
+
+
 #: Maps each event_type string to its class, so a persisted envelope can be
 #: reconstructed as ``EVENT_TYPES[event_type](component=..., **data)``.
 EVENT_TYPES: dict[str, type[Event]] = {
@@ -1313,4 +1364,5 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "CanaryVerdictRecorded": CanaryVerdictRecorded,
     "PromotionBlocked": PromotionBlocked,
     "ProviderVoteRecorded": ProviderVoteRecorded,
+    "ResearchBudgetHalted": ResearchBudgetHalted,
 }

@@ -141,6 +141,7 @@ from windbreak.ledger.events import (
     RecoveryCompleted,
     ReduceOnlyRefused,
     ReduceOnlyViolation,
+    ResearchBudgetHalted,
     ReturnToScreener,
     ScreenDecisionRecorded,
     SelectorDecisionRecorded,
@@ -375,6 +376,7 @@ def test_event_types_registry_maps_type_name_to_class() -> None:
         "CanaryVerdictRecorded": CanaryVerdictRecorded,
         "PromotionBlocked": PromotionBlocked,
         "ProviderVoteRecorded": ProviderVoteRecorded,
+        "ResearchBudgetHalted": ResearchBudgetHalted,
     } == EVENT_TYPES
 
 
@@ -1125,3 +1127,73 @@ def test_provider_vote_recorded_is_reexported_from_windbreak_ledger() -> None:
         "ProviderVoteRecorded not re-exported from windbreak.ledger"
     )
     assert ledger_package.ProviderVoteRecorded is ProviderVoteRecorded
+
+
+# --- Issue #339: ResearchBudgetHalted, the fail-closed research-halt event ---
+
+
+def test_research_budget_halted_populates_event_type_and_payload() -> None:
+    """`ResearchBudgetHalted` derives the full `Event` contract from typed fields.
+
+    Every payload leaf must be int/str -- never a float and never `None` -- so
+    the halt stays queryable as typed data rather than as prose buried in a
+    message string.
+    """
+    event = ResearchBudgetHalted(
+        component="scheduler",
+        market_ticker="",
+        halt_kind="per_day",
+        utc_day="2024-12-24",
+        spent_micros=6_000_000,
+        budget_micros=6_000_000,
+    )
+
+    assert event.event_type == "ResearchBudgetHalted"
+    assert event.component == "scheduler"
+    assert event.payload == {
+        "market_ticker": "",
+        "halt_kind": "per_day",
+        "utc_day": "2024-12-24",
+        "spent_micros": 6_000_000,
+        "budget_micros": 6_000_000,
+    }
+    assert all(isinstance(leaf, int | str) for leaf in event.payload.values())
+    assert not any(isinstance(leaf, float) for leaf in event.payload.values())
+
+
+def test_research_budget_halted_round_trips_through_the_event_types_registry() -> None:
+    """A persisted halt envelope reconstructs to an equal event.
+
+    Without the `EVENT_TYPES` registration this fails only at replay time, in
+    production, rather than here.
+    """
+    event = ResearchBudgetHalted(
+        component="scheduler",
+        market_ticker="MKT-DEEP",
+        halt_kind="per_forecast",
+        utc_day="2024-12-24",
+        spent_micros=3_000_000,
+        budget_micros=2_999_999,
+    )
+
+    assert EVENT_TYPES["ResearchBudgetHalted"] is ResearchBudgetHalted
+    rebuilt = EVENT_TYPES[event.event_type](
+        component=event.component,
+        **event.payload,
+    )
+    assert rebuilt == event
+    assert rebuilt.envelope_json == event.envelope_json
+
+
+def test_research_budget_halted_is_reexported_from_windbreak_ledger() -> None:
+    """`ResearchBudgetHalted` is importable from `windbreak.ledger` directly.
+
+    The package's import block and `__all__` are separately hand-maintained
+    lists; this pins that they agree for the new event.
+    """
+    import windbreak.ledger as ledger_package
+
+    assert hasattr(ledger_package, "ResearchBudgetHalted"), (
+        "ResearchBudgetHalted not re-exported from windbreak.ledger"
+    )
+    assert ledger_package.ResearchBudgetHalted is ResearchBudgetHalted
