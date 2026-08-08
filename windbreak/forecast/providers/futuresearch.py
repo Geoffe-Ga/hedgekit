@@ -309,16 +309,35 @@ def _parse_publication_date(value: object, fingerprint: str) -> datetime | None:
 
     Raises:
         ProviderResponseRejectedError: If the value is neither ``None`` nor a
-            parseable ISO-8601 string.
+            parseable ISO-8601 string, or if it parses to a *naive* datetime
+            (issue #329).
     """
     if value is None:
         return None
     if not isinstance(value, str):
         _reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
     try:
-        return datetime.fromisoformat(value.replace(_ZULU_SUFFIX, _UTC_SUFFIX))
+        parsed = datetime.fromisoformat(value.replace(_ZULU_SUFFIX, _UTC_SUFFIX))
     except ValueError:
         _reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
+    # A string with no UTC offset -- "2024-03-15T00:00:00", or a bare
+    # "2024-03-15" -- parses cleanly and yields tzinfo None, silently breaking
+    # the "timezone-aware datetime" contract above. Unguarded it reaches
+    # `_build_citation` and becomes a structurally-invalid `ProviderCitation`,
+    # caught only much later as an S8.8 `FAILURE_PUBLICATION_DATE_INVALID` in
+    # `windbreak/forecast/citations.py` -- so reject it here, at the provider
+    # boundary, exactly like every other malformed date shape.
+    #
+    # The offset is not assumed: `windbreak/forecast/pubdate.py` degrades a
+    # naive value rather than fabricating a timezone, and inventing UTC here
+    # would assert a fact the provider never reported.
+    #
+    # `utcoffset()` is consulted rather than testing `tzinfo is None` alone,
+    # because a tzinfo whose `utcoffset()` returns None is still naive by
+    # Python's own definition.
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        _reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
+    return parsed
 
 
 def _build_citation(entry: object, fingerprint: str) -> ProviderCitation:
