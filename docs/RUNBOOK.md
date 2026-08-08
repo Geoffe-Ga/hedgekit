@@ -459,14 +459,46 @@ one forecast's research cost (an unusually expensive research stage, a
 runaway page-fetch loop bounded by `max_pages`, etc.) rather than the whole
 day's spend.
 
-**Known limitation -- not wired into the live loop yet.** `ResearchBudget` is
-a real, tested guard, but `windbreak/scheduler/loop.py`'s PAPER-tick
-`_forecast_stage` calls `run_pipeline(...)` without a `budget` argument, so
-neither `BUDGET_DAY_EXHAUSTED` nor `BUDGET_FORECAST_EXCEEDED` fires in
-today's running PAPER loop. The class is reachable today only by a caller
-that constructs a `ResearchBudget` directly and passes it to
-`run_pipeline(..., budget=ResearchBudget(ledger=...))` -- wiring a real,
-ledgered `ResearchBudget` into the composition root is a later pass.
+**How the loop enforces this (issue #339).** `build_paper_deps` constructs
+**one** `ResearchBudget` per process from `config.forecast.budget` and carries
+it on `PaperTickDeps`, so its per-UTC-day spend bucket accumulates across every
+tick that bundle runs. There is deliberately no `budget` parameter on
+`build_paper_deps`: config is the single source, so there is no injection door
+through which an unlimited or absent budget could arrive.
+
+A halted tick appends exactly one `ResearchBudgetHalted` ledger row (component
+`scheduler`) carrying `halt_kind` (`per_day` or `per_forecast`), `utc_day`,
+`spent_micros`, and `budget_micros`. It then **skips the forecast, select, and
+approve stages** but still emits its heartbeat, equity sample, positions
+snapshot, and weekly report -- so a budget-halted loop stays observably alive
+and flat rather than dying. Its ledger differs from a normal tick's by exactly
+two absent rows: `ForecastCreated` and `SelectorDecisionRecorded`. No
+`ForecastCreated` row is fabricated for a tick where the forecast engine never
+ran; in a hash-chained audit ledger an honest gap beats an invented record.
+
+**Operator arithmetic.** With the SPEC defaults -- a 20,000,000-micro day
+ceiling against the fixed 3,000,000-micro per-forecast research charge -- a UTC
+day permits **7 charged forecasts** before research halts for the rest of that
+day. Raising the ceiling is a config edit to
+`config.forecast.budget.per_day_micros`; there is no runtime lever and no
+partial-day rollover.
+
+**Caveat -- the day counter is process-local.** Day spend lives in memory on the
+budget instance and is never persisted, so restarting the loop (crash, deploy,
+manual bounce) resets the day's spend to zero and the ceiling can be re-spent.
+This is fail-*open* across restarts and is the one gap in the guarantee above.
+Durable day-spend rehydration is deliberately out of scope here, because the
+obvious source -- summing `ForecastCreated.research_cost_micros` -- records a
+fixed constant rather than the true charged amount, so it would under-count and
+still fail open, just less visibly.
+
+**Caveat -- a negative ceiling now aborts startup.** The YAML loader applies no
+range checks, so a negative `per_forecast_micros`/`per_day_micros`/`max_pages`
+reaches the composition root intact and `ResearchBudget` rejects it with a
+`ValueError` while `--paper` is starting. That is the intended fail-closed
+outcome: a loop that cannot determine its ceiling must not run. A **zero**
+ceiling is legal and means "immediately exhausted" -- it silently halts all
+research, which is fail-closed but easy to mistake for a hung loop.
 
 ### Add / remove a provider
 

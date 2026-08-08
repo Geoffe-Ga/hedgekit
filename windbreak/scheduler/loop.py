@@ -39,6 +39,13 @@ from typing import TYPE_CHECKING, Protocol, cast
 from windbreak.config import config_hash
 from windbreak.connector.freshness import is_fresh
 from windbreak.connector.paper import PaperExchange
+from windbreak.forecast.budget import (
+    BUDGET_DAY_EXHAUSTED_EVENT,
+    BUDGET_FORECAST_EXCEEDED_EVENT,
+    DailyBudgetExhaustedError,
+    PerForecastBudgetExceededError,
+    ResearchBudget,
+)
 from windbreak.forecast.cassettes import ReplayCassette
 from windbreak.forecast.pipeline import (
     PROVIDER_VOTE_COSTED_EVENT,
@@ -54,6 +61,7 @@ from windbreak.ledger.events import (
     ModeHeartbeat,
     PositionsSnapshotRecorded,
     ProviderVoteRecorded,
+    ResearchBudgetHalted,
     SelectorDecisionRecorded,
 )
 from windbreak.ledger.store import SqliteLedgerStore
@@ -94,6 +102,7 @@ if TYPE_CHECKING:
 
     from windbreak.config.schema import WindbreakConfig
     from windbreak.connector.models import OrderBookSnapshot
+    from windbreak.forecast.budget import BudgetEvent
     from windbreak.forecast.cassettes import LlmTransport
     from windbreak.forecast.records import ForecastRecord
     from windbreak.forecast.sandbox import ResearchTools
@@ -108,6 +117,12 @@ _COMPONENT = "scheduler"
 
 #: The calibration-map version tag echoed into every selector decision.
 _CALIBRATION_MAP_VERSION = "v0"
+
+#: ``halt_kind`` stamped on a halt caused by the UTC day's budget running out.
+_HALT_KIND_PER_DAY = "per_day"
+
+#: ``halt_kind`` stamped on a halt caused by one forecast breaching its ceiling.
+_HALT_KIND_PER_FORECAST = "per_forecast"
 
 #: A full parts-per-million share (100%), used for the total-position ceiling the
 #: SPEC S16 ``RiskConfig`` has no dedicated field for.
@@ -246,6 +261,73 @@ class _SqliteKernelLedgerWriter:
             event: The event to persist.
         """
         self._store.append(event)
+
+
+class _SqliteBudgetLedgerWriter:
+    """A research-budget ledger writer that appends to a `SqliteLedgerStore`.
+
+    The persisting counterpart of
+    :class:`~windbreak.forecast.budget.InMemoryBudgetLedger` (which that module
+    documents as test-only), so a fail-closed research halt joins the same
+    hash-chained ledger as every other stage of the tick.
+
+    The budget engine's own :class:`~windbreak.forecast.budget.BudgetEvent` is a
+    different shape from a ledger :class:`~windbreak.ledger.events.Event`, so
+    this writer is the translation seam between them. Translation is *total*:
+    each of the two breach kinds maps onto a typed ``ResearchBudgetHalted`` row,
+    and any other kind raises rather than silently dropping an audit row.
+    """
+
+    def __init__(self, store: SqliteLedgerStore) -> None:
+        """Bind the writer to a ledger store.
+
+        Args:
+            store: The append-only store every halt event is persisted to.
+        """
+        self._store = store
+
+    def record(self, event: BudgetEvent) -> None:
+        """Append a budget breach to the ledger as a typed halt event.
+
+        Payload keys are read by subscript, never ``.get`` with a default, so a
+        payload-shape drift surfaces as a loud ``KeyError`` rather than a
+        silently zeroed audit row. Note the two kinds name the spent amount
+        differently: the per-day payload carries ``spent_micros`` (the day's
+        cumulative spend) while the per-forecast payload carries ``cost_micros``
+        (the single breaching forecast's cost).
+
+        Args:
+            event: The budget event to persist.
+
+        Raises:
+            ValueError: If ``event`` is neither of the two breach kinds.
+        """
+        payload = event.payload
+        if event.event_type == BUDGET_DAY_EXHAUSTED_EVENT:
+            self._store.append(
+                ResearchBudgetHalted(
+                    component=_COMPONENT,
+                    market_ticker="",
+                    halt_kind=_HALT_KIND_PER_DAY,
+                    utc_day=cast("str", payload["utc_day"]),
+                    spent_micros=cast("int", payload["spent_micros"]),
+                    budget_micros=cast("int", payload["budget_micros"]),
+                )
+            )
+            return
+        if event.event_type == BUDGET_FORECAST_EXCEEDED_EVENT:
+            self._store.append(
+                ResearchBudgetHalted(
+                    component=_COMPONENT,
+                    market_ticker=cast("str", payload["market_ticker"]),
+                    halt_kind=_HALT_KIND_PER_FORECAST,
+                    utc_day=cast("str", payload["utc_day"]),
+                    spent_micros=cast("int", payload["cost_micros"]),
+                    budget_micros=cast("int", payload["budget_micros"]),
+                )
+            )
+            return
+        raise ValueError(f"unhandled budget event type {event.event_type!r}")
 
 
 # --- small, individually-tested composition seams -------------------------------
@@ -510,6 +592,16 @@ class PaperTickDeps:
             gathers citations through.
         report_dir: Where the weekly report stub is written each tick.
         clock: The injected zero-arg epoch-second clock, for determinism.
+        budget: The research spend guard every tick's forecast runs under. This
+            is the bundle's one deliberately *mutable* member: the frozen
+            dataclass forbids rebinding the field, not mutating the object it
+            holds, and that is load-bearing. The instance is built once per
+            process in :func:`build_paper_deps`, so its per-UTC-day spend bucket
+            accumulates across every ``run_single_tick`` call against this
+            bundle -- which is the only thing making the per-day ceiling mean
+            anything on an always-on loop. :func:`dataclasses.replace` shares
+            the same instance by design, so swapping the ``approval`` seam
+            cannot reset the day.
     """
 
     config: WindbreakConfig
@@ -524,6 +616,7 @@ class PaperTickDeps:
     research_tools: ResearchTools
     report_dir: Path
     clock: Callable[[], int]
+    budget: ResearchBudget
 
 
 def _default_clock() -> int:
@@ -668,6 +761,37 @@ def _build_gateway(
     return gateway
 
 
+def _build_research_budget(
+    store: SqliteLedgerStore, config: WindbreakConfig
+) -> ResearchBudget:
+    """Build the loop's one research spend guard from configuration.
+
+    Config is the single source of the three ceilings, and there is deliberately
+    no way to inject a budget from outside: that is what makes an unlimited or
+    absent budget unrepresentable rather than merely discouraged. All three
+    ceilings are already scaled integers on the config, so they pass through
+    untouched -- no arithmetic, and therefore no float, enters this path.
+
+    Args:
+        store: The ledger store a fail-closed halt is recorded to.
+        config: The active configuration supplying the three ceilings.
+
+    Returns:
+        The process-lived research budget.
+
+    Raises:
+        ValueError: If any configured ceiling is negative -- aborting startup
+            rather than degrading to an unenforceable budget.
+    """
+    caps = config.forecast.budget
+    return ResearchBudget(
+        per_forecast_micros=caps.per_forecast_micros,
+        per_day_micros=caps.per_day_micros,
+        max_pages=caps.max_pages,
+        ledger=_SqliteBudgetLedgerWriter(store),
+    )
+
+
 def build_paper_deps(
     *,
     books_dir: Path,
@@ -725,6 +849,7 @@ def build_paper_deps(
         research_tools=_resolve_research_tools(research_tools, ledger_path),
         report_dir=report_dir,
         clock=resolved_clock,
+        budget=_build_research_budget(store, config),
     )
 
 
@@ -743,6 +868,9 @@ class TickOutcome:
             contract-centis (``0`` whenever the real kernel vetoes, as it always
             does today).
         equity_micros: The sampled account equity this tick, in micros.
+        research_halted: Whether this tick's research was halted fail-closed on
+            a budget ceiling. When ``True`` no forecast exists, so
+            ``forecast_id`` is ``""`` and no selector decision was made.
     """
 
     beat: int
@@ -750,6 +878,7 @@ class TickOutcome:
     intent_count: int
     filled_centis: int
     equity_micros: int
+    research_halted: bool = False
 
 
 def _snapshot_stage(deps: PaperTickDeps) -> OrderBookSnapshot:
@@ -787,12 +916,21 @@ def _baseline_pips(order_book: OrderBookSnapshot) -> int:
 
 def _forecast_stage(
     deps: PaperTickDeps, order_book: OrderBookSnapshot, created_at: datetime
-) -> ForecastRecord:
+) -> ForecastRecord | None:
     """Run the forecast pipeline and ledger the forecast event.
 
     The ledgered ``ForecastCreated`` carries the forecast's ``research_cost_micros``
     and ``market_price_baseline_pips`` (issue #188), the two fields the weekly
     evaluation/cost-meter fold reads verbatim off the payload.
+
+    Research runs under the bundle's budget (issue #339). On a budget breach the
+    pipeline raises, and this stage answers ``None`` rather than fabricating a
+    forecast: in a hash-chained audit ledger an honest gap beats a
+    ``ForecastCreated`` row for a tick where the engine provably never ran. The
+    ``except`` deliberately names exactly the two budget errors -- widening it
+    would dress an unrelated pipeline failure up as a benign budget halt. It
+    ledgers nothing itself, because the budget's own ledger writer has already
+    appended the durable ``ResearchBudgetHalted`` row before raising.
 
     Args:
         deps: The tick's dependency bundle.
@@ -800,7 +938,9 @@ def _forecast_stage(
         created_at: The injected creation instant, for determinism.
 
     Returns:
-        The produced forecast record.
+        The produced forecast record, or ``None`` when research halted
+        fail-closed on the budget -- in which case neither a ``ForecastCreated``
+        nor any ``ProviderVoteRecorded`` row is appended for this tick.
     """
     market = deps.exchange.get_market(deps.ticker)
     baseline = BaselineQuoteSnapshot(
@@ -809,14 +949,18 @@ def _forecast_stage(
         fetched_at=order_book.fetched_at,
     )
     vote_ledger = InMemoryForecastLedger()
-    forecast = run_pipeline(
-        market,
-        baseline,
-        transport=deps.transport,
-        created_at=created_at,
-        research_tools=deps.research_tools,
-        ledger=vote_ledger,
-    )
+    try:
+        forecast = run_pipeline(
+            market,
+            baseline,
+            transport=deps.transport,
+            created_at=created_at,
+            research_tools=deps.research_tools,
+            ledger=vote_ledger,
+            budget=deps.budget,
+        )
+    except (DailyBudgetExhaustedError, PerForecastBudgetExceededError):
+        return None
     deps.store.append(
         ForecastCreated(
             component=_COMPONENT,
@@ -1092,6 +1236,33 @@ def _equity_and_positions_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
     return equity.value
 
 
+def _decide_and_approve(
+    deps: PaperTickDeps,
+    order_book: OrderBookSnapshot,
+    forecast: ForecastRecord | None,
+    created_at: datetime,
+) -> tuple[str, int, int]:
+    """Select and approve against a forecast, or short-circuit a halted tick.
+
+    Narrows the optional forecast in one place so the select and approve stages
+    keep their existing non-optional contracts.
+
+    Args:
+        deps: The tick's dependency bundle.
+        order_book: The current book snapshot the selector reads.
+        forecast: The tick's forecast, or ``None`` when research halted.
+        created_at: The injected creation instant, for determinism.
+
+    Returns:
+        A ``(forecast_id, intent_count, filled_centis)`` triple -- ``("", 0, 0)``
+        when research halted, since no forecast exists to select against.
+    """
+    if forecast is None:
+        return "", 0, 0
+    decision = _select_stage(deps, order_book, forecast, created_at)
+    return forecast.forecast_id, len(decision.intents), _approve_stage(deps, decision)
+
+
 def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     """Drive one PAPER tick end to end, ledgering every stage (SPEC S5.3).
 
@@ -1105,6 +1276,14 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     an audit event to the shared hash-chained ledger. With the real kernel the
     approval always vetoes, so no order ever routes and ``filled_centis`` is ``0``.
 
+    A tick whose per-forecast or per-UTC-day research budget is exhausted halts
+    fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row, skips
+    the forecast, select, and approve stages, and still emits its heartbeat,
+    equity sample, positions snapshot, and weekly report -- so the loop stays
+    observably alive and flat rather than dying on an uncaught budget error.
+    Its ledger therefore differs from a normal tick's by exactly two absent
+    rows: ``ForecastCreated`` and ``SelectorDecisionRecorded``.
+
     Args:
         deps: The fully wired dependency bundle.
         beat: The 1-based tick sequence number, stamped on the heartbeat.
@@ -1116,8 +1295,9 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     created_at = datetime.fromtimestamp(now_epoch_s, UTC)
     order_book = _snapshot_stage(deps)
     forecast = _forecast_stage(deps, order_book, created_at)
-    decision = _select_stage(deps, order_book, forecast, created_at)
-    filled = _approve_stage(deps, decision)
+    forecast_id, intent_count, filled = _decide_and_approve(
+        deps, order_book, forecast, created_at
+    )
     deps.store.append(
         ModeHeartbeat(component=_COMPONENT, mode=Mode.PAPER.name, beat=beat)
     )
@@ -1130,8 +1310,9 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     )
     return TickOutcome(
         beat=beat,
-        forecast_id=forecast.forecast_id,
-        intent_count=len(decision.intents),
+        forecast_id=forecast_id,
+        intent_count=intent_count,
         filled_centis=filled,
         equity_micros=equity,
+        research_halted=forecast is None,
     )

@@ -39,7 +39,9 @@ that supplies `None` for both in production.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -50,6 +52,9 @@ from tests.scheduler.conftest import (
 )
 from windbreak.numeric.types import MoneyMicros
 from windbreak.riskkernel.modes import Mode
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 #: The four veto reasons a PAPER-mode evaluation with `verification=None` must
 #: produce today, in the exact SPEC S10.3 check order
@@ -411,3 +416,105 @@ def test_market_snapshot_event_to_record_handles_an_empty_book_side() -> None:
     assert isinstance(event, MarketSnapshotRecorded)
     assert event.best_bid_pips is None
     assert event.best_ask_pips is None
+
+
+# --- Issue #339: the budget-event -> ledger-event translation table ----------
+
+
+def test_sqlite_budget_ledger_writer_maps_a_day_exhausted_event(
+    tmp_path: Path,
+) -> None:
+    """A per-day exhaustion becomes a `per_day` halt row with an empty ticker.
+
+    Exact values are asserted rather than mere presence: the per-day payload's
+    spend field is named `spent_micros`, and a mutant that read `budget_micros`
+    into `spent_micros` (or vice versa) would survive any "a row exists" check.
+    """
+    from windbreak.forecast.budget import BUDGET_DAY_EXHAUSTED_EVENT, BudgetEvent
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.scheduler.loop import _SqliteBudgetLedgerWriter
+
+    store = SqliteLedgerStore(tmp_path / "day.db")
+    writer = _SqliteBudgetLedgerWriter(store)
+
+    writer.record(
+        BudgetEvent(
+            BUDGET_DAY_EXHAUSTED_EVENT,
+            {
+                "utc_day": "2024-12-24",
+                "spent_micros": 6_000_000,
+                "budget_micros": 6_000_000,
+            },
+            "2024-12-24T00:00:00.000000Z",
+        )
+    )
+
+    records = store.read_all()
+    assert [record.event_type for record in records] == ["ResearchBudgetHalted"]
+    assert json.loads(records[0].payload_json)["data"] == {
+        "market_ticker": "",
+        "halt_kind": "per_day",
+        "utc_day": "2024-12-24",
+        "spent_micros": 6_000_000,
+        "budget_micros": 6_000_000,
+    }
+
+
+def test_sqlite_budget_ledger_writer_maps_a_forecast_exceeded_event(
+    tmp_path: Path,
+) -> None:
+    """A per-forecast breach becomes a `per_forecast` halt row carrying the ticker.
+
+    Pins the field-name asymmetry between the two kinds: the per-forecast
+    payload names the spend `cost_micros`, not `spent_micros`.
+    """
+    from windbreak.forecast.budget import BUDGET_FORECAST_EXCEEDED_EVENT, BudgetEvent
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.scheduler.loop import _SqliteBudgetLedgerWriter
+
+    store = SqliteLedgerStore(tmp_path / "forecast.db")
+    writer = _SqliteBudgetLedgerWriter(store)
+
+    writer.record(
+        BudgetEvent(
+            BUDGET_FORECAST_EXCEEDED_EVENT,
+            {
+                "cost_micros": 3_000_000,
+                "budget_micros": 2_999_999,
+                "market_ticker": "MKT-DEEP",
+                "utc_day": "2024-12-24",
+            },
+            "2024-12-24T00:00:00.000000Z",
+        )
+    )
+
+    records = store.read_all()
+    assert json.loads(records[0].payload_json)["data"] == {
+        "market_ticker": "MKT-DEEP",
+        "halt_kind": "per_forecast",
+        "utc_day": "2024-12-24",
+        "spent_micros": 3_000_000,
+        "budget_micros": 2_999_999,
+    }
+
+
+def test_sqlite_budget_ledger_writer_rejects_an_unhandled_budget_event_type(
+    tmp_path: Path,
+) -> None:
+    """An unrecognized budget event raises rather than dropping an audit row.
+
+    `COST_REPORT` is a real budget event kind this writer deliberately does not
+    translate. Failing loudly is the fail-closed choice: a silently swallowed
+    event would be an audit row that simply never appears.
+    """
+    from windbreak.forecast.budget import COST_REPORT_EVENT, BudgetEvent
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.scheduler.loop import _SqliteBudgetLedgerWriter
+
+    store = SqliteLedgerStore(tmp_path / "unhandled.db")
+    writer = _SqliteBudgetLedgerWriter(store)
+
+    with pytest.raises(ValueError, match="COST_REPORT"):
+        writer.record(BudgetEvent(COST_REPORT_EVENT, {}, "2024-12-24T00:00:00.000000Z"))
+
+    assert store.read_all() == []
