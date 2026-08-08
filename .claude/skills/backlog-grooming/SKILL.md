@@ -4,8 +4,7 @@ description: >-
   Systematic GitHub backlog maintenance: review merged PRs, close resolved
   issues, identify gaps, and create missing issues. Use when asked to
   groom the backlog, clean up the issue tracker, or review recent work.
-  Do NOT use for PR code review (use comprehensive-pr-review) or
-  issue-first development workflow and PR creation (use git-workflow).
+  Do NOT use for reviewing a specific PR diff.
 metadata:
   author: Geoff
   version: 1.0.0

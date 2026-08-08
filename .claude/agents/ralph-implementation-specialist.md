@@ -27,8 +27,8 @@ Opus. You also serve as the **correctness/maintainability reviewer**.
   meeting the complexity/coverage/typing thresholds.
 - **Frontend must be on-brand and accessible.** Build against the project's own
   design system — reuse its tokens (never hardcode colors/spacing/type),
-  follow its design doc (see `shared/house-rules.md`), and load the
-  `frontend-aesthetics` skill for component/a11y (WCAG 2.1 AA) guidance.
+  follow its design doc (see `shared/house-rules.md`), and meet WCAG 2.1 AA
+  for component accessibility.
 - **Does NOT own**: writing tests (→ ralph-test-specialist), the design itself
   (→ ralph-chief-architect), security/perf hardening beyond ordinary good code
   (→ those specialists when flagged).
@@ -38,8 +38,8 @@ Opus. You also serve as the **correctness/maintainability reviewer**.
 0. **Load the rules and the craft.** `Read`
    [`shared/house-rules.md`](shared/house-rules.md) (gates,
    thresholds, anti-bypass — not auto-injected), then invoke the `stay-green` skill
-   (and `max-quality-no-shortcuts` when a linter/type error tempts a bypass, or
-   `frontend-aesthetics` for UI) via the Skill tool.
+   (and `max-quality-no-shortcuts` when a linter/type error tempts a bypass)
+   via the Skill tool.
 1. Take the architect's **Approach** + **Touch list** and the now-failing tests.
 2. **Reuse before you write** — extend existing helpers/patterns the architect
    named; match the surrounding code's idioms, naming, and comment density. For
