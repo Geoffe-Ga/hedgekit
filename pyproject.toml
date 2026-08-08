@@ -160,7 +160,76 @@ extend-ignore-names = [
 exclude_dirs = ["tests", "venv", "virtualenv"]
 
 [tool.mutmut]
-paths_to_mutate = "windbreak/"
-backup = false
-runner = "python -m pytest --exitfirst --quiet --tb=no"
-tests_dir = "tests/"
+# mutmut 3.x config surface (issue #324). The 2.x keys this replaces:
+#   paths_to_mutate -> source_paths           (and it must be a LIST: 3.x does
+#                                              [Path(p) for p in <value>], so the
+#                                              old bare string would iterate
+#                                              characters, not paths)
+#   tests_dir       -> pytest_add_cli_args_test_selection
+#   runner          -> pytest_add_cli_args    (3.x always drives pytest itself,
+#                                              so only the extra args carry over)
+#   backup          -> removed; 3.x mutates into a ./mutants/ tree rather than
+#                      rewriting sources in place, so there is nothing to back up.
+source_paths = ["windbreak/"]
+# --no-cov is required, not cosmetic. pytest addopts in this file carry
+# --cov=windbreak --cov-fail-under=90, and mutmut runs the suite once per
+# mutant, usually stopping at the first failure (--exitfirst). Under those
+# partial runs coverage lands far below 90%, so every run -- including mutmut's
+# initial clean baseline -- exits non-zero on the coverage gate and mutmut
+# concludes it cannot establish a baseline ("Failed to run clean test"), leaving
+# every mutant unchecked. Coverage is enforced by check-all.sh; the mutation
+# gate measures a different thing and must not re-enforce it.
+pytest_add_cli_args = ["--exitfirst", "--quiet", "--tb=no", "--no-cov"]
+# Behavioural tests only. The repo-governance suites are deselected because a
+# mutant in windbreak/ can never be killed by them -- they assert facts about
+# repo FILES (pins, docs, import contracts, script contents), not about the
+# behaviour of the mutated code -- so running them costs time per mutant and
+# buys no signal. Under mutmut 3.x they are also actively broken: the suite runs
+# inside ./mutants/, so each needs its inputs mirrored via also_copy, and
+# test_full_scan_mode_real_repo_denylisted_packages_are_clean cannot be fixed
+# that way at all -- it scans the real source tree, which in ./mutants/ is
+# deliberately mutated, so it fails by construction.
+#
+# NOTE: this narrows what the release gate executes. It does not lower the
+# threshold, and it cannot mask a surviving windbreak/ mutant, but it is a
+# deliberate scoping decision on an owner-directive gate (issue #107).
+pytest_add_cli_args_test_selection = [
+    "tests/",
+    "--ignore=tests/toolchain",
+    "--ignore=tests/architecture",
+    "--ignore=tests/docs",
+    "--ignore=tests/scripts",
+    "--ignore=tests/numeric/test_float_lint.py",
+]
+# mutmut 2.x mutated sources in place, so the whole repo was on hand when the
+# suite ran. 3.x runs the suite inside an isolated ./mutants/ tree containing
+# only source_paths plus also_copy (which already covers tests/, pyproject.toml
+# and the lockfiles). Anything else the suite reads from the repo root must be
+# listed here or collection dies before a single mutant is judged:
+#   scripts/  -- tests/scripts/* load these modules by path (e.g.
+#                tests/scripts/test_run_canaries.py imports scripts/run_canaries.py)
+#   docs/     -- referenced by a docs-drift test
+#   the root config files + .github/ -- tests/toolchain/* resolve them relative
+#                to the tree root, which under mutmut 3.x is ./mutants/
+also_copy = [
+    "scripts/",
+    "docs/",
+    "deploy/",
+    "plans/",
+    ".github/",
+    "Dockerfile",
+    "prompts/",
+    "ACCOUNTING.md",
+    "ARCHITECTURE.md",
+    "CLAUDE.md",
+    "EVALUATION.md",
+    "LEGAL_AND_COMPLIANCE.md",
+    "OPERATOR_WARNINGS.md",
+    "README.md",
+    "RUNBOOK.md",
+    "SECURITY.md",
+    "constraints-quality.txt",
+    "requirements.txt",
+    "requirements-dev.txt",
+    ".pre-commit-config.yaml",
+]
