@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeGuard
 
 from windbreak.alerts.registry import AlertType
 from windbreak.ledger.events import Event
@@ -211,6 +211,29 @@ def _own_component_events(events: tuple[Event, ...]) -> Iterator[Event]:
     return (event for event in events if event.component == _COMPONENT)
 
 
+def _is_scaled_int(value: object) -> TypeGuard[int]:
+    """Return whether ``value`` may be narrowed onto the scaled-int path.
+
+    ``bool`` is a subclass of ``int``, so a bare ``isinstance(value, int)``
+    admits ``True``/``False`` -- and the scaled-int constructors reject exactly
+    that: :class:`~windbreak.numeric.types.MoneyMicros` and
+    :class:`~windbreak.numeric.types.ContractCentis` raise ``TypeError`` on a
+    ``bool``. Without this exclusion a single malformed ledger row does not take
+    the defensive skip path it was meant to; it slips through the narrowing into
+    a constructor that raises, turning a corrupt payload leaf into an unhandled
+    crash while the kernel is projecting its startup baseline. Excluding ``bool``
+    here keeps such a row on the skip path, where a malformed fact is simply not
+    a fact.
+
+    Args:
+        value: A JSON-safe payload leaf, of unknown runtime type.
+
+    Returns:
+        Whether ``value`` is an ``int`` that is not a ``bool``.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _seed_cash(events: tuple[Event, ...], connector: MarketConnector) -> MoneyMicros:
     """Return the cash baseline seeded from history, else from the connector.
 
@@ -239,7 +262,7 @@ def _seed_cash(events: tuple[Event, ...], connector: MarketConnector) -> MoneyMi
     for event in _own_component_events(events):
         if event.event_type in _CASH_SEED_EVENT_TYPES:
             cash = event.payload.get(_CASH_PAYLOAD_KEY)
-            if isinstance(cash, int):
+            if _is_scaled_int(cash):
                 seed = MoneyMicros(cash)
     if seed is not None:
         return seed
@@ -305,6 +328,15 @@ def _rows_to_positions(rows: object) -> dict[str, ContractCentis]:
     Each well-formed row contributes ``{ticker: ContractCentis(quantity_centis)}``;
     the JSON-safe ``object`` payload leaves are narrowed defensively so a
     malformed row can never smuggle a non-int quantity onto the scaled-int path.
+    Malformed rows are skipped individually, so one bad row never discards the
+    good rows beside it -- and ``rows`` that is not a list at all yields an empty
+    mapping rather than a connector fallback, because the snapshot *exists*: the
+    kernel then expects a flat account and breaches loudly against any real
+    holding, instead of quietly adopting a garbage baseline.
+
+    Quantities are narrowed through :func:`_is_scaled_int`, not a bare
+    ``isinstance(quantity, int)``, so a ``bool`` is skipped like any other
+    malformed leaf instead of reaching ``ContractCentis`` and raising.
 
     Args:
         rows: The snapshot's ``positions`` payload value.
@@ -320,7 +352,7 @@ def _rows_to_positions(rows: object) -> dict[str, ContractCentis]:
             continue
         ticker = row.get(_ROW_TICKER_KEY)
         quantity = row.get(_ROW_QUANTITY_CENTIS_KEY)
-        if isinstance(ticker, str) and isinstance(quantity, int):
+        if isinstance(ticker, str) and _is_scaled_int(quantity):
             positions[ticker] = ContractCentis(quantity)
     return positions
 

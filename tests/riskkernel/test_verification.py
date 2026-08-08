@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from tests.riskkernel.conftest import DEFAULT_NOW_EPOCH_S, make_context, make_intent
 from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.alerts.registry import AlertSeverity, AlertType, get_registration
@@ -1495,3 +1497,204 @@ def test_ledger_expectation_source_open_orders_still_fold_a_foreign_kill() -> No
     source = LedgerExpectationSource(history, connector)
 
     assert source.get_expectations().expected_open_order_ids == frozenset()
+
+
+# --- Defensive-path coverage (issue #309) ----------------------------------------
+#
+# Three paths PR #308's Gate 2.5 self-review flagged as defensive-only and
+# deferred: the cash seed's breach-only fallback, `_rows_to_positions`'s
+# malformed-row narrowing, and the `isinstance(x, int)` checks that also accept
+# `True`/`False`. They are covered here because the pre-v1.0.0 mutation gate
+# (`./scripts/mutation.sh`) surfaces untested defensive branches as surviving
+# mutants.
+#
+# The narrowing is not merely theoretical. Replay rebuilds *base* `Event`s from
+# stored envelope JSON via `windbreak.ledger.store.events_from_records`, so
+# `PositionsSnapshotRecorded`'s `list[dict[str, object]]` typing does not survive
+# the round-trip -- on the read path `payload["positions"]` is whatever JSON a
+# corrupt, older, or foreign writer left behind.
+
+
+def _replayed_positions_snapshot(rows: object) -> Event:
+    """Build a bare replayed positions snapshot carrying ``rows`` verbatim.
+
+    The typed :class:`PositionsSnapshotRecorded` cannot express a malformed
+    payload -- its ``positions`` field is ``list[dict[str, object]]`` -- but the
+    replay path never constructs the typed class. This mirrors what
+    ``events_from_records`` actually hands the projection, so the narrowing is
+    tested against the shapes it really defends against.
+
+    Args:
+        rows: The ``positions`` payload value, well-formed or not.
+
+    Returns:
+        The constructed bare `Event`.
+    """
+    return Event(
+        event_type="PositionsSnapshotRecorded",
+        component="riskkernel",
+        payload_schema_version=1,
+        payload={"positions": rows},
+    )
+
+
+def test_ledger_expectation_source_cash_falls_back_when_only_breaches() -> None:
+    """A history of *only* breach events leaves the cash seed unset, so the
+    baseline takes the connector fallback.
+
+    Distinct from the existing breach-ignored test, which pairs a breach with a
+    non-breach event and asserts the non-breach cash wins: here there is no
+    non-breach event at all, so the `seed is None` fallback is the branch under
+    test. Re-baselining onto a cash figure already known to breach is exactly
+    what this path exists to prevent.
+    """
+    connector = _MutableBalanceConnector(available=MoneyMicros(88_000_000))
+    history = [
+        _verification_event("VerificationMismatch", cash_micros=5_000_000),
+        _verification_event("VerificationMismatch", cash_micros=6_000_000),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(88_000_000)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [250, "KXFED-24DEC", {"KXFED-24DEC": 250}],
+    ids=["non-iterable-int", "bare-string", "mapping"],
+)
+def test_ledger_expectation_source_positions_narrow_a_non_list_payload(
+    malformed: object,
+) -> None:
+    """A ``positions`` payload that is not a list narrows to a flat expectation.
+
+    Note this does *not* fall back to the connector: the snapshot exists, so
+    the internal rows sentinel is non-`None` and the narrowing returns an empty
+    mapping. A corrupt snapshot therefore makes the kernel expect a flat
+    account, which breaches loudly against any real holding rather than
+    silently adopting a garbage baseline -- the fail-closed direction. The
+    connector below deliberately holds a position so a wrong fallback would
+    show up as that position leaking into the expectation.
+
+    The `non-iterable-int` case is the one with real teeth, and is why this is
+    parametrized rather than a single mapping payload: the string and mapping
+    payloads still narrow to an empty mapping even with the list guard deleted
+    (iterating them yields characters and keys, each skipped as a non-row), so
+    they alone cannot detect that guard's removal. Iterating an `int` raises,
+    so only that case actually fails if the guard is lost.
+    """
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        positions=(
+            Position(
+                ticker="KXFED-24DEC",
+                quantity=ContractCentis(500),
+                average_price=PricePips(4550),
+            ),
+        ),
+    )
+
+    source = LedgerExpectationSource(
+        [_replayed_positions_snapshot(malformed)], connector
+    )
+
+    assert dict(source.get_expectations().expected_positions) == {}
+
+
+def test_ledger_expectation_source_positions_fall_back_on_a_null_payload() -> None:
+    """A snapshot whose ``positions`` payload is absent -- or explicitly null --
+    takes the *connector* fallback, not the empty narrowing.
+
+    This is the boundary of the test above, and the two must not be conflated.
+    A missing key and a JSON ``null`` both surface as `None` from
+    `payload.get`, which is indistinguishable from "this snapshot recorded no
+    positions fact at all" -- so the seed is left unset and the connector's live
+    positions win. A payload that is present but the wrong *type* is a
+    different thing: it is a recorded fact that cannot be read, and narrows to
+    a flat expectation instead.
+    """
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        positions=(
+            Position(
+                ticker="KXFED-24DEC",
+                quantity=ContractCentis(500),
+                average_price=PricePips(4550),
+            ),
+        ),
+    )
+
+    source = LedgerExpectationSource([_replayed_positions_snapshot(None)], connector)
+
+    assert dict(source.get_expectations().expected_positions) == {
+        "KXFED-24DEC": ContractCentis(500)
+    }
+
+
+def test_ledger_expectation_source_positions_skip_malformed_rows() -> None:
+    """Individually malformed rows are skipped while well-formed rows around
+    them still seed the baseline.
+
+    Each row below trips a distinct guard in the narrowing -- a row that is not
+    a mapping at all, a row whose ticker is not a string, and a row whose
+    quantity is not an int -- and the one good row must survive all three.
+    """
+    connector = _MutableBalanceConnector(available=MoneyMicros(1))
+    rows = [
+        "not-a-row",
+        {"ticker": 12345, "quantity_centis": 10},
+        {"ticker": "KXBAD", "quantity_centis": "250"},
+        {"ticker": "KXFED-24DEC", "quantity_centis": 250},
+    ]
+
+    source = LedgerExpectationSource([_replayed_positions_snapshot(rows)], connector)
+
+    assert dict(source.get_expectations().expected_positions) == {
+        "KXFED-24DEC": ContractCentis(250)
+    }
+
+
+def test_ledger_expectation_source_cash_rejects_a_bool_payload() -> None:
+    """A boolean ``exchange_verified_available_cash`` never seeds the baseline.
+
+    ``bool`` is a subclass of ``int``, so a bare ``isinstance(cash, int)``
+    accepts ``True`` and seeds ``MoneyMicros(1)`` -- one micro-dollar -- from a
+    payload carrying no cash figure at all. Essentially any real balance
+    breaches against that fabricated baseline, so the value must be rejected
+    and the connector fallback must fire instead.
+    """
+    connector = _MutableBalanceConnector(available=MoneyMicros(42_000_000))
+    history = [
+        Event(
+            event_type="VerificationPassed",
+            component="riskkernel",
+            payload_schema_version=1,
+            payload={"exchange_verified_available_cash": True},
+        )
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(42_000_000)
+
+
+def test_ledger_expectation_source_positions_reject_a_bool_quantity() -> None:
+    """A boolean ``quantity_centis`` never becomes a position.
+
+    The same ``bool``-is-an-``int`` hole on the position path: unnarrowed,
+    ``True`` smuggles ``ContractCentis(1)`` onto the scaled-int path for a
+    ticker whose real size is unknown. The row must be skipped like any other
+    malformed row, leaving only the well-formed one.
+    """
+    connector = _MutableBalanceConnector(available=MoneyMicros(1))
+    rows = [
+        {"ticker": "KXBOOL", "quantity_centis": True},
+        {"ticker": "KXFED-24DEC", "quantity_centis": 250},
+    ]
+
+    source = LedgerExpectationSource([_replayed_positions_snapshot(rows)], connector)
+
+    assert dict(source.get_expectations().expected_positions) == {
+        "KXFED-24DEC": ContractCentis(250)
+    }
