@@ -8,8 +8,20 @@ name: "Scan: Mutation survivors"
 # queue-depth hopper uses to refill the Ralph backlog off-schedule.
 
 on:
-  schedule:
-    - cron: "0 8 8,22 * *"       # biweekly (8th & 22nd) 08:00 UTC — expensive, schedule-only (never hopper)
+  # PAUSED 2026-08-08 by the MVP priority audit
+  # (plan/2026-08-08_MVP_PRIORITY_AUDIT.md §5, §7).
+  #
+  # Mutation score is the documented MANUAL pre-v1.0.0 release gate (issue
+  # #107, CLAUDE.md) — never an automated gate — so this scanner's output can
+  # only ever compete with MVP work for the Ralph picker's attention. Ten of
+  # its issues were already open and unstarted when it was paused.
+  #
+  # RESTORE when the MVP critical path (audit Tier A: #339, #340, #342, #343,
+  # #344) has closed, by uncommenting the schedule below. `workflow_dispatch`
+  # stays enabled so the gate can still be run on demand before a release.
+  #
+  # schedule:
+  #   - cron: "0 8 8,22 * *"     # biweekly (8th & 22nd) 08:00 UTC — expensive, schedule-only (never hopper)
   workflow_dispatch:
     inputs:
       max_issues:

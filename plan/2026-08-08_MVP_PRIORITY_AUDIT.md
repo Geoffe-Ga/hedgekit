@@ -258,19 +258,42 @@ The fleet's work order is now: **#152** (unblock by merging PR #263) → **#339*
 operator-visibility set, oldest-first) → #340, #342, #343, #344, #345 (the new
 blockers).
 
-One wrinkle worth flagging: `pick-next.sh` is oldest-first *within* a tier, so
-the six newly filed blockers sort **behind** the six promoted follow-ups at P1.
-That ordering is defensible — #294/#269/#305 are the wire-in work #344 depends
-on anyway — but if you want #340/#342 (the two that end the universal veto)
-picked first, they need P0 rather than P1.
+**Ordering fix (applied):** `pick-next.sh` is oldest-first *within* a tier, so
+the newly filed blockers initially sorted **behind** the promoted follow-ups at
+P1. #340 and #342 — the pair that together end the kernel's universal veto —
+were promoted to **P0** so they are picked before the P1 wire-in work. Final
+P0 order: #152 → #339 → #340 → #342.
 
-### Still recommended, not applied
+### Scanner throttle — APPLIED 2026-08-08
 
-**Throttle the scanners.** They produce more than the fleet drains — 71 → 84 →
-98 open across the last three grooms — and they only ever ask whether the *code*
-is good, never whether the *product* runs. Suggest pausing `scan:mutation` and
-`scan:perf` until Tier A closes. This is a workflow change, so it is left to the
-operator rather than applied here.
+The scanners produce more than the fleet drains (71 → 84 → 98 open across the
+last three grooms) and only ever ask whether the *code* is good, never whether
+the *product* runs. Both offenders are now paused:
+
+- **`scan-mutation.yml`** — schedule commented out, `workflow_dispatch` kept so
+  the manual pre-v1.0.0 release gate (issue #107) can still be run on demand.
+- **`scan-perf.yml`** — schedule commented out, **and** its filing priority
+  lowered `P2 → P3` so an on-demand run cannot refill the tier the picker reads
+  first.
+- **`hopper.yml`** — `scan-perf.yml` removed from the low-runway dispatch
+  rotation. This mattered: the hopper dispatches perf when queue depth drops, so
+  commenting the cron alone would **not** have stopped it. (`scan-mutation.yml`
+  was already excluded from the rotation as too expensive.)
+
+Each pause carries an inline RESTORE note naming the exact condition — audit
+Tier A (#339, #340, #342, #343, #344) closing — and, for perf, the two issues
+(#319, #332) to re-promote at that point. Verified: `test_scan_workflows.sh`
+20/20, `test_queue_depth.sh` 10/10, YAML parses with `workflow_dispatch` intact
+on both.
+
+### Still recommended, NOT applied — needs the operator
+
+**Merge PR #263** (see §6). Deliberately not done here: the `claude-review`
+check is red *by design* because claude-code-action's workflow-validation guard
+skips review on changes to `.github/workflows/`, precisely so an agent cannot
+land changes to its own review workflow unreviewed. An agent merging it would be
+the exact failure mode that guard exists to prevent. It needs a human review and
+an admin merge.
 
 ---
 
