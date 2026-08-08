@@ -539,6 +539,52 @@ def test_citation_non_string_publication_date_is_rejected_as_malformed(
     assert error.failure_code == RESPONSE_FAILURE_MALFORMED_VOTE_JSON
 
 
+@pytest.mark.parametrize(
+    "naive",
+    [
+        "2024-03-15T00:00:00",
+        "2024-03-15T00:00:00.123456",
+        "2024-03-15",
+    ],
+    ids=["seconds", "microseconds", "date-only"],
+)
+def test_citation_naive_publication_date_is_rejected_as_malformed(
+    naive: str, market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """A `publication_date` carrying no UTC offset is rejected at the provider
+    boundary, like every other malformed date shape.
+
+    `datetime.fromisoformat` parses all three of these cleanly and returns a
+    value with `tzinfo is None`, which contradicts this parser's documented
+    "timezone-aware datetime" contract. Left unguarded the naive value flows
+    through `_build_citation` into a `ProviderCitation`, and the problem only
+    surfaces much later as an S8.8 `FAILURE_PUBLICATION_DATE_INVALID` in
+    `citations.py` -- so the provider emits a structurally-invalid citation it
+    should have refused outright.
+
+    The `date-only` case matters independently of the other two: a bare date is
+    the shape a real provider is most likely to emit, and it is the one a naive
+    check written against the `T`-separated forms would miss.
+
+    Rejecting rather than coercing is deliberate and matches the siblings:
+    `windbreak/forecast/pubdate.py` degrades a naive value to `None` precisely
+    so a timezone is never fabricated, and assuming UTC here would invent a
+    fact the provider did not report.
+    """
+    citations = json.dumps(
+        [
+            {
+                "url": "https://example.test/a",
+                "quoted_text": "some text",
+                "publication_date": naive,
+            }
+        ]
+    )
+    error = _rejected(_body(citations=citations), market, baseline)
+
+    assert error.failure_code == RESPONSE_FAILURE_MALFORMED_VOTE_JSON
+
+
 def test_citations_field_not_a_list_is_rejected_as_malformed(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
