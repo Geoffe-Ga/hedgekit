@@ -1232,10 +1232,14 @@ def _build_risk_kernel(
     With a ``verification_connector`` the kernel's per-beat verification cycle
     becomes live (issue #288, superseding issue #236's frozen-startup snapshot):
     a :class:`LedgerExpectationSource` folds the replayed ``history`` once into a
-    scoped baseline -- cash seeded from the last non-breach verification event,
-    positions from the last positions snapshot -- falling back per dimension to
-    that connector's own startup balances/positions/open-orders where the ledger
-    carries no such fact, a :class:`VerificationTolerances` is composed from
+    scoped baseline -- cash seeded from the last non-breach verification event
+    *the kernel itself recorded*, positions from the last positions snapshot *it
+    recorded* (a shared ledger also carries other components' rows, so only
+    ``component="riskkernel"`` rows may seed this safety-critical baseline; none
+    records such a snapshot today, so positions always falls through) -- falling
+    back per dimension to that connector's own startup
+    balances/positions/open-orders where the ledger carries no such fact, a
+    :class:`VerificationTolerances` is composed from
     ``risk.verification_balance_tolerance_micros`` /
     ``risk.verification_position_tolerance_centis``, and a
     :class:`ReadOnlyVerifier` -- sharing **both** the kernel's ledger writer and
@@ -1341,10 +1345,14 @@ def _build_verifier(
     Projects a scoped ledger-derived baseline the verifier reconciles the venue
     against each beat (issue #288, superseding the frozen-startup-snapshot seam
     of issue #236): a :class:`LedgerExpectationSource` folds ``history`` once,
-    seeding cash from the last non-breach verification event and positions from
-    the last positions snapshot, and falling back -- per dimension,
-    independently -- to ``verification_connector``'s own startup state where the
-    ledger carries no such fact (see :class:`LedgerExpectationSource`). The
+    seeding cash from the last non-breach verification event *the kernel itself
+    recorded* and positions from the last positions snapshot *it recorded*, and
+    falling back -- per dimension, independently -- to
+    ``verification_connector``'s own startup state where the ledger carries no
+    such fact. Only ``component="riskkernel"`` rows may seed, because a shared
+    ledger also carries e.g. the PAPER loop's simulated position snapshots; no
+    component records a ``riskkernel``-stamped snapshot today, so positions is
+    connector-fallback in practice (see :class:`LedgerExpectationSource`). The
     per-dimension tolerances come from ``config.risk``. The verifier shares
     ``dispatcher`` and ``writer`` with the kill switch so its alerts and events
     reach the same sinks and hash-chained ledger.

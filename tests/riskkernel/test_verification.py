@@ -952,7 +952,9 @@ class _MutableBalanceConnector:
         raise NotImplementedError(order_id)
 
 
-def _verification_event(event_type: str, *, cash_micros: int) -> Event:
+def _verification_event(
+    event_type: str, *, cash_micros: int, component: str = "riskkernel"
+) -> Event:
     """Build a bare verification-cycle event carrying one cash observation.
 
     Mirrors the shape `ReadOnlyVerifier._record` emits (a bare `Event` whose
@@ -967,13 +969,17 @@ def _verification_event(event_type: str, *, cash_micros: int) -> Event:
         event_type: The verification event's exact `event_type` string.
         cash_micros: The `exchange_verified_available_cash` value to carry,
             in micros.
+        component: The ledger component to stamp the event with. Defaults to
+            the kernel's own `"riskkernel"`, exactly as
+            `ReadOnlyVerifier._record` stamps it, so only a test deliberately
+            exercising the component filter ever passes anything else.
 
     Returns:
         The constructed bare `Event`.
     """
     return Event(
         event_type=event_type,
-        component="riskkernel",
+        component=component,
         payload_schema_version=1,
         payload={"exchange_verified_available_cash": cash_micros},
     )
@@ -1274,3 +1280,218 @@ def test_ledger_expectation_source_seeds_each_dimension_independently() -> None:
     assert dict(expectations.expected_positions) == {"KXFED-24DEC": ContractCentis(250)}
     assert expectations.expected_available_cash == MoneyMicros(77_000_000)
     assert expectations.expected_open_order_ids == frozenset({"fallback-order"})
+
+
+# --- Component-scoped ledger seeds (issue #288 review follow-up) ------------------
+#
+# The cash and position seeds must match on `event.component == "riskkernel"`,
+# not on `event.event_type` alone. The PAPER scheduler loop records
+# `PositionsSnapshotRecorded(component="scheduler", positions=...)` derived from
+# a *simulated* `PaperExchange` (windbreak/scheduler/loop.py), and the documented
+# deploy topology shares ONE ledger volume across processes -- so an event-type-only
+# fold lets a LIVE risk kernel seed its safety-critical reconciliation baseline
+# from simulated paper positions. The consequences are symmetric and both bad: a
+# fake baseline that does not match the real venue is a full-size position breach
+# (a spurious `AUTO_RECONCILIATION` auto-kill), and a fake baseline that happens
+# to match the venue masks genuine drift the kernel exists to catch.
+#
+# The open-order dimension is deliberately NOT component-scoped; the last test
+# below pins that asymmetry so a future "scope every dimension" cleanup cannot
+# silently break the kill fold's single source of truth.
+
+
+def test_ledger_expectation_source_positions_ignore_a_later_foreign_snapshot() -> None:
+    """A `PositionsSnapshotRecorded` stamped with a foreign component never
+    seeds the kernel's position baseline -- not even when it is the LAST
+    snapshot in the history, where an event-type-only fold would let it
+    overwrite the kernel's own. The kernel-stamped rows recorded before it are
+    what survive, and the simulated paper ticker never appears at all."""
+    connector = _MutableBalanceConnector(available=MoneyMicros(1))
+    history = [
+        PositionsSnapshotRecorded(
+            component="riskkernel",
+            positions=[
+                {
+                    "ticker": "KXFED-24DEC",
+                    "quantity_centis": 250,
+                    "average_price_pips": 4500,
+                }
+            ],
+        ),
+        PositionsSnapshotRecorded(
+            component="scheduler",
+            positions=[
+                {
+                    "ticker": "PAPER-SIM",
+                    "quantity_centis": 12345,
+                    "average_price_pips": 5000,
+                }
+            ],
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert dict(expectations.expected_positions) == {"KXFED-24DEC": ContractCentis(250)}
+    assert "PAPER-SIM" not in expectations.expected_positions
+
+
+def test_ledger_expectation_source_positions_fall_back_when_only_foreign() -> None:
+    """When the only `PositionsSnapshotRecorded` in history is foreign-stamped,
+    the kernel's own ledger carries no snapshot at all, so the position
+    baseline takes the same connector fallback an empty history takes: the
+    connector's live `ContractCentis(500)` in `KXFED-24DEC`.
+
+    That exact expected value is load-bearing -- it must be the connector's
+    positions and NOT `{}`. An implementation that filters the foreign rows out
+    of the fold but leaves its internal `rows` sentinel non-`None` would fall
+    through to an empty snapshot instead of to the connector, expect a flat
+    account, and turn every genuinely-held position into a full-size position
+    breach on the very next verification cycle."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        positions=(
+            Position(
+                ticker="KXFED-24DEC",
+                quantity=ContractCentis(500),
+                average_price=PricePips(4550),
+            ),
+        ),
+    )
+    history = [
+        PositionsSnapshotRecorded(
+            component="scheduler",
+            positions=[
+                {
+                    "ticker": "PAPER-SIM",
+                    "quantity_centis": 12345,
+                    "average_price_pips": 5000,
+                }
+            ],
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert dict(expectations.expected_positions) == {"KXFED-24DEC": ContractCentis(500)}
+    assert "PAPER-SIM" not in expectations.expected_positions
+
+
+def test_ledger_expectation_source_positions_own_flat_snapshot_beats_foreign() -> None:
+    """The kernel's own snapshot of a FLAT account (an empty row list) beats
+    both a later foreign snapshot and the connector's live position.
+
+    Two properties in one: today's event-type-only fold takes the later
+    foreign rows, and once the seed is component-scoped this becomes the guard
+    that the filter did not also turn an own *empty* snapshot into a *missing*
+    one -- a flat snapshot is a real recorded fact, and must keep beating the
+    connector rather than falling through to it."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        positions=(
+            Position(
+                ticker="KXFED-24DEC",
+                quantity=ContractCentis(500),
+                average_price=PricePips(4550),
+            ),
+        ),
+    )
+    history = [
+        PositionsSnapshotRecorded(component="riskkernel", positions=[]),
+        PositionsSnapshotRecorded(
+            component="scheduler",
+            positions=[
+                {
+                    "ticker": "PAPER-SIM",
+                    "quantity_centis": 12345,
+                    "average_price_pips": 5000,
+                }
+            ],
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert dict(expectations.expected_positions) == {}
+
+
+def test_ledger_expectation_source_cash_ignores_a_foreign_component_event() -> None:
+    """A verification event stamped with a foreign component never seeds the
+    cash baseline, even when it is the LAST non-breach verification event in
+    the shared history: the kernel's own earlier `VerificationPassed` cash
+    wins. Another process's `"VerificationPassed"` describes a different
+    account entirely, so folding it would re-baseline a live kernel onto cash
+    it has never held."""
+    connector = _MutableBalanceConnector(available=MoneyMicros(1))
+    history = [
+        _verification_event("VerificationPassed", cash_micros=10_000_000),
+        _verification_event(
+            "VerificationPassed", cash_micros=999_000_000, component="scheduler"
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(10_000_000)
+
+
+def test_ledger_expectation_source_cash_falls_back_when_only_foreign() -> None:
+    """When the only non-breach verification event in history is
+    foreign-stamped, the kernel's own ledger carries no cash observation, so
+    the cash baseline takes the connector fallback -- the connector's live
+    `MoneyMicros(77_000_000)`, never the foreign event's figure."""
+    connector = _MutableBalanceConnector(available=MoneyMicros(77_000_000))
+    history = [
+        _verification_event(
+            "VerificationPassed", cash_micros=999_000_000, component="scheduler"
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(77_000_000)
+
+
+def test_ledger_expectation_source_open_orders_still_fold_a_foreign_kill() -> None:
+    """A `KillEngaged` (plus its `CancelAllDirective`) stamped with a foreign
+    component STILL empties the open-order expectation, even though the
+    connector reports a resting order. The open-order dimension is deliberately
+    NOT component-scoped, for two reasons.
+
+    First, correctness of the fold: `_seed_open_order_ids` delegates to
+    `kill_state_in`, the one canonical kill fold that `KillSwitch.from_events`
+    and `RiskKernel.from_events` also run -- over the same unfiltered history --
+    in `windbreak/main.py`. Component-scoping it at this single call site would
+    let the open-order expectation disagree with the kill mode the kernel
+    actually replays to.
+
+    Second, direction of failure: a foreign kill event only makes the
+    expectation MORE conservative (expect nothing resting), so the worst case
+    is a breach on a live resting order, never a silently-missed one. It fails
+    closed, which is the opposite of the cash and position seeds, where a
+    foreign event can fabricate a permissive-looking baseline."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        open_orders=(
+            OpenOrder(
+                id="resting-1",
+                ticker="KXFED-24DEC",
+                side="yes",
+                price=PricePips(5000),
+                quantity=ContractCentis(10),
+            ),
+        ),
+    )
+    history = [
+        KillEngaged(
+            component="scheduler", trigger="CLI", kill_sequence=1, epoch=1_700_000_000
+        ),
+        CancelAllDirective(component="scheduler", scope="all_open_orders"),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_open_order_ids == frozenset()

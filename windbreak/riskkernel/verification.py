@@ -35,14 +35,18 @@ from windbreak.ledger.events import Event
 from windbreak.numeric.types import ContractCentis, MoneyMicros
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable, Iterator, Mapping
 
     from windbreak.alerts.dispatch import AlertDispatcher
     from windbreak.connector.interface import MarketConnector
     from windbreak.connector.models import OpenOrder, Position
     from windbreak.riskkernel.process import KernelLedgerWriter
 
-#: Component label stamped on every verification event this module records.
+#: Component label stamped on every verification event this module records --
+#: and, because :func:`_own_component_events` filters the seeding path by it,
+#: also this module's *seeding trust boundary*: the label written on the way out
+#: is the label required on the way back in, so the baseline folds only facts
+#: this kernel itself recorded.
 _COMPONENT = "riskkernel"
 
 #: Payload schema version stamped on every verification event.
@@ -184,13 +188,45 @@ _ROW_TICKER_KEY = "ticker"
 _ROW_QUANTITY_CENTIS_KEY = "quantity_centis"
 
 
+def _own_component_events(events: tuple[Event, ...]) -> Iterator[Event]:
+    """Return an iterator over only the events this kernel itself recorded.
+
+    This is the *seeding trust boundary*: the kernel seeds its safety-critical
+    reconciliation baseline only from facts it recorded itself. ``--ledger-path``
+    is a shared flag, and the documented compose topology mounts one ``ledger``
+    volume across every process (``deploy/docker-compose.yml``), so one ledger
+    routinely carries other components' events -- notably the PAPER loop's
+    ``component="scheduler"`` snapshots, which are derived from a *simulated*
+    ``PaperExchange`` (``windbreak/scheduler/loop.py``). Folding a foreign
+    event into this kernel's baseline would describe an account it has never
+    held, so every event-type match on the seeding path is scoped through here.
+
+    Args:
+        events: The startup event history, oldest first.
+
+    Returns:
+        A lazy iterator over the events stamped with :data:`_COMPONENT`, in
+        history order.
+    """
+    return (event for event in events if event.component == _COMPONENT)
+
+
 def _seed_cash(events: tuple[Event, ...], connector: MarketConnector) -> MoneyMicros:
     """Return the cash baseline seeded from history, else from the connector.
 
-    Scans ``events`` for the *last* clean-pass or within-tolerance-drift
-    verification event and takes its recorded ``exchange_verified_available_cash``
-    (a breach event is ignored). Falls back to the connector's currently reported
-    available cash when history carries no such event.
+    Scans only the events *this component recorded*
+    (:func:`_own_component_events`) for the *last* clean-pass or
+    within-tolerance-drift verification event and takes its recorded
+    ``exchange_verified_available_cash`` (a breach event is ignored). Falls back
+    to the connector's currently reported available cash when that filtered
+    history carries no such event.
+
+    The component scoping is latent hardening here, not an active fix: today
+    :class:`ReadOnlyVerifier` is the only emitter of ``"VerificationPassed"`` /
+    ``"VerificationDrift"`` / ``"VerificationMismatch"``, so no foreign row can
+    currently reach this fold and the filter changes no observed behavior. It
+    is applied anyway as defense in depth -- the cash baseline must never
+    silently begin trusting a future foreign emitter of a same-named event.
 
     Args:
         events: The startup event history, oldest first.
@@ -200,7 +236,7 @@ def _seed_cash(events: tuple[Event, ...], connector: MarketConnector) -> MoneyMi
         The cash baseline, in micros.
     """
     seed: MoneyMicros | None = None
-    for event in events:
+    for event in _own_component_events(events):
         if event.event_type in _CASH_SEED_EVENT_TYPES:
             cash = event.payload.get(_CASH_PAYLOAD_KEY)
             if isinstance(cash, int):
@@ -215,11 +251,35 @@ def _seed_positions(
 ) -> dict[str, ContractCentis]:
     """Return the position baseline seeded from history, else from the connector.
 
-    Uses the rows of the *last* ``PositionsSnapshotRecorded`` event (which
-    override any earlier snapshot's ticker set wholesale), mapped to
-    ``ContractCentis``. Falls back to the connector's currently reported
-    positions when history carries no snapshot at all -- a snapshot recording a
-    flat account (an empty row list) still wins over the connector.
+    Uses the rows of the *last* ``PositionsSnapshotRecorded`` event *this
+    component recorded* (:func:`_own_component_events`), which override any
+    earlier own snapshot's ticker set wholesale, mapped to ``ContractCentis``.
+    Falls back to the connector's currently reported positions when that
+    filtered history carries no snapshot at all -- so a *foreign* snapshot
+    leaves the seed unset and the connector fallback fires, while an *own*
+    snapshot recording a flat account (an empty row list) still wins over the
+    connector.
+
+    The component filter is the load-bearing one. ``windbreak/scheduler/loop.py``
+    records a ``component="scheduler"`` ``PositionsSnapshotRecorded`` whose rows
+    are derived from a *simulated* ``PaperExchange``, and the documented topology
+    puts those rows in the very ledger a live kernel replays: one named
+    ``ledger`` volume is mounted across every process
+    (``deploy/docker-compose.yml``) and
+    :meth:`~windbreak.ledger.store.SqliteLedgerStore.read_all` returns the whole
+    chain unscoped -- which is why every row carries a ``component`` column at
+    all (SPEC v3 S12). Unfiltered, a live kernel could seed its safety-critical
+    reconciliation baseline from simulated positions, and then either auto-kill
+    itself spuriously through ``AUTO_RECONCILIATION`` or mask real drift behind a
+    coincidentally agreeable simulation.
+
+    What that means today, stated plainly: *no* component records a
+    ``riskkernel``-stamped ``PositionsSnapshotRecorded``, so the position
+    dimension always falls back to the connector -- this is not a live ledger
+    projection of positions and must not be read as one. The ledger-seed path is
+    retained deliberately as the forward-compatible hook for when the kernel does
+    record its own snapshots; until then the connector fallback is the
+    fail-closed default.
 
     Args:
         events: The startup event history, oldest first.
@@ -229,7 +289,7 @@ def _seed_positions(
         The expected per-ticker position, in contract-centis.
     """
     rows: object | None = None
-    for event in events:
+    for event in _own_component_events(events):
         if event.event_type == _POSITIONS_SNAPSHOT_EVENT_TYPE:
             rows = event.payload.get(_POSITIONS_PAYLOAD_KEY)
     if rows is None:
@@ -325,14 +385,15 @@ class LedgerExpectationSource:
     falls back, independently, to the connector's own startup capture:
 
     * **cash** (ledger-seeded): the ``exchange_verified_available_cash`` of the
-      last non-breach verification event
+      last non-breach verification event *this component recorded*
       (``"VerificationPassed"`` / ``"VerificationDrift"``); a
       ``"VerificationMismatch"`` is excluded so a restart never re-baselines onto
       a cash figure already known to breach. Fallback: the connector's available
       cash. A full reconstruction is impossible here because incremental fills
       and available-cash movements are not ledgered with amounts.
     * **positions** (ledger-seeded): the rows of the last
-      ``PositionsSnapshotRecorded`` event. Fallback: the connector's positions.
+      ``PositionsSnapshotRecorded`` event *this component recorded*. Fallback:
+      the connector's positions.
     * **open orders** (startup-connector-captured): empty only while the history
       ends KILLED and unrearmed (a ``KillEngaged`` -- whose kill cancelled every
       resting order -- with no matching later ``KillReArmed``), otherwise the
@@ -345,7 +406,25 @@ class LedgerExpectationSource:
       every later legitimately-resting order into a false-positive breach. Open
       orders can never be ledger-*seeded* positively: venue order ids are never
       ledgered (``OrderTransitionLedgered`` carries only the client_order_id),
-      so the ledger cannot name the resting orders a restart should expect.
+      so the ledger cannot name the resting orders a restart should expect. This
+      dimension is also deliberately *not* component-scoped, precisely because it
+      delegates to that one kill fold -- the same fold ``KillSwitch.from_events``
+      and ``RiskKernel.from_events`` run over the same unfiltered history -- so
+      scoping it here would let the open-order expectation disagree with the kill
+      mode the kernel replays to. A foreign kill event can only empty the
+      expectation, i.e. make it strictly more conservative, so that asymmetry
+      fails closed (follow-up: issue #327).
+
+    Trust boundary: both ledger-seeded dimensions fold only events stamped
+    :data:`_COMPONENT` (:func:`_own_component_events`), because one ledger is
+    routinely shared across processes and the PAPER loop writes
+    ``component="scheduler"`` position snapshots taken from a *simulated*
+    exchange. Stated plainly: nothing records a ``riskkernel``-stamped
+    ``PositionsSnapshotRecorded`` today, so **positions is always
+    connector-fallback in practice** -- that ledger-seed path is a
+    forward-compatible hook, not a live projection of venue positions. For cash
+    the filter is latent hardening only, since this module is currently the sole
+    emitter of the verification event types the cash seed reads.
 
     Bounded cross-restart residual: because the cash seed is the last non-breach
     verification cash, a within-tolerance drift persisted by a prior run's last
