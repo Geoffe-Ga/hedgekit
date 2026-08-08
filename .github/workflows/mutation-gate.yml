@@ -9,18 +9,19 @@ name: Mutation Gate (manual pre-v1.0.0)
 #
 # or via the Actions tab "Run workflow" button.
 #
-# REVIVAL NOTE (why the old automated job failed, for the v1.0.0 run):
-# The unpinned `mutmut>=2.4.0` dev dependency resolves to mutmut 3.x, whose
-# config schema renamed `paths_to_mutate` -> `source_paths` and `tests_dir`
-# -> `pytest_add_cli_args_test_selection`. With the legacy `[tool.mutmut]`
-# keys still present in pyproject.toml, mutmut 3.x crashes on EVERY invocation
-# at config load with `TypeError: can only concatenate list (not "str") to
-# list` (configuration.py `_load_config`). Before reviving this gate:
-#   1. Either pin `mutmut<3` or migrate `[tool.mutmut]` in pyproject.toml to
-#      the 3.x schema (list-valued `source_paths` /
-#      `pytest_add_cli_args_test_selection`).
-#   2. Update the score-parsing below to match the chosen mutmut version's
-#      `mutmut results` output format (3.x changed it).
+# REVIVAL NOTE — RESOLVED by issue #324. Both prerequisites this note listed
+# are now done: `[tool.mutmut]` in pyproject.toml is migrated to the 3.x schema
+# (list-valued `source_paths` / `pytest_add_cli_args_test_selection`), mutmut is
+# pinned to 3.7.0 in constraints-quality.txt, and the score parsing moved off
+# `mutmut results` prose onto the machine-readable
+# `mutants/mutmut-cicd-stats.json` that 3.x `export-cicd-stats` emits.
+#
+# The scoring logic is NOT duplicated here any more. This job now calls
+# `scripts/mutation.sh`, the one implementation of the gate, so the workflow and
+# a local run cannot drift apart or disagree on a release decision (DRY). The
+# steps this replaced were broken three ways under 3.x beyond the stale parsing:
+# `--paths-to-mutate=` is no longer a CLI flag (config-only), `mutmut html` no
+# longer exists, and the `html/` artifact it uploaded is never produced.
 
 on:
   workflow_dispatch:
@@ -56,27 +57,19 @@ jobs:
           pip install -c constraints-quality.txt -r requirements-dev.txt
           pip install -c constraints-quality.txt pytest mutmut
 
-      - name: Run mutation tests
-        run: |
-          mutmut run --paths-to-mutate=. || true
-          mutmut results
-          mutmut html
+      # One implementation of the gate, invoked here and locally. scripts/mutation.sh
+      # runs mutmut, exports the 3.x CI/CD stats JSON, computes the score, and
+      # fails CLOSED on an interrupted, incomplete, or zero-mutant run -- so a
+      # misconfigured mutmut can no longer report success. Its exit code IS the
+      # gate result, so this step deliberately does not swallow failures.
+      - name: Run mutation gate
+        run: ./scripts/mutation.sh --min-score "${MIN_MUTATION_SCORE}"
 
-      - name: Check mutation score
-        run: |
-          MUTATION_SCORE=$(mutmut results | grep -oP 'Survived: \K\d+' || echo "100")
-          TOTAL=$(mutmut results | grep -oP 'Total: \K\d+' || echo "1")
-          SCORE=$((100 - (MUTATION_SCORE * 100 / TOTAL)))
-          echo "Mutation score: $SCORE%"
-          if [ "$SCORE" -lt "$MIN_MUTATION_SCORE" ]; then
-            echo "Mutation score $SCORE% is below minimum threshold of $MIN_MUTATION_SCORE%"
-            exit 1
-          fi
-
-      - name: Upload mutation test results
+      - name: Upload mutation stats
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-test-results
-          path: html/
+          path: mutants/mutmut-cicd-stats.json
           retention-days: 30
+          if-no-files-found: warn
