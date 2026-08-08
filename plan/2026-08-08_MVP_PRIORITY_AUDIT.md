@@ -202,26 +202,79 @@ real data flows. Deferred, not dismissed.
 
 ---
 
-## 6. Mechanical actions
+## 6. The P0 is blocked on a human, not on engineering
 
-1. **File 6 new issues** (A1-A5, B1). A3 as **P0**; the rest **P1**.
-2. **Promote to P1:** #294, #269, #305, #246, #274, #275.
-3. **Promote to P2:** #122, #217.
-4. **Demote to P3:** the mutation set (10), the perf set (6), the doc-drift set
-   (5), the de-slop comment set (8), the dedup set (3) — 32 issues.
-5. **Leave alone:** #152 (P0), #329 (P1), the seven MVP-path coverage scans,
-   #210.
-6. **Throttle the scanners.** They produce more than the fleet drains and they
-   only look at code, never at whether the product runs. Suggest pausing
-   `scan:mutation` and `scan:perf` until Tier A closes.
+#152 (review agent intermittently posts no verdict) is the backlog's oldest P0
+and therefore the fleet's very first pick. Its fix — **PR #263** — has been
+**open and unmerged since 2026-07-15**, three-plus weeks.
 
-After this pass the fleet's work order becomes: A3 → A1 → A2 → A4 → A5 → B1 →
-B2-B5 → C1-C4 — i.e. *make it run*, then *make it real*, then *make it
-visible* — instead of grinding coverage on unreachable branches.
+It is not stuck for engineering reasons. The PR modifies
+`.github/workflows/code-review.yml`, so claude-code-action's workflow-validation
+guard skips the automated review by design; the `claude-review` check stays red
+and **no rerun can ever produce a verdict until it merges**. It needs operator
+review and an admin merge, and nothing else.
+
+The cost compounds: the no-verdict flake taxes manual reruns on *every* PR the
+fleet opens — including all of the Tier A work above. This is the single
+highest-leverage action in this document and it takes one click, not one sprint.
+
+**Recommended: review and admin-merge PR #263 before starting Tier A.**
 
 ---
 
-## 7. What this audit did not find
+## 7. Mechanical actions — APPLIED 2026-08-08
+
+1. **Filed 6 new issues:** **#339** (A3, spend ceiling — **P0**), **#340** (A1,
+   jurisdiction stub), **#342** (A2, status/heartbeat/verification), **#343**
+   (A4, live Kalshi data), **#344** (A5, transport selection), **#345** (B1,
+   market universe) — all P1 except #339, all `agent-ready`.
+2. **Promoted to P1:** #294, #269, #305, #246, #274, #275.
+3. **Promoted to P2:** #122, #217, #287.
+4. **Demoted to P3 (27):** perf #289, #290, #291, #319, #320, #332; mutation-gate
+   #337, #338; non-MVP coverage #165, #250, #251, #253, #315, #316, #330; deps
+   #325, #326; tooling/doc #109, #121, #142; dedup #272, #276; non-MVP features
+   #124, #150; M7 scope #197, #200, #201.
+5. **Left alone:** #152 (P0), #329 (P1), #159 (P2 — #345 depends on it), the
+   MVP-path coverage scans (#162, #163, #166, #167, #249, #252, #254, #313,
+   #314, #317, #318, #331), #101, #114, #206, #210, #238, #265.
+
+Note on the demotion count: an earlier draft of this audit said "32". The true
+figure is 27 — the mutation set (#168-175, #312, #333), the de-slop comment set
+(#136-139, #205-208, #277, #280), and several doc-drift issues were **already**
+at P3 or `priority-low`, so they needed no change. They remain deferred; they
+were simply already deferred.
+
+### Resulting tier composition
+
+| Tier | Before | After |
+|---|---:|---:|
+| P0 | 1 | 2 |
+| P1 | 1 | 12 |
+| P2 | ~50 | 22 |
+| P3 / low | ~46 | ~70 |
+
+The fleet's work order is now: **#152** (unblock by merging PR #263) → **#339**
+(spend ceiling) → #246, #269, #274, #275, #294, #305, #329 (the wire-in and
+operator-visibility set, oldest-first) → #340, #342, #343, #344, #345 (the new
+blockers).
+
+One wrinkle worth flagging: `pick-next.sh` is oldest-first *within* a tier, so
+the six newly filed blockers sort **behind** the six promoted follow-ups at P1.
+That ordering is defensible — #294/#269/#305 are the wire-in work #344 depends
+on anyway — but if you want #340/#342 (the two that end the universal veto)
+picked first, they need P0 rather than P1.
+
+### Still recommended, not applied
+
+**Throttle the scanners.** They produce more than the fleet drains — 71 → 84 →
+98 open across the last three grooms — and they only ever ask whether the *code*
+is good, never whether the *product* runs. Suggest pausing `scan:mutation` and
+`scan:perf` until Tier A closes. This is a workflow change, so it is left to the
+operator rather than applied here.
+
+---
+
+## 8. What this audit did not find
 
 Worth saying, because it's the flip side. The engineering standard here is
 genuinely high and none of the above is a quality complaint:
