@@ -16,6 +16,12 @@ coverage.xml
 htmlcov/
 .pytest_cache/
 .mutmut-cache
+# mutmut 3.x (issue #324) no longer mutates sources in place behind a single
+# .mutmut-cache file; it builds a whole ./mutants/ tree of generated mutated
+# code plus copied inputs. Left untracked-but-not-ignored it is both committable
+# noise and a lint target -- ruff honours .gitignore for file discovery, so
+# without this entry `check-all.sh` fails on 100+ errors in generated mutants.
+mutants/
 
 # Type-checker / lint caches
 .mypy_cache/
