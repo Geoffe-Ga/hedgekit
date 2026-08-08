@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-08T14:03:20.113764+00:00",
+  "timestamp": "2026-08-08T14:15:58.921170+00:00",
   "project": "windbreak",
   "thresholds": {
     "coverage": 90,
@@ -43,11 +43,11 @@
       "status": "passing"
     },
     "ci_status": {
-      "total_jobs": 1,
-      "passing_jobs": 1,
-      "percentage": 100.0,
-      "status": "passing",
-      "run_url": "https://github.com/Geoffe-Ga/windbreak/actions/runs/31260934158"
+      "total_jobs": 0,
+      "passing_jobs": 0,
+      "percentage": 0.0,
+      "status": "unknown",
+      "run_url": "https://github.com/Geoffe-Ga/windbreak/actions/runs/31261319659"
     }
   }
 }
