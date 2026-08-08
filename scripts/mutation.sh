@@ -156,29 +156,50 @@ interrupted = 1 if data.get("check_was_interrupted_by_user") else 0
 accounted = killed + survived + no_tests + skipped + suspicious + timeout + segfault
 scored = accounted - skipped
 
-for name, value in [
-    ("KILLED", killed),
-    ("SURVIVED", survived),
-    ("NO_TESTS", no_tests),
-    ("SKIPPED", skipped),
-    ("SUSPICIOUS", suspicious),
-    ("TIMEOUT", timeout),
-    ("SEGFAULT", segfault),
-    ("TOTAL", total),
-    ("ACCOUNTED", accounted),
-    ("SCORED", scored),
-    ("INTERRUPTED", interrupted),
-]:
-    print(f"{name}={value}")
+# One space-separated line, in the fixed order the `read` below expects.
+print(
+    " ".join(
+        str(value)
+        for value in (
+            killed,
+            survived,
+            no_tests,
+            skipped,
+            suspicious,
+            timeout,
+            segfault,
+            total,
+            accounted,
+            scored,
+            interrupted,
+        )
+    )
+)
 PY
 )
 
+# Assigned via `read` rather than `eval` of NAME=VALUE pairs. eval would execute
+# whatever the file expanded to, and it also hides the assignments from static
+# analysis, which then reports every downstream use as SC2153 "may not be
+# assigned". Naming the variables here keeps them statically visible and means
+# nothing from the JSON is ever executed.
+#
+# (This comment deliberately avoids opening a line with the linter's own name:
+# a comment starting with that word is parsed as a directive, SC1073.)
 if [ -z "$STATS_VARS" ]; then
     echo "Error: could not parse $STATS_FILE" >&2
     exit 2
 fi
 
-eval "$STATS_VARS"
+read -r KILLED SURVIVED NO_TESTS SKIPPED SUSPICIOUS TIMEOUT SEGFAULT \
+    TOTAL ACCOUNTED SCORED INTERRUPTED <<EOF
+$STATS_VARS
+EOF
+
+if [ -z "$INTERRUPTED" ]; then
+    echo "Error: incomplete stats parsed from $STATS_FILE" >&2
+    exit 2
+fi
 
 if [ "$INTERRUPTED" -ne 0 ]; then
     echo "Error: the mutation run was interrupted before it finished" >&2
