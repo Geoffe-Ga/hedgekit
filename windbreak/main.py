@@ -1230,8 +1230,15 @@ def _build_risk_kernel(
     to transition the single machine.
 
     With a ``verification_connector`` the kernel's per-beat verification cycle
-    becomes live (issue #236): a :class:`StartupBaselineExpectationSource` freezes
-    that connector's own startup balances/positions/open-orders once, a
+    becomes live (issue #288, superseding issue #236's frozen-startup snapshot):
+    a :class:`LedgerExpectationSource` folds the replayed ``history`` once into a
+    scoped baseline -- cash seeded from the last non-breach verification event
+    *the kernel itself recorded*, positions from the last positions snapshot *it
+    recorded* (a shared ledger also carries other components' rows, so only
+    ``component="riskkernel"`` rows may seed this safety-critical baseline; none
+    records such a snapshot today, so positions always falls through) -- falling
+    back per dimension to that connector's own startup
+    balances/positions/open-orders where the ledger carries no such fact, a
     :class:`VerificationTolerances` is composed from
     ``risk.verification_balance_tolerance_micros`` /
     ``risk.verification_position_tolerance_centis``, and a
@@ -1313,7 +1320,9 @@ def _build_risk_kernel(
         switch, threshold=config.risk.kill_after_consecutive_mismatches
     )
     integration = KillIntegration(switch=switch, watcher=watcher, monitor=monitor)
-    verifier = _build_verifier(config, verification_connector, dispatcher, writer)
+    verifier = _build_verifier(
+        config, verification_connector, dispatcher, writer, history
+    )
     kernel = RiskKernel.from_events(
         history,
         writer,
@@ -1329,22 +1338,35 @@ def _build_verifier(
     verification_connector: MarketConnector | None,
     dispatcher: AlertDispatcher,
     writer: KernelLedgerWriter,
+    history: tuple[Event, ...],
 ) -> ReadOnlyVerifier | None:
     """Compose the live read-only verifier, or ``None`` when unconfigured.
 
-    Freezes ``verification_connector``'s own startup state as the baseline the
-    verifier reconciles the venue against each beat (issue #236), reading the
-    per-dimension tolerances from ``config.risk``. The verifier shares
+    Projects a scoped ledger-derived baseline the verifier reconciles the venue
+    against each beat (issue #288, superseding the frozen-startup-snapshot seam
+    of issue #236): a :class:`LedgerExpectationSource` folds ``history`` once,
+    seeding cash from the last non-breach verification event *the kernel itself
+    recorded* and positions from the last positions snapshot *it recorded*, and
+    falling back -- per dimension, independently -- to
+    ``verification_connector``'s own startup state where the ledger carries no
+    such fact. Only ``component="riskkernel"`` rows may seed, because a shared
+    ledger also carries e.g. the PAPER loop's simulated position snapshots; no
+    component records a ``riskkernel``-stamped snapshot today, so positions is
+    connector-fallback in practice (see :class:`LedgerExpectationSource`). The
+    per-dimension tolerances come from ``config.risk``. The verifier shares
     ``dispatcher`` and ``writer`` with the kill switch so its alerts and events
     reach the same sinks and hash-chained ledger.
 
     Args:
         config: The loaded configuration supplying the balance/position drift
             tolerances.
-        verification_connector: The read-only market connector to observe, or
-            ``None`` to compose no verifier.
+        verification_connector: The read-only market connector to observe (and
+            the per-dimension fallback source), or ``None`` to compose no
+            verifier.
         dispatcher: The alert dispatcher shared with the kill switch.
         writer: The kernel ledger writer shared with the kill switch.
+        history: The replayed startup event history the baseline is seeded from
+            (empty when there is no ledger store to replay).
 
     Returns:
         The composed :class:`ReadOnlyVerifier`, or ``None`` when
@@ -1354,14 +1376,14 @@ def _build_verifier(
         return None
     from windbreak.numeric.types import ContractCentis, MoneyMicros
     from windbreak.riskkernel.verification import (
+        LedgerExpectationSource,
         ReadOnlyVerifier,
-        StartupBaselineExpectationSource,
         VerificationTolerances,
     )
 
     return ReadOnlyVerifier(
         connector=verification_connector,
-        expectation_source=StartupBaselineExpectationSource(verification_connector),
+        expectation_source=LedgerExpectationSource(history, verification_connector),
         tolerances=VerificationTolerances(
             balance_tolerance=MoneyMicros(
                 config.risk.verification_balance_tolerance_micros

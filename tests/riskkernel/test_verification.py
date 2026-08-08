@@ -52,6 +52,14 @@ from windbreak.connector.semantics import (
     PartialFillRepresentation,
     UnsettledProceeds,
 )
+from windbreak.ledger.events import (
+    CancelAllDirective,
+    ConfigLoaded,
+    Event,
+    KillEngaged,
+    KillReArmed,
+    PositionsSnapshotRecorded,
+)
 from windbreak.numeric.types import ContractCentis, MoneyMicros, PricePips
 from windbreak.riskkernel.modes import Mode, ModeStateMachine
 from windbreak.riskkernel.process import (
@@ -61,8 +69,8 @@ from windbreak.riskkernel.process import (
 )
 from windbreak.riskkernel.verification import (
     LedgerExpectations,
+    LedgerExpectationSource,
     ReadOnlyVerifier,
-    StartupBaselineExpectationSource,
     VerificationOutcome,
     VerificationTolerances,
 )
@@ -815,17 +823,37 @@ def test_every_verification_event_payload_is_int_str_or_bool_never_float() -> No
             assert isinstance(value, (int, str, bool)), f"{event.event_type}: {value!r}"
 
 
-# --- StartupBaselineExpectationSource (issue #236) --------------------------------
+# --- LedgerExpectationSource (issue #288) -----------------------------------------
 #
-# `windbreak run --process riskkernel --snapshot-fixture-dir DIR` wires a
-# `ReadOnlyVerifier` over a `FakeExchange` connector, but needs an
-# `ExpectationSource` too -- there is no separate ledger of "what the venue
-# should hold" to read expectations from in that composition. Instead, the
-# semantics are "nothing may change while the kernel holds no intent to change
-# it": `StartupBaselineExpectationSource` captures the connector's own
-# balances/positions/open-orders exactly once, at construction, and every
-# later `get_expectations()` call returns that frozen snapshot -- so a venue
-# that drifts from its own startup state breaches against itself.
+# `StartupBaselineExpectationSource` (issue #236) froze a connector's own
+# startup snapshot because there was no ledger of "what the venue *should*
+# hold" to read expectations from. `LedgerExpectationSource` replaces it: it
+# folds the startup `history` once, at construction, into one frozen
+# `LedgerExpectations`, per dimension --
+#
+#   * cash: the `exchange_verified_available_cash` of the LAST verification
+#     event whose `event_type` is `"VerificationPassed"` or
+#     `"VerificationDrift"` (a `"VerificationMismatch"` is IGNORED, so a
+#     restart never re-baselines onto a breached value); else the connector's
+#     `get_balances().available`.
+#   * positions: the rows of the LAST `PositionsSnapshotRecorded` event,
+#     mapped `{ticker: ContractCentis(quantity_centis)}`; else
+#     `{p.ticker: p.quantity for p in connector.get_positions()}`.
+#   * open orders: `frozenset()` only while the history ends KILLED and
+#     unrearmed (`kill_state_in(history).killed` -- a `KillEngaged` with no
+#     matching later `KillReArmed`, whose kill cancelled everything); once
+#     re-armed (or never killed) it falls back to
+#     `frozenset(o.id for o in connector.get_open_orders())`, so a past kill or
+#     kill drill never permanently zeroes the expectation.
+#
+# Every dimension falls back independently, and -- exactly like the source it
+# replaces -- the projection happens exactly once, at construction: a later
+# connector mutation never changes what `get_expectations()` returns.
+#
+# `LedgerExpectationSource` does not exist yet, so every test below fails
+# collection with `ImportError: cannot import name 'LedgerExpectationSource'
+# from 'windbreak.riskkernel.verification'` -- the expected Gate 1 RED state
+# for issue #288.
 
 #: A fixed UTC instant for every `BalanceSnapshot.fetched_at` the stub
 #: connectors below report; its exact value is irrelevant to every assertion.
@@ -846,42 +874,27 @@ _FULLY_KNOWN_SEMANTICS = BalanceSemantics(
 )
 
 
-def test_startup_baseline_expectation_source_matches_connectors_own_snapshot() -> None:
-    """`StartupBaselineExpectationSource(connector).get_expectations()` mirrors
-    exactly what `connector` itself reports for balances/positions/open orders.
-
-    `StartupBaselineExpectationSource` does not exist yet, so this fails
-    collection with `ImportError: cannot import name
-    'StartupBaselineExpectationSource' from 'windbreak.riskkernel.verification'`
-    -- the expected Gate 1 RED state for issue #236.
-    """
-    connector = FakeExchange.from_fixture_dir(_fixture_path("clean"))
-
-    source = StartupBaselineExpectationSource(connector)
-    expectations = source.get_expectations()
-
-    assert expectations.expected_available_cash == connector.get_balances().available
-    assert dict(expectations.expected_positions) == {
-        position.ticker: position.quantity for position in connector.get_positions()
-    }
-    assert expectations.expected_open_order_ids == frozenset(
-        order.id for order in connector.get_open_orders()
-    )
-
-
 @dataclass
 class _MutableBalanceConnector:
-    """A minimal, mutable `MarketConnector` whose available cash can change
-    after construction, so a test can prove a baseline source captured its
-    snapshot once rather than reading the connector live on every call.
+    """A minimal, mutable `MarketConnector` stub for exercising the
+    connector-fallback side of `LedgerExpectationSource`'s per-dimension
+    projection, and for proving it captures its snapshot once rather than
+    reading the connector live on every call.
 
     Attributes:
         available: The account's current available cash, mutable so a test
-            can change it after building a `StartupBaselineExpectationSource`
-            over this connector.
+            can change it after building a `LedgerExpectationSource` over this
+            connector.
+        positions: The account's fixed positions, returned verbatim by
+            `get_positions` (empty by default, so a test that only cares
+            about the cash or open-order dimension need not set it).
+        open_orders: The account's fixed resting orders, returned verbatim by
+            `get_open_orders` (empty by default).
     """
 
     available: MoneyMicros
+    positions: tuple[Position, ...] = ()
+    open_orders: tuple[OpenOrder, ...] = ()
 
     def get_balances(self) -> BalanceSnapshot:
         """Return the account's current, possibly-since-mutated available cash."""
@@ -890,12 +903,12 @@ class _MutableBalanceConnector:
         )
 
     def get_positions(self) -> tuple[Position, ...]:
-        """Return no positions, ever."""
-        return ()
+        """Return the connector's fixed positions."""
+        return self.positions
 
     def get_open_orders(self) -> tuple[OpenOrder, ...]:
-        """Return no open orders, ever."""
-        return ()
+        """Return the connector's fixed open orders."""
+        return self.open_orders
 
     def get_balance_semantics(self) -> BalanceSemantics:
         """Return a fully-known `BalanceSemantics` (unused by this test)."""
@@ -939,17 +952,546 @@ class _MutableBalanceConnector:
         raise NotImplementedError(order_id)
 
 
-def test_startup_baseline_expectation_source_captures_snapshot_at_construction() -> (
+def _verification_event(
+    event_type: str, *, cash_micros: int, component: str = "riskkernel"
+) -> Event:
+    """Build a bare verification-cycle event carrying one cash observation.
+
+    Mirrors the shape `ReadOnlyVerifier._record` emits (a bare `Event` whose
+    `event_type` is one of `"VerificationPassed"` / `"VerificationDrift"` /
+    `"VerificationMismatch"`), but populates only the one payload key
+    `LedgerExpectationSource`'s cash projection folds
+    (`exchange_verified_available_cash`) -- the other real-payload keys
+    (`outcome`, `balance_ok`, ...) are irrelevant to the fold these tests
+    exercise and are omitted for clarity.
+
+    Args:
+        event_type: The verification event's exact `event_type` string.
+        cash_micros: The `exchange_verified_available_cash` value to carry,
+            in micros.
+        component: The ledger component to stamp the event with. Defaults to
+            the kernel's own `"riskkernel"`, exactly as
+            `ReadOnlyVerifier._record` stamps it, so only a test deliberately
+            exercising the component filter ever passes anything else.
+
+    Returns:
+        The constructed bare `Event`.
+    """
+    return Event(
+        event_type=event_type,
+        component=component,
+        payload_schema_version=1,
+        payload={"exchange_verified_available_cash": cash_micros},
+    )
+
+
+def test_ledger_expectation_source_with_irrelevant_history_mirrors_the_connector() -> (
     None
 ):
+    """With a history containing only an irrelevant event (`ConfigLoaded`),
+    every dimension falls back to mirroring the connector exactly -- the same
+    fallback semantics `StartupBaselineExpectationSource` always used."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(50_000_000),
+        positions=(
+            Position(
+                ticker="KXFED-24DEC",
+                quantity=ContractCentis(300),
+                average_price=PricePips(4550),
+            ),
+        ),
+        open_orders=(
+            OpenOrder(
+                id="order-9",
+                ticker="KXFED-24DEC",
+                side="yes",
+                price=PricePips(5000),
+                quantity=ContractCentis(50),
+            ),
+        ),
+    )
+    history = [ConfigLoaded(component="riskkernel", config_hash="abc", diff={})]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert expectations.expected_available_cash == connector.get_balances().available
+    assert dict(expectations.expected_positions) == {
+        position.ticker: position.quantity for position in connector.get_positions()
+    }
+    assert expectations.expected_open_order_ids == frozenset(
+        order.id for order in connector.get_open_orders()
+    )
+
+
+def test_ledger_expectation_source_captures_snapshot_at_construction() -> None:
     """A connector mutated *after* construction never changes what an
-    already-built `StartupBaselineExpectationSource` reports: the baseline is
-    captured once, at `__init__` time, never read live on a later
-    `get_expectations()` call.
+    already-built `LedgerExpectationSource` reports: the projection happens
+    once, at `__init__` time, never read live on a later `get_expectations()`
+    call -- the same freeze guarantee `StartupBaselineExpectationSource` gave.
     """
     connector = _MutableBalanceConnector(available=MoneyMicros(1_000_000))
-    source = StartupBaselineExpectationSource(connector)
+    source = LedgerExpectationSource([], connector)
 
     connector.available = MoneyMicros(2_000_000)
 
     assert source.get_expectations().expected_available_cash == MoneyMicros(1_000_000)
+
+
+def test_ledger_expectation_source_cash_seeds_from_the_last_non_breach_event() -> None:
+    """When `history` carries two non-breach verification events, the LAST
+    one's cash wins -- over the connector *and* over the earlier event."""
+    connector = _MutableBalanceConnector(available=MoneyMicros(999_000_000))
+    history = [
+        _verification_event("VerificationPassed", cash_micros=10_000_000),
+        _verification_event("VerificationDrift", cash_micros=20_000_000),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(20_000_000)
+
+
+def test_ledger_expectation_source_cash_ignores_a_trailing_breach_event() -> None:
+    """A history ending in a `VerificationMismatch` after a
+    `VerificationPassed`/`VerificationDrift` ignores the mismatch entirely:
+    the seed stays at the prior clean/drift cash, never the breached value --
+    a restart must never re-baseline onto a value already known to be wrong.
+    """
+    connector = _MutableBalanceConnector(available=MoneyMicros(1))
+    history = [
+        _verification_event("VerificationPassed", cash_micros=10_000_000),
+        _verification_event("VerificationMismatch", cash_micros=999_000_000),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(10_000_000)
+
+
+def test_ledger_expectation_source_positions_seed_from_the_last_snapshot() -> None:
+    """The rows of the LAST `PositionsSnapshotRecorded` event win, mapped to
+    `ContractCentis`: a later snapshot overrides an earlier one's ticker set
+    entirely, not merely adding to it."""
+    connector = _MutableBalanceConnector(available=MoneyMicros(1))
+    history = [
+        PositionsSnapshotRecorded(
+            component="riskkernel",
+            positions=[
+                {
+                    "ticker": "KXFED-24DEC",
+                    "quantity_centis": 100,
+                    "average_price_pips": 4500,
+                }
+            ],
+        ),
+        PositionsSnapshotRecorded(
+            component="riskkernel",
+            positions=[
+                {
+                    "ticker": "KXFED-24DEC",
+                    "quantity_centis": 300,
+                    "average_price_pips": 4600,
+                },
+                {
+                    "ticker": "KXWEA-24DEC",
+                    "quantity_centis": -50,
+                    "average_price_pips": 5000,
+                },
+            ],
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert dict(expectations.expected_positions) == {
+        "KXFED-24DEC": ContractCentis(300),
+        "KXWEA-24DEC": ContractCentis(-50),
+    }
+
+
+def test_ledger_expectation_source_open_orders_empty_while_killed_unrearmed() -> None:
+    """A history ending in an unrearmed kill (a `KillEngaged` with no matching
+    later `KillReArmed`, alongside its `CancelAllDirective`) expects zero open
+    orders -- `frozenset()` -- even when the connector still reports resting
+    orders: the kill cancelled everything and has not been re-armed, so nothing
+    is expected to remain resting on the venue."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        open_orders=(
+            OpenOrder(
+                id="resting-1",
+                ticker="KXFED-24DEC",
+                side="yes",
+                price=PricePips(5000),
+                quantity=ContractCentis(10),
+            ),
+        ),
+    )
+    history = [
+        KillEngaged(
+            component="riskkernel", trigger="CLI", kill_sequence=1, epoch=1_700_000_000
+        ),
+        CancelAllDirective(component="riskkernel", scope="all_open_orders"),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_open_order_ids == frozenset()
+
+
+def test_ledger_expectation_source_open_orders_fall_back_after_rearm() -> None:
+    """A history whose last kill has been re-armed (`KillEngaged` -> its
+    `CancelAllDirective` -> a matching `KillReArmed`) is no longer killed, so the
+    open-order expectation falls back to the connector's *live* resting orders
+    rather than staying empty. This is the post-kill/re-arm regression guard: a
+    once-fired kill (or a routine kill drill) must NOT permanently zero the
+    open-order expectation, which would make every later legitimately-resting
+    order a false-positive breach for the life of the ledger."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        open_orders=(
+            OpenOrder(
+                id="rearmed-resting-1",
+                ticker="KXFED-24DEC",
+                side="yes",
+                price=PricePips(5000),
+                quantity=ContractCentis(10),
+            ),
+            OpenOrder(
+                id="rearmed-resting-2",
+                ticker="KXFED-24DEC",
+                side="no",
+                price=PricePips(4000),
+                quantity=ContractCentis(20),
+            ),
+        ),
+    )
+    history = [
+        KillEngaged(
+            component="riskkernel", trigger="CLI", kill_sequence=1, epoch=1_700_000_000
+        ),
+        CancelAllDirective(component="riskkernel", scope="all_open_orders"),
+        KillReArmed(component="riskkernel", kill_sequence=1),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_open_order_ids == frozenset(
+        {"rearmed-resting-1", "rearmed-resting-2"}
+    )
+
+
+def test_cancel_all_directive_breaches_when_venue_still_shows_resting_orders() -> None:
+    """Wired into a real `ReadOnlyVerifier`, an unrearmed kill history's
+    zero-open-order expectation breaches against a venue that still reports a
+    resting order: the balance and position dimensions are read straight off
+    the same connector on both the expectation and the observation side (a
+    tautological match, isolating the breach to the open-order dimension
+    alone), yet `open_order_ok` is `False` and the outcome is `BREACH`.
+    """
+    connector = _ConnectorServingOpenOrders(
+        inner=FakeExchange.from_fixture_dir(_fixture_path("clean")),
+        positions=(
+            Position(
+                ticker="KXFED-24DEC",
+                quantity=ContractCentis(500),
+                average_price=PricePips(4550),
+            ),
+        ),
+        open_orders=(
+            OpenOrder(
+                id="resting-1",
+                ticker="KXFED-24DEC",
+                side="yes",
+                price=PricePips(5000),
+                quantity=ContractCentis(10),
+            ),
+        ),
+    )
+    history = [
+        KillEngaged(
+            component="riskkernel", trigger="CLI", kill_sequence=1, epoch=1_700_000_000
+        ),
+        CancelAllDirective(component="riskkernel", scope="all_open_orders"),
+    ]
+    source = LedgerExpectationSource(history, connector)
+    ledger_writer = InMemoryKernelLedgerWriter()
+    sink = _RecordingSink()
+    verifier = ReadOnlyVerifier(
+        connector=connector,
+        expectation_source=source,
+        tolerances=VerificationTolerances(
+            balance_tolerance=_ZERO_TOLERANCE_MICROS,
+            position_tolerance=_ZERO_TOLERANCE_CENTIS,
+        ),
+        dispatcher=AlertDispatcher([sink], ledger_writer=LoggingLedgerWriter()),
+        ledger_writer=ledger_writer,
+    )
+
+    snapshot = verifier.run_cycle(now_epoch_s=DEFAULT_NOW_EPOCH_S)
+
+    assert snapshot.open_order_ok is False
+    assert snapshot.outcome is VerificationOutcome.BREACH
+
+
+def test_ledger_expectation_source_seeds_each_dimension_independently() -> None:
+    """A history carrying only a `PositionsSnapshotRecorded` event (no
+    verification event, no `CancelAllDirective`) seeds positions from the
+    ledger while cash and open orders still fall back to the connector --
+    proving each dimension's projection is independent, not all-or-nothing.
+    """
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(77_000_000),
+        positions=(
+            Position(
+                ticker="IGNORED-TICKER",
+                quantity=ContractCentis(999),
+                average_price=PricePips(1),
+            ),
+        ),
+        open_orders=(
+            OpenOrder(
+                id="fallback-order",
+                ticker="IGNORED-TICKER",
+                side="yes",
+                price=PricePips(1),
+                quantity=ContractCentis(1),
+            ),
+        ),
+    )
+    history = [
+        PositionsSnapshotRecorded(
+            component="riskkernel",
+            positions=[
+                {
+                    "ticker": "KXFED-24DEC",
+                    "quantity_centis": 250,
+                    "average_price_pips": 4500,
+                }
+            ],
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert dict(expectations.expected_positions) == {"KXFED-24DEC": ContractCentis(250)}
+    assert expectations.expected_available_cash == MoneyMicros(77_000_000)
+    assert expectations.expected_open_order_ids == frozenset({"fallback-order"})
+
+
+# --- Component-scoped ledger seeds (issue #288 review follow-up) ------------------
+#
+# The cash and position seeds must match on `event.component == "riskkernel"`,
+# not on `event.event_type` alone. The PAPER scheduler loop records
+# `PositionsSnapshotRecorded(component="scheduler", positions=...)` derived from
+# a *simulated* `PaperExchange` (windbreak/scheduler/loop.py), and the documented
+# deploy topology shares ONE ledger volume across processes -- so an event-type-only
+# fold lets a LIVE risk kernel seed its safety-critical reconciliation baseline
+# from simulated paper positions. The consequences are symmetric and both bad: a
+# fake baseline that does not match the real venue is a full-size position breach
+# (a spurious `AUTO_RECONCILIATION` auto-kill), and a fake baseline that happens
+# to match the venue masks genuine drift the kernel exists to catch.
+#
+# The open-order dimension is deliberately NOT component-scoped; the last test
+# below pins that asymmetry so a future "scope every dimension" cleanup cannot
+# silently break the kill fold's single source of truth.
+
+
+def test_ledger_expectation_source_positions_ignore_a_later_foreign_snapshot() -> None:
+    """A `PositionsSnapshotRecorded` stamped with a foreign component never
+    seeds the kernel's position baseline -- not even when it is the LAST
+    snapshot in the history, where an event-type-only fold would let it
+    overwrite the kernel's own. The kernel-stamped rows recorded before it are
+    what survive, and the simulated paper ticker never appears at all."""
+    connector = _MutableBalanceConnector(available=MoneyMicros(1))
+    history = [
+        PositionsSnapshotRecorded(
+            component="riskkernel",
+            positions=[
+                {
+                    "ticker": "KXFED-24DEC",
+                    "quantity_centis": 250,
+                    "average_price_pips": 4500,
+                }
+            ],
+        ),
+        PositionsSnapshotRecorded(
+            component="scheduler",
+            positions=[
+                {
+                    "ticker": "PAPER-SIM",
+                    "quantity_centis": 12345,
+                    "average_price_pips": 5000,
+                }
+            ],
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert dict(expectations.expected_positions) == {"KXFED-24DEC": ContractCentis(250)}
+    assert "PAPER-SIM" not in expectations.expected_positions
+
+
+def test_ledger_expectation_source_positions_fall_back_when_only_foreign() -> None:
+    """When the only `PositionsSnapshotRecorded` in history is foreign-stamped,
+    the kernel's own ledger carries no snapshot at all, so the position
+    baseline takes the same connector fallback an empty history takes: the
+    connector's live `ContractCentis(500)` in `KXFED-24DEC`.
+
+    That exact expected value is load-bearing -- it must be the connector's
+    positions and NOT `{}`. An implementation that filters the foreign rows out
+    of the fold but leaves its internal `rows` sentinel non-`None` would fall
+    through to an empty snapshot instead of to the connector, expect a flat
+    account, and turn every genuinely-held position into a full-size position
+    breach on the very next verification cycle."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        positions=(
+            Position(
+                ticker="KXFED-24DEC",
+                quantity=ContractCentis(500),
+                average_price=PricePips(4550),
+            ),
+        ),
+    )
+    history = [
+        PositionsSnapshotRecorded(
+            component="scheduler",
+            positions=[
+                {
+                    "ticker": "PAPER-SIM",
+                    "quantity_centis": 12345,
+                    "average_price_pips": 5000,
+                }
+            ],
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert dict(expectations.expected_positions) == {"KXFED-24DEC": ContractCentis(500)}
+    assert "PAPER-SIM" not in expectations.expected_positions
+
+
+def test_ledger_expectation_source_positions_own_flat_snapshot_beats_foreign() -> None:
+    """The kernel's own snapshot of a FLAT account (an empty row list) beats
+    both a later foreign snapshot and the connector's live position.
+
+    Two properties in one: today's event-type-only fold takes the later
+    foreign rows, and once the seed is component-scoped this becomes the guard
+    that the filter did not also turn an own *empty* snapshot into a *missing*
+    one -- a flat snapshot is a real recorded fact, and must keep beating the
+    connector rather than falling through to it."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        positions=(
+            Position(
+                ticker="KXFED-24DEC",
+                quantity=ContractCentis(500),
+                average_price=PricePips(4550),
+            ),
+        ),
+    )
+    history = [
+        PositionsSnapshotRecorded(component="riskkernel", positions=[]),
+        PositionsSnapshotRecorded(
+            component="scheduler",
+            positions=[
+                {
+                    "ticker": "PAPER-SIM",
+                    "quantity_centis": 12345,
+                    "average_price_pips": 5000,
+                }
+            ],
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+    expectations = source.get_expectations()
+
+    assert dict(expectations.expected_positions) == {}
+
+
+def test_ledger_expectation_source_cash_ignores_a_foreign_component_event() -> None:
+    """A verification event stamped with a foreign component never seeds the
+    cash baseline, even when it is the LAST non-breach verification event in
+    the shared history: the kernel's own earlier `VerificationPassed` cash
+    wins. Another process's `"VerificationPassed"` describes a different
+    account entirely, so folding it would re-baseline a live kernel onto cash
+    it has never held."""
+    connector = _MutableBalanceConnector(available=MoneyMicros(1))
+    history = [
+        _verification_event("VerificationPassed", cash_micros=10_000_000),
+        _verification_event(
+            "VerificationPassed", cash_micros=999_000_000, component="scheduler"
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(10_000_000)
+
+
+def test_ledger_expectation_source_cash_falls_back_when_only_foreign() -> None:
+    """When the only non-breach verification event in history is
+    foreign-stamped, the kernel's own ledger carries no cash observation, so
+    the cash baseline takes the connector fallback -- the connector's live
+    `MoneyMicros(77_000_000)`, never the foreign event's figure."""
+    connector = _MutableBalanceConnector(available=MoneyMicros(77_000_000))
+    history = [
+        _verification_event(
+            "VerificationPassed", cash_micros=999_000_000, component="scheduler"
+        ),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(77_000_000)
+
+
+def test_ledger_expectation_source_open_orders_still_fold_a_foreign_kill() -> None:
+    """A `KillEngaged` (plus its `CancelAllDirective`) stamped with a foreign
+    component STILL empties the open-order expectation, even though the
+    connector reports a resting order. The open-order dimension is deliberately
+    NOT component-scoped, for two reasons.
+
+    First, correctness of the fold: `_seed_open_order_ids` delegates to
+    `kill_state_in`, the one canonical kill fold that `KillSwitch.from_events`
+    and `RiskKernel.from_events` also run -- over the same unfiltered history --
+    in `windbreak/main.py`. Component-scoping it at this single call site would
+    let the open-order expectation disagree with the kill mode the kernel
+    actually replays to.
+
+    Second, direction of failure: a foreign kill event only makes the
+    expectation MORE conservative (expect nothing resting), so the worst case
+    is a breach on a live resting order, never a silently-missed one. It fails
+    closed, which is the opposite of the cash and position seeds, where a
+    foreign event can fabricate a permissive-looking baseline."""
+    connector = _MutableBalanceConnector(
+        available=MoneyMicros(1),
+        open_orders=(
+            OpenOrder(
+                id="resting-1",
+                ticker="KXFED-24DEC",
+                side="yes",
+                price=PricePips(5000),
+                quantity=ContractCentis(10),
+            ),
+        ),
+    )
+    history = [
+        KillEngaged(
+            component="scheduler", trigger="CLI", kill_sequence=1, epoch=1_700_000_000
+        ),
+        CancelAllDirective(component="scheduler", scope="all_open_orders"),
+    ]
+
+    source = LedgerExpectationSource(history, connector)
+
+    assert source.get_expectations().expected_open_order_ids == frozenset()

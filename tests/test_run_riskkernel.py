@@ -52,7 +52,9 @@ Issue #236 (wire a `ReadOnlyVerifier` into the live composition, making the
 `AUTO_RECONCILIATION` auto-kill trigger live rather than composed-but-dormant)
 extends this module further: `_build_risk_kernel` gains a keyword-only
 `verification_connector: MarketConnector | None = None` that, when supplied,
-wires a `StartupBaselineExpectationSource` (over that same connector) and a
+wires a `LedgerExpectationSource` (folding the replayed history, and -- with the
+config-only ledger these tests use -- falling back on every dimension to that
+same connector's own startup state) and a
 `ReadOnlyVerifier` -- sharing the kernel's ledger writer and the kill switch's
 `AlertDispatcher` -- through to `RiskKernel.from_events(verifier=...)`; and
 `_drive_risk_kernel` builds a `FakeExchange.from_fixture_dir` connector from
@@ -162,8 +164,9 @@ def _json_lines(stderr: str) -> list[dict[str, object]]:
 # --- issue #236 fixtures: a mutable connector for the live-verifier wiring -----
 #
 # `_build_risk_kernel` will gain a keyword-only `verification_connector` that,
-# when supplied, wires a `StartupBaselineExpectationSource` (capturing the
-# connector's own balances/positions/open-orders exactly once, at
+# when supplied, wires a `LedgerExpectationSource` (folding the replayed
+# history; with the config-only ledger here it falls back on every dimension to
+# the connector's own balances/positions/open-orders, captured exactly once, at
 # construction) plus a `ReadOnlyVerifier` sharing the kernel's ledger writer
 # and the kill switch's `AlertDispatcher`. `_DriftingBalanceConnector` reports
 # one available-cash figure on its very first `get_balances` call -- the
@@ -193,7 +196,8 @@ _FULLY_KNOWN_SEMANTICS = BalanceSemantics(
 
 #: `tests/fixtures/verification/clean` -- a full `FakeExchange` fixture
 #: directory whose own state trivially matches itself, so a
-#: `StartupBaselineExpectationSource` built over it always grades CLEAN: the
+#: `LedgerExpectationSource` built over it (falling back to the connector for
+#: the config-only ledger these tests use) always grades CLEAN: the
 #: fixture used for the CLI's "verification wired and passing" happy path.
 _CLEAN_SNAPSHOT_FIXTURE_DIR = (
     Path(__file__).resolve().parent / "fixtures" / "verification" / "clean"
@@ -205,9 +209,9 @@ class _DriftingBalanceConnector:
     """A minimal, mutable `MarketConnector` whose available cash steps once.
 
     Reports `available_before_drift` on the very first `get_balances` call
-    (the `StartupBaselineExpectationSource` construction-time snapshot) and
-    `available_after_drift` on every call after that (every later
-    verification cycle).
+    (the `LedgerExpectationSource` construction-time cash fallback, taken once
+    for the config-only ledger these tests use) and `available_after_drift` on
+    every call after that (every later verification cycle).
 
     Attributes:
         available_before_drift: The available cash reported on the first

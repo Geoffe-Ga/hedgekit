@@ -931,6 +931,117 @@ def test_sustained_verification_breach_through_kernel_auto_kills_on_nth_cycle() 
     assert kill_events[0].payload["trigger"] == KillTrigger.AUTO_RECONCILIATION.name
 
 
+# --- Replay-KILLED then breach: verification stays inert against a dead end -----
+
+
+class _ObservingMonitor(ReconciliationMismatchMonitor):
+    """A `ReconciliationMismatchMonitor` subclass recording every outcome it
+    observes, on top of performing its normal auto-kill behavior -- proof
+    that `RiskKernel._feed_mismatch_monitor` really fed a breaching cycle's
+    outcome through, without reaching into any private monitor state.
+    """
+
+    def __init__(self, switch: KillSwitch, threshold: int) -> None:
+        """Wire the spy exactly like its base, plus an empty observed log.
+
+        Args:
+            switch: The kill switch engaged once the threshold is reached.
+            threshold: The number of consecutive breaches that auto-kills.
+        """
+        super().__init__(switch, threshold)
+        self.observed: list[VerificationOutcome] = []
+
+    def observe(self, outcome: VerificationOutcome) -> None:
+        """Record `outcome`, then fold it through the base implementation.
+
+        Args:
+            outcome: The verification outcome to record and fold.
+        """
+        self.observed.append(outcome)
+        super().observe(outcome)
+
+
+def test_replay_killed_history_then_breach_stays_killed_with_no_halt_event() -> None:
+    """A kernel rebuilt via `RiskKernel.from_events` over an unrearmed
+    `KillEngaged` history comes back `KILLED`; running one breaching
+    verification cycle against it leaves the kernel `KILLED` -- the
+    verifier's own `VerificationMismatch` event still records unconditionally,
+    the mismatch monitor still observes the `BREACH` outcome, but
+    `_halt_on_breach`'s already-`KILLED` guard (`process.py:738`) means the
+    cycle never records a `VerificationMismatchHalt` event: a `KILLED` kernel
+    can never bounce to `HALT`.
+    """
+    events = [
+        KillEngaged(
+            component="riskkernel", trigger="CLI", kill_sequence=1, epoch=_FIXED_EPOCH_S
+        ),
+    ]
+    shared_machine = ModeStateMachine(mode_ceiling=Mode.LIVE, mode=Mode.RESEARCH)
+    writer = InMemoryKernelLedgerWriter()
+    alert_sink = _FakeAlertSink()
+    switch = KillSwitch.from_events(
+        events, shared_machine, writer, alert_sink, clock=lambda: _FIXED_EPOCH_S
+    )
+    monitor = _ObservingMonitor(
+        switch, threshold=RiskConfig().kill_after_consecutive_mismatches
+    )
+    integration = KillIntegration(switch=switch, monitor=monitor)
+    # Built inline (not via `_build_breach_verifier`, whose own private
+    # `InMemoryKernelLedgerWriter` would put `VerificationMismatch` on a
+    # different log than `writer`) so the verifier's own event and the
+    # kernel's kill/halt events all land in the one `writer` this test
+    # inspects -- mirroring `test_verification.py::_make_verifier`'s
+    # shared-writer wiring.
+    breach_verifier = ReadOnlyVerifier(
+        connector=FakeExchange.from_fixture_dir(_BALANCE_BREACH_FIXTURE_DIR),
+        expectation_source=_StaticExpectationSource(
+            LedgerExpectations(
+                expected_available_cash=_BALANCE_BREACH_EXPECTED_CASH,
+                expected_positions=_BALANCE_BREACH_EXPECTED_POSITIONS,
+                expected_open_order_ids=frozenset(),
+            )
+        ),
+        tolerances=VerificationTolerances(
+            balance_tolerance=_ZERO_BALANCE_TOLERANCE,
+            position_tolerance=_ZERO_POSITION_TOLERANCE,
+        ),
+        dispatcher=AlertDispatcher([], ledger_writer=LoggingLedgerWriter()),
+        ledger_writer=writer,
+    )
+    kernel = RiskKernel.from_events(
+        events,
+        writer,
+        mode_machine=shared_machine,
+        verifier=breach_verifier,
+        kill_integration=integration,
+    )
+    assert kernel.mode is Mode.KILLED
+
+    kernel.run_verification_cycle()
+
+    assert kernel.mode is Mode.KILLED
+    mismatch_events = [
+        event for event in writer.events if event.event_type == "VerificationMismatch"
+    ]
+    assert len(mismatch_events) == 1
+    halt_events = [
+        event
+        for event in writer.events
+        if event.event_type == "VerificationMismatchHalt"
+    ]
+    assert halt_events == []
+    assert monitor.observed == [VerificationOutcome.BREACH]
+    # The breach cycle records NO new `KillEngaged`: a single breach never
+    # reaches the monitor's escalation threshold and an already-`KILLED` kernel
+    # fires no fresh kill. The kernel is `KILLED` purely from the replayed
+    # history, which `from_events` folds in-memory without re-ledgering it onto
+    # this run's fresh writer -- so `writer.events` holds zero `KillEngaged`.
+    kill_events = [
+        event for event in writer.events if event.event_type == "KillEngaged"
+    ]
+    assert kill_events == []
+
+
 # --- DashboardKillStub: challenge/confirm handshake ------------------------------
 
 
