@@ -461,7 +461,11 @@ pass.
 
 Alerts reach you only through the sinks `config.alerts` declares. Until you
 declare one, every alert falls back to the log-only sink: it appears on stderr
-as a JSON `AlertEmitted` line and **nowhere else**. That is the shipped default
+as a JSON `AlertEmitted` line and **nowhere else** you can be paged from. (The
+one exception is the kill switch's `HALT_KILL` alert, which since issue #287
+*also* appends an `AlertEmitted` row to the hash-chained ledger — an audit
+record, not a delivery channel: it proves after the fact that the page fired,
+and it cannot page you.) The log-only fallback is the shipped default
 (`alerts.sinks` holds one ntfy entry whose `topic_env` is still the
 `configured-by-operator` placeholder), so treat configuring a real sink as a
 prerequisite for any unattended run.
