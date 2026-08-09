@@ -45,6 +45,8 @@ from windbreak.numeric import ContractCentis, MoneyMicros, PricePips
 from windbreak.selector import SelectorInputs, select
 from windbreak.selector.sizing import (
     CapClipResult,
+    _depth_through_fill,
+    _participation_fixed_point,
     clip_to_caps,
     dispersion_scale,
     kelly_size,
@@ -111,6 +113,18 @@ def _book(levels: tuple[tuple[int, int], ...]) -> OrderBookSnapshot:
         ),
         fetched_at=_INSTANT,
     )
+
+
+def _asks(levels: tuple[tuple[int, int], ...]) -> tuple[OrderBookLevel, ...]:
+    """Build just the resting YES asks from `(price_pips, quantity_centis)` pairs.
+
+    Args:
+        levels: Best-first `(price_pips, quantity_centis)` pairs.
+
+    Returns:
+        The ask levels, best-first, as the participation helpers take them.
+    """
+    return _book(levels).yes_asks
 
 
 # --- dispersion_scale: hand-computed examples --------------------------------
@@ -424,6 +438,198 @@ def test_clip_to_caps_participation_fixed_point_uniquely_binds() -> None:
     )
 
 
+# --- the participation cap's depth walk and its fixed point (issue #167) -----
+#
+# A three-level book whose cumulative depths are all distinct -- D1 = 10_000,
+# D2 = 25_000, D3 = 65_000 -- so "stopped at the best level", "walked to the
+# marginal level" and "ignored the fill and returned the whole book" are three
+# different numbers and no assertion below can pass for the wrong reason.
+_DISTINCT_DEPTH_ASKS = ((4_000, 10_000), (4_100, 15_000), (4_200, 40_000))
+
+#: Three equal 10_000-centi levels; at 50% participation the fixed point needs
+#: three shrink passes to converge (walked out in the tests below).
+_EQUAL_LEVEL_ASKS = ((4_000, 10_000), (4_100, 10_000), (4_200, 10_000))
+
+
+def test_depth_through_fill_stops_at_the_first_level_that_covers_the_fill() -> None:
+    """A fill no deeper than level 1's resting size is marginal *at* level 1, so
+    the depth resting at-or-better is level 1's 10_000 alone -- not the book's
+    whole 65_000, since levels 2 and 3 are priced strictly worse for a YES buy.
+
+    The boundary is inclusive: a fill of exactly 10_000 is still covered by level
+    1 and must not walk on to level 2 (a `>` in place of the `>=` would return
+    25_000 here).
+    """
+    asks = _asks(_DISTINCT_DEPTH_ASKS)
+
+    assert _depth_through_fill(asks, 1) == 10_000
+    assert _depth_through_fill(asks, 10_000) == 10_000
+
+
+def test_depth_through_fill_walks_past_every_level_the_fill_exhausts() -> None:
+    """A fill deeper than level 1 spans on into level 2, and the at-or-better
+    depth is the *cumulative* 25_000 through its marginal level.
+
+    25_000 lies strictly between level 1's 10_000 and the book's 65_000, so this
+    disagrees both with an implementation that stopped at the best level and with
+    one that ignored the fill and returned the whole book's depth. The second
+    assertion pins the same inclusive boundary one level deeper.
+    """
+    asks = _asks(_DISTINCT_DEPTH_ASKS)
+
+    assert _depth_through_fill(asks, 10_001) == 25_000
+    assert _depth_through_fill(asks, 25_000) == 25_000
+
+
+def test_depth_through_fill_past_the_whole_book_returns_its_total_depth() -> None:
+    """A fill deeper than every resting ask cannot walk further than the book: the
+    walk falls through and reports the full cumulative 65_000 -- the most depth
+    that could possibly be at-or-better -- rather than zero or the last level's
+    40_000 alone. An empty book rests no depth at all: exactly 0.
+    """
+    asks = _asks(_DISTINCT_DEPTH_ASKS)
+
+    assert _depth_through_fill(asks, 65_001) == 65_000
+    assert _depth_through_fill(asks, 1_000_000_000) == 65_000
+    assert _depth_through_fill((), 1) == 0
+
+
+def test_participation_fixed_point_converges_over_repeated_shrink_passes() -> None:
+    """Three 10_000-centi levels at 50% participation, `size_centis=100_000`.
+
+      S0 = min(100_000, floor(500_000*30_000/1_000_000)) = min(100_000, 15_000)
+         = 15_000
+      pass 1: a 15_000 fill spans level 1 (10_000 deep) into level 2, so the
+              at-or-better depth is 20_000 -> cap = floor(500_000*20_000/1e6)
+              = 10_000; 15_000 > 10_000 -> S1 = 10_000
+      pass 2: a 10_000 fill is exactly covered by level 1 -> depth 10_000 ->
+              cap = 5_000; 10_000 > 5_000 -> S2 = 5_000
+      pass 3: a 5_000 fill is still within level 1 -> depth 10_000 -> cap 5_000
+              again; 5_000 <= 5_000 -> fixed point.
+
+    Shrinking the fill re-tightened the very depth the cap is measured against
+    twice over, so a single-pass implementation would emit 10_000 -- twice the
+    correct size, and itself a participation violation. Every iterate here is
+    already a whole-contract multiple, so both `lot` modes land on 5_000.
+    """
+    asks = _asks(_EQUAL_LEVEL_ASKS)
+
+    assert _participation_fixed_point(100_000, asks, 500_000, lot=False) == 5_000
+    assert _participation_fixed_point(100_000, asks, 500_000, lot=True) == 5_000
+
+
+def test_participation_fixed_point_leaves_an_admissible_size_untouched() -> None:
+    """The cap must *allow* as exactly as it vetoes.
+
+    On the same three-level book at 50%, a 5_000 fill takes exactly half of the
+    10_000 resting at-or-better than its own marginal level, so it is admissible
+    and comes back unchanged -- no shrink pass fires. One whole contract more
+    (5_100) is not admissible, and shrinks to exactly 5_000.
+    """
+    asks = _asks(_EQUAL_LEVEL_ASKS)
+
+    assert _participation_fixed_point(5_000, asks, 500_000, lot=True) == 5_000
+    assert _participation_fixed_point(5_100, asks, 500_000, lot=True) == 5_000
+
+
+def test_participation_fixed_point_floors_each_iterate_to_a_whole_contract() -> None:
+    """Two 150-centi levels (total depth 300) at 75% participation, size 1_000.
+
+      continuous: S0 = min(1_000, floor(750_000*300/1_000_000)) = 225; a 225 fill
+        spans level 1 (150) into level 2 -> depth 300 -> cap 225; 225 <= 225, so
+        the continuous fixed point is 225 centis (two and a quarter contracts).
+      lot:        S0 = floor_lot(225) = 200; a 200 fill still spans into level 2
+        -> depth 300 -> cap = floor_lot(225) = 200; 200 <= 200 -> 200.
+
+    The two modes must not agree here: the continuous limit names the binding
+    cap, while the emitted size honors participation *at its own quantized
+    marginal level*. Dropping either flooring returns 225 for both.
+    """
+    asks = _asks(((4_000, 150), (4_100, 150)))
+
+    assert _participation_fixed_point(1_000, asks, 750_000, lot=False) == 225
+    assert _participation_fixed_point(1_000, asks, 750_000, lot=True) == 200
+
+
+def test_participation_fixed_point_on_a_book_with_no_asks_permits_no_fill() -> None:
+    """An empty ask book rests no depth, so any share of it is zero and the walk
+    has no level to pass over: the clamp admits nothing. Exactly 0 even at 100%
+    participation, where the clamp is the only thing standing between the
+    requested size and the emitted one.
+    """
+    assert _participation_fixed_point(100_000, (), 1_000_000, lot=False) == 0
+    assert _participation_fixed_point(100_000, (), 1_000_000, lot=True) == 0
+
+
+def test_clip_to_caps_participation_binds_through_a_fill_that_spans_levels() -> None:
+    """The multi-pass walk reached through the public boundary, not just the
+    helper: three 10_000-centi levels at 50%, `raw=50_000`, price 500_000 ppm.
+
+    Every notional cap is loose -- the tightest is `daily_notional` at
+    divide(500_000_000*100, 500_000) = 100_000 centis, twice the raw size -- so
+    participation is the unique binder and the emitted size is the 5_000-centi
+    fixed point walked out above.
+    """
+    positions = _generous_positions()
+    risk_config = RiskConfig(max_participation_ppm=500_000)
+    order_book = _book(_EQUAL_LEVEL_ASKS)
+
+    result = clip_to_caps(
+        ContractCentis(50_000),
+        executable_price_ppm=500_000,
+        order_book=order_book,
+        risk_config=risk_config,
+        positions=positions,
+    )
+
+    assert result == CapClipResult(
+        size=ContractCentis(5_000), binding_cap="participation"
+    )
+
+
+def test_clip_to_caps_participation_allows_a_raw_size_at_its_own_limit() -> None:
+    """The same book and participation share, with `raw` exactly at the limit the
+    previous test clips down to: nothing binds.
+
+    The size survives whole and `binding_cap` is `None` -- the arm where the cap
+    legitimately permits the fill, which a participation cap that always vetoed
+    (or that clipped to its clamp regardless) would fail.
+    """
+    positions = _generous_positions()
+    risk_config = RiskConfig(max_participation_ppm=500_000)
+    order_book = _book(_EQUAL_LEVEL_ASKS)
+
+    result = clip_to_caps(
+        ContractCentis(5_000),
+        executable_price_ppm=500_000,
+        order_book=order_book,
+        risk_config=risk_config,
+        positions=positions,
+    )
+
+    assert result == CapClipResult(size=ContractCentis(5_000), binding_cap=None)
+
+
+def test_clip_to_caps_on_a_book_with_no_asks_permits_no_fill() -> None:
+    """No resting asks means no depth to participate in, so the participation
+    limit is 0 and the size is zeroed -- reported against `participation`, the
+    cap that actually bound, rather than masked as a generic `exchange_min_order`
+    sub-lot floor (the SPEC S9.9 divergence `clip_to_caps` preserves).
+    """
+    positions = _generous_positions()
+    risk_config = RiskConfig(max_participation_ppm=500_000)
+
+    result = clip_to_caps(
+        ContractCentis(50_000),
+        executable_price_ppm=500_000,
+        order_book=_book(()),
+        risk_config=risk_config,
+        positions=positions,
+    )
+
+    assert result == CapClipResult(size=ContractCentis(0), binding_cap="participation")
+
+
 def test_clip_to_caps_exchange_min_order_zeros_a_sub_lot_raw_size() -> None:
     """`raw=50` (half a contract) survives every notional/participation cap
     untouched (all generous, none reduce it below 50), but the final
@@ -447,6 +653,33 @@ def test_clip_to_caps_exchange_min_order_zeros_a_sub_lot_raw_size() -> None:
     assert result == CapClipResult(
         size=ContractCentis(0), binding_cap="exchange_min_order"
     )
+
+
+def test_clip_to_caps_emits_a_survivor_of_exactly_one_whole_contract() -> None:
+    """The exchange-minimum floor is *exclusive*: a survivor of exactly one whole
+    contract (100 centis) is the smallest emittable order, not a sub-lot remnant
+    to be zeroed.
+
+    `raw=100` clears every cap untouched (all generous, and a single deep ask
+    level leaves participation loose) and comes back whole with
+    `binding_cap=None`. Half a contract less would floor to 0 and be reported as
+    `exchange_min_order` (the test above), so this pins the other side of that
+    boundary -- an off-by-one there would silently refuse every minimum-size
+    order the selector ever sizes.
+    """
+    positions = _generous_positions()
+    risk_config = RiskConfig()
+    order_book = _book(((4_500, 1_000_000),))
+
+    result = clip_to_caps(
+        ContractCentis(100),
+        executable_price_ppm=450_000,
+        order_book=order_book,
+        risk_config=risk_config,
+        positions=positions,
+    )
+
+    assert result == CapClipResult(size=ContractCentis(100), binding_cap=None)
 
 
 def test_clip_to_caps_returns_none_binding_cap_when_raw_survives_unclipped() -> None:

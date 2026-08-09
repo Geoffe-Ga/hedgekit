@@ -336,6 +336,20 @@ def _participation_fixed_point(
     participation *at its own quantized marginal level* -- the form the emitted
     size must take.
 
+    One pass per ask level is not merely a *safe* bound but a *sufficient* one,
+    which is why this loop iterates over ``yes_asks`` itself and keeps no spare
+    pass to fall out of. Two facts give it. A pass that does not converge must
+    move the marginal level strictly shallower -- were the marginal level
+    unchanged, the recomputed cap would equal the iterate just assigned from it,
+    which converges. And an iterate marginal at the *deepest* level converges
+    immediately, because there the cap is the starting clamp, which the iterate
+    by construction never exceeds. So an ``n``-level book converges within ``n``
+    passes; an empty book rests no depth, admits no fill, is already clamped to
+    zero, and needs none. An earlier ``n + 1`` bound left a pass that no book
+    could reach -- dead, and untestable by construction (issue #167). The
+    invariant it was insuring is now asserted directly, over generated books, by
+    ``test_participation_fixed_point_always_reaches_a_true_fixed_point``.
+
     Args:
         size_centis: The size to clip, in contract-centis (non-negative).
         yes_asks: The market's resting YES asks, best-first.
@@ -355,7 +369,7 @@ def _participation_fixed_point(
     current = min(size_centis, clamp)
     if lot:
         current = _floor_lot(current)
-    for _ in range(len(yes_asks) + 1):
+    for _ in yes_asks:
         depth = _depth_through_fill(yes_asks, current)
         cap = divide(max_participation_ppm * depth, _PPM_ONE, rounding=_SIZE_ROUNDING)
         if lot:
