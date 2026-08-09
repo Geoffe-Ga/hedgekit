@@ -482,12 +482,12 @@ def test_risk_kernel_evaluate_intent_records_one_intent_vetoed_event() -> None:
 def test_risk_kernel_evaluate_intent_records_intent_approved_when_not_vetoed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the check pipeline approves an intent (no veto), the kernel ledgers
-        exactly one `IntentApproved` event and never a mislabeled `IntentVetoed`.
+    """When the check pipeline approves, the kernel ledgers one `IntentApproved`.
 
-    Since issue #340 promoted the last SPEC S10.3 check, a permissive
-        context genuinely reaches this branch, so the approving path is exercised
-        end-to-end rather than through a stubbed pipeline.
+    Exactly one event, never a mislabeled `IntentVetoed`. Since issue #340
+    promoted the last SPEC S10.3 check, a permissive context genuinely reaches
+    this branch, so the approving path is exercised end-to-end rather than
+    through a stubbed pipeline.
     """
     from windbreak.riskkernel import checks as checks_module
 

@@ -346,17 +346,18 @@ def test_approval_pipeline_veto_reserves_nothing_and_issues_no_token() -> None:
 def test_approval_pipeline_success_issues_a_token_and_reserves_capital(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the check pipeline approves (no veto), `ApprovalPipeline.approve`
-        reserves the worst-case cost, issues a signed token whose claims carry
-        the pipeline-computed `expires_at` / `max_fee_micros` /
-        `kernel_sequence_number`, and records an `ApprovalTokenIssued` event.
+    """An approving pipeline reserves the cost, issues a token, and ledgers it.
 
-    Since issue #340 promoted the last SPEC S10.3 check, a permissive
-        context reaches this branch unaided; the approving
-        pipeline is stubbed here, mirroring
-        `tests/riskkernel/test_process_isolation.py`'s identical technique, so
-        the reservation/token-issuance contract is pinned before that remaining
-        logic exists.
+    `ApprovalPipeline.approve` reserves the worst-case cost, issues a signed
+    token whose claims carry the pipeline-computed `expires_at` /
+    `max_fee_micros` / `kernel_sequence_number`, and records an
+    `ApprovalTokenIssued` event.
+
+    Since issue #340 promoted the last SPEC S10.3 check, a permissive context
+    reaches this branch unaided. The pipeline is still stubbed here, mirroring
+    `tests/riskkernel/test_process_isolation.py`'s identical technique, so this
+    test pins the reservation/token-issuance contract in isolation from the
+    check sequence.
     """
     approved = checks_module.Decision(vetoed=False, reasons=())
     monkeypatch.setattr(
