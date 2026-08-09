@@ -471,8 +471,11 @@ class RiskKernel:
         rest -- stays caller-supplied; callers must run
         :func:`windbreak.riskkernel.evidence.anchor_gate_evidence` before
         building evidence, which re-derives ``paper_window_days`` from the
-        registered plan's ``paper_clock_start`` (SPEC S13.6). Wiring that
-        producer into the composition root is tracked separately as issue #246.
+        registered plan's ``paper_clock_start`` (SPEC S13.6). The CLI
+        composition root (:func:`windbreak.main._build_risk_kernel`) hands the
+        kernel the same ``--ledger-path`` store as its ``gate_plan_store``, so a
+        ``--process riskkernel`` run reads that registration rather than failing
+        closed (issue #246).
 
         Args:
             evidence: The promotion-readiness evidence snapshot.

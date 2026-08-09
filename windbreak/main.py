@@ -1229,6 +1229,15 @@ def _build_risk_kernel(
     shared machine to ``KILLED`` on an unrearmed history -- so the two never race
     to transition the single machine.
 
+    That same ``ledger_store`` is also handed to the kernel as its
+    ``gate_plan_store`` (issue #246), so a PAPER -> LIVE_MICRO promotion reads
+    its three plan-sourced thresholds from the pre-registered, content-addressed
+    gate plan already on that ledger. Without this the CLI-composed kernel would
+    fail closed with ``GatePlanUnavailableError`` on *every* PAPER promotion even
+    with a perfectly good registration on disk. It stays fail-closed where it
+    should: with no ``ledger_store`` there is no plan source, and the promotion
+    is refused rather than falling back to the live config.
+
     With a ``verification_connector`` the kernel's per-beat verification cycle
     becomes live (issue #288, superseding issue #236's frozen-startup snapshot):
     a :class:`LedgerExpectationSource` folds the replayed ``history`` once into a
@@ -1268,9 +1277,10 @@ def _build_risk_kernel(
             threshold, and ``risk.verification_balance_tolerance_micros`` /
             ``risk.verification_position_tolerance_centis`` set the live
             verifier's per-dimension drift tolerances.
-        ledger_store: The append-only ledger the kernel persists to and replays
-            durable kill state from (issue #235), or ``None`` to run against a
-            log-only writer with no replay (an empty history).
+        ledger_store: The append-only ledger the kernel persists to, replays
+            durable kill state from (issue #235), and reads its registered PAPER
+            gate plan from (issue #246), or ``None`` to run against a log-only
+            writer with no replay (an empty history) and no plan source.
         verification_connector: The read-only market connector the live verifier
             observes the venue through (issue #236), or ``None`` to compose no
             verifier -- leaving the per-beat verification cycle a no-op exactly
@@ -1329,6 +1339,7 @@ def _build_risk_kernel(
         mode_machine=machine,
         verifier=verifier,
         kill_integration=integration,
+        gate_plan_store=ledger_store,
     )
     return kernel, integration
 

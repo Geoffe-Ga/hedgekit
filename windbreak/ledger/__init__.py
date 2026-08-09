@@ -73,6 +73,7 @@ from windbreak.ledger.rebuild import rebuild, rebuild_command
 from windbreak.ledger.store import (
     ChainHead,
     ChainIntegrityError,
+    LatestRecordLookup,
     LedgerRecord,
     LedgerStore,
     SqliteLedgerStore,
@@ -94,6 +95,7 @@ __all__ = [
     "Event",
     "ExchangeStatusObserved",
     "ForecastCreated",
+    "LatestRecordLookup",
     "LedgerRecord",
     "LedgerStore",
     "MarketSnapshotRecorded",

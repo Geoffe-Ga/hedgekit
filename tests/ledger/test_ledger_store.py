@@ -56,11 +56,13 @@ import pytest
 from windbreak.ledger.events import (
     GENESIS_PREV_HASH,
     ConfigLoaded,
+    Event,
     ModeHeartbeat,
     canonical_json,
 )
 from windbreak.ledger.store import (
     ChainHead,
+    LatestRecordLookup,
     LedgerRecord,
     SqliteLedgerStore,
     compute_event_hash,
@@ -603,3 +605,124 @@ def test_events_from_records_raises_value_error_on_an_envelope_missing_data() ->
 
     with pytest.raises(ValueError):
         events_from_records([record])
+
+
+# --- issue #246: indexed reverse lookup of the newest record of given types -----
+#
+# `latest_gate_plan_registration` scans the WHOLE ledger (`read_all()`) at least
+# twice per promotion attempt just to find the last registration row.
+# `SqliteLedgerStore.latest_record_of_types` answers that question with a single
+# indexed `ORDER BY sequence_number DESC LIMIT 1` read, and is declared through
+# the NARROW, optional `LatestRecordLookup` capability protocol -- deliberately
+# separate from `LedgerStore`, which several hand-rolled test doubles implement
+# structurally and which must therefore stay exactly as wide as it is.
+#
+# Neither the method nor the protocol exists yet, so this module's import of
+# `LatestRecordLookup` fails collection with `ImportError: cannot import name
+# 'LatestRecordLookup' from 'windbreak.ledger.store'` -- the expected Gate 1 RED
+# state for issue #246.
+
+
+def test_latest_record_of_types_returns_none_for_an_empty_ledger(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """An empty ledger has no record of any type, so the lookup returns `None`
+    rather than raising -- the caller distinguishes "absent" from "corrupt".
+    """
+    store = ledger_store_factory()
+
+    assert store.latest_record_of_types({"ConfigLoaded"}) is None
+
+
+def test_latest_record_of_types_returns_none_when_no_row_matches(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """A non-empty ledger holding no row of the requested types returns `None`,
+    never the newest row of some other type (which would be a wrong answer the
+    fail-closed gate-plan read would then trust).
+    """
+    store = ledger_store_factory()
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+
+    assert store.latest_record_of_types({"ModeHeartbeat"}) is None
+
+
+def test_latest_record_of_types_returns_the_highest_sequence_match(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """Among several matching rows the newest (highest `sequence_number`) wins,
+    and every one of the eight persisted columns round-trips identically to the
+    same row read back through `read_all` -- the scan this read supersedes.
+    """
+    store = ledger_store_factory()
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=1))
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=2))
+
+    latest = store.latest_record_of_types({"ModeHeartbeat"})
+
+    assert latest == store.read_all()[2]
+
+
+def test_latest_record_of_types_spans_every_requested_type(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """With more than one requested type the newest row across the WHOLE set
+    wins -- the property the two-event gate-plan vocabulary
+    (`GatePlanRegistered` / `GatePlanChanged`) depends on.
+    """
+    store = ledger_store_factory()
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=1))
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+
+    latest = store.latest_record_of_types({"ModeHeartbeat", "ConfigLoaded"})
+
+    assert latest is not None
+    assert latest.sequence_number == 2
+    assert latest.event_type == "ConfigLoaded"
+
+
+def test_latest_record_of_types_returns_none_for_an_empty_type_set(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """Asking for no types at all matches nothing, so the lookup returns `None`
+    without emitting a degenerate `IN ()` query.
+    """
+    store = ledger_store_factory()
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+
+    assert store.latest_record_of_types(frozenset()) is None
+
+
+def test_sqlite_ledger_store_satisfies_the_optional_lookup_capability() -> None:
+    """`SqliteLedgerStore` structurally satisfies `LatestRecordLookup`, which is
+    how `latest_gate_plan_registration` duck-type dispatches onto the indexed
+    read instead of the full scan.
+    """
+    assert issubclass(SqliteLedgerStore, LatestRecordLookup)
+
+
+def test_latest_record_lookup_is_not_satisfied_by_a_bare_ledger_store() -> None:
+    """A hand-rolled `LedgerStore` double that predates the capability does NOT
+    satisfy `LatestRecordLookup` -- proof the new capability is separately
+    declared and that widening `LedgerStore` itself was not required.
+    """
+
+    class _BareStore:
+        """A minimal structural `LedgerStore` with no indexed lookup."""
+
+        def append(self, event: Event) -> int:
+            """Raise; this double is never appended to."""
+            raise NotImplementedError(event)
+
+        def read_all(self) -> list[LedgerRecord]:
+            """Return no records."""
+            return []
+
+        def verify_chain(self) -> None:
+            """Do nothing; the double has no chain."""
+
+        def close(self) -> None:
+            """Do nothing; the double holds no resources."""
+
+    assert not isinstance(_BareStore(), LatestRecordLookup)
