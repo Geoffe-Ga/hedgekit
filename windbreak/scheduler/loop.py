@@ -1199,6 +1199,10 @@ def _approve_stage(
             observed_at_epoch_s=status_epoch_s,
         )
     )
+    # A second clock read, deliberately not the tick-start `now_epoch_s`:
+    # freshness must be judged at evaluation time, so a slow forecast stage can
+    # legitimately age the heartbeat out rather than being masked by a reading
+    # taken before it ran.
     context = build_evaluation_context(
         deps.config,
         now_epoch_s=deps.clock(),

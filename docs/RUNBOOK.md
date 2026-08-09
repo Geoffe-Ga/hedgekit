@@ -84,9 +84,9 @@ pipeline-heartbeat evidence, so `exchange_status_ok` and
 `pipeline_heartbeat_ok` now evaluate genuine observations and pass on a healthy
 exchange.
 
-- The reconciliation checks fail closed on `verification=None`, which is
-  exactly what the loop honestly supplies today -- no read-only exchange
-  verification cycle runs in PAPER yet.
+The remaining cause is verification: the three reconciliation checks fail
+closed on `verification=None`, which is exactly what the loop honestly supplies
+today -- no read-only exchange verification cycle runs in PAPER yet.
 
 Note the status **value** is read from the connector every tick and never
 synthesized, so a `paused` or `closed` exchange still vetoes -- with the
@@ -98,9 +98,10 @@ selector decision, and an `IntentVetoed`) but routes nothing and fills
 nothing; `filled_centis` on every tick's outcome is `0`. Don't be surprised
 to see nothing but vetoes in `/decisions` or `selector_decisions.json` --
 that is the expected, honestly-ledgered state of the loop today. The first
-real, kernel-approved paper fill activates once live exchange-status,
-heartbeat, and verification feeds are wired into the loop in place of today's
-fail-closed `None`s.
+real, kernel-approved paper fill activates once a read-only verification feed
+is wired into the loop in place of today's fail-closed `None`. Exchange status
+and the pipeline heartbeat are already real (issue #342); verification is the
+last one outstanding.
 
 **Known limitation -- the kill switch does not stop the PAPER loop yet.**
 `windbreak kill --state-dir <dir>` and `windbreak rearm --state-dir <dir>` write
