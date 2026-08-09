@@ -90,6 +90,7 @@ from windbreak.order_gateway.state_machine import OrderEvent, OrderState, transi
 from windbreak.order_gateway.wal import WriteAheadLog
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from pathlib import Path
 
     from windbreak.connector.paper import PaperExchange
@@ -1164,5 +1165,824 @@ def test_recover_over_a_corrupt_wal_keeps_the_gateway_shut_and_resubmits_nothing
     ]
     assert len(refusals) == 1
     assert json.loads(refusals[0].payload_json)["data"]["reason"] == "recovery_pending"
+    fresh_store.verify_chain()
+    fresh_store.close()
+
+
+# --- 9. A record the WAL cannot fully validate is refused (issue #427) ----------
+
+#: The exact field set a journalled *intent* record carries. Spelled out here
+#: rather than imported from `wal.py` so these tests are an independent
+#: statement of the on-disk contract: a read path that quietly widened or
+#: narrowed the accepted shape fails them instead of agreeing with itself.
+_INTENT_RECORD_FIELDS = ("kind", "client_order_id", "intent")
+
+#: The exact field set a journalled *ack* record carries.
+_ACK_RECORD_FIELDS = ("kind", "client_order_id", "order_id", "filled")
+
+#: The exact nine fields an intent record's `intent` payload carries.
+_INTENT_PAYLOAD_FIELDS = (
+    "intent_id",
+    "market_ticker",
+    "outcome",
+    "action",
+    "price",
+    "size",
+    "max_notional",
+    "implied_probability",
+    "idempotency_key",
+)
+
+#: A venue order id for the hand-built ack records below.
+_ACK_ORDER_ID = "venue-order-427"
+
+#: An immediately-filled quantity, in contract-centis, for hand-built acks.
+_ACK_FILLED_CENTIS = 25
+
+
+def _write_wal_text(wal_path: Path, text: str) -> None:
+    """Overwrite the journal with exactly `text`, byte for byte.
+
+    Used where the corruption under test is *not* a well-formed record -- a
+    blank line, a torn line -- and so cannot be expressed as a mapping to
+    re-encode.
+
+    Args:
+        wal_path: Path to the JSONL journal to overwrite.
+        text: The exact file content to write.
+    """
+    wal_path.write_text(text, encoding="utf-8")
+
+
+def _journalled_intent_object(wal_path: Path, key: str) -> dict[str, object]:
+    """Journal one genuine intent record and return its decoded mapping.
+
+    The record is produced by the real `append_intent`, so a tampering applied
+    to the returned mapping perturbs exactly one thing about an otherwise
+    byte-genuine record.
+
+    Args:
+        wal_path: Path to the journal to append to (overwritten by callers).
+        key: The idempotency key distinguishing this intent.
+
+    Returns:
+        The decoded mapping of the record just appended (the journal's last),
+        so this may be called more than once to build a multi-record journal.
+    """
+    intent = make_intent(idempotency_key=key)
+    WriteAheadLog(wal_path).append_intent(intent, client_order_id(intent))
+    return _read_wal_objects(wal_path)[-1]
+
+
+def _sound_intent_object(wal_path: Path) -> dict[str, object]:
+    """Journal one sound intent record to sit *before* the corrupt one.
+
+    Several refusals below deliberately place their corrupt record on line 2
+    rather than line 1. Every message the read path emits names a line, and a
+    message that hard-coded line 1 -- or that reported the position of the
+    line it started from rather than the one that failed -- would pass a suite
+    that only ever corrupted the opening record while misdirecting an operator
+    on every real journal.
+
+    Args:
+        wal_path: Path to the journal to append to (overwritten by callers).
+
+    Returns:
+        The decoded mapping of a genuine intent record.
+    """
+    return _journalled_intent_object(wal_path, "idem-wal-preceding-sound")
+
+
+def _ack_object(coid: str) -> dict[str, object]:
+    """Build a well-formed ack record mapping for `coid`.
+
+    Args:
+        coid: The client-order-id the ack correlates.
+
+    Returns:
+        A mapping with exactly the four fields an ack record carries.
+    """
+    return {
+        "kind": "ack",
+        "client_order_id": coid,
+        "order_id": _ACK_ORDER_ID,
+        "filled": _ACK_FILLED_CENTIS,
+    }
+
+
+def _expected_missing_kind_message(lineno: int) -> str:
+    """Build the exact message a record with no `kind` field must be refused with.
+
+    Args:
+        lineno: The 1-based line the offending record sits on.
+
+    Returns:
+        The exact expected `str(ValueError)`.
+    """
+    return (
+        f"write-ahead log corrupt: the record on line {lineno} is missing "
+        f"its 'kind' field"
+    )
+
+
+def _expected_unrecognised_kind_message(lineno: int, kind: object) -> str:
+    """Build the exact message an unrecognised `kind` must be refused with.
+
+    The offending value is named, so an operator reading the log learns *what*
+    the journal claimed rather than being handed an incidental `KeyError` from
+    somewhere further down the read path.
+
+    Args:
+        lineno: The 1-based line the offending record sits on.
+        kind: The unrecognised discriminator value, as decoded from JSON.
+
+    Returns:
+        The exact expected `str(ValueError)`.
+    """
+    return (
+        f"write-ahead log corrupt: the record on line {lineno} has unrecognised "
+        f"kind {kind!r} (expected 'intent' or 'ack')"
+    )
+
+
+def _expected_field_set_message(
+    where: str, actual: Iterable[str], expected: Iterable[str]
+) -> str:
+    """Build the exact message a wrong field set must be refused with.
+
+    Both sides are reported sorted, so the message is deterministic regardless
+    of JSON key order.
+
+    Args:
+        where: Which part of which line is malformed, e.g. `"the ack record on
+            line 2"`.
+        actual: The fields the record actually carries.
+        expected: The fields its declared kind requires.
+
+    Returns:
+        The exact expected `str(ValueError)`.
+    """
+    return (
+        f"write-ahead log corrupt: {where} carries fields {sorted(actual)} "
+        f"(expected {sorted(expected)})"
+    )
+
+
+def _expected_not_an_object_message(where: str) -> str:
+    """Build the exact message a non-object JSON value must be refused with.
+
+    Args:
+        where: Which part of which line is malformed.
+
+    Returns:
+        The exact expected `str(ValueError)`.
+    """
+    return f"write-ahead log corrupt: {where} is not a JSON object"
+
+
+def _expected_malformed_line_message(lineno: int) -> str:
+    """Build the exact message an unparseable line must be refused with.
+
+    Args:
+        lineno: The 1-based line that could not be decoded.
+
+    Returns:
+        The exact expected `str(ValueError)`.
+    """
+    return f"write-ahead log corrupt: line {lineno} is not a well-formed JSON record"
+
+
+def test_read_all_reads_back_an_ack_that_left_nothing_resting(tmp_path: Path) -> None:
+    """A `null` `order_id` is a genuine record shape and stays readable.
+
+    The positive control for the exact-field-set rule below: an ack whose
+    placement left nothing resting journals `order_id: null`, which is a
+    *present* field carrying `None`. A validator that confused "absent" with
+    "null" would refuse this perfectly sound record and take the Gateway down
+    on every restart after a fully-filled order.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    wal = WriteAheadLog(wal_path)
+    intent = make_intent(idempotency_key="idem-wal-null-order-id")
+    coid = client_order_id(intent)
+    wal.append_intent(intent, coid)
+    wal.append_ack(coid, None, ContractCentis(_ACK_FILLED_CENTIS))
+
+    records = WriteAheadLog(wal_path).read_all()
+
+    assert len(records) == 2
+    assert records[1].kind == "ack"
+    assert records[1].client_order_id == coid
+    assert records[1].order_id is None
+    assert records[1].filled == ContractCentis(_ACK_FILLED_CENTIS)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["snapshot", "", "Intent", "ack ", "INTENT", None, 0, ["ack"]],
+    ids=[
+        "future-record-type",
+        "empty-string",
+        "capitalised-intent",
+        "trailing-space-ack",
+        "upper-case-intent",
+        "json-null",
+        "json-integer",
+        "json-array",
+    ],
+)
+def test_read_all_refuses_a_record_whose_kind_is_unrecognised(
+    tmp_path: Path, kind: object
+) -> None:
+    """An unrecognised `kind` is refused by name, never assumed to be an ack.
+
+    Every case below is otherwise a *fully well-formed ack record* -- the four
+    ack fields, all present and all well-typed -- with only the discriminator
+    replaced. So nothing else in the read path can account for the refusal:
+    the record is turned away because its `kind` was not recognised, and for no
+    other reason. Before issue #427 each of these was read straight down the
+    ack branch, which validates nothing at all.
+
+    The near misses matter as much as the obvious ones. `"Intent"`, `"INTENT"`
+    and `"ack "` differ from a legal discriminator by case or by one trailing
+    space; a guard that lower-cased, stripped, or prefix-matched the value
+    would wave them through. A non-string `kind` (`null`, an integer, an array)
+    must be refused rather than crash the comparison.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    sound = _sound_intent_object(wal_path)
+    intent = make_intent(idempotency_key="idem-wal-unknown-kind")
+    record = _ack_object(client_order_id(intent))
+    record["kind"] = kind
+    _rewrite_wal_objects(wal_path, [sound, record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value, _expected_unrecognised_kind_message(2, kind)
+    )
+
+
+def test_read_all_refuses_a_record_carrying_no_kind_at_all(tmp_path: Path) -> None:
+    """A record with no `kind` field is refused, not treated as an ack.
+
+    Distinct from a record whose `kind` is `null`: here the discriminator is
+    absent entirely, and the message says so rather than reporting a `None`
+    value the journal never contained.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    sound = _sound_intent_object(wal_path)
+    intent = make_intent(idempotency_key="idem-wal-no-kind")
+    record = _ack_object(client_order_id(intent))
+    del record["kind"]
+    _rewrite_wal_objects(wal_path, [sound, record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(excinfo.value, _expected_missing_kind_message(2))
+
+
+def test_read_all_refuses_an_intent_record_relabelled_as_an_ack(
+    tmp_path: Path,
+) -> None:
+    """Flipping `kind` to `"ack"` no longer routes an intent past the id guard.
+
+    The headline defect of issue #427. `"ack"` *is* a recognised kind, so the
+    discriminator check alone cannot catch this -- what catches it is that the
+    record still carries an `intent` field and carries neither of the two
+    fields an ack requires. A one-word edit on disk used to be enough to skip
+    the `client_order_id` re-derivation entirely.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    record = _journalled_intent_object(wal_path, "idem-wal-relabelled-ack")
+    record["kind"] = "ack"
+    _rewrite_wal_objects(wal_path, [record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the ack record on line 1", record, _ACK_RECORD_FIELDS
+        ),
+    )
+
+
+def test_read_all_refuses_an_intent_relabelled_as_an_ack_with_ack_fields_grafted_on(
+    tmp_path: Path,
+) -> None:
+    """The relabelling that used to be *silently accepted* is now refused.
+
+    The bare relabel above at least crashed (on a bare `KeyError('order_id')`
+    -- fail-closed by accident). This one did not: graft the two missing ack
+    fields onto the relabelled record and the old read path returned it
+    happily, as an ack under whatever `client_order_id` the journal claimed,
+    with the intent payload never validated and never even looked at. That is a
+    silent accept, and it is exactly how an order gets recovered under an
+    identity that is not its own.
+
+    The leftover `intent` field is what gives it away: a record must carry
+    *exactly* the fields its kind requires, so an extra one is corruption even
+    when every required field is present and well-formed.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    record = _journalled_intent_object(wal_path, "idem-wal-relabelled-grafted")
+    record["kind"] = "ack"
+    record["order_id"] = _ACK_ORDER_ID
+    record["filled"] = _ACK_FILLED_CENTIS
+    _rewrite_wal_objects(wal_path, [record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the ack record on line 1", record, _ACK_RECORD_FIELDS
+        ),
+    )
+
+
+def test_read_all_refuses_an_ack_record_relabelled_as_an_intent(
+    tmp_path: Path,
+) -> None:
+    """The mirror relabelling is refused too, and names the intent shape.
+
+    An ack claiming to be an intent has no payload to re-derive an id from.
+    Pinning both directions stops an implementation from validating one kind's
+    shape and trusting the other's.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    sound = _sound_intent_object(wal_path)
+    intent = make_intent(idempotency_key="idem-wal-relabelled-intent")
+    record = _ack_object(client_order_id(intent))
+    record["kind"] = "intent"
+    _rewrite_wal_objects(wal_path, [sound, record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the intent record on line 2", record, _INTENT_RECORD_FIELDS
+        ),
+    )
+
+
+@pytest.mark.parametrize("dropped", _ACK_RECORD_FIELDS[1:])
+def test_read_all_refuses_an_ack_record_missing_a_field_it_requires(
+    tmp_path: Path, dropped: str
+) -> None:
+    """A missing ack field is a named refusal, never a bare `KeyError`.
+
+    `kind` is excluded from the sweep because dropping it is the
+    no-discriminator case pinned separately above. Each of the remaining
+    fields is dropped in turn: before issue #427, dropping `order_id` or
+    `filled` raised `KeyError`, which names a Python dict key and says nothing
+    about the journal being corrupt, and dropping `client_order_id` raised the
+    same for a record the reader had already decided to trust.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    intent = make_intent(idempotency_key=f"idem-wal-ack-no-{dropped}")
+    record = _ack_object(client_order_id(intent))
+    del record[dropped]
+    _rewrite_wal_objects(wal_path, [record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the ack record on line 1", record, _ACK_RECORD_FIELDS
+        ),
+    )
+
+
+def test_read_all_refuses_an_ack_record_carrying_an_unexpected_field(
+    tmp_path: Path,
+) -> None:
+    """A field this build does not know about is refused, not ignored.
+
+    A newer build's extra field (a checksum, a venue timestamp) is evidence
+    this reader cannot fully validate the record. Fail-closed means refusing
+    it, not reading the subset it happens to recognise and discarding the rest.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    sound = _sound_intent_object(wal_path)
+    intent = make_intent(idempotency_key="idem-wal-ack-extra-field")
+    record = _ack_object(client_order_id(intent))
+    record["venue_checksum"] = "0badc0de"
+    _rewrite_wal_objects(wal_path, [sound, record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the ack record on line 2", record, _ACK_RECORD_FIELDS
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("renamed", "replacement"),
+    [
+        ("order_id", "venue_order_id"),
+        ("filled", "filled_centis"),
+        ("client_order_id", "coid"),
+    ],
+)
+def test_read_all_refuses_an_ack_record_whose_field_was_renamed(
+    tmp_path: Path, renamed: str, replacement: str
+) -> None:
+    """A renamed field is refused even though the field *count* is unchanged.
+
+    The near miss that separates "the record has the right number of fields"
+    from "the record has the right fields". Every other corruption in this
+    section adds or removes a field, so a validator that compared only how many
+    fields a record carried would pass all of them -- and then index the
+    original name and raise the bare `KeyError` this issue exists to abolish.
+    Renaming keeps the count at four and changes only which names are there.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    intent = make_intent(idempotency_key=f"idem-wal-ack-renamed-{renamed}")
+    record = _ack_object(client_order_id(intent))
+    record[replacement] = record.pop(renamed)
+    assert len(record) == len(_ACK_RECORD_FIELDS)
+    _rewrite_wal_objects(wal_path, [record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the ack record on line 1", record, _ACK_RECORD_FIELDS
+        ),
+    )
+
+
+def test_read_all_refuses_an_intent_record_whose_payload_field_was_renamed(
+    tmp_path: Path,
+) -> None:
+    """Renaming the `intent` field is refused, count unchanged (three fields).
+
+    The same near miss one level up: the record still declares `kind`
+    `"intent"` and still carries three fields, but the payload is no longer
+    where an intent record's payload lives.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    record = _journalled_intent_object(wal_path, "idem-wal-record-renamed")
+    record["payload"] = record.pop("intent")
+    assert len(record) == len(_INTENT_RECORD_FIELDS)
+    _rewrite_wal_objects(wal_path, [record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the intent record on line 1", record, _INTENT_RECORD_FIELDS
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("renamed", "replacement"),
+    [("price", "price_pips"), ("size", "quantity"), ("intent_id", "id")],
+)
+def test_read_all_refuses_an_intent_payload_whose_field_was_renamed(
+    tmp_path: Path, renamed: str, replacement: str
+) -> None:
+    """A renamed payload field is refused, all nine still present by count.
+
+    The most dangerous of the three near misses: the `client_order_id` is a
+    digest over these nine fields under these nine names, so a payload whose
+    field was renamed cannot re-derive its recorded id even in principle. A
+    count-only check would send it to `_intent_from_payload`, which would raise
+    a bare `KeyError` for the original name -- never reaching the id guard the
+    record was supposed to be checked against.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    record = _journalled_intent_object(wal_path, f"idem-wal-payload-ren-{renamed}")
+    payload = cast("dict[str, object]", record["intent"])
+    payload[replacement] = payload.pop(renamed)
+    assert len(payload) == len(_INTENT_PAYLOAD_FIELDS)
+    _rewrite_wal_objects(wal_path, [record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the intent payload on line 1", payload, _INTENT_PAYLOAD_FIELDS
+        ),
+    )
+
+
+@pytest.mark.parametrize("dropped", _INTENT_PAYLOAD_FIELDS)
+def test_read_all_refuses_an_intent_payload_missing_one_of_its_nine_fields(
+    tmp_path: Path, dropped: str
+) -> None:
+    """Every one of the nine payload fields is required, by name.
+
+    All nine are swept rather than a representative one, because the failure
+    mode differs field by field: before issue #427 each raised its own bare
+    `KeyError` from inside `_intent_from_payload`, and a validator that checked
+    only the fields it happened to read first would leave the rest exposed.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    record = _journalled_intent_object(wal_path, f"idem-wal-payload-no-{dropped}")
+    payload = cast("dict[str, object]", record["intent"])
+    del payload[dropped]
+    _rewrite_wal_objects(wal_path, [record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the intent payload on line 1", payload, _INTENT_PAYLOAD_FIELDS
+        ),
+    )
+
+
+def test_read_all_refuses_an_intent_payload_carrying_an_unexpected_field(
+    tmp_path: Path,
+) -> None:
+    """An extra payload field is refused rather than dropped on the floor.
+
+    It matters more here than on an ack: the `client_order_id` is derived from
+    the intent's nine fields, so a tenth field is content the recorded digest
+    cannot possibly attest to. Ignoring it would mean recovering an order whose
+    journalled description and whose verified identity disagree.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    sound = _sound_intent_object(wal_path)
+    record = _journalled_intent_object(wal_path, "idem-wal-payload-extra-field")
+    payload = cast("dict[str, object]", record["intent"])
+    payload["stop_price"] = 4200
+    _rewrite_wal_objects(wal_path, [sound, record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the intent payload on line 2", payload, _INTENT_PAYLOAD_FIELDS
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, 4600, "intent", ["intent_id"]],
+    ids=["json-null", "json-integer", "json-string", "json-array"],
+)
+def test_read_all_refuses_an_intent_record_whose_payload_is_not_an_object(
+    tmp_path: Path, payload: object
+) -> None:
+    """A non-object `intent` payload is refused before anything indexes it.
+
+    Indexing a string by field name yields `TypeError`, and indexing a list
+    yields another; neither says the journal is corrupt, and neither is a
+    refusal the read path decided to make.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    sound = _sound_intent_object(wal_path)
+    record = _journalled_intent_object(wal_path, "idem-wal-payload-not-object")
+    record["intent"] = payload
+    _rewrite_wal_objects(wal_path, [sound, record])
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_not_an_object_message("the intent payload on line 2"),
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["null", "4600", '"intent"', "[]", '["kind", "intent"]'],
+    ids=["json-null", "json-integer", "json-string", "empty-array", "array"],
+)
+def test_read_all_refuses_a_line_that_is_not_a_json_object(
+    tmp_path: Path, line: str
+) -> None:
+    """A line that parses but is not an object is refused as corruption.
+
+    It is well-formed JSON, so the decode succeeds and the record reaches the
+    shape checks with no mapping to check. Fail-closed: refuse.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    sound = _sound_intent_object(wal_path)
+    _write_wal_text(wal_path, f"{canonical_json(sound)}\n{line}\n")
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value, _expected_not_an_object_message("line 2")
+    )
+
+
+def test_read_all_refuses_a_blank_line_instead_of_silently_skipping_it(
+    tmp_path: Path,
+) -> None:
+    """A blank line is corruption, not whitespace to be tolerated (issue #427).
+
+    Nothing in this journal's writer can produce one: `_append` writes exactly
+    one canonical-JSON line plus one newline per record. A blank line therefore
+    means the file is no longer what the writer wrote, and the read path used
+    to skip it and hand back the surrounding records as though the journal were
+    intact. The blank sits between two sound records here, so a reader that
+    skipped it would return two perfectly good records and report success.
+
+    The line number must be the blank one, not the first: a refusal that always
+    blamed line 1 would send an operator to the wrong record.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    intent = make_intent(idempotency_key="idem-wal-blank-line")
+    coid = client_order_id(intent)
+    wal = WriteAheadLog(wal_path)
+    wal.append_intent(intent, coid)
+    wal.append_ack(coid, _ACK_ORDER_ID, ContractCentis(_ACK_FILLED_CENTIS))
+    sound_lines = wal_path.read_text(encoding="utf-8").splitlines()
+    assert len(WriteAheadLog(wal_path).read_all()) == 2
+
+    _write_wal_text(wal_path, f"{sound_lines[0]}\n\n{sound_lines[1]}\n")
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(excinfo.value, _expected_malformed_line_message(2))
+
+
+def test_read_all_refuses_a_torn_trailing_line_as_a_plain_value_error(
+    tmp_path: Path,
+) -> None:
+    """A crash-torn tail is refused with the WAL's own error, not JSON's.
+
+    The realistic corruption: the process died part-way through appending, so
+    the final line is a prefix of a record. The read path already stopped here,
+    but only incidentally -- `json.JSONDecodeError` *subclasses* `ValueError`,
+    so the failure looked like a refusal without any code having refused
+    anything. Pinning `type(...) is ValueError` and the exact message is what
+    tells the two apart.
+
+    The tear is at line 2 of 2 and one sound record precedes it, so the
+    tolerant alternative -- returning the records before the tear -- is
+    available and must not be taken.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    intent = make_intent(idempotency_key="idem-wal-torn-tail")
+    coid = client_order_id(intent)
+    wal = WriteAheadLog(wal_path)
+    wal.append_intent(intent, coid)
+    wal.append_ack(coid, _ACK_ORDER_ID, ContractCentis(_ACK_FILLED_CENTIS))
+    sound_lines = wal_path.read_text(encoding="utf-8").splitlines()
+
+    torn = sound_lines[1][: len(sound_lines[1]) // 2]
+    assert torn
+    _write_wal_text(wal_path, f"{sound_lines[0]}\n{torn}")
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(excinfo.value, _expected_malformed_line_message(2))
+
+
+def test_read_all_refuses_a_torn_line_fused_with_the_append_that_followed_it(
+    tmp_path: Path,
+) -> None:
+    """A tear that a later append ran into is refused, and it is why we refuse.
+
+    This is the case that decides the torn-line rule. A torn line carries no
+    terminating newline, so the *next* append lands on the same line and fuses
+    with it: the damage is no longer at the tail, and the record that fused
+    onto it -- a perfectly good one, durably written after the restart -- is
+    destroyed along with it. A reader that tolerated a torn tail by truncating
+    at the tear would therefore silently discard sound, later records too. So
+    the WAL refuses every unparseable line wherever it sits.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    intent = make_intent(idempotency_key="idem-wal-fused-tear")
+    coid = client_order_id(intent)
+    wal = WriteAheadLog(wal_path)
+    wal.append_intent(intent, coid)
+    sound_line = wal_path.read_text(encoding="utf-8").splitlines()[0]
+
+    _write_wal_text(wal_path, sound_line[: len(sound_line) // 2])
+    wal.append_ack(coid, _ACK_ORDER_ID, ContractCentis(_ACK_FILLED_CENTIS))
+    assert len(wal_path.read_text(encoding="utf-8").splitlines()) == 1
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(excinfo.value, _expected_malformed_line_message(1))
+
+
+@pytest.mark.parametrize("bad_index", range(len(_MULTI_RECORD_SIZES)))
+def test_read_all_reports_the_line_the_unreadable_record_actually_sits_on(
+    tmp_path: Path, bad_index: int
+) -> None:
+    """The reported line number tracks the offending record's position.
+
+    Three sound records are journalled and read back intact, then exactly one
+    is replaced by an unparseable line, at each position in turn. A read path
+    that hard-coded a line number, counted from zero, or skipped blank lines
+    while numbering would misreport at least one of these -- and an operator
+    told to inspect the wrong line of a corrupt journal is being misdirected at
+    precisely the worst moment.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    wal = WriteAheadLog(wal_path)
+    for size in _MULTI_RECORD_SIZES:
+        intent = make_intent(
+            idempotency_key=f"idem-wal-lineno-{size}", size=ContractCentis(size)
+        )
+        wal.append_intent(intent, client_order_id(intent))
+    lines = wal_path.read_text(encoding="utf-8").splitlines()
+    assert len(WriteAheadLog(wal_path).read_all()) == len(_MULTI_RECORD_SIZES)
+
+    lines[bad_index] = "{not json"
+    _write_wal_text(wal_path, "".join(f"{line}\n" for line in lines))
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value, _expected_malformed_line_message(bad_index + 1)
+    )
+
+
+def test_recover_over_a_relabelled_wal_record_keeps_the_gateway_shut(
+    tmp_path: Path, paper_exchange: PaperExchange
+) -> None:
+    """A relabelled record stops recovery dead, exactly as a tampered id does.
+
+    The end-to-end consequence, mirroring the issue #252 case that PR #426
+    pinned but corrupting the journal the way issue #427 describes: one intent
+    is driven to `ACKED`, leaving a partially filled order resting, and its
+    journalled record's `kind` is then flipped to `"ack"`. A fresh Gateway must
+    refuse rather than guess -- `.recover()` raises, writes nothing to the
+    ledger, and leaves `accepting_approvals` `False`, so re-presenting the same
+    intent and token is refused `REFUSED_RECOVERY_PENDING` instead of being
+    submitted a second time. The exchange still shows the one resting order it
+    had, not two.
+    """
+    db_path = tmp_path / "ledger.db"
+    wal_path = tmp_path / "wal.jsonl"
+    store = SqliteLedgerStore(db_path)
+    gateway = _build_recovering_gateway(paper_exchange, store, WriteAheadLog(wal_path))
+    assert gateway.recover().halted is False
+
+    intent = make_intent(idempotency_key="idem-wal-relabel-recover")
+    token = issue_matching_token(intent)
+    assert gateway.process_intent(intent, token).outcome is SubmitOutcome.ACKED
+    resting_before = paper_exchange.get_open_orders()
+    assert len(resting_before) == 1
+    ledger_rows_before = len(store.read_all())
+    store.close()
+
+    objects = _read_wal_objects(wal_path)
+    objects[0]["kind"] = "ack"
+    _rewrite_wal_objects(wal_path, objects)
+
+    fresh_store = SqliteLedgerStore(db_path)
+    fresh_gateway = _build_recovering_gateway(
+        paper_exchange, fresh_store, WriteAheadLog(wal_path)
+    )
+    assert fresh_gateway.accepting_approvals is False
+
+    with pytest.raises(ValueError) as excinfo:
+        fresh_gateway.recover()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_field_set_message(
+            "the ack record on line 1", objects[0], _ACK_RECORD_FIELDS
+        ),
+    )
+    assert fresh_gateway.accepting_approvals is False
+    assert len(fresh_store.read_all()) == ledger_rows_before
+
+    replayed = fresh_gateway.process_intent(intent, token)
+
+    assert replayed.outcome is SubmitOutcome.REFUSED_RECOVERY_PENDING
+    assert replayed.ack is None
+    assert paper_exchange.get_open_orders() == resting_before
     fresh_store.verify_chain()
     fresh_store.close()
