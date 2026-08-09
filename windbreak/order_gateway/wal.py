@@ -23,6 +23,31 @@ share one :class:`WalRecord` shape:
 and re-derives its :func:`~windbreak.order_gateway.client_order_id.client_order_id`,
 failing loudly if the re-derived id disagrees with the recorded one (a tampered
 or corrupt journal must never silently mis-attribute an order).
+
+**The read path refuses anything it cannot fully validate** (issue #427). Every
+line must decode to a JSON object; every record must declare a recognised
+``kind``; and a record -- like an intent record's payload -- must carry
+*exactly* the fields that kind requires, no more and no fewer. Each refusal is
+an explicit ``ValueError`` naming the offending line and value. That exactness
+is what closes the discriminator: ``"ack"`` is a legal ``kind``, so relabelling
+a journalled *intent* record as an ack would otherwise route it past the id
+re-derivation above -- but the relabelled record still carries an ``intent``
+field and neither of the two an ack requires, so it is refused. An extra field
+written by some newer build is refused for the same reason: this reader cannot
+attest to content it does not understand, and fail-closed means refusing rather
+than reading the subset it recognises.
+
+**Blank and torn lines are refused, not skipped** (issue #427). A crash during
+``_append`` can leave a partial final line, and the tempting rule -- tolerate a
+torn *tail*, since the record it describes was never acted on -- does not
+survive contact with an append-only file: a torn line has no terminating
+newline, so the next append fuses onto it, taking a sound, durably written
+record down with the damaged one. There is no way to tell a crash-torn line
+from any other corruption after the fact, so the journal takes the one rule it
+can prove: every line must be a complete record, and any line that is not stops
+the read. Recovering from a silently shortened WAL is precisely the
+resubmit/orphan hazard the log exists to prevent; truncating a damaged journal
+is an operator's deliberate act, never the reader's guess.
 """
 
 from __future__ import annotations
@@ -50,6 +75,29 @@ _KIND_INTENT = "intent"
 
 #: Discriminator value marking a journalled ack record.
 _KIND_ACK = "ack"
+
+#: The exact field set an intent record carries -- what :meth:`WriteAheadLog.
+#: append_intent` writes, and therefore the only shape the read path accepts.
+_INTENT_RECORD_FIELDS = frozenset({"kind", "client_order_id", "intent"})
+
+#: The exact field set an ack record carries (:meth:`WriteAheadLog.append_ack`).
+_ACK_RECORD_FIELDS = frozenset({"kind", "client_order_id", "order_id", "filled"})
+
+#: The exact nine fields an intent record's payload carries (SPEC S6.1) -- what
+#: :func:`_intent_to_payload` writes, and what ``client_order_id`` hashes.
+_INTENT_PAYLOAD_FIELDS = frozenset(
+    {
+        "intent_id",
+        "market_ticker",
+        "outcome",
+        "action",
+        "price",
+        "size",
+        "max_notional",
+        "implied_probability",
+        "idempotency_key",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,56 +256,86 @@ class WriteAheadLog:
             journal file does not yet exist.
 
         Raises:
-            ValueError: If a journalled intent's re-derived
+            ValueError: If any line is not a complete JSON object, declares an
+                absent or unrecognised ``kind``, does not carry exactly the
+                fields its kind requires, or is an intent whose re-derived
                 :func:`~windbreak.order_gateway.client_order_id.client_order_id`
-                disagrees with the id it was recorded under (a corrupt journal).
+                disagrees with the id it was recorded under. Every one of those
+                means a corrupt journal, and none is recoverable by guessing.
         """
         if not self._path.exists():
             return ()
         text = self._path.read_text(encoding="utf-8")
-        records = [self._record_from_line(line) for line in text.splitlines() if line]
+        records = [
+            self._record_from_line(line, lineno)
+            for lineno, line in enumerate(text.splitlines(), start=1)
+        ]
         return tuple(records)
 
-    def _record_from_line(self, line: str) -> WalRecord:
-        """Parse one JSONL line into a :class:`WalRecord`.
+    def _record_from_line(self, line: str, lineno: int) -> WalRecord:
+        """Parse one JSONL line into a fully validated :class:`WalRecord`.
 
         Args:
             line: One canonical-JSON journal line.
+            lineno: The line's 1-based position, for error messages.
 
         Returns:
             The reconstructed record.
 
         Raises:
-            ValueError: If an intent line's re-derived id disagrees with its
-                recorded ``client_order_id``.
+            ValueError: If the line is not a complete JSON object, carries no
+                ``kind`` or an unrecognised one, does not carry exactly the
+                fields its kind requires, or is an intent whose re-derived id
+                disagrees with its recorded ``client_order_id``.
         """
-        obj = cast("dict[str, object]", json.loads(line))
-        coid = cast("str", obj["client_order_id"])
-        if obj["kind"] == _KIND_INTENT:
-            return self._intent_record(coid, cast("dict[str, object]", obj["intent"]))
-        order_id = cast("str | None", obj["order_id"])
-        filled = ContractCentis(cast("int", obj["filled"]))
-        return WalRecord(
-            kind=_KIND_ACK,
-            client_order_id=coid,
-            intent=None,
-            order_id=order_id,
-            filled=filled,
+        obj = _require_object(_decode_line(line, lineno), f"line {lineno}")
+        if "kind" not in obj:
+            raise ValueError(
+                f"write-ahead log corrupt: the record on line {lineno} is missing "
+                f"its 'kind' field"
+            )
+        kind = obj["kind"]
+        if kind == _KIND_INTENT:
+            _require_fields(
+                obj, _INTENT_RECORD_FIELDS, f"the intent record on line {lineno}"
+            )
+            return self._intent_record(
+                cast("str", obj["client_order_id"]), obj["intent"], lineno
+            )
+        if kind == _KIND_ACK:
+            _require_fields(obj, _ACK_RECORD_FIELDS, f"the ack record on line {lineno}")
+            return WalRecord(
+                kind=_KIND_ACK,
+                client_order_id=cast("str", obj["client_order_id"]),
+                intent=None,
+                order_id=cast("str | None", obj["order_id"]),
+                filled=ContractCentis(cast("int", obj["filled"])),
+            )
+        raise ValueError(
+            f"write-ahead log corrupt: the record on line {lineno} has unrecognised "
+            f"kind {kind!r} (expected {_KIND_INTENT!r} or {_KIND_ACK!r})"
         )
 
-    def _intent_record(self, coid: str, payload: dict[str, object]) -> WalRecord:
+    def _intent_record(self, coid: str, raw_payload: object, lineno: int) -> WalRecord:
         """Rebuild an intent record and verify its content-addressed id.
 
         Args:
             coid: The id the intent was recorded under.
-            payload: The journalled intent payload (ints and strings only).
+            raw_payload: The journalled ``intent`` value, not yet known to be a
+                mapping of exactly the nine intent fields.
+            lineno: The record's 1-based line, for error messages.
 
         Returns:
             The reconstructed intent :class:`WalRecord`.
 
         Raises:
-            ValueError: If ``client_order_id(intent)`` disagrees with ``coid``.
+            ValueError: If the payload is not an object carrying exactly the
+                nine intent fields, or if ``client_order_id(intent)`` disagrees
+                with ``coid``.
         """
+        where = f"the intent payload on line {lineno}"
+        payload = _require_object(raw_payload, where)
+        _require_fields(payload, _INTENT_PAYLOAD_FIELDS, where)
         intent = _intent_from_payload(payload)
         rederived = client_order_id(intent)
         if rederived != coid:
@@ -271,6 +349,78 @@ class WriteAheadLog:
             intent=intent,
             order_id=None,
             filled=ContractCentis(0),
+        )
+
+
+def _decode_line(line: str, lineno: int) -> object:
+    """Decode one journal line, refusing anything that will not parse.
+
+    The raised error is a plain ``ValueError``, never the ``JSONDecodeError``
+    ``json`` raises. That subclasses ``ValueError``, so letting it escape would
+    look like a refusal without any code having refused anything -- and a caller
+    catching ``ValueError`` could not tell the two apart.
+
+    Args:
+        line: One raw line of the journal (blank lines included).
+        lineno: The line's 1-based position, for the error message.
+
+    Returns:
+        The decoded JSON value, not yet known to be an object.
+
+    Raises:
+        ValueError: If the line is blank or is not well-formed JSON -- the
+            shape a crash mid-append leaves behind.
+    """
+    try:
+        decoded: object = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"write-ahead log corrupt: line {lineno} is not a well-formed JSON record"
+        ) from exc
+    return decoded
+
+
+def _require_object(value: object, where: str) -> dict[str, object]:
+    """Narrow a decoded JSON value to a mapping, refusing anything else.
+
+    Args:
+        value: The decoded JSON value.
+        where: Which part of which line it came from, for the error message.
+
+    Returns:
+        ``value`` as a mapping.
+
+    Raises:
+        ValueError: If ``value`` is not a JSON object.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(f"write-ahead log corrupt: {where} is not a JSON object")
+    return cast("dict[str, object]", value)
+
+
+def _require_fields(
+    obj: dict[str, object], expected: frozenset[str], where: str
+) -> None:
+    """Refuse a mapping that does not carry exactly ``expected``'s fields.
+
+    Exactly, in both directions: a missing field means the record cannot be
+    fully read, and an unexpected one means it was written by something this
+    build does not understand. Either way the reader cannot validate what it
+    has, so it refuses rather than reading the part it recognises.
+
+    Args:
+        obj: The mapping to check.
+        expected: The fields it must carry, and only those.
+        where: Which part of which line it came from, for the error message.
+
+    Raises:
+        ValueError: If ``obj``'s field set differs from ``expected``. Both sets
+            are reported sorted, so the message does not depend on key order.
+    """
+    if set(obj) != expected:
+        raise ValueError(
+            f"write-ahead log corrupt: {where} carries fields {sorted(obj)} "
+            f"(expected {sorted(expected)})"
         )
 
 
