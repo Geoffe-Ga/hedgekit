@@ -11,10 +11,8 @@ description: >-
   into a TDD-driven local fix loop, replies and resolves threads, and merges
   only when the latest verdict is `LGTM`, the comment was posted after the
   current HEAD's push, and all required checks are green.
-  Do NOT use for giving a review (use comprehensive-pr-review), debugging CI
-  failures themselves (use ci-debugging), general TDD work outside review
-  context (use stay-green), bug RCA (use bug-squashing-methodology), or
-  issue/branch/PR creation (use git-workflow).
+  Do NOT use for debugging CI failures themselves (use ci-debugging) or
+  general TDD work outside review context (use stay-green).
 metadata:
   author: Geoff
   version: 1.1.0
@@ -45,7 +43,7 @@ Before touching code, restate each review item as a 6-component micro-prompt so 
 - **Examples** — if the reviewer suggested code, paste it verbatim.
 - **Constraints** — keep blast radius small; preserve public API; add a regression test.
 
-If a comment is ambiguous on any component, reply asking for clarification rather than guessing. See `prompt-engineering` for the full framework.
+If a comment is ambiguous on any component, reply asking for clarification rather than guessing.
 
 ## Instructions
 
@@ -83,7 +81,7 @@ The Claude review is a single comment with sections (Strengths / Security Concer
 
 Also pull any **line-level** review threads via `mcp__github__pull_request_read` with `method: "get_review_comments"` and merge them into the same table — these come back with `isResolved` metadata so you can ignore already-resolved threads.
 
-Apply the prompt-engineering framing above. Drop or push back on items that are out of scope, factually wrong, or already addressed — reply with a short justification instead of changing code.
+Drop or push back on items that are out of scope, factually wrong, or already addressed — reply with a short justification instead of changing code.
 
 ### Step 3: Fix Locally with TDD — Never Push to Probe CI
 

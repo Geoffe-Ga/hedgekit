@@ -10,9 +10,9 @@ description: >-
   code quality scan", "bullshit detector", or when the weekly de-slop GitHub
   Action runs. Findings must be corroborated by two independent signals before
   filing — null findings are a valid result. Do NOT use for implementing fixes
-  (Ralph / continue-epic does that), for reviewing a specific PR diff (use
-  comprehensive-pr-review), for fixing CI failures (use ci-debugging), or for
-  triaging a backlog of existing issues (use backlog-grooming).
+  (Ralph / continue-epic does that), for fixing CI failures (use
+  ci-debugging), or for triaging a backlog of existing issues (use
+  backlog-grooming).
 metadata:
   author: Geoff
   version: 1.0.0
