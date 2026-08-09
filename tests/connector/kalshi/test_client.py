@@ -9,23 +9,27 @@ injected seam (never real HTTP; SPEC S7.1: CI runs offline).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import os
+import time
+from datetime import UTC, datetime, tzinfo
 from email.utils import format_datetime
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from windbreak.connector.kalshi import client as client_module
 from windbreak.connector.kalshi.client import (
     KALSHI_API_BASE,
     KalshiApiError,
     KalshiClient,
     KalshiResponse,
+    _parse_server_date,
     _RedirectFreeSession,
 )
 from windbreak.net.allowlist import OutboundAllowlist
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
     import requests
 
@@ -209,6 +213,83 @@ def test_2xx_without_date_header_has_none_server_date() -> None:
     response = client.get("markets")
 
     assert response.server_date is None
+
+
+class _OffsetlessTimezone(tzinfo):
+    """A `tzinfo` whose `utcoffset` is `None`, so its datetimes are still naive.
+
+    Python defines a datetime as naive when `tzinfo is None` *or* when
+    `tzinfo.utcoffset(dt)` returns `None`. `parsedate_to_datetime` never
+    produces that second shape, so the double below stands in for the
+    third-party or deserializing parser that could (issue #346). Only
+    `utcoffset` is overridden -- it is the single method both the naive-ness
+    test and `astimezone` consult.
+    """
+
+    def utcoffset(self, dt: datetime | None) -> None:
+        """Return `None` -- this zone declines to define an offset.
+
+        Args:
+            dt: The datetime being interrogated; unused, since the answer is
+                unconditional.
+
+        Returns:
+            `None`, always.
+        """
+        return None
+
+
+@pytest.fixture
+def local_timezone_utc_minus_5() -> Iterator[None]:
+    """Pin the process's local timezone to a fixed UTC-05:00 for one test.
+
+    `datetime.astimezone()` silently interprets a *naive* datetime as **local**
+    time. A test distinguishing "stamped UTC" from "reinterpreted as local" is
+    therefore a false green on a UTC host -- which most CI runners are -- since
+    both paths then yield the same instant. Pinning a fixed-offset zone (`EST5`
+    carries no DST rule, so it is UTC-05:00 on every date) makes the correct
+    and buggy results differ by five hours on every host, in CI and locally
+    alike.
+
+    Yields:
+        None, with `TZ` pinned. The previous `TZ` and the interpreter's cached
+        zone are both restored on exit, whether or not the test raises.
+    """
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "EST5"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_offsetless_tzinfo_date_header_is_stamped_utc_not_localized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parsed `Date` whose `tzinfo.utcoffset()` is `None` is naive, so it
+    takes the same "HTTP dates are GMT" branch a `tzinfo`-less parse takes
+    (issue #346).
+
+    Routing it to `astimezone` instead does *not* raise: it silently reads the
+    wall clock as the **host's** local time, so the recorded exchange instant
+    would skew by whatever offset the machine happens to run at -- a wrong
+    answer that differs between a developer's laptop and CI. The fixture pins
+    UTC-05:00, so the buggy path would return 17:30 and this assertion pins
+    12:30. The stdlib parser cannot emit this shape, so it is monkeypatched:
+    the guard exists for the deserialized or third-party-parsed datetime.
+    """
+    offsetless = datetime(2024, 12, 1, 12, 30, tzinfo=_OffsetlessTimezone())
+    monkeypatch.setattr(client_module, "parsedate_to_datetime", lambda _raw: offsetless)
+
+    assert _parse_server_date({"Date": "Sun, 01 Dec 2024 12:30:00 -0000"}) == datetime(
+        2024, 12, 1, 12, 30, tzinfo=UTC
+    )
 
 
 def test_construction_rejects_non_https_base_url() -> None:
