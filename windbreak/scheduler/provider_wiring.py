@@ -24,14 +24,23 @@ Three things live here:
 **Why only the live path is wrapped in a retrying, priced provider.** Replaying
 a recorded cassette spends no money and suffers no transient transport faults.
 Wrapping it would charge each vote a *list price* for a call that never
-happened -- and
-:class:`~windbreak.forecast.providers.retry.RetryingProvider` stamps that
-accrued price onto a failed vote's ``cost_micros`` -- so an offline tick would
-start reporting fabricated spend into the research budget and the cost ledger.
-The price table exists to keep cost accounting honest; billing a replay would
-be the first thing to make it dishonest. The invariant that matters is the
-other direction, and it holds structurally: the live branch is the only place a
-live transport is ever constructed, and it always wraps.
+happened -- and since issue #399
+:class:`~windbreak.forecast.providers.retry.RetryingProvider` prices *every*
+attempt it makes, the successful one included -- so an offline tick would bill
+a full ensemble's worth of fabricated spend into the research budget and the
+cost ledger on every replayed run. The price table exists to keep cost
+accounting honest; billing a replay would be the first thing to make it
+dishonest.
+
+The invariant that matters is the other direction, and it holds structurally:
+the live branch is the only place a live transport is ever constructed, and it
+always wraps. That is load-bearing for cost correctness, not just for retries.
+The wrapped :class:`~windbreak.forecast.providers.fixture.FixtureVoteProvider`
+reports ``cost_micros == 0`` -- truthfully for a replay, which spends nothing,
+and unavoidably for a live call, since ``LlmTransport.complete`` returns bare
+completion text carrying no token accounting to price from. The retry wrapper
+is therefore the *only* layer that can book a live vote's cost, and a live
+provider built without it would book every successful vote at zero.
 
 This module is on the money path (``scripts/lint_no_floats.py`` guards
 ``windbreak/scheduler``), so it is float-free: the retry schedule is whole
