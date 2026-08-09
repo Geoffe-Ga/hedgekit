@@ -23,14 +23,17 @@ Usage: $(basename "$0") [OPTIONS]
 Run all quality checks in sequence.
 
 Runs:
-  1. Linting (Ruff + float-lint + shellcheck)
-  2. Architecture boundary checks (import-linter)
-  3. Formatting (ruff format)
-  4. Type checking (MyPy)
-  5. Security checks (Bandit + pip-audit + detect-secrets)
-  6. Complexity analysis (Radon)
-  7. Unit tests
-  8. Coverage report
+  1. Pre-commit (every hook in .pre-commit-config.yaml, incl. the file-hygiene
+     hooks and vulture dead-code detection; one named exclusion, see
+     scripts/precommit.sh)
+  2. Linting (Ruff + float-lint + shellcheck)
+  3. Architecture boundary checks (import-linter)
+  4. Formatting (ruff format)
+  5. Type checking (MyPy)
+  6. Security checks (Bandit + pip-audit + detect-secrets)
+  7. Complexity analysis (Radon)
+  8. Unit tests
+  9. Coverage report
 
 OPTIONS:
     --verbose   Show detailed output
@@ -102,7 +105,14 @@ run_check() {
     echo ""
 }
 
-# Run all checks
+# Run all checks.
+#
+# The whole pre-commit hook set runs FIRST, deliberately (issue #401). Several
+# hooks are fixers that rewrite files; running them ahead of everything else
+# means the remaining gates judge the post-fix tree rather than a tree that is
+# about to change underneath them. The step still reports failure whenever a
+# fixer touched a file, so Gate 1 cannot pass on unfixed content.
+run_check "Pre-commit (all hooks)" "precommit.sh"
 run_check "Linting" "lint.sh" --check
 run_check "Architecture (import-linter)" "architecture.sh"
 run_check "Formatting" "format.sh" --check

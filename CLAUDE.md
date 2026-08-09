@@ -175,13 +175,33 @@ Run all quality checks before every commit. This is the master quality gate.
 ```
 
 Executes:
+- **The whole pre-commit hook set** — every hook in `.pre-commit-config.yaml`
+  over `--all-files`, via `scripts/precommit.sh`. This is what makes Gate 1 a
+  superset of CI's pre-commit job *by construction* rather than by a
+  hand-maintained list that drifts (issue #401). It covers dead-code detection
+  (vulture), shellcheck, and the file-hygiene hooks (trailing whitespace,
+  end-of-file, YAML/TOML/JSON validity, mixed line endings, debug statements,
+  private keys, and the rest) in addition to the tools listed below.
+  - One hook is excluded, deliberately and by name: `no-commit-to-branch`,
+    which asserts a branch policy rather than code quality and would redden
+    Gate 1 for anyone running it on `main`. CI skips it for the same reason
+    (issue #127). `conventional-pre-commit` runs at the `commit-msg` stage, so
+    no file-set run selects it — locally or in CI.
+  - `tests/toolchain/test_precommit_gate_coverage.py` fails the suite if a hook
+    is ever put out of Gate 1's reach without a registered reason.
+  - Several hooks are **fixers**, so this step can rewrite files. It reports
+    failure whenever it does, so Gate 1 never passes on unfixed content —
+    review the printed diff and re-run.
 - Code formatting verification (ruff format — single formatter authority, ADR-0002)
-- Linting (ruff, pylint)
+- Linting (ruff, float-lint, shellcheck)
+- Architecture boundary checks (import-linter)
 - Type checking (mypy)
-- Security scanning (bandit, pip-audit)
-- Dead code detection (vulture)
+- Security scanning (bandit, pip-audit, detect-secrets)
 - Complexity analysis (radon, xenon)
 - Test suite with coverage (pytest)
+
+Runtime: roughly 2m45s warm on a developer machine; the whole-hook-set step is
+about 10s of that (~+7% over the pre-#401 gate).
 
 Exit code 0 = ready to commit. Non-zero = fix issues first.
 
