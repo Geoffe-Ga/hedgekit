@@ -88,15 +88,23 @@ from windbreak.config.schema import (
 from windbreak.net.allowlist import (
     EgressDeniedError,
     OutboundAllowlist,
+    _exchange_hosts,
     allowlist_from_config,
 )
 
 if TYPE_CHECKING:
+    from windbreak.config.schema import ExchangeConfig
     from windbreak.ledger.events import Event
 
 #: The current-generation Kalshi public API host (SPEC S7.1), matching
 #: ``windbreak.connector.kalshi.client.KALSHI_API_BASE``'s hostname.
 _KALSHI_HOST = "api.elections.kalshi.com"
+
+#: The Kalshi *demo* API host, matching
+#: ``windbreak.connector.kalshi.client.KALSHI_DEMO_API_BASE``'s hostname. Written
+#: as a literal for the same reason ``_KALSHI_HOST`` is: a test that imported the
+#: module's own constant could not notice that constant changing.
+_KALSHI_DEMO_HOST = "demo-api.kalshi.co"
 _ANTHROPIC_HOST = "api.anthropic.com"
 _OPENAI_HOST = "api.openai.com"
 
@@ -272,6 +280,137 @@ def test_allowlist_from_config_unknown_exchange_provider_contributes_no_host() -
 
     with pytest.raises(EgressDeniedError):
         allowlist.require(f"https://{_KALSHI_HOST}/trade-api/v2/markets")
+
+
+# --- Exchange environment: demo vs production host derivation (issue #318) ----
+#
+# ``exchange.environment`` selects the venue a live deployment dials --
+# ``windbreak.connector.live._ENVIRONMENT_API_BASES`` maps SPEC S16's
+# ``demo | production`` to their API bases -- and this allowlist is the control
+# that stops that deployment reaching any *other* venue's host. Only the ``demo``
+# arm was ever exercised (the shipped default is ``environment = "demo"``), so
+# the production-only arm -- the false branch of ``environment == "demo"``, which
+# is what withholds demo egress from a production deployment -- had no test at
+# all, and nothing pinned that the demo host stays *out* of a production host
+# set.
+#
+# Both arms are asserted as exact host **sets**, not by membership: for an egress
+# allowlist an over-broad set is the entire risk, and a membership assertion
+# passes just as happily while the set silently grows a host.
+
+
+def _exchange_with_environment(environment: str) -> ExchangeConfig:
+    """Build the shipped default exchange config with ``environment`` replaced.
+
+    Args:
+        environment: The ``exchange.environment`` value to configure.
+
+    Returns:
+        The default ``ExchangeConfig`` (so ``provider`` stays ``"kalshi"``)
+        carrying that environment.
+    """
+    return dataclasses.replace(WindbreakConfig().exchange, environment=environment)
+
+
+def test_exchange_config_defaults_are_kalshi_in_the_demo_environment() -> None:
+    """Fixture assumption: the shipped default exchange is ``kalshi``/``demo``.
+
+    Every ``WindbreakConfig()``-based test above therefore exercises the *demo*
+    arm; the production arm is only reachable by overriding this field, which is
+    exactly why it went untested.
+    """
+    exchange = WindbreakConfig().exchange
+    assert exchange.provider == "kalshi"
+    assert exchange.environment == "demo"
+
+
+def test_exchange_hosts_in_a_production_environment_exclude_the_demo_host() -> None:
+    """A ``kalshi`` provider outside ``demo`` derives exactly the production host.
+
+    The demo host must be absent: a production deployment that could also dial
+    ``demo-api.kalshi.co`` has an allowlist one host wider than the venue it
+    declared.
+    """
+    hosts = _exchange_hosts(_exchange_with_environment("production"))
+
+    assert hosts == frozenset({_KALSHI_HOST})
+
+
+def test_exchange_hosts_in_a_demo_environment_add_the_demo_host() -> None:
+    """A ``demo`` environment derives exactly the production *and* demo hosts.
+
+    The complementary arm, pinned as a set so the demo addition cannot silently
+    disappear (which would leave a demo deployment unable to reach its own venue)
+    and cannot silently grow a third host either.
+    """
+    hosts = _exchange_hosts(_exchange_with_environment("demo"))
+
+    assert hosts == frozenset({_KALSHI_HOST, _KALSHI_DEMO_HOST})
+
+
+@pytest.mark.parametrize(
+    "environment",
+    ["Demo", "DEMO", " demo", "demo ", "demo2", "predemo", "prod", "", "production"],
+)
+def test_only_the_exact_demo_token_admits_the_demo_host(environment: str) -> None:
+    """Near-misses of ``"demo"`` derive the production host set, not the demo one.
+
+    The match is an exact, case-sensitive equality, and these cases pin that
+    dimension rather than merely "the two arms differ": a substring, prefix or
+    case-folded comparison would admit several of these and still pass a test
+    that only contrasted ``"demo"`` with ``"production"``. Failing closed here
+    agrees with ``windbreak.connector.live``, which refuses to resolve an API
+    base for any environment token outside its exact ``demo``/``production``
+    keys rather than defaulting one to the real venue.
+
+    Args:
+        environment: A near-miss ``exchange.environment`` token.
+    """
+    hosts = _exchange_hosts(_exchange_with_environment(environment))
+
+    assert hosts == frozenset({_KALSHI_HOST})
+
+
+def test_allowlist_from_config_in_production_denies_the_demo_kalshi_host() -> None:
+    """Through the public seam: production admits its own host and denies demo's.
+
+    ``_exchange_hosts`` is private, so this drives the same branch through
+    ``allowlist_from_config`` -> ``OutboundAllowlist.require`` and asserts the
+    refusal by exact type and exact message -- ``EgressDeniedError`` has
+    subclass-free ancestry here, but matching a substring would pass for any
+    denial reason at all, including one that never reached the host check.
+    """
+    config = dataclasses.replace(
+        WindbreakConfig(), exchange=_exchange_with_environment("production")
+    )
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require(f"https://{_KALSHI_HOST}/trade-api/v2/markets")
+
+    with pytest.raises(EgressDeniedError) as denied:
+        allowlist.require(f"https://{_KALSHI_DEMO_HOST}/trade-api/v2/markets")
+
+    assert type(denied.value) is EgressDeniedError
+    assert str(denied.value) == (
+        "egress denied: host 'demo-api.kalshi.co' is not allowlisted "
+        "(url 'https://demo-api.kalshi.co/trade-api/v2/markets')"
+    )
+
+
+def test_allowlist_from_config_in_a_demo_environment_admits_the_demo_host() -> None:
+    """Through the public seam: a ``demo`` deployment may dial the demo host.
+
+    The positive control for the test above -- without it, an allowlist that had
+    stopped deriving the demo host entirely would still satisfy the production
+    assertion.
+    """
+    config = dataclasses.replace(
+        WindbreakConfig(), exchange=_exchange_with_environment("demo")
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require(f"https://{_KALSHI_DEMO_HOST}/trade-api/v2/markets")
 
 
 def test_allowlist_from_config_forwards_the_recorder() -> None:
