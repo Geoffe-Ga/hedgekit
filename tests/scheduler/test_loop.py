@@ -991,3 +991,211 @@ def test_participation_cap_vetoes_exactly_past_its_share_of_real_depth(
     result = _check_named("participation_cap_compliance")(intent, context)
 
     assert result.vetoed is expected_vetoed
+
+
+# --- Issue #361: the loop reads the connector's positions, never its own fold --
+
+
+#: The sole ticker in the `deep_walk` replay fixture -- deliberately not
+#: `tests.riskkernel.conftest.DEFAULT_MARKET_TICKER`, which names a market the
+#: book fixtures do not carry.
+_DEEP_WALK_TICKER = "MKT-DEEP"
+
+#: The NO-side taker fill the `deep_walk` book produces for a 100-centi order
+#: limited at 5500 NO pips: 75 centis at 5500, with 25 centis left resting.
+_NO_FILL_CENTIS = 75
+_NO_FILL_PRICE_PIPS = 5500
+
+#: The same holding in the YES frame, as `PaperExchange.get_positions` reports
+#: it: a long NO is a short YES, priced at the complement of the NO average.
+_NO_HOLDING_YES_FRAME_CENTIS = -_NO_FILL_CENTIS
+_NO_HOLDING_YES_FRAME_PIPS = 10_000 - _NO_FILL_PRICE_PIPS
+
+#: What that holding is worth, in micros: the cash it actually cost, priced in
+#: its own NO frame (75 centis * 5500 pips). Marking it at the *YES*-frame
+#: product would report a negative -337_500, which is not a mark at all.
+_NO_HOLDING_VALUE_MICROS = _NO_FILL_CENTIS * _NO_FILL_PRICE_PIPS
+
+
+def _books_fixture_dir() -> Path:
+    """Return the shared `tests/fixtures/books` replay-fixture directory."""
+    from pathlib import Path as _Path
+
+    return _Path(__file__).resolve().parents[1] / "fixtures" / "books"
+
+
+def _paper_exchange_holding_no():
+    """Build a `PaperExchange` whose only holding is a NO-side position.
+
+    Returns:
+        The `PaperExchange`, already filled on the NO side of `MKT-DEEP`.
+    """
+    from windbreak.connector import paper
+    from windbreak.numeric import ContractCentis, PricePips
+
+    exchange = paper.PaperExchange.from_fixture_dir(_books_fixture_dir() / "deep_walk")
+    exchange.place_order(
+        paper.PaperOrderIntent(
+            _DEEP_WALK_TICKER,
+            "no",
+            PricePips(_NO_FILL_PRICE_PIPS),
+            ContractCentis(100),
+        ),
+        approval_token=object(),
+    )
+    return exchange
+
+
+def _stage_deps(exchange, store):
+    """Bundle the three `_equity_and_positions_stage` reads into a stand-in.
+
+    The stage touches only `deps.exchange`, `deps.store`, and the configured
+    capital floor, so a full `PaperTickDeps` (which would drag in a transport,
+    a gateway, and a signing key) buys nothing here. The exchange and the
+    ledger store are both the *real* production types, so the rows asserted on
+    are the rows production writes.
+
+    Args:
+        exchange: The `PaperExchange` the stage observes.
+        store: The ledger store the stage appends to.
+
+    Returns:
+        A `PaperTickDeps`-shaped stand-in carrying exactly those three reads.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        exchange=exchange,
+        store=store,
+        config=SimpleNamespace(capital=SimpleNamespace(floor_micros=0)),
+    )
+
+
+def _ledgered(store, event_type: str):
+    """Return every payload of `event_type` on `store`, oldest first.
+
+    Args:
+        store: The ledger store to read.
+        event_type: The event type to select.
+
+    Returns:
+        The matching payloads' `data` envelopes, in append order.
+    """
+    return [
+        json.loads(record.payload_json)["data"]
+        for record in store.read_all()
+        if record.event_type == event_type
+    ]
+
+
+def test_positions_stage_reports_a_no_side_holding_exactly_as_the_connector_does(
+    tmp_path: Path,
+) -> None:
+    """A NO-side holding is ledgered as the short-YES row the connector reports.
+
+    The loop used to sum YES-side fills only, so an account long NO snapshotted
+    as flat -- and `concentration_limits` / `reduce_only_provable`, whose whole
+    job is to bound exposure, then evaluated against a position of zero. The
+    row must now match `PaperExchange.get_positions()` exactly, because two
+    independent definitions of "position" is the defect itself.
+    """
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.scheduler.loop import _equity_and_positions_stage
+
+    exchange = _paper_exchange_holding_no()
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+
+    _equity_and_positions_stage(_stage_deps(exchange, store), DEFAULT_NOW_EPOCH_S)
+
+    snapshots = _ledgered(store, "PositionsSnapshotRecorded")
+    assert len(snapshots) == 1
+    assert snapshots[-1]["positions"] == [
+        {
+            "ticker": position.ticker,
+            "quantity_centis": position.quantity.value,
+            "average_price_pips": position.average_price.value,
+        }
+        for position in exchange.get_positions()
+    ]
+    assert snapshots[-1]["positions"] == [
+        {
+            "ticker": _DEEP_WALK_TICKER,
+            "quantity_centis": _NO_HOLDING_YES_FRAME_CENTIS,
+            "average_price_pips": _NO_HOLDING_YES_FRAME_PIPS,
+        }
+    ]
+
+
+def test_positions_stage_marks_a_long_no_holding_at_what_it_cost(
+    tmp_path: Path,
+) -> None:
+    """Equity counts the NO leg at its own side's price, not the YES complement.
+
+    A short-YES row's mark is not `quantity * average_price`: that product is
+    negative, and a long NO is economically a short YES *plus* a full $1 of
+    collateral per contract. Valuing it in its own frame is the same figure the
+    exchange debited from cash, so buying NO moves equity by the fee alone.
+    """
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.scheduler.loop import _equity_and_positions_stage
+
+    exchange = _paper_exchange_holding_no()
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+
+    equity = _equity_and_positions_stage(
+        _stage_deps(exchange, store), DEFAULT_NOW_EPOCH_S
+    )
+
+    expected = exchange.get_balances().available.value + _NO_HOLDING_VALUE_MICROS
+    assert equity == expected
+    assert _ledgered(store, "EquitySampled")[-1]["equity_micros"] == expected
+
+
+def test_positions_stage_records_no_snapshot_for_a_two_sided_ticker(
+    tmp_path: Path,
+) -> None:
+    """A ticker held on both sides ledgers no position row, and never a flat one.
+
+    `PaperExchange.get_positions` refuses to net a YES leg against a NO leg,
+    because the netted answer reports flat while both legs and their collateral
+    are live. The loop must inherit that refusal rather than quietly writing
+    the YES leg alone (an understated holding) or an empty row list (a
+    fabricated healthy zero). The tick still finishes -- an exception that kills
+    the loop is not failing closed -- and still samples equity, understated by
+    the unpriceable holding, which can only tighten `daily_loss_limit`.
+    """
+    from windbreak.connector import paper
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.numeric import ContractCentis, PricePips
+    from windbreak.scheduler.loop import _equity_and_positions_stage
+
+    exchange = _paper_exchange_holding_no()
+    exchange.place_order(
+        paper.PaperOrderIntent(
+            _DEEP_WALK_TICKER, "yes", PricePips(4700), ContractCentis(100)
+        ),
+        approval_token=object(),
+    )
+    with pytest.raises(paper.TwoSidedPositionError):
+        exchange.get_positions()
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+
+    equity = _equity_and_positions_stage(
+        _stage_deps(exchange, store), DEFAULT_NOW_EPOCH_S
+    )
+
+    assert _ledgered(store, "PositionsSnapshotRecorded") == []
+    assert equity == exchange.get_balances().available.value
+    assert _ledgered(store, "EquitySampled")[-1]["equity_micros"] == equity
+
+
+def test_the_loop_no_longer_carries_its_own_position_fold() -> None:
+    """`_positions_from_fills` is gone: one definition of "position", not two.
+
+    The helper summed YES-side fills only and disagreed with
+    `PaperExchange.get_positions()`; keeping a second fold alive is what let
+    them disagree in the first place.
+    """
+    from windbreak.scheduler import loop
+
+    assert not hasattr(loop, "_positions_from_fills")

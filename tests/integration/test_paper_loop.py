@@ -112,7 +112,11 @@ if TYPE_CHECKING:
 _REMAINING_ACCOUNT_FEED_VETO_REASONS = ("daily loss limit reached",)
 
 #: The always-present per-tick stage events, regardless of whether the
-#: selector emitted a tradeable intent.
+#: selector emitted a tradeable intent. `PositionsSnapshotRecorded` is present
+#: on every tick these fixtures produce; since issue #361 the one tick shape
+#: that omits it is a connector refusing to describe a two-sided holding, which
+#: no fixture here reaches (pinned instead by `tests/scheduler/test_loop.py`'s
+#: `test_positions_stage_records_no_snapshot_for_a_two_sided_ticker`).
 _ALWAYS_PRESENT_EVENT_TYPES = (
     "MarketSnapshotRecorded",
     "ForecastCreated",
@@ -323,9 +327,10 @@ def test_run_single_tick_weekly_report_wires_equity_position_decision_sections(
     (`## Equity vs floor`, `## Positions`, `## Decisions`) carry the tick's own
     real equity sample, position snapshot, and selector decision (issue #255)
     instead of the `No data yet.` placeholder those sections still hardcode
-    today. Every real tick unconditionally ledgers exactly one `EquitySampled`,
-    one `PositionsSnapshotRecorded`, and one `SelectorDecisionRecorded`
-    (`_ALWAYS_PRESENT_EVENT_TYPES`), so -- unlike
+    today. Every real tick ledgers exactly one `EquitySampled`, one
+    `PositionsSnapshotRecorded`, and one `SelectorDecisionRecorded`
+    (`_ALWAYS_PRESENT_EVENT_TYPES`, whose note covers the one snapshot-omitting
+    tick shape these fixtures never reach), so -- unlike
     `test_real_kernel_tick_ledgers_full_stage_sequence`'s conditional
     `IntentVetoed` assertion -- these three assertions do not depend on
     whether the selector's fixed research cost ever clears `net_edge_min`.
