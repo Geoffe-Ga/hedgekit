@@ -55,6 +55,7 @@ from windbreak.config import RiskConfig
 from windbreak.connector.fake import FakeExchange
 from windbreak.ledger.events import (
     EVENT_TYPES,
+    AlertEmitted,
     CancelAllDirective,
     Event,
     KillEngaged,
@@ -62,10 +63,12 @@ from windbreak.ledger.events import (
     ModeHeartbeat,
     SignificanceOverrideApplied,
 )
+from windbreak.ledger.store import SqliteLedgerStore, events_from_records
 from windbreak.main import main as windbreak_main
 from windbreak.numeric.types import ContractCentis, MoneyMicros
 from windbreak.riskkernel.demotion import DemotionTrigger
 from windbreak.riskkernel.kill import (
+    KILL_FILENAME,
     DashboardChallengeError,
     DashboardKillStub,
     KillFileWatcher,
@@ -82,7 +85,11 @@ from windbreak.riskkernel.modes import (
     Mode,
     ModeStateMachine,
 )
-from windbreak.riskkernel.process import InMemoryKernelLedgerWriter, RiskKernel
+from windbreak.riskkernel.process import (
+    InMemoryKernelLedgerWriter,
+    PersistingKernelLedgerWriter,
+    RiskKernel,
+)
 from windbreak.riskkernel.promotion import SIGNIFICANCE_OVERRIDE_ACK_PHRASE
 from windbreak.riskkernel.reservations import (
     DuplicateReservationError,
@@ -120,10 +127,19 @@ _EARLIER_KILL_SEQUENCE = 3
 
 #: The closed set of event types the kill path may ever ledger (SPEC intent:
 #: position-hold, never dump): the kill announcement, the one cancel-all
-#: directive, and one release per active reservation.
+#: directive, one release per active reservation, and -- since issue #287 --
+#: the tamper-evident record that the one `HALT_KILL` operator alert was
+#: emitted, so a post-incident audit can prove the page went out rather than
+#: reading its absence from a rotated log as healthy.
 _CLOSED_KILL_EVENT_TYPES = frozenset(
-    {"KillEngaged", "CancelAllDirective", "ReservationReleased"}
+    {"KillEngaged", "CancelAllDirective", "ReservationReleased", "AlertEmitted"}
 )
+
+#: The severity `AlertType.HALT_KILL` is registered at, as the string the
+#: ledgered `AlertEmitted.severity` carries. Pinned as a literal (not read back
+#: from `ALERT_REGISTRY`) so a silent downgrade of the kill alert's registered
+#: severity fails this module rather than tautologically agreeing with itself.
+_HALT_KILL_LEDGERED_SEVERITY = "critical"
 
 #: Substrings that must never appear (case-insensitively) in a kill-path
 #: event's payload keys or string values -- the position-hold invariant is that
@@ -207,22 +223,25 @@ class _FakeAlertSink:
 
     Records every dispatched `AlertType` in call order, so a test can assert
     both the exact count of `HALT_KILL` dispatches and that no other alert
-    type was fired.
+    type was fired. Bodies are recorded in the same order (issue #287), so a
+    test can pin that the body ledgered as `AlertEmitted.message` is the exact
+    body the operator was paged with rather than a paraphrase of it.
     """
 
     def __init__(self) -> None:
-        """Initialize with an empty dispatch log."""
+        """Initialize with empty dispatch and body logs."""
         self.dispatched: list[AlertType] = []
+        self.bodies: list[str] = []
 
     def dispatch(self, alert_type: AlertType, message: str) -> None:
-        """Record a dispatched alert type, ignoring its message body.
+        """Record a dispatched alert type and its body.
 
         Args:
             alert_type: The alert type dispatched.
-            message: The alert body (unused; recorded calls key on type only).
+            message: The alert body delivered to the operator.
         """
-        del message
         self.dispatched.append(alert_type)
+        self.bodies.append(message)
 
     def count(self, alert_type: AlertType) -> int:
         """Return how many times `alert_type` was dispatched.
@@ -1721,3 +1740,202 @@ def test_multi_cycle_history_ending_killed_rebuilds_end_to_end() -> None:
     switch.kill(KillTrigger.CLI)
 
     assert switch.active_kill_sequence == _RESTORED_KILL_SEQUENCE + 1
+
+
+# --- Issue #287: the HALT_KILL alert is ledgered, not only dispatched ----------
+
+
+class _ExplodingOnAlertWriter:
+    """A `KernelLedgerWriter` that persists everything but the alert record.
+
+    Stands in for a ledger whose append fails at exactly the worst moment: the
+    kill's every fail-safe effect has already happened and only the audit row
+    proving the operator was paged is left to write. Every other event is
+    retained, so a test can assert the fail-safe surface completed *before* the
+    failure rather than being rolled back by it.
+    """
+
+    def __init__(self) -> None:
+        """Initialize with an empty log of the events that did persist."""
+        self.events: list[Event] = []
+
+    def record(self, event: Event) -> None:
+        """Retain `event`, unless it is the alert row -- which raises.
+
+        Args:
+            event: The kernel event to persist.
+
+        Raises:
+            OSError: If `event` is the `AlertEmitted` audit row, simulating a
+                full disk or a revoked write permission on the ledger file.
+        """
+        if event.event_type == "AlertEmitted":
+            raise OSError("ledger append failed")
+        self.events.append(event)
+
+
+def test_kill_ledgers_the_dispatched_halt_kill_alert() -> None:
+    """`kill()` records exactly one `AlertEmitted` carrying the same body it
+    paged the operator with, stamped `riskkernel` at the registered severity.
+    """
+    switch, writer, _machine, sink = _build_switch()
+
+    switch.kill(KillTrigger.CLI)
+
+    alert_events = [
+        event for event in writer.events if event.event_type == "AlertEmitted"
+    ]
+    assert len(alert_events) == 1
+    assert alert_events[0].component == "riskkernel"
+    assert alert_events[0].payload["severity"] == _HALT_KILL_LEDGERED_SEVERITY
+    # The ledgered body is the dispatched body verbatim: an audit that cannot
+    # show what the operator actually read is not an audit of the alert.
+    assert sink.bodies == [alert_events[0].payload["message"]]
+    assert sink.count(AlertType.HALT_KILL) == 1
+
+
+def test_kill_ledgers_the_alert_row_after_every_fail_safe_effect(
+    tmp_path: Path,
+) -> None:
+    """The `AlertEmitted` row is the kill path's *last* ledger write.
+
+    Ordering is load-bearing, not cosmetic: a failing append must never be able
+    to skip a fail-safe effect, so the audit row is written only once the mode
+    has halted, the cancel-all is ledgered, reservations are released, the
+    operator is paged, and the on-disk `KILL` file exists.
+    """
+    writer = InMemoryKernelLedgerWriter()
+    reservation_ledger = ReservationLedger(writer)
+    reservation_ledger.reserve(
+        "intent-a", MoneyMicros(1_000_000), "idem-a", expires_at=_FAR_FUTURE_EXPIRY_S
+    )
+    switch, _writer, machine, _sink = _build_switch(
+        writer=writer, reservation_ledger=reservation_ledger, state_dir=tmp_path
+    )
+    events_before_kill = len(writer.events)
+
+    switch.kill(KillTrigger.CLI)
+
+    kill_path_events = writer.events[events_before_kill:]
+    assert [event.event_type for event in kill_path_events] == [
+        "KillEngaged",
+        "CancelAllDirective",
+        "ReservationReleased",
+        "AlertEmitted",
+    ]
+    assert machine.mode is Mode.KILLED
+    assert tmp_path.joinpath(KILL_FILENAME).exists()
+
+
+def test_kill_alert_row_names_no_action_and_smuggles_no_sink_detail() -> None:
+    """The ledgered alert payload holds only the hold-only body and severity.
+
+    A hash chain is append-only, so anything written into it is unredactable.
+    Sink-delivery detail is `str(exc)` from an arbitrary sink -- exactly the
+    shape that leaked whole token-bearing URLs in issue #274 -- so it must not
+    reach the chain, and the payload must stay the closed two-key shape the
+    registered `AlertEmitted` schema declares.
+    """
+    switch, writer, _machine, _sink = _build_switch()
+
+    switch.kill(KillTrigger.AUTO_RECONCILIATION)
+
+    alert_event = next(
+        event for event in writer.events if event.event_type == "AlertEmitted"
+    )
+    assert set(alert_event.payload) == {"severity", "message"}
+    body = str(alert_event.payload["message"])
+    assert not any(token in body.lower() for token in _FORBIDDEN_ACTION_TOKENS)
+    assert "://" not in body
+
+
+def test_kill_raises_when_the_alert_row_cannot_be_persisted() -> None:
+    """A failed audit append is loud, and every fail-safe effect still happened.
+
+    A kill switch whose audit record silently fails to write is worse than one
+    that never claimed to write: the ledger would then read as a clean history
+    with no kill alert in it. So the append is unguarded and propagates -- and
+    because it is the last write, the halt, the cancel-all and the page are all
+    already done when it does.
+    """
+    writer = _ExplodingOnAlertWriter()
+    mode_machine = ModeStateMachine(mode_ceiling=Mode.LIVE, mode=Mode.LIVE)
+    sink = _FakeAlertSink()
+    switch = KillSwitch(mode_machine, writer, sink, clock=lambda: _FIXED_EPOCH_S)
+
+    with pytest.raises(OSError, match="ledger append failed"):
+        switch.kill(KillTrigger.CLI)
+
+    assert mode_machine.mode is Mode.KILLED
+    assert sink.count(AlertType.HALT_KILL) == 1
+    assert [event.event_type for event in writer.events] == [
+        "KillEngaged",
+        "CancelAllDirective",
+    ]
+
+
+def test_killed_hash_chain_still_verifies_and_the_alert_is_recoverable(
+    tmp_path: Path,
+) -> None:
+    """After a real persisted kill the chain verifies and the alert replays.
+
+    This is the acceptance shape issue #287 exists for: a reader with nothing
+    but the ledger file reconstructs *that* the kill switch fired, *why* it
+    fired, and *that* the operator alert was emitted -- and the hash chain
+    still verifies over the appended rows, so none of it can have been edited
+    after the fact.
+    """
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    writer = PersistingKernelLedgerWriter(store)
+    mode_machine = ModeStateMachine(mode_ceiling=Mode.LIVE, mode=Mode.LIVE)
+    switch = KillSwitch(
+        mode_machine,
+        writer,
+        _FakeAlertSink(),
+        state_dir=tmp_path,
+        clock=lambda: _FIXED_EPOCH_S,
+    )
+
+    switch.kill(KillTrigger.AUTO_RECONCILIATION)
+
+    # `verify_chain()` returns None and raises on a broken chain, so it is
+    # called bare -- asserting on its return value would assert nothing.
+    store.verify_chain()
+
+    replayed = events_from_records(store.read_all())
+    kill_event = next(event for event in replayed if event.event_type == "KillEngaged")
+    alert_event = next(
+        event for event in replayed if event.event_type == "AlertEmitted"
+    )
+    assert kill_event.payload["trigger"] == KillTrigger.AUTO_RECONCILIATION.name
+    assert kill_event.payload["kill_sequence"] == 1
+    assert alert_event.component == "riskkernel"
+    assert alert_event.payload["severity"] == _HALT_KILL_LEDGERED_SEVERITY
+    assert replayed.index(alert_event) > replayed.index(kill_event)
+
+
+def test_replay_recovers_kill_state_with_and_without_the_alert_row() -> None:
+    """`kill_state_in` folds identically over a legacy and a post-#287 history.
+
+    A ledger written before the kill path ledgered its alert must replay
+    exactly like one written after it, and the new row must never be mistaken
+    for kill state: the fold keys on `KillEngaged`/`KillReArmed` alone.
+    """
+    engaged = KillEngaged(
+        component="riskkernel",
+        trigger="CLI",
+        kill_sequence=_RESTORED_KILL_SEQUENCE,
+        epoch=_FIXED_EPOCH_S,
+    )
+    alert = AlertEmitted(
+        component="riskkernel",
+        severity=_HALT_KILL_LEDGERED_SEVERITY,
+        message="kill switch engaged; trading halted, positions held",
+    )
+    legacy_history: list[Event] = [engaged]
+    modern_history: list[Event] = [engaged, alert]
+
+    assert kill_state_in(legacy_history) == kill_state_in(modern_history)
+    assert kill_state_in(modern_history) == ReplayedKillState(
+        last_kill_sequence=_RESTORED_KILL_SEQUENCE, killed=True
+    )
