@@ -263,6 +263,11 @@ provision_locked() {
         return 0
     fi
     if [[ ! -x "$VENV/bin/python" ]]; then
+        # The one intentionally-ambient interpreter in the toolchain (issue
+        # #366): this is what CREATES the pinned venv, so there is nothing
+        # pinned to resolve against yet. Everything installed into it below is
+        # pinned by constraints-quality.txt, and every gate afterwards resolves
+        # through scripts/toolchain-env.sh rather than PATH.
         python3 -m venv "$VENV"
         fresh=true
     fi

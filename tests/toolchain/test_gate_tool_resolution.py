@@ -458,6 +458,27 @@ def test_gate_scripts_have_no_bare_name_tool_invocations(
     )
 
 
+def test_mutation_release_gate_resolves_mutmut_from_the_pinned_toolchain() -> None:
+    """`mutation.sh` is a release gate, so it gets the same treatment.
+
+    It is not dispatched by `check-all.sh` (mutation testing is the manual
+    pre-v1.0.0 gate, issue #107), but its verdict decides whether a release
+    ships -- and a mutation score measured by an ambient mutmut against an
+    ambient dependency set is not evidence about this repository.
+    """
+    source = _read(_SCRIPTS_DIR / "mutation.sh")
+
+    assert "toolchain-env.sh" in source, (
+        "scripts/mutation.sh does not resolve through scripts/toolchain-env.sh, "
+        "so which mutmut scores the release gate depends on the caller's PATH"
+    )
+    for tool in ("mutmut", "python3"):
+        offenders = _bare_invocations(source, tool)
+        assert not offenders, (
+            f"scripts/mutation.sh invokes {tool!r} by bare name: {offenders}"
+        )
+
+
 def test_architecture_scripts_inherited_path_is_documented() -> None:
     """The one still-inherited sub-check must be named, with its reason.
 
@@ -472,12 +493,16 @@ def test_architecture_scripts_inherited_path_is_documented() -> None:
     source = _read(_TOOLCHAIN_ENV_SCRIPT)
 
     assert "architecture.sh" in source, (
-        "scripts/toolchain-env.sh does not document architecture.sh as the "
+        "scripts/toolchain-env.sh does not document architecture.sh as a "
         "still-inherited sub-check required by issue #366's acceptance criteria"
     )
     assert "lint-imports" in source, (
         "the architecture.sh exemption does not name the inherited tool "
         "(lint-imports), so the reason cannot be audited"
+    )
+    assert "provision-venv.sh" in source, (
+        "the exemption list omits provision-venv.sh's bootstrap `python3 -m "
+        "venv`, the only other bare-name resolution left in scripts/"
     )
 
 

@@ -33,9 +33,15 @@
 # alien binary, because a verdict produced by an unknown environment is not
 # evidence.
 #
-# STILL-INHERITED SUB-CHECK (issue #366 acceptance criteria)
+# STILL-INHERITED RESOLUTIONS (issue #366 acceptance criteria)
 #
-#   scripts/architecture.sh -> plans/architecture/run-check.sh -> `lint-imports`
+# Exactly two bare-name resolutions remain in scripts/, both deliberate:
+#
+# 1. `python3 -m venv` in provision-venv.sh, which CREATES the pinned venv.
+#    There is nothing pinned to resolve against at that moment; everything
+#    installed into it is then pinned by constraints-quality.txt.
+#
+# 2. scripts/architecture.sh -> plans/architecture/run-check.sh -> `lint-imports`
 #
 # is deliberately left resolving by bare name. `tests/architecture/
 # test_import_linter_gate.py` pins a contract that running architecture.sh with
