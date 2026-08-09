@@ -48,6 +48,23 @@ quote freshness, status staleness, and the pipeline heartbeat are each measured
 as ``now - stamp`` and each mismeasure when ``now`` is wrong relative to the
 venue. So the clock is anchored once and never renewed.
 
+Replay exhaustion (issue #382) is the consequence of that, made explicit. A
+clock that does not renew itself does not advance with wall time, so a
+re-enactment that runs long enough eventually reports a venue clock its
+recording no longer substantiates, and ``clock_skew_limit`` vetoes as an
+accident of run length rather than for a stated reason. The answer is not to
+make the clock track wall time: every committed recording places its venue
+clock on the recording's own origin, so ``now + recorded_delta`` is just
+``now`` and the skew returns to identically zero -- the unfalsifiable state
+#377 removed. Instead the recording is treated as covering a bounded span, and
+:meth:`PaperExchange.get_exchange_time` raises :class:`ReplayExhaustedError`
+once the replay leaves it -- either because the cursor consumed every recorded
+step, or because an anchored run outlived the recorded span. The PAPER loop
+turns that refusal into an absent reading, and ``clock_skew_limit`` vetoes with
+"exchange clock unknown". A recording is not a live venue and cannot answer for
+one indefinitely; the always-on path is :class:`LiveBookPaperExchange`, whose
+venue clock is the venue's.
+
 Consistency guard (issues #18, #362): the constructor rejects any fixture whose
 :class:`~windbreak.connector.semantics.BalanceSemantics` claims a behavior this
 simulator does not implement (see :data:`_SEMANTICS_REQUIREMENTS`). A taker walk
@@ -134,6 +151,7 @@ __all__ = [
     "LiveBookPaperExchange",
     "PaperExchange",
     "PaperOrderIntent",
+    "ReplayExhaustedError",
     "TwoSidedPositionError",
 ]
 
@@ -271,6 +289,25 @@ class TwoSidedPositionError(RuntimeError):
         )
 
 
+class ReplayExhaustedError(RuntimeError):
+    """Raised when a replay has no recording left to read a venue clock from.
+
+    A recorded session substantiates the venue's clock for exactly as long as
+    it covers. Past that it holds no observation of the venue at all, and the
+    anchored reading -- which deliberately does not renew itself (issue #377) --
+    describes an instant the recording never witnessed. Serving it anyway is
+    what made a long PAPER run veto on accumulated drift: a statement about how
+    long the process had been up, dressed as a statement about the venue's
+    clock (issue #382).
+
+    Refusing is the fail-closed reading, and it stays loud rather than
+    permissive: :func:`~windbreak.scheduler.loop.read_exchange_clock_epoch_s`
+    turns this into an absent reading, and ``clock_skew_limit`` vetoes with
+    "exchange clock unknown" -- the same answer it gives any venue that cannot
+    state its own time.
+    """
+
+
 @dataclass(slots=True)
 class _SideTotals:
     """Running totals for one ``(ticker, side)`` slice of the fill log.
@@ -405,6 +442,20 @@ def _load_sessions(directory: Path) -> dict[str, tuple[_SessionStep, ...]]:
     }
 
 
+def _recorded_book_instants(
+    sessions: Mapping[str, tuple[_SessionStep, ...]],
+) -> list[datetime]:
+    """Return every ticker's recorded book instants as one flat list.
+
+    Args:
+        sessions: The loaded ticker-keyed replay steps.
+
+    Returns:
+        Every recorded book ``fetched_at``, in no particular order.
+    """
+    return [step.book.fetched_at for steps in sessions.values() for step in steps]
+
+
 def _recording_origin(
     sessions: Mapping[str, tuple[_SessionStep, ...]],
 ) -> datetime | None:
@@ -422,8 +473,31 @@ def _recording_origin(
         The earliest recorded book ``fetched_at``, or ``None`` when no session
         holds a single step (nothing to re-base).
     """
-    instants = [step.book.fetched_at for steps in sessions.values() for step in steps]
+    instants = _recorded_book_instants(sessions)
     return min(instants) if instants else None
+
+
+def _recording_end(
+    sessions: Mapping[str, tuple[_SessionStep, ...]],
+) -> datetime | None:
+    """Return the last book instant across every ticker, or ``None`` if empty.
+
+    The last instant the recording *observed* the venue, and therefore the last
+    instant it can substantiate anything about the venue's clock (issue #382).
+    Measured from books rather than from trade prints on purpose: a print
+    recorded after the final book extends the tape but not the observation, and
+    stretching the span to cover it would keep the venue clock readable for
+    longer than the recording watched the venue -- the permissive direction.
+
+    Args:
+        sessions: The loaded ticker-keyed replay steps.
+
+    Returns:
+        The latest recorded book ``fetched_at``, or ``None`` when the recording
+        holds no step at all.
+    """
+    instants = _recorded_book_instants(sessions)
+    return max(instants) if instants else None
 
 
 def _shift_step(step: _SessionStep, offset: timedelta) -> _SessionStep:
@@ -574,6 +648,15 @@ class PaperExchange:
         self.exchange_status = exchange_status
         self.exchange_time = exchange_time if offset is None else exchange_time + offset
         self._clock = clock
+        # Only an anchored replay declares a mapping between the recording and
+        # this run's clock, so only an anchored replay can be outlived by wall
+        # time (issue #382). A verbatim replay's literals and the observation
+        # clock are unrelated timelines; asking whether one has passed the other
+        # has no answer, and its cursor remains the only thing that can exhaust
+        # it.
+        self._substantiated_until = (
+            None if replay_anchor is None else _recording_end(self.sessions)
+        )
         self.balances = balances
         self.balance_semantics = balance_semantics
         self.fee_models = fee_models
@@ -706,10 +789,62 @@ class PaperExchange:
         skew it produces is real: a long-running re-enactment genuinely drifts
         away from the wall clock, and the fail-closed answer is to say so.
 
+        Saying so is what issue #382 makes explicit. Drift is an honest signal
+        only while the recording still covers the run; past that the anchored
+        reading describes an instant the recording never witnessed, and
+        ``clock_skew_limit`` would be vetoing on process uptime rather than on
+        anything about the venue. So an exhausted replay refuses
+        (:class:`ReplayExhaustedError`) instead of answering, and the veto
+        downstream carries the reason. Only the clock is refused: the books stay
+        exactly where the one shared offset put them and go stale on
+        ``quote_freshness``'s own terms, because re-dating them here would split
+        the single timeline #369 and #377 deliberately share.
+
         Returns:
             The venue's clock, in UTC.
+
+        Raises:
+            ReplayExhaustedError: If the cursor has consumed every recorded
+                step, or an anchored run has outlived the recorded span. Both
+                mean the recording holds no observation covering this instant.
         """
+        exhausted = self._replay_exhaustion_reason()
+        if exhausted is not None:
+            raise ReplayExhaustedError(exhausted)
         return self.exchange_time
+
+    def _replay_exhaustion_reason(self) -> str | None:
+        """Return why the replay can no longer report a venue clock, or ``None``.
+
+        Two independent triggers, both named by issue #382 and both meaning the
+        same thing -- the recording has nothing left to answer with:
+
+        * **The cursor consumed the recording.** Every session has stepped past
+          its last recorded step, which is the same fact
+          :meth:`advance` reports by returning ``False``. A recording with no
+          steps at all is exhausted from the outset, since it never held an
+          observation to begin with.
+        * **The run outlived the recorded span.** The observation clock is past
+          the last instant the recording watched the venue. Only an anchored
+          replay can trip this, because only an anchored replay declares which
+          wall instant the recording is being re-enacted from.
+
+        Returns:
+            A human-readable reason, or ``None`` while the replay can still
+            substantiate the venue's clock.
+        """
+        if all(
+            cursor >= len(self.sessions[ticker])
+            for ticker, cursor in self._cursor.items()
+        ):
+            return "the replay has consumed every step of its recording"
+        end = self._substantiated_until
+        if end is not None and self._clock() > end:
+            return (
+                "the run has outlived its recording, which observed no instant "
+                f"past {end.isoformat()}"
+            )
+        return None
 
     def get_balance_semantics(self) -> BalanceSemantics:
         """Return the fixture balance semantics, every answer of which is implemented.
@@ -797,6 +932,34 @@ class PaperExchange:
         return sum(
             self._order_cash_micros(fill.ticker, fill.price, fill.quantity)
             for fill in self._fills
+        )
+
+    def fill_cash_micros(self, fill: Fill) -> MoneyMicros:
+        """Return the cash ``fill`` moved out of the account, in micros.
+
+        The per-fill half of the exact arithmetic :meth:`_cash_spent_micros`
+        folds across the whole fill log, exposed rather than left for a caller
+        to re-derive. Ledgered fill accounting (issue #365) books this figure at
+        execution so the Risk Kernel's reconciliation expectation can advance
+        from ledgered evidence; a bookkeeper reimplementing book-cost-plus-fee
+        would drift from this class the first time either rounding rule moved,
+        and a bookkeeping drift is indistinguishable from the real venue
+        divergence verification exists to catch.
+
+        The figure is a positive magnitude, not a signed movement: every paper
+        fill is an acquisition (a close of a YES holding is a *buy* on the NO
+        side), so the direction is a property of the account convention the
+        booking layer owns, not of the venue.
+
+        Args:
+            fill: The executed fill to price.
+
+        Returns:
+            The fill's book cost plus the venue's worst-case trading fee, in
+            micros.
+        """
+        return MoneyMicros(
+            self._order_cash_micros(fill.ticker, fill.price, fill.quantity)
         )
 
     def _reserved_micros(self) -> int:

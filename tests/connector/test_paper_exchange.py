@@ -2047,9 +2047,16 @@ class TestReplayAnchorMovesTheVenueClock:
         earliest book, so an anchored replay puts the venue clock on the anchor
         -- the recording's internal relationship between venue clock and book is
         preserved, exactly as the inter-step deltas are.
+
+        The observation clock is pinned to the anchor rather than left on wall
+        time: a re-enactment declared to start at a fixed literal is exhausted
+        the moment the real clock passes the recorded span (issue #382), and
+        this test is about the offset, not about exhaustion.
         """
         exchange = paper.PaperExchange.from_fixture_dir(
-            books_fixture_dir / "deep_walk", replay_anchor=_REPLAY_ANCHOR
+            books_fixture_dir / "deep_walk",
+            clock=lambda: _REPLAY_ANCHOR,
+            replay_anchor=_REPLAY_ANCHOR,
         )
 
         assert exchange.get_exchange_time() == _REPLAY_ANCHOR
@@ -2066,6 +2073,10 @@ class TestReplayAnchorMovesTheVenueClock:
         it from our own clock would make `clock_skew_limit` compare the local
         clock with itself -- skew zero, forever, for any drift. So the clock is
         anchored once and left alone, even as the observation clock advances.
+
+        Both reads sit inside the recorded span on purpose: past it the replay
+        has no recording left to answer from and refuses outright (issue #382),
+        which would prove nothing about renewal.
         """
         instants = [_REPLAY_ANCHOR]
         exchange = paper.PaperExchange.from_fixture_dir(
@@ -2075,7 +2086,7 @@ class TestReplayAnchorMovesTheVenueClock:
         )
 
         first = exchange.get_exchange_time()
-        instants[0] = _REPLAY_ANCHOR + timedelta(hours=1)
+        instants[0] = _REPLAY_ANCHOR + timedelta(minutes=1)
         second = exchange.get_exchange_time()
 
         assert first == second == _REPLAY_ANCHOR
@@ -2092,3 +2103,151 @@ class TestReplayAnchorMovesTheVenueClock:
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
 
         assert exchange.get_exchange_time() == _TS
+
+
+# --- Issue #382: a replay that has run out of recording says so -------------
+#
+# The venue clock is anchored once and never renewed (#377), so it does not
+# advance with wall time -- and that is deliberate: a clock that renewed itself
+# from our own would reproduce a skew of exactly zero for any venue at any
+# drift. The consequence is that a long-running re-enactment eventually reports
+# a venue clock the recording no longer substantiates, and `clock_skew_limit`
+# vetoes as an accident of run length rather than for a stated reason.
+#
+# The fix is NOT to make the clock track wall time. For every committed fixture
+# the recorded venue clock sits exactly on the recording's origin, so
+# `now + recorded_delta` is `now` and the skew is identically zero -- the
+# unfalsifiable state #377 removed. Snapping the reading to the nearest recorded
+# step does not help either: these recordings step two to five *minutes* apart,
+# so the "current" recorded reading is minutes stale against a two-second
+# tolerance and vetoes on drift regardless.
+#
+# So the replay declares exhaustion instead. A recording substantiates the venue
+# clock for exactly as long as it covers; once the re-enactment outruns that
+# span -- or once the cursor consumes every recorded step -- there is no venue
+# time left to report and the connector refuses rather than serving a literal
+# the skew check re-derives as drift. The refusal reaches
+# `clock_skew_limit` as an absent reading, which vetoes with "exchange clock
+# unknown": fail closed, for a reason the operator can act on.
+
+#: `deep_walk`'s recording spans the gap between its two books.
+_DEEP_WALK_SPAN = _DEEP_WALK_STEP_DELTA
+
+
+class TestReplayExhaustionMakesTheVenueClockUnreadable:
+    """An exhausted replay refuses the venue clock rather than drifting (#382)."""
+
+    def test_the_venue_clock_is_readable_at_the_last_instant_recorded(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The recorded span is inclusive of its final instant.
+
+        The boundary is asserted from the recording's own step gap rather than
+        from the implementation, so shrinking the span by one step would flip
+        this.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk",
+            clock=lambda: _REPLAY_ANCHOR + _DEEP_WALK_SPAN,
+            replay_anchor=_REPLAY_ANCHOR,
+        )
+
+        assert exchange.get_exchange_time() == _REPLAY_ANCHOR
+
+    def test_the_venue_clock_is_unreadable_one_second_past_the_recorded_span(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """One second past the last recorded instant, the replay refuses.
+
+        This is the whole of issue #382: the alternative is to keep reporting
+        an anchored literal that is now demonstrably not the venue's time, and
+        let the skew check discover that as drift.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk",
+            clock=lambda: _REPLAY_ANCHOR + _DEEP_WALK_SPAN + timedelta(seconds=1),
+            replay_anchor=_REPLAY_ANCHOR,
+        )
+
+        with pytest.raises(paper.ReplayExhaustedError, match="recording"):
+            exchange.get_exchange_time()
+
+    def test_the_book_still_reads_after_the_clock_is_exhausted(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Exhaustion refuses the clock alone; the books stay on their offset.
+
+        The recorded books remain exactly where the single shared offset put
+        them -- they simply go stale, which is `quote_freshness`'s question, not
+        this one. Re-dating them here would split the one timeline #369 and #377
+        deliberately share.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk",
+            clock=lambda: _REPLAY_ANCHOR + timedelta(days=1),
+            replay_anchor=_REPLAY_ANCHOR,
+        )
+
+        assert exchange.get_order_book("MKT-DEEP").fetched_at == _REPLAY_ANCHOR
+
+    def test_a_consumed_cursor_makes_the_venue_clock_unreadable(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Running the cursor off the end exhausts the replay on its own.
+
+        The two triggers are independent: this one fires with the observation
+        clock parked on the anchor, so only the consumed recording can explain
+        the refusal. `advance` reporting no further step and the clock becoming
+        unreadable are the same fact stated twice.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk",
+            clock=lambda: _REPLAY_ANCHOR,
+            replay_anchor=_REPLAY_ANCHOR,
+        )
+
+        assert exchange.advance() is True
+        assert exchange.get_exchange_time() == _REPLAY_ANCHOR
+        assert exchange.advance() is False
+        with pytest.raises(paper.ReplayExhaustedError, match="recording"):
+            exchange.get_exchange_time()
+
+    def test_an_unanchored_replay_answers_however_late_the_read(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Wall time cannot outrun a recording it was never mapped onto.
+
+        Anchoring is what declares "this recording is being re-enacted from
+        here"; without it the recorded literals and the observation clock are
+        unrelated timelines, so "has wall time passed the recorded span" is not
+        a question with an answer. Only the cursor can exhaust a verbatim
+        replay -- and the reading it keeps giving is honestly a year stale,
+        which `clock_skew_limit` vetoes on its own.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk",
+            clock=lambda: _REPLAY_ANCHOR + timedelta(days=365),
+        )
+
+        assert exchange.get_exchange_time() == _TS
+
+    def test_an_empty_recording_substantiates_no_venue_clock(
+        self, tmp_path: Path, books_fixture_dir: Path
+    ) -> None:
+        """A session file with no steps is exhausted before it starts.
+
+        The fail-closed direction matters: an empty recording that reported the
+        fixture's clock would be claiming venue time from a recording holding no
+        observation at all.
+        """
+        directory = tmp_path / "empty"
+        shutil.copytree(books_fixture_dir / "deep_walk", directory)
+        directory.joinpath("sessions.json").write_text(
+            json.dumps({"MKT-DEEP": []}), encoding="utf-8"
+        )
+        exchange = paper.PaperExchange.from_fixture_dir(
+            directory, clock=lambda: _REPLAY_ANCHOR, replay_anchor=_REPLAY_ANCHOR
+        )
+
+        with pytest.raises(paper.ReplayExhaustedError, match="recording"):
+            exchange.get_exchange_time()

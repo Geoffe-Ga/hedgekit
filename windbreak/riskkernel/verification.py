@@ -207,6 +207,15 @@ _POSITIONS_PAYLOAD_KEY = "positions"
 _ROW_TICKER_KEY = "ticker"
 _ROW_QUANTITY_CENTIS_KEY = "quantity_centis"
 
+#: The ledger ``event_type`` carrying one fill's booked accounting entry (see
+#: :class:`~windbreak.ledger.events.FillAccounted`). Anything else arriving on
+#: the fill-accounting seam is treated as an unreconstructable entry.
+_FILL_ACCOUNTED_EVENT_TYPE = "FillAccounted"
+
+#: The ``FillAccounted`` payload keys the advance reads.
+_FILL_CASH_DELTA_KEY = "cash_delta_micros"
+_FILL_POSITION_DELTA_KEY = "position_delta_centis"
+
 
 def _own_component_events(events: tuple[Event, ...]) -> Iterator[Event]:
     """Return an iterator over only the events this kernel itself recorded.
@@ -421,16 +430,156 @@ def _seed_open_order_ids(
     return frozenset(order.id for order in connector.get_open_orders())
 
 
+class FillAccountingFeed(Protocol):
+    """The seam a live expectation reads *this account's* booked fills through.
+
+    The contract is deliberately narrow and stateful: :meth:`drain` returns the
+    :class:`~windbreak.ledger.events.FillAccounted` entries booked for this
+    account that it has not returned before, oldest first, and never returns
+    them again. Everything the kernel must not decide for itself -- which ledger
+    the entries live in, which component is trusted to book them, and where the
+    baseline's cursor starts -- is settled by the composition root that builds
+    the feed, exactly as the SPEC S5 trust boundary requires. This module sees
+    only ``int``/``str`` payload leaves and never a connector type.
+    """
+
+    def drain(self) -> tuple[Event, ...]:
+        """Return the booked fill entries not yet returned, oldest first.
+
+        Returns:
+            The newly booked :class:`~windbreak.ledger.events.FillAccounted`
+            events; empty when nothing has been booked since the last call.
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class _FillEntry:
+    """One booked fill's reconstructed accounting, ready to apply.
+
+    Attributes:
+        ticker: The market that traded.
+        cash_delta: The signed available-cash movement, in micros.
+        position_delta: The signed YES-frame position movement, in centis.
+    """
+
+    ticker: str
+    cash_delta: MoneyMicros
+    position_delta: ContractCentis
+
+
+def _fill_entry(event: Event) -> _FillEntry | None:
+    """Reconstruct one booked fill's accounting, or ``None`` if it cannot be.
+
+    Fail-closed narrowing, mirroring :func:`_rows_to_positions`: the payload
+    leaves arrive as JSON-safe ``object`` and every one of them must be exactly
+    the type the scaled-integer constructors accept before it may advance a
+    safety-critical baseline. ``bool`` is excluded via :func:`_is_scaled_int`,
+    so a malformed leaf takes this ``None`` path instead of reaching a
+    constructor that raises.
+
+    An event of any other ``event_type`` also returns ``None``. The feed's
+    contract is "this account's booked fill accounting", so anything else on it
+    means the seam is not delivering what it promised -- which is a gap in the
+    books, not a row to ignore.
+
+    Args:
+        event: The event drained from the fill-accounting seam.
+
+    Returns:
+        The reconstructed :class:`_FillEntry`, or ``None`` when this event
+        cannot be accounted for.
+    """
+    if event.event_type != _FILL_ACCOUNTED_EVENT_TYPE:
+        return None
+    ticker = event.payload.get(_ROW_TICKER_KEY)
+    cash = event.payload.get(_FILL_CASH_DELTA_KEY)
+    position = event.payload.get(_FILL_POSITION_DELTA_KEY)
+    if not (isinstance(ticker, str) and _is_scaled_int(cash)):
+        return None
+    if not _is_scaled_int(position):
+        return None
+    return _FillEntry(
+        ticker=ticker,
+        cash_delta=MoneyMicros(cash),
+        position_delta=ContractCentis(position),
+    )
+
+
+def _advanced(
+    expectations: LedgerExpectations, entry: _FillEntry
+) -> LedgerExpectations:
+    """Return ``expectations`` advanced by one booked fill's two deltas.
+
+    Only the two ledger-derived dimensions move. The open-order expectation is
+    carried through untouched: venue order ids are never ledgered (an
+    ``OrderTransitionLedgered`` carries only the client_order_id), so no booked
+    fill can name the resting order it retired. A fill that empties a resting
+    order therefore still diverges on that dimension and still halts -- the
+    fail-closed answer, and the reason this advance can never quietly turn the
+    open-order check into one that cannot fail.
+
+    Args:
+        expectations: The expectation to advance.
+        entry: The booked fill's reconstructed accounting.
+
+    Returns:
+        A new :class:`LedgerExpectations` with the cash and position dimensions
+        moved by ``entry``'s deltas.
+    """
+    positions = dict(expectations.expected_positions)
+    held = positions.get(entry.ticker, ContractCentis(0))
+    positions[entry.ticker] = ContractCentis(held.value + entry.position_delta.value)
+    return LedgerExpectations(
+        expected_available_cash=MoneyMicros(
+            expectations.expected_available_cash.value + entry.cash_delta.value
+        ),
+        expected_positions=positions,
+        expected_open_order_ids=expectations.expected_open_order_ids,
+    )
+
+
 class LedgerExpectationSource:
     """An :class:`ExpectationSource` projecting a *scoped* startup baseline.
 
     Built once at kernel startup from the replayed ledger ``history`` and the
     :class:`~windbreak.connector.readonly.ReadOnlyVenueView`, this source folds
-    that history exactly
-    once, at construction, into one frozen :class:`LedgerExpectations` stored on
-    ``self._expectations``; every :meth:`get_expectations` call returns that same
-    object, so a connector mutated after construction never changes the result
-    (the freeze guarantee the verifier relies on).
+    that history exactly once, at construction, into a baseline
+    :class:`LedgerExpectations` stored on ``self._expectations``. **The
+    connector is read exactly there and nowhere else**: a connector mutated
+    after construction never changes the result. That is the guarantee the
+    verifier relies on, and it is what keeps the comparison falsifiable rather
+    than the issue #352 tautology of grading the venue against itself.
+
+    The baseline is not frozen forever, though. When a ``fill_accounting`` feed
+    is supplied it advances -- from *ledgered evidence only* (issue #365). Each
+    fill is booked once, at execution, as a durable hash-chained
+    :class:`~windbreak.ledger.events.FillAccounted` entry, and each
+    :meth:`get_expectations` call folds whatever the feed has newly drained onto
+    the running expectation. Without that, the baseline stayed at the account
+    *as it stood before this process traded*, so the first real fill moved the
+    venue off it permanently: the next cycle graded ``BREACH``, the kernel
+    HALTed per issue #32, and only a restart cleared it -- an always-on PAPER
+    deployment could not survive its own first fill.
+
+    The advance is not a relaxation, because a booked entry and an observation
+    remain independent. The entry is frozen at execution and describes one
+    discrete movement; the observation is the venue's live *aggregate* balance
+    and position. A venue that moved by something other than what was booked --
+    an unbooked fill, a fee charged differently, a settlement, a phantom
+    position, a retired resting order -- still diverges and still halts. Only
+    the *explained* part of the movement is absorbed.
+
+    Fail closed: an entry whose accounting cannot be reconstructed (a malformed
+    payload leaf, or an event the seam should never have delivered) is never
+    skipped past. The advance stops at it and latches off permanently, so the
+    unexplained gap keeps showing up as divergence for the life of the process
+    rather than being quietly re-baselined away. Entries booked *before* the gap
+    are real facts and still apply; only advancing past it is refused.
+
+    Omitting ``fill_accounting`` restores the pre-#365 behavior exactly: the
+    baseline never moves, and :meth:`get_expectations` returns one identical
+    object every call.
 
     The projection is *scoped*, not a full venue reconstruction, because the
     ledger is not a complete record of intended venue state -- each dimension is
@@ -491,8 +640,14 @@ class LedgerExpectationSource:
     runtime ``verification`` <-> ``process`` import cycle.
     """
 
-    def __init__(self, history: Iterable[Event], connector: ReadOnlyVenueView) -> None:
-        """Project ``history`` and ``connector`` into one frozen expectation.
+    def __init__(
+        self,
+        history: Iterable[Event],
+        connector: ReadOnlyVenueView,
+        *,
+        fill_accounting: FillAccountingFeed | None = None,
+    ) -> None:
+        """Project ``history`` and ``connector`` into the baseline expectation.
 
         The history is materialized once (so a one-shot iterable is safe) and
         each dimension is folded independently; the connector is read only for
@@ -503,8 +658,16 @@ class LedgerExpectationSource:
             history: The replayed startup event history, oldest first.
             connector: The read-only market connector supplying the per-dimension
                 fallbacks. It is read exactly here, at construction.
+            fill_accounting: The seam newly booked fills are folded in through
+                (issue #365). ``None`` -- the default -- leaves the baseline
+                frozen for the life of the source, which is the correct wiring
+                for a composition root where nothing books fill accounting: an
+                expectation that advanced on evidence nobody records would drift
+                away from the venue silently.
         """
         events = tuple(history)
+        self._fill_accounting = fill_accounting
+        self._unaccountable = False
         self._expectations = LedgerExpectations(
             expected_available_cash=_seed_cash(events, connector),
             expected_positions=_seed_positions(events, connector),
@@ -512,13 +675,26 @@ class LedgerExpectationSource:
         )
 
     def get_expectations(self) -> LedgerExpectations:
-        """Return the baseline projected at construction.
+        """Return the baseline, advanced by every fill booked since the last call.
+
+        The connector is never touched here -- only the ledgered entries the
+        fill-accounting seam drains. Once an unreconstructable entry has been
+        seen the source latches and stops advancing for good, so an unexplained
+        gap in the books can never be quietly re-baselined away.
 
         Returns:
-            The immutable :class:`LedgerExpectations` folded from the startup
-            history and connector; identical on every call, regardless of any
-            later connector mutation.
+            The current :class:`LedgerExpectations`. With no fill-accounting
+            seam wired (or once latched) this is one identical object on every
+            call, regardless of any later connector mutation.
         """
+        if self._fill_accounting is None or self._unaccountable:
+            return self._expectations
+        for event in self._fill_accounting.drain():
+            entry = _fill_entry(event)
+            if entry is None:
+                self._unaccountable = True
+                break
+            self._expectations = _advanced(self._expectations, entry)
         return self._expectations
 
 
