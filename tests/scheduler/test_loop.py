@@ -1798,3 +1798,61 @@ def test_build_evaluation_context_never_stamps_the_forecast_with_its_own_clock()
         context.market.forecast_epoch_s == DEFAULT_NOW_EPOCH_S - _FORECAST_TTL_SECONDS
     )
     assert context.market.forecast_epoch_s != context.now_epoch_s
+
+
+#: The one host the offline default's egress allowlist admits, so a fetch
+#: against it is refused by the *transport* rather than bounced by the
+#: allowlist -- which is the refusal this test means to observe.
+_OFFLINE_RESEARCH_HOST = "research.local"
+
+
+def test_omitted_research_tools_default_to_the_offline_no_network_bundle(
+    tmp_path: Path,
+) -> None:
+    """No supplied tools and no live HTTP means the offline bundle (issue #162).
+
+    The default is what a cassette-mode deployment silently gets, so the
+    fail-closed property has to hold *without* anyone opting into it: the
+    bundle's search finds nothing, which is what makes the forecast pipeline
+    abstain on zero verified citations before any fetch, any vote, or any spend.
+    A default that quietly reached the network instead would be the one wiring
+    mistake no configuration file records.
+
+    Args:
+        tmp_path: The pytest scratch directory, standing in for the ledger's
+            parent.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.scheduler.loop import _resolve_research_tools
+
+    tools = _resolve_research_tools(
+        None, tmp_path / "ledger.db", WindbreakConfig(), None
+    )
+
+    assert tools.search("will this reach the network") == ()
+    with pytest.raises(RuntimeError, match="unexpectedly called"):
+        tools.fetch(f"https://{_OFFLINE_RESEARCH_HOST}/anything")
+
+
+def test_supplied_research_tools_are_used_verbatim(tmp_path: Path) -> None:
+    """An explicitly supplied bundle wins over either default (issue #162).
+
+    Identity, not equivalence: a test asserting the returned bundle merely
+    behaves the same way would pass against a resolver that rebuilt it, losing
+    whatever counted transport a caller wired in to observe.
+
+    Args:
+        tmp_path: The pytest scratch directory, standing in for the ledger's
+            parent.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.scheduler.loop import _resolve_research_tools
+    from windbreak.scheduler.provider_wiring import offline_research_tools
+
+    supplied = offline_research_tools(tmp_path / "supplied-cache")
+
+    resolved = _resolve_research_tools(
+        supplied, tmp_path / "ledger.db", WindbreakConfig(), None
+    )
+
+    assert resolved is supplied
