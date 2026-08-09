@@ -59,7 +59,12 @@ from windbreak.selector.correlation import (
     CorrelationTag,
 )
 from windbreak.selector.edge import EdgeFigures, compute_executable_edge
-from windbreak.selector.sizing import dispersion_scale, kelly_size
+from windbreak.selector.sizing import (
+    _depth_through_fill,
+    _participation_fixed_point,
+    dispersion_scale,
+    kelly_size,
+)
 from windbreak.selector.types import (
     FeeModelInput,
     PositionReadModelInput,
@@ -539,3 +544,63 @@ def test_emitted_intent_is_never_negative_ev_after_fees(inputs: SelectorInputs) 
         figures.research_cost_adjusted_edge_ppm
         >= inputs.risk_config.config.min_net_edge_ppm
     )
+
+
+@given(
+    quantities=st.lists(
+        st.integers(min_value=0, max_value=50_000), min_size=0, max_size=6
+    ),
+    max_participation_ppm=st.integers(min_value=1, max_value=1_000_000),
+    size_centis=st.integers(min_value=0, max_value=500_000),
+    lot=st.booleans(),
+)
+@settings(deadline=None, max_examples=300)
+def test_participation_fixed_point_always_reaches_a_true_fixed_point(
+    quantities: list[int],
+    max_participation_ppm: int,
+    size_centis: int,
+    lot: bool,
+) -> None:
+    """The bounded iteration must *converge*, never merely run out of passes.
+
+    Whatever it returns, the returned size takes no more than
+    `max_participation_ppm` of the depth resting at-or-better than that very
+    size's own marginal level -- the SPEC S9.6 participation invariant, restated
+    at the answer rather than at the size it started from. This is the property
+    the loop's iteration bound exists to guarantee: were the bound too small for
+    some book, the loop would fall out mid-shrink and return an iterate still
+    above its own cap, and this assertion is what catches it.
+
+    The result is also never negative, never larger than the size asked for, and
+    -- under `lot` -- always a whole-contract multiple.
+
+    Args:
+        quantities: Resting ask quantities, best-first, in contract-centis.
+        max_participation_ppm: The participation share, in ppm.
+        size_centis: The size to clip, in contract-centis.
+        lot: Whether every iterate floors to a whole contract.
+    """
+    asks = tuple(
+        OrderBookLevel(
+            price=PricePips(4_000 + index), quantity=ContractCentis(quantity)
+        )
+        for index, quantity in enumerate(quantities)
+    )
+
+    result = _participation_fixed_point(
+        size_centis, asks, max_participation_ppm, lot=lot
+    )
+
+    assert 0 <= result <= size_centis
+    if lot:
+        assert result % 100 == 0
+
+    depth = _depth_through_fill(asks, result)
+    cap = divide(
+        max_participation_ppm * depth,
+        1_000_000,
+        rounding=RoundingDirection.UNDERSTATE_EQUITY,
+    )
+    if lot:
+        cap = cap - (cap % 100)
+    assert result <= cap
