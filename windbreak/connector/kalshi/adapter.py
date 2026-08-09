@@ -420,6 +420,35 @@ class KalshiConnector:
                 extra={"component": "connector.kalshi"},
             )
 
+    def _gated_raw_market(self, ticker: str) -> Mapping[str, Any]:
+        """Return the raw market payload for ``ticker`` iff it is an allowed binary.
+
+        Scans :meth:`_raw_markets` for the matching ticker and applies the
+        product allowlist, mirroring the gate :meth:`get_market` enforces so
+        every single-ticker read path refuses a non-binary (margin/perp/
+        derivative) surface identically (SPEC §7.1).
+
+        Args:
+            ticker: The market ticker to locate and gate.
+
+        Returns:
+            The raw market payload when ``ticker`` is an offered, allowed binary.
+
+        Raises:
+            UnknownMarketError: If the ticker is absent from the catalog or its
+                product type is refused by the allowlist. Deliberately does not
+                ledger a ``PRODUCT_REFUSED`` event: a targeted lookup must not
+                flood the ledger (contrast :meth:`list_markets`), matching
+                :meth:`get_market`.
+        """
+        for raw in self._raw_markets():
+            if raw.get("ticker") != ticker:
+                continue
+            if gate_product(raw) is not None:
+                raise UnknownMarketError(ticker)
+            return raw
+        raise UnknownMarketError(ticker)
+
     def get_market(self, ticker: str) -> NormalizedMarket:
         """Return the normalized binary market for ``ticker``.
 
@@ -427,7 +456,8 @@ class KalshiConnector:
         exactly like :meth:`list_markets` / :meth:`get_order_book`: it consults
         exchange status first and fails closed if the venue is not open, rather
         than returning live market data from a paused/closed exchange (SPEC §3
-        principle 3).
+        principle 3). The product allowlist is applied by
+        :meth:`_gated_raw_market` before any normalization.
 
         Args:
             ticker: The market ticker to look up.
@@ -442,21 +472,21 @@ class KalshiConnector:
                 ledgered as a ``MARKET_MALFORMED`` event before raising).
         """
         self._ensure_operational()
-        for raw in self._raw_markets():
-            if raw.get("ticker") != ticker:
-                continue
-            if gate_product(raw) is not None:
-                raise UnknownMarketError(ticker)
-            events = self._event_index()
-            try:
-                return normalize_market(raw, events.get(raw["event_ticker"]))
-            except _MALFORMED_MARKET_ERRORS as exc:
-                self._record_malformed(raw, exc)
-                raise UnknownMarketError(ticker) from exc
-        raise UnknownMarketError(ticker)
+        raw = self._gated_raw_market(ticker)
+        events = self._event_index()
+        try:
+            return normalize_market(raw, events.get(raw["event_ticker"]))
+        except _MALFORMED_MARKET_ERRORS as exc:
+            self._record_malformed(raw, exc)
+            raise UnknownMarketError(ticker) from exc
 
     def get_order_book(self, ticker: str) -> OrderBookSnapshot:
         """Return the current YES order book for ``ticker``.
+
+        Applies the product allowlist via :meth:`_gated_raw_market` before
+        contacting the venue, so a non-binary product's book is never fetched
+        (fail closed, SPEC §7.1). The market payload is read purely to gate:
+        the ``/orderbook`` route carries no ``market_type`` of its own.
 
         Args:
             ticker: The market ticker to look up.
@@ -466,9 +496,11 @@ class KalshiConnector:
 
         Raises:
             MaintenanceHaltError: If the exchange is not open for trading.
-            UnknownMarketError: If the venue has no book for that ticker.
+            UnknownMarketError: If the ticker is refused (a non-binary product),
+                not offered, or the venue has no book for it.
         """
         self._ensure_operational()
+        self._gated_raw_market(ticker)  # refuse non-binary/absent before fetching
         try:
             response = self._client.get("markets", ticker, "orderbook")
         except KalshiApiError as exc:

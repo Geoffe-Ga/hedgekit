@@ -63,6 +63,23 @@ Citation-verification fixture choice (issue #26)
     `make_mutating_refetch_transport`) mirroring `make_fake_vote_transport`'s
     "the fixture body is literally the class" convention -- a fresh,
     independently-stateful double per test, never one shared instance.
+
+Divergence-cassette fixture choice (issue #191)
+    `DIVERGENT_VOTE_RESPONSES` and the `diverse_markets` fixture below back
+    `test_vote_cassette_divergence.py`'s cross-market record/replay coverage:
+    three distinct (`NormalizedMarket`, `BaselineQuoteSnapshot`) pairs -- a
+    Fed-rate market, a weather market, and a presidential-election market --
+    each paired with three hand-authored, schema-valid #184 vote JSON
+    responses whose `probability_ppm` values diverge from each other and,
+    for at least one member, from that market's own `baseline_ppm`
+    (`price_pips * 100`) by more than 20_000 ppm. Unlike
+    `CANNED_VOTE_RESPONSES` (chosen to reproduce one fixed baseline-derived
+    sequence for a single market), these responses are deliberately varied
+    per market so the divergence tests exercise the record/replay cassette
+    harness under genuinely different vote content, not just a different
+    market shell wrapped around identical votes. Exactly one response in the
+    whole mapping carries `"abstain": true`, exercising that schema branch
+    end-to-end through the cassette harness.
 """
 
 from __future__ import annotations
@@ -415,3 +432,187 @@ def make_mutating_refetch_transport() -> Callable[..., MutatingRefetchTransport]
     convention.
     """
     return MutatingRefetchTransport
+
+
+# --- Divergence-cassette fixtures (issue #191) ------------------------------------
+#
+# See the module docstring's "Divergence-cassette fixture choice" note.
+
+#: Ticker for the Fed-rate divergence-test market.
+_FED_TICKER = "KXFED-25MAR"
+
+#: Ticker for the weather divergence-test market.
+_WEATHER_TICKER = "KXWEATHER-25JUL-NYC90"
+
+#: Ticker for the presidential-election divergence-test market.
+_ELECTIONS_TICKER = "KXPRES-28-DEM"
+
+
+def _diverse_market(
+    *,
+    ticker: str,
+    event_ticker: str,
+    title: str,
+    resolution_criteria: str,
+    category: str,
+    close_time: datetime,
+) -> NormalizedMarket:
+    """Build one diverse `NormalizedMarket` for the divergence tests (#191).
+
+    Every field not named as a parameter is fixed to the same shared default
+    the `market` fixture above uses, so only the caller-supplied fields vary
+    between the three divergence-test markets.
+
+    Args:
+        ticker: The market's ticker.
+        event_ticker: The market's parent event ticker.
+        title: The market's question text.
+        resolution_criteria: The market's resolution-criteria prose.
+        category: The market's category.
+        close_time: The market's close instant.
+
+    Returns:
+        A valid `NormalizedMarket`.
+    """
+    return NormalizedMarket(
+        exchange="fake-exchange",
+        ticker=ticker,
+        event_ticker=event_ticker,
+        title=title,
+        resolution_criteria=resolution_criteria,
+        category=category,
+        close_time=close_time,
+        expected_resolution_time=None,
+        market_type="fully_collateralized_binary",
+        price_tick_pips=100,
+        min_order_contract_centis=100,
+        fractional_trading_enabled=False,
+        mutually_exclusive_group_id=None,
+        jurisdiction_status="eligible",
+        raw_exchange_payload_hash="sha256:abc123",
+        volume_24h_micros=0,
+    )
+
+
+def _diverse_baseline(
+    *, snapshot_id: str, price_pips: int, fetched_at: datetime
+) -> BaselineQuoteSnapshot:
+    """Build one diverse `BaselineQuoteSnapshot` for the divergence tests (#191).
+
+    Args:
+        snapshot_id: The baseline snapshot's unique identifier.
+        price_pips: The baseline executable price, in pips.
+        fetched_at: When the baseline snapshot was taken.
+
+    Returns:
+        A valid `BaselineQuoteSnapshot`.
+    """
+    return BaselineQuoteSnapshot(
+        snapshot_id=snapshot_id, price_pips=price_pips, fetched_at=fetched_at
+    )
+
+
+@pytest.fixture
+def diverse_markets(
+    created_at: datetime,
+) -> tuple[tuple[NormalizedMarket, BaselineQuoteSnapshot], ...]:
+    """Provide three diverse (market, baseline) pairs for divergence tests (#191).
+
+    A Fed-rate market, a weather market, and a presidential-election market,
+    each with a distinct baseline price so `baseline_ppm` (`price_pips *
+    100`) differs across all three -- see the module docstring's
+    "Divergence-cassette fixture choice" note.
+    """
+    fed = _diverse_market(
+        ticker=_FED_TICKER,
+        event_ticker="KXFED-25",
+        title="Fed cuts rates in March 2025?",
+        resolution_criteria=(
+            "Resolves YES if the FOMC cuts the federal funds rate at its "
+            "March 2025 meeting."
+        ),
+        category="economics",
+        close_time=datetime(2025, 3, 19, 19, tzinfo=UTC),
+    )
+    weather = _diverse_market(
+        ticker=_WEATHER_TICKER,
+        event_ticker="KXWEATHER-25JUL",
+        title="Will NYC hit 90F on July 15, 2025?",
+        resolution_criteria=(
+            "Resolves YES if the NWS-reported high temperature at Central "
+            "Park exceeds 90F on 2025-07-15."
+        ),
+        category="weather",
+        close_time=datetime(2025, 7, 15, 23, tzinfo=UTC),
+    )
+    elections = _diverse_market(
+        ticker=_ELECTIONS_TICKER,
+        event_ticker="KXPRES-28",
+        title="Will the Democratic nominee win the 2028 presidential election?",
+        resolution_criteria=(
+            "Resolves YES if the Democratic Party's nominee wins a majority "
+            "of the Electoral College in the 2028 U.S. presidential election."
+        ),
+        category="elections",
+        close_time=datetime(2028, 11, 7, 23, tzinfo=UTC),
+    )
+    return (
+        (
+            fed,
+            _diverse_baseline(
+                snapshot_id="snap-fed-0001", price_pips=4500, fetched_at=created_at
+            ),
+        ),
+        (
+            weather,
+            _diverse_baseline(
+                snapshot_id="snap-weather-0001", price_pips=3000, fetched_at=created_at
+            ),
+        ),
+        (
+            elections,
+            _diverse_baseline(
+                snapshot_id="snap-elections-0001",
+                price_pips=6000,
+                fetched_at=created_at,
+            ),
+        ),
+    )
+
+
+#: Hand-authored, schema-valid #184 vote JSON responses per divergence-test
+#: market (issue #191), keyed by ticker. Each market's three responses carry
+#: mutually distinct `probability_ppm` values, and at least one *non-abstaining*
+#: (hence surviving) response diverges from that market's own `baseline_ppm`
+#: (`price_pips * 100`) by more than 20_000 ppm -- so the divergence survives
+#: the #241 abstention exclusion. Exactly one response across the whole mapping
+#: (the elections market's third vote) carries `"abstain": true`, exercising
+#: that schema branch end-to-end through the cassette harness; the elections
+#: market's divergent reading therefore sits on a surviving vote, not the
+#: abstaining one.
+DIVERGENT_VOTE_RESPONSES: dict[str, tuple[str, str, str]] = {
+    _FED_TICKER: (
+        '{"probability_ppm": 440000, "rationale_summary": '
+        '"base rate holds steady", "abstain": false}',
+        '{"probability_ppm": 455000, "rationale_summary": '
+        '"recent dot plot shift", "abstain": false}',
+        '{"probability_ppm": 490000, "rationale_summary": '
+        '"market pricing in a cut", "abstain": false}',
+    ),
+    _WEATHER_TICKER: (
+        '{"probability_ppm": 310000, "rationale_summary": '
+        '"climatological base rate", "abstain": false}',
+        '{"probability_ppm": 325000, "rationale_summary": '
+        '"forecast model ensemble mean", "abstain": false}',
+        '{"probability_ppm": 350000, "rationale_summary": '
+        '"heat dome signal building", "abstain": false}',
+    ),
+    _ELECTIONS_TICKER: (
+        '{"probability_ppm": 590000, "rationale_summary": '
+        '"polling average steady", "abstain": false}',
+        '{"probability_ppm": 635000, "rationale_summary": '
+        '"incumbent-party tailwind", "abstain": false}',
+        '{"probability_ppm": 560000, "rationale_summary": '
+        '"insufficient signal this far out", "abstain": true}',
+    ),
+}

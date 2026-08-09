@@ -32,18 +32,28 @@ drives from ``windbreak run --process riskkernel`` -- the production
 entrypoint per the ``systemd``/``docker-compose`` deploy configs. That
 kernel's :meth:`KillFileWatcher.poll_once` runs every beat, so
 ``windbreak kill --state-dir DIR`` now halts a running kernel whenever
-``DIR`` is that kernel's configured ``ops.state_dir``. Three edges remain
-open: the :class:`ReconciliationMismatchMonitor` is composed from the
-configured threshold but ``_build_risk_kernel`` wires **no verifier**, so the
-kernel's per-beat verification cycle no-ops and the monitor is never fed --
-the ``AUTO_RECONCILIATION`` auto-kill is thus composed-but-dormant in
-production until a verifier is wired (tracked as issue #236), leaving the
-operator ``KILL`` file as today's live trigger; ``windbreak/riskkernel/
+``DIR`` is that kernel's configured ``ops.state_dir``. The
+:class:`ReconciliationMismatchMonitor` is composed from the configured
+threshold and, since issue #236, is fed a live signal: when ``windbreak run
+--process riskkernel`` is given a ``--snapshot-fixture-dir``,
+``_build_risk_kernel`` wires a
+:class:`~windbreak.riskkernel.verification.ReadOnlyVerifier`
+over that read-only connector, so the kernel's per-beat verification cycle
+grades a real reconciliation outcome and a sustained ``BREACH`` engages the
+``AUTO_RECONCILIATION`` auto-kill -- no longer composed-but-dormant. The wiring
+is live, but a static ``--snapshot-fixture-dir`` connector reports identical
+data every cycle, so it can never drift from its own frozen startup baseline:
+against a static fixture this exercises the reconciliation *plumbing*, not a
+real breach kill. A drift only arises from a mutating or live connector -- the
+ledger-derived expectation source seam tracked in issue #288. With no
+``--snapshot-fixture-dir`` no verifier is wired and the operator ``KILL`` file
+remains the live trigger. Two edges remain: ``windbreak/riskkernel/
 process.py``'s ``main()`` (reachable only via ``python -m
 windbreak.riskkernel``, a dev-only path) still runs without kill wiring; and
-replaying an existing ``KILLED`` state from the ledger on startup is not yet
-wired into that composition (tracked as issue #235) -- until then, the on-disk
-``KILL`` file below remains the mechanism that survives a restart.
+replaying an existing ``KILLED`` state from the ledger on startup is now wired
+into that composition (issue #235) whenever ``windbreak run --process
+riskkernel`` is given a ``--ledger-path``, with the on-disk ``KILL`` file below
+kept as the belt-and-suspenders restart measure alongside it.
 
 **Durable kill state (issue #123):** kill state need not live only in process
 memory, and the ``KILL`` file need not be the sole interim restart measure. The
@@ -51,12 +61,11 @@ kill/re-arm ledger is authoritative: :func:`kill_state_in` folds a recorded
 history into a :class:`ReplayedKillState`, and :meth:`KillSwitch.from_events`
 (with :meth:`~windbreak.riskkernel.process.RiskKernel.from_events`) rebuilds a
 switch already at its restored kill sequence and, on an unrearmed history, a
-kernel already ``KILLED``. Ledger replay is thus designed to be the *primary*
-durable mechanism, with the ``KILL`` file as belt-and-suspenders -- but
-``_build_risk_kernel`` does not yet call ``from_events`` on startup (that
-composition is issue #235), so today the on-disk ``KILL`` file is what
-actually survives a ``windbreak run`` restart in production; an operator's
-``KILL`` drop is not lost, it just isn't yet replayed from the ledger.
+kernel already ``KILLED``. Ledger replay is thus the *primary* durable
+mechanism, with the ``KILL`` file as belt-and-suspenders: ``_build_risk_kernel``
+now calls ``from_events`` on startup over a supplied ledger (issue #235), so an
+engaged kill survives a ``windbreak run --process riskkernel --ledger-path``
+restart even after the operator's ``KILL`` file is deleted.
 
 Everything on this path is float-free (SPEC S6.1): epoch seconds and kill
 sequence numbers are ``int`` only.

@@ -11,6 +11,14 @@ Q3 rounds *up*
 (:attr:`~windbreak.numeric.rounding.RoundingDirection.OVERSTATE_COST`), a
 deliberately risk-widening convention -- so no float ever enters the
 probability path guarded by ``scripts/lint_no_floats.py``.
+
+Dispersion is deliberately *provider-family-agnostic*: aggregation reads only
+each vote's ``probability_ppm``, never its ``provider`` identity, so every
+surviving vote contributes symmetrically to the exclusive-median IQR regardless
+of member family (a research-forecaster ``futuresearch`` vote weighs exactly the
+same as an ``openai``/``anthropic`` LLM vote). The spread is the ensemble's
+honest disagreement signal that SPEC S9.6 sizes against -- it is never damped,
+weighted, or re-scaled per provider family.
 """
 
 from __future__ import annotations
@@ -43,7 +51,11 @@ class VoteAggregate:
 
     Attributes:
         probability_ppm: The integer median vote probability, in ppm.
-        vote_dispersion_ppm: The exclusive-median IQR spread, in ppm.
+        vote_dispersion_ppm: The exclusive-median IQR spread, in ppm. Derived
+            purely from the votes' probabilities, never their provider identity,
+            so it is provider-family-agnostic: every vote contributes
+            symmetrically regardless of member family (SPEC S9.6's honest
+            disagreement signal, never damped or weighted per family).
         ci_low_ppm: The lowest vote probability (min), in ppm.
         ci_high_ppm: The highest vote probability (max), in ppm.
     """
@@ -117,6 +129,13 @@ def _quartiles(values: Sequence[int]) -> tuple[int, int]:
 
 def aggregate_votes(votes: Sequence[ModelVote]) -> VoteAggregate:
     """Aggregate ensemble votes into a median, dispersion, and CI bounds.
+
+    Aggregation reads only each vote's ``probability_ppm``, never its
+    ``provider`` identity, so the result -- including ``vote_dispersion_ppm`` --
+    is provider-family-agnostic: relabeling or reordering which member family
+    produced which vote leaves every quantity unchanged. A research-forecaster
+    vote contributes exactly like an LLM vote to the honest disagreement signal
+    (SPEC S9.6); it is never damped or weighted per family.
 
     Args:
         votes: The ensemble votes to aggregate; must be non-empty and each

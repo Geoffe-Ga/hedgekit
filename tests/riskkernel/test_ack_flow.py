@@ -108,7 +108,7 @@ def _isolate_checks(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
 
     Mirrors ``tests/riskkernel/test_reservations.py``'s T4 isolation
     technique and ``tests/riskkernel/test_micro_cap_properties.py``'s copy of
-    it: 3 of the 24 SPEC S10.3 checks are still unconditional-veto stubs,
+    it: 1 of the 24 SPEC S10.3 checks is still an unconditional-veto stub,
     which would otherwise mask every behavior this file targets.
 
     Args:

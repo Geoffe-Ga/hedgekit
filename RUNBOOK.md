@@ -143,7 +143,9 @@ windbreak rebuild --ledger-path <path> --output-dir <path>
 `rebuild` verifies the ledger's hash chain first; a corrupted chain fails
 closed with a nonzero exit code and the offending sequence number on stderr,
 rather than silently emitting a plausible-but-wrong projection. See
-`docs/RUNBOOK.md` for the six files it writes.
+`docs/RUNBOOK.md` for the ten files it writes, including the two
+fleet-observability projections (`canary_status.json`, `forecasts.json`,
+issue #195) `docs/RUNBOOK.md`'s "Provider operations" section reads from.
 
 ## 9. Anchor and verify the ledger against tail-rewrite tampering (issue #75)
 
@@ -197,7 +199,7 @@ Each is described honestly below rather than invented as a fake command.
   read models (procedure 8) and, once satisfied, re-arms or restarts as
   appropriate.
 - **Export an audit bundle / export tax records (SPEC §19).** Today the only
-  record-export path is `windbreak rebuild`'s six read-model JSON files
+  record-export path is `windbreak rebuild`'s ten read-model JSON files
   (procedure 8); there is no `audit-bundle` or `tax-export` command. Tracked
   in issue #201.
 - **Pause the daemon.** There is no standalone pause command; stopping the

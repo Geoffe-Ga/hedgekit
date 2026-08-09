@@ -99,7 +99,7 @@ pre-commit run --all-files   # all 32 hooks (recommended before commit)
 ./scripts/lint.sh            # ruff
 ./scripts/format.sh --fix    # black + isort
 ./scripts/typecheck.sh       # mypy --strict
-./scripts/security.sh        # bandit + pip-audit
+./scripts/security.sh        # bandit + pip-audit + detect-secrets (baseline)
 ./scripts/complexity.sh      # radon/xenon (≤10 cyclomatic)
 ./scripts/mutation.sh        # mutmut
 ./scripts/check-all.sh       # everything

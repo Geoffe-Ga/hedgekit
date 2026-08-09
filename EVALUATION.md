@@ -84,3 +84,52 @@ fires a critical alert and an automatic one-rung demotion.
 it is not yet wired into any scheduler — nothing calls it automatically on a
 cadence today. Tracked in issue #200, alongside the rest of the live-divergence
 fast-follow hardening.
+
+## Provider track-record gate (SPEC §13/§16, §19, §9.6)
+
+Live eligibility is *earned* per provider, never granted by default. A voting
+provider's forecasts are forced live-ineligible (`eligible_for_live=False`)
+until that provider itself has accumulated at least
+`config.forecast.provider_gate.min_resolved` (default 150) resolved paper
+forecasts with a Brier skill over the executable-market baseline of at least
+`config.forecast.provider_gate.min_brier_skill_ppm` (default 10000 ppm) — the
+same statistical bar `config.evaluation.min_resolved_for_calibration` and
+`config.evaluation.brier_skill_required_ppm` set for calibration and ensemble
+promotion, applied here per provider rather than to the ensemble as a whole
+(`windbreak.forecast.providers.track_record`).
+
+An unproven provider's votes still **run** and are **recorded** in paper —
+that is how its track record accrues in the first place — only its live
+eligibility is withheld; the decision is ledgered as a `PROVIDER_GATE_HELD`
+forecast event naming every unproven provider. The gate is a **read model**
+over M6's evaluation artifacts: it consumes each provider's resolved-count
+and Brier-skill figures and never recomputes a score itself, so it is only
+ever as fresh as the last evaluation pass. A provider with no track record at
+all — or a record below either bar — is treated as unproven; the gate fails
+*closed* by construction, in keeping with the plain expectation that no
+unmeasured edge ever backs a live order (SPEC §19). Because the dispersion
+that SPEC §9.6 sizes against is deliberately provider-family-agnostic (see
+`windbreak.forecast.ensemble`), gating a provider's *live eligibility*
+without excluding its *vote* from the ensemble keeps that honest
+disagreement signal intact even while the provider itself remains unproven.
+
+## Versioned calibration map (SPEC §8.2)
+
+`windbreak.forecast.calibration` loads a versioned probability-calibration
+map applied at the pipeline's calibration stage (stage 11 of SPEC §8.2): a
+deterministic integer piecewise-linear correction from a raw aggregate
+probability toward the frequency its historical forecasts actually resolved
+at. Until M6 fits a real map from resolved paper forecasts, every run applies
+the `"v0"` identity map, which corrects nothing — the byte-identical behavior
+of every run before this mechanism existed. The applied map's `map_id` and
+`version` are ledgered as a `CALIBRATION_MAP_APPLIED` forecast event
+alongside the exact pre-/post-calibration ppm, so which map (if any) touched
+a given forecast is always reconstructable from the audit trail.
+
+Temporal integrity applies to a calibration map exactly as it does to a
+forecast's own creation date (see above): loading a map whose version — an
+ISO-8601 training date — postdates the forecast's own `created_at` raises
+`TemporalIntegrityError` and fails the whole run closed. A map fitted *after*
+a forecast was made could only have learned from outcomes that forecast could
+not yet have known about; letting it calibrate that forecast anyway would let
+the future leak into the past exactly as a training-cutoff violation would.

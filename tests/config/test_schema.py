@@ -97,3 +97,59 @@ def test_dashboard_config_is_immutable() -> None:
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         section.port = 1
+
+
+def test_provider_gate_config_defaults_match_evaluation_thresholds() -> None:
+    """`ProviderGateConfig`'s defaults (150 resolved / 10000 ppm skill) match
+    `EvaluationConfig`'s own promotion thresholds -- the same statistical bar
+    applied to a per-provider live-eligibility gate (issue #194).
+    `ProviderGateConfig` does not exist yet, so this fails with `ImportError`
+    at the local import below -- scoped to this one test so every other test
+    in this file keeps collecting and passing.
+    """
+    from windbreak.config.schema import ProviderGateConfig
+
+    section = ProviderGateConfig()
+    defaults = WindbreakConfig()
+
+    assert section.min_resolved == 150
+    assert section.min_brier_skill_ppm == 10000
+    assert section.min_resolved == defaults.evaluation.min_resolved_for_calibration
+    assert section.min_brier_skill_ppm == defaults.evaluation.brier_skill_required_ppm
+
+
+def test_provider_gate_config_is_immutable() -> None:
+    """`ProviderGateConfig`, like every other config section, is frozen."""
+    from windbreak.config.schema import ProviderGateConfig
+
+    section = ProviderGateConfig()
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        section.min_resolved = 1
+
+
+def test_forecast_config_provider_gate_defaults_to_provider_gate_config() -> None:
+    """`ForecastConfig.provider_gate` defaults to a fresh `ProviderGateConfig()`."""
+    from windbreak.config.schema import ProviderGateConfig
+
+    cfg = WindbreakConfig()
+
+    assert isinstance(cfg.forecast.provider_gate, ProviderGateConfig)
+    assert cfg.forecast.provider_gate == ProviderGateConfig()
+
+
+def test_risk_config_verification_tolerance_fields_default_to_zero() -> None:
+    """`RiskConfig.verification_balance_tolerance_micros` and
+    `.verification_position_tolerance_centis` both default to `0` -- a
+    fail-closed exact-match default, matching `_build_risk_kernel`'s
+    zero-tolerance composition when a config leaves them unset (issue #236).
+
+    Neither field exists on `RiskConfig` yet, so this fails with
+    `AttributeError: 'RiskConfig' object has no attribute
+    'verification_balance_tolerance_micros'` -- the expected Gate 1 RED state
+    for issue #236.
+    """
+    cfg = WindbreakConfig()
+
+    assert cfg.risk.verification_balance_tolerance_micros == 0
+    assert cfg.risk.verification_position_tolerance_centis == 0

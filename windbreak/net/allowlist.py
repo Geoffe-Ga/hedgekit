@@ -36,7 +36,12 @@ from urllib.parse import urlsplit
 from windbreak.ledger.events import Event
 
 if TYPE_CHECKING:
-    from windbreak.config.schema import ExchangeConfig, ForecastConfig, WindbreakConfig
+    from windbreak.config.schema import (
+        ExchangeConfig,
+        ForecastConfig,
+        ResearchSettings,
+        WindbreakConfig,
+    )
 
 #: The only URL schemes egress is ever permitted for: plain http(s), never
 #: ``file://``, ``ftp://``, or any other privileged scheme.
@@ -238,15 +243,40 @@ def _forecast_hosts(forecast: ForecastConfig) -> frozenset[str]:
         forecast: The forecast configuration section.
 
     Returns:
-        One host per recognized provider across the ensemble and the triage
-        model; an unrecognized provider name contributes no host.
+        One host per recognized provider across three sources -- the legacy
+        ``ensemble`` triage/promotion ``ModelRef`` set, the ``triage_model``,
+        and each ``vote_ensemble`` member (issue #240) -- unioned; an
+        unrecognized provider name contributes no host (fail closed).
     """
-    models = (*forecast.ensemble, forecast.triage_model)
-    return frozenset(
-        _FORECAST_PROVIDER_HOSTS[model.provider]
-        for model in models
-        if model.provider in _FORECAST_PROVIDER_HOSTS
+    providers = (
+        *(model.provider for model in (*forecast.ensemble, forecast.triage_model)),
+        *(member.provider for member in forecast.vote_ensemble),
     )
+    return frozenset(
+        _FORECAST_PROVIDER_HOSTS[provider]
+        for provider in providers
+        if provider in _FORECAST_PROVIDER_HOSTS
+    )
+
+
+def _research_hosts(research: ResearchSettings) -> frozenset[str]:
+    """Derive the live-research host set from the research configuration.
+
+    Args:
+        research: The forecast configuration's research section.
+
+    Returns:
+        The parsed host of ``search_endpoint_url`` (only when it parses to a
+        real host -- the ``configured-by-operator`` placeholder yields none, so
+        an unconfigured deployment fails closed) plus each
+        ``allowed_research_hosts`` entry, all lowercased.
+    """
+    hosts: set[str] = set()
+    endpoint_host = urlsplit(research.search_endpoint_url).hostname
+    if endpoint_host:
+        hosts.add(endpoint_host.lower())
+    hosts.update(host.lower() for host in research.allowed_research_hosts)
+    return frozenset(hosts)
 
 
 def allowlist_from_config(
@@ -254,10 +284,13 @@ def allowlist_from_config(
 ) -> OutboundAllowlist:
     """Build an :class:`OutboundAllowlist` from a windbreak configuration.
 
-    The host set is the union of the exchange host (:func:`_exchange_hosts`) and
-    the forecast-provider hosts (:func:`_forecast_hosts`). Alert-sink hosts are
-    not derived here (see the module docstring). An unrecognized exchange or
-    model provider contributes no host, so the resulting allowlist fails closed.
+    The host set is the union of the exchange host (:func:`_exchange_hosts`), the
+    forecast-provider hosts (:func:`_forecast_hosts`, spanning the legacy
+    ``ensemble``, the ``triage_model``, and each ``vote_ensemble`` member), and
+    the live-research hosts (:func:`_research_hosts`). Alert-sink hosts are not
+    derived here (see the module docstring). An unrecognized exchange or model
+    provider, and an unconfigured research section, each contribute no host, so
+    the resulting allowlist fails closed.
 
     Args:
         config: The windbreak configuration to derive hosts from.
@@ -267,5 +300,9 @@ def allowlist_from_config(
     Returns:
         An allowlist over the derived host set, wired to ``recorder``.
     """
-    hosts = _exchange_hosts(config.exchange) | _forecast_hosts(config.forecast)
+    hosts = (
+        _exchange_hosts(config.exchange)
+        | _forecast_hosts(config.forecast)
+        | _research_hosts(config.forecast.research)
+    )
     return OutboundAllowlist(hosts, recorder=recorder)

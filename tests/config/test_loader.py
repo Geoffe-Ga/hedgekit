@@ -368,3 +368,86 @@ def test_dashboard_non_int_port_is_a_config_error(
 
     with pytest.raises(ConfigError, match=r"dashboard\.port"):
         load_config(config_path)
+
+
+def test_unknown_key_in_forecast_provider_gate_is_fatal(
+    spec16_dict: dict[str, Any],
+    tmp_path: Path,
+    write_config: Callable[[Path, dict[str, Any]], Path],
+) -> None:
+    """An unknown key under `forecast.provider_gate` is fatal (issue #194).
+
+    `ForecastConfig` has no `provider_gate` field yet, so today the whole
+    `forecast.provider_gate` mapping itself is the unrecognized key, and the
+    raised `ConfigError` names the bare `forecast.provider_gate` path -- not
+    the nested `forecast.provider_gate.bogus_key` this test expects once the
+    schema gains the field. A legitimate RED mismatch, not a typo (mirrors
+    `test_dashboard_host_key_is_unknown_and_fatal`'s issue #79 precedent).
+    """
+    mapping = copy.deepcopy(spec16_dict)
+    mapping["forecast"]["provider_gate"] = {
+        "min_resolved": 150,
+        "min_brier_skill_ppm": 10000,
+        "bogus_key": 1,
+    }
+    config_path = write_config(tmp_path, mapping)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_path)
+
+    message = str(excinfo.value)
+    assert "forecast.provider_gate.bogus_key" in message
+    assert "unknown keys are fatal per SPEC §16" in message
+
+
+def test_verification_tolerance_fields_load_from_yaml(
+    tmp_path: Path, write_config: Callable[[Path, dict[str, Any]], Path]
+) -> None:
+    """YAML `risk.verification_balance_tolerance_micros` /
+    `.verification_position_tolerance_centis` load onto `RiskConfig` (issue
+    #236): `_build_risk_kernel` reads these two fields to compose the live
+    verifier's `VerificationTolerances`.
+
+    `RiskConfig` has neither field yet, so today both are unrecognized keys
+    and `load_config` raises `ConfigError: unknown configuration key(s):
+    risk.verification_balance_tolerance_micros, ...` rather than loading the
+    values -- the expected Gate 1 RED state for issue #236.
+    """
+    config_path = write_config(
+        tmp_path,
+        {
+            "risk": {
+                "verification_balance_tolerance_micros": 500,
+                "verification_position_tolerance_centis": 3,
+            }
+        },
+    )
+
+    cfg = load_config(config_path)
+
+    assert cfg.risk.verification_balance_tolerance_micros == 500
+    assert cfg.risk.verification_position_tolerance_centis == 3
+
+
+def test_forecast_provider_gate_override_round_trips(
+    spec16_dict: dict[str, Any],
+    tmp_path: Path,
+    write_config: Callable[[Path, dict[str, Any]], Path],
+) -> None:
+    """An explicit `forecast.provider_gate` override loads and round-trips.
+
+    `ForecastConfig` has no `provider_gate` field yet, so today this raises
+    `ConfigError` for the still-unrecognized `forecast.provider_gate` key
+    (issue #194) rather than successfully loading the override.
+    """
+    mapping = copy.deepcopy(spec16_dict)
+    mapping["forecast"]["provider_gate"] = {
+        "min_resolved": 200,
+        "min_brier_skill_ppm": 15000,
+    }
+    config_path = write_config(tmp_path, mapping)
+
+    cfg = load_config(config_path)
+
+    assert cfg.forecast.provider_gate.min_resolved == 200
+    assert cfg.forecast.provider_gate.min_brier_skill_ppm == 15000

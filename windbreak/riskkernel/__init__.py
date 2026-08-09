@@ -10,11 +10,13 @@ pure-stdlib AST test.
 
 This package root re-exports the mode machine (:mod:`~windbreak.riskkernel.modes`),
 the pre-trade checks (:mod:`~windbreak.riskkernel.checks`), the process skeleton
-(:mod:`~windbreak.riskkernel.process`), the capital-reservation ledger and
-approval pipeline (:mod:`~windbreak.riskkernel.reservations`), and the approval-
-token issuer (:mod:`~windbreak.riskkernel.tokens`). It deliberately does **not**
-re-export :mod:`windbreak.riskkernel.signing`: the signing key handle is reachable
-only via its fully qualified module path, preserving the SPEC S5.3 boundary.
+(:mod:`~windbreak.riskkernel.process`), the gate-plan-anchored promotion-evidence
+producer (:mod:`~windbreak.riskkernel.evidence`), the capital-reservation ledger
+and approval pipeline (:mod:`~windbreak.riskkernel.reservations`), and the
+approval-token issuer (:mod:`~windbreak.riskkernel.tokens`). It deliberately does
+**not** re-export :mod:`windbreak.riskkernel.signing`: the signing key handle is
+reachable only via its fully qualified module path, preserving the SPEC S5.3
+boundary.
 """
 
 from windbreak.riskkernel.checks import (
@@ -30,7 +32,9 @@ from windbreak.riskkernel.context import (
     EvaluationContext,
     ExchangeTradingStatus,
     FeeBounds,
+    JurisdictionStatus,
     MarketView,
+    ProductType,
     RiskLimits,
 )
 from windbreak.riskkernel.demotion import (
@@ -38,6 +42,11 @@ from windbreak.riskkernel.demotion import (
     DemotionAction,
     DemotionTrigger,
     resolve_demotion,
+)
+from windbreak.riskkernel.evidence import (
+    SECONDS_PER_DAY,
+    anchor_gate_evidence,
+    anchored_paper_window_days,
 )
 from windbreak.riskkernel.floor import worst_case_cost, worst_case_equity
 from windbreak.riskkernel.governance import (
@@ -118,6 +127,7 @@ __all__ = [
     "DEFAULT_HUMAN_ACK_TTL_SECONDS",
     "DEFAULT_TOKEN_TTL_SECONDS",
     "REARM_CONFIRMATION_PHRASE",
+    "SECONDS_PER_DAY",
     "SIGNIFICANCE_OVERRIDE_ACK_PHRASE",
     "TRIGGER_ACTIONS",
     "AccountState",
@@ -149,6 +159,7 @@ __all__ = [
     "HumanAckQueue",
     "IllegalModeTransitionError",
     "InMemoryKernelLedgerWriter",
+    "JurisdictionStatus",
     "KernelLedgerWriter",
     "KillFileWatcher",
     "KillIntegration",
@@ -167,6 +178,7 @@ __all__ = [
     "OverrideAcknowledgementError",
     "PendingFloorLower",
     "PendingHumanAck",
+    "ProductType",
     "PromotionDecision",
     "PromotionGate",
     "ReconciliationMismatchMonitor",
@@ -178,6 +190,8 @@ __all__ = [
     "RiskLimits",
     "TokenIssuer",
     "UnknownApprovalError",
+    "anchor_gate_evidence",
+    "anchored_paper_window_days",
     "build_promotion_gates",
     "constant_promotion_gates",
     "effective_mode_ceiling",

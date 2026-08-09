@@ -55,6 +55,52 @@ class ExchangeTradingStatus(enum.Enum):
     CLOSED = "closed"
 
 
+class JurisdictionStatus(enum.Enum):
+    """Whether a market is jurisdiction-eligible, as the kernel's check reads it.
+
+    Mirrors the connector's
+    :attr:`windbreak.connector.models.NormalizedMarket.jurisdiction_status`
+    ``Literal["eligible", "ineligible", "unknown"]`` domain, but deliberately
+    **not** imported from the connector, for the same SPEC S5 Process-B reason
+    :class:`ExchangeTradingStatus` documents.
+
+    Note the missing third member. The connector's ``"unknown"`` maps to ``None``
+    on :class:`MarketView` rather than to an enum member, so an unproven
+    jurisdiction has no value it could ever be compared equal to
+    :attr:`ELIGIBLE`. Absence can only fail closed (SPEC S1.1 invariant 1).
+
+    Attributes:
+        ELIGIBLE: The market is proven jurisdiction-eligible -- the sole
+            tradable status.
+        INELIGIBLE: The market is proven ineligible; never tradable.
+    """
+
+    ELIGIBLE = "eligible"
+    INELIGIBLE = "ineligible"
+
+
+class ProductType(enum.Enum):
+    """The product shape a market is, as the kernel's eligibility check reads it.
+
+    Mirrors the connector's
+    :attr:`windbreak.connector.models.NormalizedMarket.market_type`, which is a
+    single-valued ``Literal["fully_collateralized_binary"]``. This enum has one
+    member for the same reason: every other raw exchange product is refused
+    before normalization and can never reach a
+    :class:`~windbreak.connector.models.NormalizedMarket`, so a second member
+    would be a value no production path can produce.
+
+    An unrecognized or absent product maps to ``None`` on :class:`MarketView`,
+    never to a member, so it can only fail closed.
+
+    Attributes:
+        FULLY_COLLATERALIZED_BINARY: A fully collateralized binary contract --
+            the sole tradable product (SPEC S1.1 invariant 2).
+    """
+
+    FULLY_COLLATERALIZED_BINARY = "fully_collateralized_binary"
+
+
 @dataclass(frozen=True, slots=True)
 class FeeBounds:
     """Worst-case fee upper bounds for the order under evaluation.
@@ -144,6 +190,20 @@ class MarketView:
         exchange_status_epoch_s: Epoch second the exchange status was observed,
             or ``None``; ``exchange_status_ok`` fails closed when it is ``None``
             or older than ``exchange_status_ttl_seconds``. Issue #110.
+        jurisdiction_status: Whether the market is proven jurisdiction-eligible,
+            or ``None`` when the datum is unknown, absent, or unrecognized;
+            ``jurisdiction_product_eligibility`` fails closed on the ``None``
+            (SPEC S6.2). Issue #340.
+        product_type: The market's product shape, or ``None`` when it is absent
+            or not a recognized tradable product;
+            ``jurisdiction_product_eligibility`` fails closed on the ``None``
+            (SPEC S1.1 invariant 2). Issue #340.
+
+    Unlike ``exchange_status``, the two eligibility fields carry no companion
+    ``_epoch_s`` and no ttl. That asymmetry is deliberate, not an oversight: an
+    exchange's trading status is a live feed that goes stale, whereas a market's
+    jurisdiction and product shape are near-immutable attributes re-read from the
+    market object on every tick.
     """
 
     quote_snapshot_epoch_s: int | None
@@ -153,6 +213,8 @@ class MarketView:
     open_position: ContractCentis | None
     exchange_status: ExchangeTradingStatus | None
     exchange_status_epoch_s: int | None
+    jurisdiction_status: JurisdictionStatus | None
+    product_type: ProductType | None
 
 
 @dataclass(frozen=True, slots=True)

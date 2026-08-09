@@ -79,60 +79,163 @@ echo "=== Running Mutation Tests ==="
 echo "Minimum required score: ${MIN_SCORE}%"
 echo ""
 
-# Run mutation tests (allow failure, we'll check score)
-echo "Running mutmut (this may take several minutes)..."
+# Run mutation tests (allow failure, we check the score ourselves).
+echo "Running mutmut (this may take a long time)..."
 if mutmut run 2>&1; then
     echo "✓ Mutmut run completed"
 else
-    # mutmut returns non-zero if there are surviving mutants, which is expected
+    # mutmut exits non-zero when mutants survive, which is not a script error.
     echo "Info: Mutmut run completed (some mutants may have survived)"
 fi
 
 echo ""
 echo "=== Mutation Test Results ==="
 
-# Get results as JSON
-if ! mutmut junitxml > /dev/null 2>&1; then
-    echo "Warning: Could not generate JUnit XML (may be empty results)" >&2
+# mutmut 3.x (issue #324) removed the `junitxml` subcommand and changed the
+# human-readable `results` output, so the 2.x approach -- grep the prose for
+# "Killed: N" -- now silently matches nothing. 3.x ships `export-cicd-stats`
+# for exactly this purpose: it writes machine-readable counts to
+# mutants/mutmut-cicd-stats.json so a pipeline can gate on the score. Parsing
+# that JSON replaces the old prose scraping, which was brittle even in 2.x.
+STATS_FILE="mutants/mutmut-cicd-stats.json"
+rm -f "$STATS_FILE"
+
+if ! mutmut export-cicd-stats; then
+    echo "Error: 'mutmut export-cicd-stats' failed" >&2
+    exit 2
 fi
 
-# Parse mutmut results
-RESULTS=$(mutmut results)
-echo "$RESULTS"
+# Fail CLOSED when there are no stats at all. The previous implementation
+# exited 0 here ("Skipping mutation score validation"), which meant a
+# misconfigured mutmut that produced zero mutants silently PASSED the release
+# gate -- the exact failure mode a major-version config change provokes. A
+# release gate that cannot measure must not report success.
+if [ ! -f "$STATS_FILE" ]; then
+    echo "Error: mutmut produced no stats at $STATS_FILE" >&2
+    echo "This means no mutants were generated -- a mutmut configuration" >&2
+    echo "problem, not a passing test suite. Check [tool.mutmut] in" >&2
+    echo "pyproject.toml (source_paths must be a LIST of paths)." >&2
+    exit 2
+fi
+
+cat "$STATS_FILE"
 echo ""
 
-# Extract counts from results
-KILLED=$(echo "$RESULTS" | grep -o 'Killed: [0-9]*' | \
-    grep -o '[0-9]*$' || echo "0")
-SURVIVED=$(echo "$RESULTS" | grep -o 'Survived: [0-9]*' | \
-    grep -o '[0-9]*$' || echo "0")
-SUSPICIOUS=$(echo "$RESULTS" | grep -o 'Suspicious: [0-9]*' | \
-    grep -o '[0-9]*$' || echo "0")
-TIMEOUT=$(echo "$RESULTS" | grep -o 'Timeout: [0-9]*' | \
-    grep -o '[0-9]*$' || echo "0")
+# Reduce the stats to integers. `total` deliberately is NOT used as the
+# denominator: it counts every mutant including not-yet-checked ones (mutmut
+# prints progress as "total - not_checked / total"), and `not_checked` is not
+# exported -- so scoring against `total` would understate an interrupted run.
+# Instead the denominator is rebuilt from the explicit outcome categories, and
+# any shortfall against `total` is treated as an incomplete run.
+STATS_VARS=$(python3 - "$STATS_FILE" <<'PY'
+import json
+import sys
 
-# Calculate total and score
-TOTAL=$((KILLED + SURVIVED + SUSPICIOUS + TIMEOUT))
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
 
-if [ "$TOTAL" -eq 0 ]; then
-    echo "Warning: No mutants were generated" >&2
-    echo "This might indicate:"
-    echo "  - No code to mutate in windbreak/"
-    echo "  - Configuration issue with mutmut"
-    echo ""
-    echo "Skipping mutation score validation"
-    exit 0
+
+def count(key: str) -> int:
+    return int(data.get(key) or 0)
+
+
+killed = count("killed")
+survived = count("survived")
+no_tests = count("no_tests")
+skipped = count("skipped")
+suspicious = count("suspicious")
+timeout = count("timeout")
+segfault = count("segfault")
+total = count("total")
+interrupted = 1 if data.get("check_was_interrupted_by_user") else 0
+
+# Every category that represents a real mutant verdict. `skipped` is counted
+# here so the completeness check below balances against `total`, then removed
+# from the scored denominator -- a deliberately skipped mutant is neither a
+# success nor a failure of the test suite.
+accounted = killed + survived + no_tests + skipped + suspicious + timeout + segfault
+scored = accounted - skipped
+
+# One space-separated line, in the fixed order the `read` below expects.
+print(
+    " ".join(
+        str(value)
+        for value in (
+            killed,
+            survived,
+            no_tests,
+            skipped,
+            suspicious,
+            timeout,
+            segfault,
+            total,
+            accounted,
+            scored,
+            interrupted,
+        )
+    )
+)
+PY
+)
+
+# Assigned via `read` rather than `eval` of NAME=VALUE pairs. eval would execute
+# whatever the file expanded to, and it also hides the assignments from static
+# analysis, which then reports every downstream use as SC2153 "may not be
+# assigned". Naming the variables here keeps them statically visible and means
+# nothing from the JSON is ever executed.
+#
+# (This comment deliberately avoids opening a line with the linter's own name:
+# a comment starting with that word is parsed as a directive, SC1073.)
+if [ -z "$STATS_VARS" ]; then
+    echo "Error: could not parse $STATS_FILE" >&2
+    exit 2
 fi
 
-# Calculate mutation score (killed / total * 100)
-SCORE=$(awk "BEGIN {printf \"%.1f\", ($KILLED / $TOTAL) * 100}")
+read -r KILLED SURVIVED NO_TESTS SKIPPED SUSPICIOUS TIMEOUT SEGFAULT \
+    TOTAL ACCOUNTED SCORED INTERRUPTED <<EOF
+$STATS_VARS
+EOF
+
+if [ -z "$INTERRUPTED" ]; then
+    echo "Error: incomplete stats parsed from $STATS_FILE" >&2
+    exit 2
+fi
+
+if [ "$INTERRUPTED" -ne 0 ]; then
+    echo "Error: the mutation run was interrupted before it finished" >&2
+    echo "A partial run cannot be scored against the release gate." >&2
+    exit 2
+fi
+
+if [ "$ACCOUNTED" -lt "$TOTAL" ]; then
+    echo "Error: incomplete mutation run -- only $ACCOUNTED of $TOTAL" >&2
+    echo "mutants have a recorded verdict. Re-run 'mutmut run' to" >&2
+    echo "completion before scoring the release gate." >&2
+    exit 2
+fi
+
+if [ "$SCORED" -le 0 ]; then
+    echo "Error: no scorable mutants were generated" >&2
+    echo "  - Is there code to mutate under source_paths?" >&2
+    echo "  - Is [tool.mutmut] in pyproject.toml valid for mutmut 3.x?" >&2
+    exit 2
+fi
+
+# Mutation score (killed / scorable * 100). Compared with 2.x this denominator
+# additionally includes `no_tests` and `segfault`, both of which are mutants the
+# suite did NOT kill. Counting them can only lower the measured score, so the
+# gate becomes stricter, never weaker, across this migration.
+SCORE=$(awk "BEGIN {printf \"%.1f\", ($KILLED / $SCORED) * 100}")
 
 echo "=== Mutation Score ==="
 echo "Killed:      $KILLED"
 echo "Survived:    $SURVIVED"
+echo "No tests:    $NO_TESTS"
 echo "Suspicious:  $SUSPICIOUS"
 echo "Timeout:     $TIMEOUT"
-echo "Total:       $TOTAL"
+echo "Segfault:    $SEGFAULT"
+echo "Skipped:     $SKIPPED (excluded from the score)"
+echo "Scorable:    $SCORED"
 echo ""
 echo "Mutation Score: ${SCORE}%"
 echo "Required:       ${MIN_SCORE}%"
@@ -145,26 +248,28 @@ if awk "BEGIN {exit !($SCORE >= $MIN_SCORE)}"; then
 
     if [ "$SURVIVED" -gt 0 ]; then
         echo "Note: $SURVIVED mutants survived. To view them:"
-        echo "  mutmut show <id>"
-        echo "  mutmut html  # Generate HTML report"
+        echo "  mutmut results          # list mutants by outcome"
+        echo "  mutmut browse           # interactive browser"
+        echo "  mutmut show <mutant>    # one mutant's diff"
     fi
 
     exit 0
 else
     echo "✗ Mutation score below minimum threshold" >&2
     echo "" >&2
-    echo "Your test suite killed ${SCORE}% of mutants" >&2
+    echo "Your test suite killed ${SCORE}% of scorable mutants" >&2
     echo "Minimum required: ${MIN_SCORE}%" >&2
     echo "" >&2
     echo "To improve mutation score:" >&2
-    echo "  1. View surviving mutants: mutmut show <id>" >&2
-    echo "  2. Add tests to catch these mutations" >&2
-    echo "  3. Generate HTML report: mutmut html" >&2
+    echo "  1. List surviving mutants: mutmut results" >&2
+    echo "  2. Inspect one: mutmut show <mutant>" >&2
+    echo "  3. Add tests that kill it, then re-run" >&2
+    echo "  4. Browse interactively: mutmut browse" >&2
     echo "" >&2
 
     if [ "$SURVIVED" -gt 0 ]; then
         echo "Surviving mutants:" >&2
-        mutmut show 1 2>&1 | head -20 || true
+        mutmut results 2>&1 | head -20 || true
     fi
 
     exit 1

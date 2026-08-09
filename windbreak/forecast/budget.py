@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 from windbreak.numeric.rounding import RoundingDirection, divide
 
@@ -71,6 +71,104 @@ def _require_non_negative(value: int, field_name: str) -> None:
     if value < 0:
         msg = f"{field_name} must be non-negative, got {value}"
         raise ValueError(msg)
+
+
+def _require_positive_micros(value: int, field_name: str) -> None:
+    """Guard that a per-attempt price/ceiling field is strictly positive.
+
+    Mirrors :func:`_require_non_negative`'s style but rejects ``0`` as well as
+    negatives: a zero-priced entry on this fail-closed money path would let a
+    runaway provider spend for free, so every price must be at least one micro.
+
+    Args:
+        value: The candidate micros integer.
+        field_name: The owning field's name, surfaced in the error message.
+
+    Raises:
+        ValueError: If ``value`` is less than ``1``. The message names
+            ``field_name``.
+    """
+    if value < 1:
+        msg = f"{field_name} must be at least 1 micro, got {value}"
+        raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderPriceTable:
+    """A fail-closed, never-zero per-provider per-attempt price map (SPEC S16).
+
+    Maps each known provider to its list price for a single forecast attempt, in
+    micros, and falls back to :attr:`unknown_provider_price_micros` for any
+    provider absent from the map -- so an unrecognized provider is never
+    silently treated as free. Every price (mapped or fallback) is validated
+    strictly positive at construction, matching the fail-closed money-path
+    convention every budget dataclass in this module uses.
+
+    Attributes:
+        prices_micros: The per-provider list price for one attempt, in micros.
+        unknown_provider_price_micros: The fallback price charged for any
+            provider absent from ``prices_micros``, in micros.
+    """
+
+    prices_micros: Mapping[str, int]
+    unknown_provider_price_micros: int
+
+    def __post_init__(self) -> None:
+        """Validate the fallback ceiling and every mapped price are positive.
+
+        Raises:
+            ValueError: If the fallback ceiling or any mapped price is below
+                ``1`` micro.
+        """
+        _require_positive_micros(
+            self.unknown_provider_price_micros, "unknown_provider_price_micros"
+        )
+        for provider, price in self.prices_micros.items():
+            _require_positive_micros(price, f"prices_micros[{provider!r}]")
+
+    def price_micros(self, provider: str) -> int:
+        """Return the per-attempt price for ``provider``, in micros.
+
+        Args:
+            provider: The provider identifier to price.
+
+        Returns:
+            The mapped per-attempt price, or
+            :attr:`unknown_provider_price_micros` when ``provider`` is absent.
+        """
+        return self.prices_micros.get(provider, self.unknown_provider_price_micros)
+
+
+#: The fallback per-attempt price charged for any provider absent from a price
+#: table, in micros. A deliberately conservative ceiling: an unknown provider is
+#: priced high, never free, so an unpriced provider cannot evade its budget.
+DEFAULT_UNKNOWN_PROVIDER_PRICE_MICROS: Final = 1_000_000
+
+#: Per-attempt list price for the OpenAI provider, in micros.
+_OPENAI_PROVIDER_PRICE_MICROS: Final = 200_000
+
+#: Per-attempt list price for the Anthropic provider, in micros.
+_ANTHROPIC_PROVIDER_PRICE_MICROS: Final = 300_000
+
+#: Per-attempt list price for the FutureSearch provider, in micros.
+_FUTURESEARCH_PROVIDER_PRICE_MICROS: Final = 500_000
+
+#: The pinned default per-attempt price table covering the three real hosted
+#: providers. The network-free fixture provider is deliberately absent: its true
+#: cost is ``0`` and rides on ``ProviderForecast.cost_micros`` directly rather
+#: than through this fail-closed (never-zero) list-price table.
+#:
+#: NOTE: sourcing these list prices from ``windbreak.config`` is a follow-up; it
+#: is deliberately NOT wired to ``config.schema`` here (SPEC S8.3 keeps the
+#: forecast engine free of any config import).
+DEFAULT_PROVIDER_PRICE_TABLE: Final[ProviderPriceTable] = ProviderPriceTable(
+    prices_micros={
+        "openai": _OPENAI_PROVIDER_PRICE_MICROS,
+        "anthropic": _ANTHROPIC_PROVIDER_PRICE_MICROS,
+        "futuresearch": _FUTURESEARCH_PROVIDER_PRICE_MICROS,
+    },
+    unknown_provider_price_micros=DEFAULT_UNKNOWN_PROVIDER_PRICE_MICROS,
+)
 
 
 def _utc_day_key(at: datetime) -> str:

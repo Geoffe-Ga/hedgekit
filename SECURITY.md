@@ -84,9 +84,10 @@ lowercased hostname before the dial is permitted; anything else raises
 one `EgressDenied` event (telemetry never gates the refusal; the raise always
 happens first). `allowlist_from_config` derives the permitted host set from
 `config.exchange.provider`, `config.exchange.environment`, and each
-recognized provider in `config.forecast.ensemble` and
-`config.forecast.triage_model`; an unrecognized provider contributes no host,
-so an unknown exchange or model can never silently inherit network access.
+recognized provider in `config.forecast.ensemble`,
+`config.forecast.triage_model`, and `config.forecast.vote_ensemble`; an
+unrecognized provider contributes no host, so an unknown exchange or model
+can never silently inherit network access.
 
 ## Supply chain
 

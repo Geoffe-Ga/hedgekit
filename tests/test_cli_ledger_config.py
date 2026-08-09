@@ -83,7 +83,15 @@ def test_run_with_config_and_ledger_path_ledgers_one_config_loaded_at_seq_1(
 def test_run_with_config_and_process_riskkernel_ledgers_that_component(
     tmp_path: Path,
 ) -> None:
-    """`--process riskkernel` stamps the ledgered ConfigLoaded's component."""
+    """`--process riskkernel` stamps the ledgered ConfigLoaded's component.
+
+    Since issue #235 the live kernel persists its own events (heartbeats,
+    verdicts) to the same ledger through a real ``KernelLedgerWriter``, so the
+    ConfigLoaded row is no longer the ledger's only record. It stays the first
+    row -- config is ledgered before the kernel loop is entered -- and is the
+    row whose ``component`` this test pins; the trailing kernel rows are the
+    #235 persistence behavior, not a regression.
+    """
     ledger_path = tmp_path / "ledger.db"
 
     exit_code = main(
@@ -106,8 +114,10 @@ def test_run_with_config_and_process_riskkernel_ledgers_that_component(
     store = SqliteLedgerStore(ledger_path)
     records = store.read_all()
     store.close()
-    assert len(records) == 1
+    assert records[0].event_type == "ConfigLoaded"
     assert records[0].component == "riskkernel"
+    # #235: the kernel now persists a ModeHeartbeat to the same hash chain.
+    assert any(record.event_type == "ModeHeartbeat" for record in records[1:])
 
 
 def test_run_without_config_ledgers_default_config_with_empty_diff(

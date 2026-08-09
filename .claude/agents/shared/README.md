@@ -23,13 +23,13 @@ graph under a conductor is identical:
 ralph-tick (fleet ORCHESTRATOR — worker pool: reconcile · serialized-merge · lazy-sync · refill)
   └─ ralph-worker × up to 4 . L1  opus    per-issue CONDUCTOR in an isolated worktree
        ├─ ralph-chief-architect ..... L0  fable   plan + ordered dispatch list (no code)
-       ├─ ralph-test-specialist ..... L2  sonnet  Gate 1 RED: failing tests          ─┐
+       ├─ ralph-test-specialist ..... L2  opus    Gate 1 RED: failing tests          ─┐
        ├─ implementation-spec.  L2  opus    Gate 1 GREEN + Refactor             │ run per
        ├─ ralph-security-specialist . L2  opus    harden auth/JWT/CORS/input/DB       │ the
-       ├─ performance-spec. ... L2  sonnet  profile/optimize hot paths          │ architect's
-       ├─ documentation-spec. . L2  sonnet  docstrings/READMEs/ADRs             │ dispatch
+       ├─ performance-spec. ... L2  opus    profile/optimize hot paths          │ architect's
+       ├─ documentation-spec. . L2  opus    docstrings/READMEs/ADRs             │ dispatch
        ├─ dependency-review ... L2  haiku   deps/pins/licenses (read-only)      │ list
-       └─ code-review-orch. ... L1  opus    Gate 2.5 pre-push self-review      ─┘
+       └─ code-review-orch. ... L1  sonnet  Gate 2.5 pre-push self-review      ─┘
 ```
 
 **The tree above is the spawn graph: each conductor (`ralph-worker`, or
@@ -60,27 +60,62 @@ specialists are leaf workers that do their own work and do not sub-delegate.
 > at the start of its run so the gates, thresholds, and anti-bypass block
 > actually bind — the link alone does not carry them into context.
 
-## Model tiers (strategic mix)
+## Model tiers (role-based policy)
 
-**Fable** for the single hardest-reasoning, long-horizon role: `ralph-chief-architect`.
-Planning is the highest-leverage decision in a tick — one wrong design compounds
-across every specialist that executes it — so the architect runs on Anthropic's
-most capable model. Fable is ~2× Opus-tier cost and can run minutes-long turns,
-which is acceptable for a once-per-issue planning pass but **not** for scoped
-worker roles. Two Fable caveats shape the fleet: its safety classifiers target
-**cyber/bio** content (so the code-writing `ralph-security-specialist` stays on **Opus**,
-never Fable — legitimate hardening work can trip a false-positive refusal), and it
-prefers **less-prescriptive prompts** (state the goal and constraints; the
-architect's Output Contract is a format spec, not step-by-step scaffolding).
+Model assignment follows **role, not history** (owner directive, 2026-07-24):
 
-**Opus** where judgment drives quality:
-`ralph-implementation-specialist` (production code is the core quality lever),
-`ralph-security-specialist` (threat modeling — and deliberately kept off Fable per the
-caveat above), `ralph-code-review-orchestrator` (synthesis).
-**Sonnet** for well-scoped roles guided by an explicit plan: `ralph-test-specialist`,
-`ralph-performance-specialist`, `ralph-documentation-specialist`. **Haiku** for the
-purely mechanical, read-only checklist walk: `ralph-dependency-review-specialist`
-(pins/lockfile/license checks need no deep reasoning — spend the cheaper tier).
+| Role | Model | Agents |
+| --- | --- | --- |
+| Planning / architecture | **fable** | `ralph-chief-architect` |
+| Implementation (writes code) | **opus** | `ralph-worker`, `ralph-implementation-specialist`, `ralph-test-specialist`, `ralph-performance-specialist`, `ralph-documentation-specialist` |
+| Security hardening | **opus** | `ralph-security-specialist` |
+| Review (review-only) | **sonnet** | `ralph-code-review-orchestrator` |
+| Quick mechanical checks | **haiku** | `ralph-dependency-review-specialist` |
+
+The aliases are what the frontmatter carries, and they resolve to the current
+frontier of each line: `fable` → Claude Fable 5, `opus` → Claude Opus 5.
+
+**Fable** for exactly one seat: `ralph-chief-architect`. Planning is the
+highest-leverage decision in a tick — one wrong design compounds across every
+specialist that executes it — so the architect gets the strongest
+judgment-driven model. Fable also prefers **less-prescriptive prompts** (state the
+goal and constraints, not step-by-step scaffolding), which is how that agent's
+definition is written.
+
+**Opus** for every agent that writes code — `ralph-worker` (it applies fixes
+directly, not just conducts), `ralph-implementation-specialist`,
+`ralph-test-specialist`, `ralph-performance-specialist`,
+`ralph-documentation-specialist` — and for `ralph-security-specialist`. Security
+would be the one seat to keep off Fable regardless: Fable's safety classifiers
+target **cyber/bio** content, so legitimate hardening work can trip a
+false-positive refusal. Dual-role specialists — the Gate-1 code writers that also
+serve as Gate-2.5 dimension reviewers — keep a single definition and run their
+assigned model in both roles; there are no reviewer-variant files.
+
+### Fable fallback (out of credits)
+
+Fable capacity is metered separately from Opus, and Claude Code has no per-agent
+fallback *chain* — a subagent's model resolves from `CLAUDE_CODE_SUBAGENT_MODEL`,
+then the per-invocation `model` parameter, then this frontmatter. So when Fable
+credits run out and an architect dispatch fails to launch, the tick **degrades to
+Opus rather than stalling**, by changing one of those inputs:
+
+1. **In-session (preferred).** The conductor re-dispatches immediately with a
+   per-invocation override — `Agent(subagent_type: ralph-chief-architect,
+   model: "opus")`. It outranks the frontmatter, so no file changes.
+2. **For the rest of the run.** Flip the pin once so later ticks skip the failing
+   Fable attempt: `./scripts/ralph/architect-model.sh opus`
+   (`... fable` restores it; no argument prints the current pin).
+
+Falling back is a **capacity** decision, never a weakened gate — an Opus architect
+plans to the same standard, and every rule in
+[`shared/house-rules.md`](house-rules.md) applies unchanged.
+
+**Sonnet** for the review-only synthesis role: `ralph-code-review-orchestrator`.
+
+**Haiku** for the purely mechanical, read-only checklist walk:
+`ralph-dependency-review-specialist` (pins/lockfile/license checks need no deep
+reasoning — spend the cheaper tier).
 
 ## Gate → agent invocation matrix
 

@@ -39,7 +39,9 @@ that supplies `None` for both in production.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -51,16 +53,22 @@ from tests.scheduler.conftest import (
 from windbreak.numeric.types import MoneyMicros
 from windbreak.riskkernel.modes import Mode
 
-#: The four veto reasons a PAPER-mode evaluation with `verification=None` must
-#: produce today, in the exact SPEC S10.3 check order
-#: (`windbreak/riskkernel/checks.py::_SPEC_10_3_CHECK_NAMES`): the
-#: `jurisdiction_product_eligibility` stub (position 2) fires before the three
-#: reconciliation checks (positions 5-7, each failing closed on the missing
-#: verification snapshot). `exchange_status_ok` / `pipeline_heartbeat_ok`
-#: (positions 21-22, issue #110) are real checks now and pass here, since
-#: `tests.riskkernel.conftest.make_context`'s defaults are permissive for both.
+if TYPE_CHECKING:
+    from pathlib import Path
+
+#: The three veto reasons a PAPER-mode evaluation with `verification=None` must
+#: produce, in the exact SPEC S10.3 check order
+#: (`windbreak/riskkernel/checks.py::_SPEC_10_3_CHECK_NAMES`): the three
+#: reconciliation checks (positions 5-7), each failing closed on the missing
+#: verification snapshot. Issue #340 removed a fourth reason -- the
+#: `jurisdiction_product_eligibility` stub at position 2 -- by making that check
+#: real; it passes here because `tests.riskkernel.conftest.make_context`'s
+#: defaults supply an eligible jurisdiction and a tradable product.
+#:
+#: This tuple is compared with exact equality on purpose. Never soften it to a
+#: membership check: it is the repo's designated proof of which reasons gate a
+#: PAPER fill, and a membership assertion would silently tolerate a new veto.
 _EXPECTED_VETO_REASONS = (
-    "awaiting NormalizedMarket metadata",
     "balance verification stale or missing",
     "position verification stale or missing",
     "open-order verification stale or missing",
@@ -75,9 +83,9 @@ def test_kernel_approval_vetoes_before_minting_any_token() -> None:
 
     Composes the real `RiskKernel.evaluate_intent` (for the ledgered audit
     event) with the real `ApprovalPipeline.approve` (for the reserve-and-issue
-    path), over an otherwise fully-permissive context (every one of the 23
+    path), over an otherwise fully-permissive context (every one of the 24
     real SPEC S10.3 checks passes -- `tests.riskkernel.conftest.make_context`'s
-    documented guarantee) except `verification=None`. Exactly the four known
+    documented guarantee) except `verification=None`. Exactly the three known
     reasons veto; the pipeline's `approve` is never reached far enough to
     reserve capital or issue a token.
     """
@@ -205,6 +213,10 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         now_epoch_s=DEFAULT_NOW_EPOCH_S,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.limits.floor == MoneyMicros(42_000_000)
@@ -226,6 +238,10 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         now_epoch_s=DEFAULT_NOW_EPOCH_S,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.limits.quote_ttl_seconds == 17
@@ -248,6 +264,10 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         now_epoch_s=DEFAULT_NOW_EPOCH_S,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.verification is None
@@ -256,13 +276,15 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
 def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat() -> (
     None
 ):
-    """`build_evaluation_context` wires `market.exchange_status`,
-    `market.exchange_status_epoch_s`, and `pipeline_heartbeat_epoch_s` all
-    `None` (issue #110): the PAPER loop honestly has no live exchange-status
-    feed or pipeline-heartbeat source yet, so it must fail closed through
-    `exchange_status_ok` / `pipeline_heartbeat_ok` rather than fabricate a
-    permissive reading -- mirroring `verification=None`'s own fail-closed
-    contract above.
+    """Absent status/heartbeat evidence lands as `None` and fails closed.
+
+    Issue #342 made these three values caller-supplied rather than hardcoded
+    `None`, so the loop can pass real evidence. This test keeps the original
+    fail-closed intent: when the caller genuinely has nothing to supply, the
+    values must land on the context as `None` and be vetoed by
+    `exchange_status_ok` / `pipeline_heartbeat_ok` -- never quietly defaulted
+    to something permissive. It is the negative half of the pair; the positive
+    half lives in the checks-pass tests below.
     """
     from windbreak.config.schema import WindbreakConfig
     from windbreak.scheduler.loop import build_evaluation_context
@@ -272,6 +294,10 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         now_epoch_s=DEFAULT_NOW_EPOCH_S,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.market.exchange_status is None
@@ -289,6 +315,10 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         now_epoch_s=1_234_567,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.now_epoch_s == 1_234_567
@@ -411,3 +441,234 @@ def test_market_snapshot_event_to_record_handles_an_empty_book_side() -> None:
     assert isinstance(event, MarketSnapshotRecorded)
     assert event.best_bid_pips is None
     assert event.best_ask_pips is None
+
+
+# --- Issue #339: the budget-event -> ledger-event translation table ----------
+
+
+def test_sqlite_budget_ledger_writer_maps_a_day_exhausted_event(
+    tmp_path: Path,
+) -> None:
+    """A per-day exhaustion becomes a `per_day` halt row with an empty ticker.
+
+    Exact values are asserted rather than mere presence: the per-day payload's
+    spend field is named `spent_micros`, and a mutant that read `budget_micros`
+    into `spent_micros` (or vice versa) would survive any "a row exists" check.
+    """
+    from windbreak.forecast.budget import BUDGET_DAY_EXHAUSTED_EVENT, BudgetEvent
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.scheduler.loop import _SqliteBudgetLedgerWriter
+
+    store = SqliteLedgerStore(tmp_path / "day.db")
+    writer = _SqliteBudgetLedgerWriter(store)
+
+    writer.record(
+        BudgetEvent(
+            BUDGET_DAY_EXHAUSTED_EVENT,
+            {
+                "utc_day": "2024-12-24",
+                "spent_micros": 6_000_000,
+                "budget_micros": 6_000_000,
+            },
+            "2024-12-24T00:00:00.000000Z",
+        )
+    )
+
+    records = store.read_all()
+    assert [record.event_type for record in records] == ["ResearchBudgetHalted"]
+    assert json.loads(records[0].payload_json)["data"] == {
+        "market_ticker": "",
+        "halt_kind": "per_day",
+        "utc_day": "2024-12-24",
+        "spent_micros": 6_000_000,
+        "budget_micros": 6_000_000,
+    }
+
+
+def test_sqlite_budget_ledger_writer_maps_a_forecast_exceeded_event(
+    tmp_path: Path,
+) -> None:
+    """A per-forecast breach becomes a `per_forecast` halt row carrying the ticker.
+
+    Pins the field-name asymmetry between the two kinds: the per-forecast
+    payload names the spend `cost_micros`, not `spent_micros`.
+    """
+    from windbreak.forecast.budget import BUDGET_FORECAST_EXCEEDED_EVENT, BudgetEvent
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.scheduler.loop import _SqliteBudgetLedgerWriter
+
+    store = SqliteLedgerStore(tmp_path / "forecast.db")
+    writer = _SqliteBudgetLedgerWriter(store)
+
+    writer.record(
+        BudgetEvent(
+            BUDGET_FORECAST_EXCEEDED_EVENT,
+            {
+                "cost_micros": 3_000_000,
+                "budget_micros": 2_999_999,
+                "market_ticker": "MKT-DEEP",
+                "utc_day": "2024-12-24",
+            },
+            "2024-12-24T00:00:00.000000Z",
+        )
+    )
+
+    records = store.read_all()
+    assert json.loads(records[0].payload_json)["data"] == {
+        "market_ticker": "MKT-DEEP",
+        "halt_kind": "per_forecast",
+        "utc_day": "2024-12-24",
+        "spent_micros": 3_000_000,
+        "budget_micros": 2_999_999,
+    }
+
+
+def test_sqlite_budget_ledger_writer_rejects_an_unhandled_budget_event_type(
+    tmp_path: Path,
+) -> None:
+    """An unrecognized budget event raises rather than dropping an audit row.
+
+    `COST_REPORT` is a real budget event kind this writer deliberately does not
+    translate. Failing loudly is the fail-closed choice: a silently swallowed
+    event would be an audit row that simply never appears.
+    """
+    from windbreak.forecast.budget import COST_REPORT_EVENT, BudgetEvent
+    from windbreak.ledger.store import SqliteLedgerStore
+    from windbreak.scheduler.loop import _SqliteBudgetLedgerWriter
+
+    store = SqliteLedgerStore(tmp_path / "unhandled.db")
+    writer = _SqliteBudgetLedgerWriter(store)
+
+    with pytest.raises(ValueError, match="COST_REPORT"):
+        writer.record(BudgetEvent(COST_REPORT_EVENT, {}, "2024-12-24T00:00:00.000000Z"))
+
+    assert store.read_all() == []
+
+
+# --- Issue #342: real status and heartbeat evidence -------------------------
+
+
+def _check_named(name: str):
+    """Return the real SPEC S10.3 check registered under `name`.
+
+    Args:
+        name: The pinned check name.
+
+    Returns:
+        The check callable from the production `DEFAULT_CHECKS` sequence.
+    """
+    from windbreak.riskkernel.checks import DEFAULT_CHECKS
+
+    return next(check for check in DEFAULT_CHECKS if check.name == name)
+
+
+def _context_with(*, status, status_epoch_s: int | None, heartbeat_epoch_s: int | None):
+    """Build a PAPER context carrying the given liveness evidence.
+
+    Args:
+        status: The projected `ExchangeTradingStatus`, or `None`.
+        status_epoch_s: Epoch second the status was observed, or `None`.
+        heartbeat_epoch_s: Epoch second the pipeline was seen alive, or `None`.
+
+    Returns:
+        The composed `EvaluationContext`.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.scheduler.loop import build_evaluation_context
+
+    return build_evaluation_context(
+        WindbreakConfig(),
+        now_epoch_s=DEFAULT_NOW_EPOCH_S,
+        verification=None,
+        instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=status,
+        exchange_status_epoch_s=status_epoch_s,
+        pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
+    )
+
+
+def test_real_status_and_heartbeat_evidence_clears_both_liveness_checks() -> None:
+    """Healthy, fresh evidence makes both liveness checks approve.
+
+    This is the positive half of issue #342: before it, no value a caller could
+    supply would let these two checks pass, because the loop hardcoded `None`.
+    """
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+
+    context = _context_with(
+        status=ExchangeTradingStatus.OPEN,
+        status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+    )
+    intent = make_intent()
+
+    assert _check_named("exchange_status_ok")(intent, context).vetoed is False
+    assert _check_named("pipeline_heartbeat_ok")(intent, context).vetoed is False
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected_vetoed"),
+    [(60, False), (61, True)],
+    ids=["fresh", "stale"],
+)
+def test_pipeline_heartbeat_vetoes_exactly_past_its_ttl(
+    age_seconds: int, expected_vetoed: bool
+) -> None:
+    """The heartbeat is fresh at exactly its ttl and stale one second later.
+
+    Pinned against the production ttl (60s), not a permissive test fixture. The
+    `fresh` case is the one that carries real signal: the `stale` case would
+    pass vacuously before issue #342, since `None` also vetoed.
+
+    Args:
+        age_seconds: How old the heartbeat is at evaluation time.
+        expected_vetoed: Whether `pipeline_heartbeat_ok` must veto.
+    """
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+
+    context = _context_with(
+        status=ExchangeTradingStatus.OPEN,
+        status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S - age_seconds,
+    )
+
+    result = _check_named("pipeline_heartbeat_ok")(make_intent(), context)
+
+    assert result.vetoed is expected_vetoed
+
+
+@pytest.mark.parametrize("status_name", ["PAUSED", "CLOSED"], ids=["paused", "closed"])
+def test_a_non_open_exchange_status_vetoes_for_not_open(status_name: str) -> None:
+    """A genuinely observed non-open status vetoes, distinguishably from absence.
+
+    The reason must be `not open for trading`, not `stale or missing`: an
+    operator has to be able to tell "the exchange is shut" from "we have no
+    idea". That distinction is why the projection keeps PAUSED and CLOSED as
+    real members instead of collapsing them to `None`.
+
+    Args:
+        status_name: The non-tradable `ExchangeTradingStatus` member name.
+    """
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+
+    context = _context_with(
+        status=getattr(ExchangeTradingStatus, status_name),
+        status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+    )
+
+    result = _check_named("exchange_status_ok")(make_intent(), context)
+
+    assert result.vetoed is True
+    assert result.reason == "exchange not open for trading"
+
+
+def test_absent_status_vetoes_as_stale_or_missing_not_as_closed() -> None:
+    """Absent evidence vetoes with the missing-evidence reason, not a verdict."""
+    context = _context_with(status=None, status_epoch_s=None, heartbeat_epoch_s=None)
+
+    result = _check_named("exchange_status_ok")(make_intent(), context)
+
+    assert result.vetoed is True
+    assert result.reason == "exchange status stale or missing"

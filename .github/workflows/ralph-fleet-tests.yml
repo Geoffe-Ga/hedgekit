@@ -31,6 +31,11 @@ name: Ralph Fleet Tests
 # verdict regex with pr-ready.sh via verdict-regex.sh — the single source of
 # truth whose drift is the class of silent-stall bug #135 fixes — so
 # code-review.yml is a path trigger here too.
+#
+# test_architect_model.sh covers architect-model.sh — the Fable→Opus capacity
+# switch for the ralph-chief-architect's `model:` pin — and ends with a static
+# check that the CHECKED-IN pin is still one of the two sanctioned models, so
+# .claude/agents/ralph-chief-architect.md is a path trigger as well.
 
 on:
   push:
@@ -45,6 +50,7 @@ on:
       - ".github/workflows/deslop.yml"
       - ".github/workflows/code-review.yml"
       - ".github/deslop-areas.json"
+      - ".claude/agents/ralph-chief-architect.md"
   pull_request:
     paths:
       - "scripts/ralph/**"
@@ -57,6 +63,7 @@ on:
       - ".github/workflows/deslop.yml"
       - ".github/workflows/code-review.yml"
       - ".github/deslop-areas.json"
+      - ".claude/agents/ralph-chief-architect.md"
 
 permissions:
   contents: read
@@ -80,3 +87,4 @@ jobs:
           bash scripts/ralph/test_scan_workflows.sh
           bash scripts/ralph/test_deslop_workflow.sh
           bash scripts/ralph/test_assert_review_posted.sh
+          bash scripts/ralph/test_architect_model.sh

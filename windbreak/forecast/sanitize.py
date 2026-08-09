@@ -97,6 +97,15 @@ RESPONSE_FAILURE_INVALID_RATIONALE: Final = "invalid_rationale"
 #: closed schema set, mirroring ``config.loader``'s unknown-key-is-fatal rule.
 RESPONSE_FAILURE_UNKNOWN_VOTE_KEY: Final = "unknown_vote_key"
 
+#: Response-failure code: the forecaster reported a version outside the
+#: operator-pinned set under the strict drift policy -- discarded per-vote
+#: (never crashes the whole run), mirroring every other rejection path.
+RESPONSE_FAILURE_VERSION_DRIFT: Final = "forecaster_version_drift"
+
+#: Response-failure code: the transport returned a non-2xx status; the response
+#: is rejected fast rather than relied upon to fail body-schema validation.
+RESPONSE_FAILURE_HTTP_STATUS: Final = "http_status_error"
+
 #: Maximum characters a ``rationale_summary`` may carry (SPEC S6.3 length cap).
 #: A model rationale is a short justification, never a document, so a generous
 #: bound still rejects a response trying to smuggle a large payload past the
@@ -561,16 +570,43 @@ def _schema_failure(response: str) -> str | None:
     )
 
 
+def screen_untrusted_text(text: str) -> str | None:
+    """Screen an arbitrary piece of untrusted text for injection artifacts.
+
+    The standalone SPEC S8.5 injection screen, exposing the module's existing
+    delimiter-forgery and tool-call-lure checks (in that fixed order) over *any*
+    untrusted text -- a whole response body, a single parsed rationale, one
+    citation quote -- so a caller need not duplicate the delimiter/tool-lure
+    logic. Unlike :func:`validate_vote_response`, emptiness is never flagged
+    here: a blank field is a field-specific validity concern a caller checks
+    separately, not an injection artifact.
+
+    Args:
+        text: The untrusted text to screen.
+
+    Returns:
+        :data:`RESPONSE_FAILURE_DELIMITER_FORGERY` if ``text`` forges an
+        untrusted-data delimiter, else :data:`RESPONSE_FAILURE_TOOL_CALL_LURE`
+        if it embeds any tool-call marker, else ``None``.
+    """
+    if _contains_delimiter(text):
+        return RESPONSE_FAILURE_DELIMITER_FORGERY
+    if any(marker in text for marker in TOOL_CALL_MARKERS):
+        return RESPONSE_FAILURE_TOOL_CALL_LURE
+    return None
+
+
 def validate_vote_response(response: str) -> str | None:
     """Screen a vote response for injection artifacts, then schema (S8.5/S6.3).
 
     Checks run in a fixed first-failure order. The pre-existing SPEC S8.5
-    injection screen runs *first* -- empty/whitespace-only, then a forged
-    delimiter token, then a tool-call lure -- so a response that is otherwise
-    schema-valid JSON but carries an injection artifact is still flagged by the
-    injection code, never masked by the schema layer. Only a response that
-    clears the injection screen is then schema-validated (SPEC S6.3) as a
-    structured vote object. The first failure wins.
+    injection screen runs *first* -- empty/whitespace-only, then (via
+    :func:`screen_untrusted_text`) a forged delimiter token, then a tool-call
+    lure -- so a response that is otherwise schema-valid JSON but carries an
+    injection artifact is still flagged by the injection code, never masked by
+    the schema layer. Only a response that clears the injection screen is then
+    schema-validated (SPEC S6.3) as a structured vote object. The first failure
+    wins.
 
     Args:
         response: The raw vote-completion text.
@@ -581,10 +617,9 @@ def validate_vote_response(response: str) -> str | None:
     """
     if not response.strip():
         return RESPONSE_FAILURE_EMPTY
-    if _contains_delimiter(response):
-        return RESPONSE_FAILURE_DELIMITER_FORGERY
-    if any(marker in response for marker in TOOL_CALL_MARKERS):
-        return RESPONSE_FAILURE_TOOL_CALL_LURE
+    injection_failure = screen_untrusted_text(response)
+    if injection_failure is not None:
+        return injection_failure
     return _schema_failure(response)
 
 

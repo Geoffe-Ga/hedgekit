@@ -96,11 +96,16 @@ _TRIAGE_RATIONALE_MD = (
 )
 
 
-class _TriageModel(NamedTuple):
-    """The pinned Stage-0 triage model's provenance strings.
+class TriageModel(NamedTuple):
+    """The Stage-0 triage model's provenance strings.
 
     Mirrors :class:`windbreak.forecast.providers.EnsembleMember`: pinning the
     provider/version keeps the single Stage-0 request byte-stable across runs.
+    A plain structural NamedTuple, it is the injection point an operator-facing
+    config->forecast wiring layer builds from a
+    :class:`windbreak.config.schema.ModelRef`-shaped ``(provider, model)`` pair
+    -- so ``windbreak.forecast.triage`` never needs to import
+    ``windbreak.config`` (the SPEC S8.3 sandbox boundary).
 
     Attributes:
         provider: The LLM provider identifier.
@@ -111,8 +116,9 @@ class _TriageModel(NamedTuple):
     model_version: str
 
 
-#: The single pinned model that produces the Stage-0 prior.
-_TRIAGE_MODEL = _TriageModel("openai", "gpt-5-triage-mini")
+#: The single pinned model that produces the Stage-0 prior by default; omitting
+#: the ``model=``/``triage_model=`` keyword is byte-identical to passing this.
+_DEFAULT_TRIAGE_MODEL = TriageModel("openai", "gpt-5-triage-mini")
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,18 +257,22 @@ def run_stage0_prior(
     baseline: BaselineQuoteSnapshot,
     *,
     transport: LlmTransport,
+    model: TriageModel = _DEFAULT_TRIAGE_MODEL,
 ) -> TriagePrior:
     """Run the cheap Stage-0 prior with a single model call (SPEC S8.4).
 
-    Issues exactly one deterministic :class:`LlmRequest` on the pinned triage
-    model, parses the response into a validated ppm prior (fail-closed on a
-    non-integer or out-of-range value), and pairs it with the fixed Stage-0
-    cost.
+    Issues exactly one deterministic :class:`LlmRequest` on ``model``, parses
+    the response into a validated ppm prior (fail-closed on a non-integer or
+    out-of-range value), and pairs it with the fixed Stage-0 cost. Omitting
+    ``model`` uses the pinned :data:`_DEFAULT_TRIAGE_MODEL`, byte-identical to
+    the request built before ``model`` existed as a keyword.
 
     Args:
         market: The market under triage.
         baseline: The baseline quote snapshot.
         transport: The LLM transport for the single Stage-0 call (keyword-only).
+        model: The triage model whose provider/version drive the sent request;
+            defaults to the pinned :data:`_DEFAULT_TRIAGE_MODEL`.
 
     Returns:
         The Stage-0 prior and its cost.
@@ -272,8 +282,8 @@ def run_stage0_prior(
             ``[0, 1_000_000]``.
     """
     request = LlmRequest(
-        provider=_TRIAGE_MODEL.provider,
-        model_version=_TRIAGE_MODEL.model_version,
+        provider=model.provider,
+        model_version=model.model_version,
         prompt=_stage0_prompt(market, baseline),
     )
     response = transport.complete(request)
@@ -323,6 +333,8 @@ class _TriageContext:
         triage_threshold_ppm: The divergence threshold used for the decision.
         operator_flagged: Whether an operator forced a full run.
         refresh_triggered: Whether a refresh forced a full run.
+        triage_model: The Stage-0 triage model, stamped into the ledger payload
+            for model provenance.
     """
 
     market_ticker: str
@@ -331,6 +343,7 @@ class _TriageContext:
     triage_threshold_ppm: int
     operator_flagged: bool
     refresh_triggered: bool
+    triage_model: TriageModel
 
 
 def _base_payload(context: _TriageContext) -> dict[str, object]:
@@ -350,6 +363,8 @@ def _base_payload(context: _TriageContext) -> dict[str, object]:
         "operator_flagged": context.operator_flagged,
         "refresh_triggered": context.refresh_triggered,
         "triage_cost_micros": context.prior.cost_micros,
+        "triage_provider": context.triage_model.provider,
+        "triage_model_version": context.triage_model.model_version,
     }
 
 
@@ -521,6 +536,7 @@ def run_triaged_pipeline(
     triage_threshold_ppm: int = TRIAGE_THRESHOLD_PPM,
     operator_flagged: bool = False,
     refresh_triggered: bool = False,
+    triage_model: TriageModel = _DEFAULT_TRIAGE_MODEL,
 ) -> ForecastRecord:
     """Run the two-stage triaged pipeline into a forecast record (SPEC S8.4).
 
@@ -551,11 +567,16 @@ def run_triaged_pipeline(
         triage_threshold_ppm: The divergence threshold forcing the full run.
         operator_flagged: Whether an operator forces a full run.
         refresh_triggered: Whether a refresh forces a full run.
+        triage_model: The Stage-0 triage model, threaded into
+            :func:`run_stage0_prior` and stamped into the ledger payload;
+            defaults to the pinned :data:`_DEFAULT_TRIAGE_MODEL`.
 
     Returns:
         The produced, immutable forecast record.
     """
-    prior = run_stage0_prior(market, baseline, transport=triage_transport)
+    prior = run_stage0_prior(
+        market, baseline, transport=triage_transport, model=triage_model
+    )
     baseline_ppm = outside_view_base_rate(baseline)
     context = _TriageContext(
         market_ticker=market.ticker,
@@ -564,6 +585,7 @@ def run_triaged_pipeline(
         triage_threshold_ppm=triage_threshold_ppm,
         operator_flagged=operator_flagged,
         refresh_triggered=refresh_triggered,
+        triage_model=triage_model,
     )
     if should_run_full_pipeline(
         prior.prior_ppm,

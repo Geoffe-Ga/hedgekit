@@ -22,6 +22,20 @@ bounded heartbeat loop and ledgered `evaluate_intent`; a subprocess-level
 "Process B survives Process A" isolation smoke test; and (issue #31) that
 `SigningKeyHandle` signs with real HMAC-SHA256 while never exposing its key
 material through any public attribute.
+
+Issue #235 (replay durable kill state on `windbreak run --process riskkernel`
+startup) adds a fourth `KernelLedgerWriter`, `PersistingKernelLedgerWriter`,
+wrapping a real `LedgerStore` so kernel events are actually persisted rather
+than only logged -- it does not exist on the real, not-yet-updated
+`process.py` module yet, so importing it below fails collection with
+`ImportError: cannot import name 'PersistingKernelLedgerWriter' from
+'windbreak.riskkernel.process'`, the expected Gate 1 RED state for issue
+#235. It also gives `RiskKernel.from_events` a new keyword-only
+`kill_integration` passthrough, so a rebuilt kernel's kill wiring survives a
+restart alongside its replayed mode; the not-yet-updated classmethod raises
+`TypeError: from_events() got an unexpected keyword argument
+'kill_integration'` when a test below supplies it, independently pinning
+that half of issue #235's Gate 1 RED state.
 """
 
 from __future__ import annotations
@@ -42,7 +56,9 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tests.riskkernel.conftest import make_context
+from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.ledger.events import Event
+from windbreak.ledger.store import SqliteLedgerStore
 from windbreak.numeric.types import (
     ContractCentis,
     MoneyMicros,
@@ -50,10 +66,17 @@ from windbreak.numeric.types import (
     ProbabilityPpm,
 )
 from windbreak.riskkernel.checks import OrderIntent
+from windbreak.riskkernel.kill import (
+    KILL_FILENAME,
+    KillFileWatcher,
+    KillIntegration,
+    KillSwitch,
+)
 from windbreak.riskkernel.modes import Mode, ModeStateMachine
 from windbreak.riskkernel.process import (
     InMemoryKernelLedgerWriter,
     LoggingKernelLedgerWriter,
+    PersistingKernelLedgerWriter,
     RiskKernel,
 )
 from windbreak.riskkernel.process import main as riskkernel_main
@@ -316,6 +339,67 @@ def test_logging_kernel_ledger_writer_record_does_not_raise(
     assert any("Test" in record.message for record in caplog.records)
 
 
+# --- PersistingKernelLedgerWriter + from_events kill wiring (issue #235) --------
+
+
+def test_persisting_kernel_ledger_writer_appends_the_event_to_the_wrapped_store(
+    tmp_path: Path,
+) -> None:
+    """`PersistingKernelLedgerWriter.record` is a thin `LedgerStore.append`
+    passthrough: after recording one event, the wrapped store's `read_all()`
+    shows exactly one row carrying that event's type and component -- proof
+    the writer actually persists, unlike `LoggingKernelLedgerWriter`, which
+    only logs.
+    """
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    try:
+        writer = PersistingKernelLedgerWriter(store)
+        event = Event(
+            event_type="Test",
+            component="riskkernel",
+            payload_schema_version=1,
+            payload={"n": 1},
+        )
+
+        writer.record(event)
+
+        records = store.read_all()
+    finally:
+        store.close()
+    assert len(records) == 1
+    assert records[0].event_type == "Test"
+    assert records[0].component == "riskkernel"
+    assert records[0].payload_schema_version == 1
+
+
+def test_from_events_kill_integration_keyword_reaches_init(tmp_path: Path) -> None:
+    """`RiskKernel.from_events`'s `kill_integration` keyword actually reaches
+    `__init__` rather than being silently dropped: with a `KILL` file already
+    present in the watcher's state dir, running one beat over a kernel
+    rebuilt via `from_events` polls that watcher and drives the kernel
+    `KILLED` -- proof the integration was truly wired, not merely accepted
+    and discarded.
+    """
+    writer = InMemoryKernelLedgerWriter()
+    machine = ModeStateMachine(mode_ceiling=Mode.LIVE)
+    switch = KillSwitch(
+        machine,
+        writer,
+        AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
+        state_dir=tmp_path,
+    )
+    watcher = KillFileWatcher(switch, tmp_path)
+    integration = KillIntegration(switch=switch, watcher=watcher)
+    (tmp_path / KILL_FILENAME).write_text("", encoding="utf-8")
+
+    rebuilt = RiskKernel.from_events(
+        [], writer, mode_machine=machine, kill_integration=integration
+    )
+    rebuilt.run(max_beats=1, heartbeat_interval=0)
+
+    assert rebuilt.mode is Mode.KILLED
+
+
 # --- RiskKernel: bounded heartbeat loop -----------------------------------------
 
 
@@ -369,9 +453,8 @@ def test_risk_kernel_evaluate_intent_records_one_intent_vetoed_event() -> None:
     (component "riskkernel", schema version 1, payload carrying the intent id
     and reasons) and returns a `Decision` marked both vetoed and ledgered.
 
-    A fully-permissive context (see `tests/riskkernel/conftest.py`) still
-    vetoes overall: 7 of the 24 SPEC S10.3 checks remain deliberate stubs
-    (issues #30/#31 together only promote 17 of them to real logic).
+    The veto is sourced from a real dimension -- an unknown jurisdiction --
+    because since issue #340 a fully-permissive context approves outright.
     """
     kernel = RiskKernel.for_testing()
     intent = _make_intent()
@@ -399,14 +482,12 @@ def test_risk_kernel_evaluate_intent_records_one_intent_vetoed_event() -> None:
 def test_risk_kernel_evaluate_intent_records_intent_approved_when_not_vetoed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the check pipeline approves an intent (no veto), the kernel ledgers
-    exactly one `IntentApproved` event and never a mislabeled `IntentVetoed`.
+    """When the check pipeline approves, the kernel ledgers one `IntentApproved`.
 
-    7 of the 24 SPEC S10.3 checks remain deliberate stubs after issues #30
-    and #31 (the rest are tracked in issues #32/#34), so no real context ever
-    produces a fully-approving decision yet; the approving pipeline is
-    stubbed here so the audit trail's correctness is pinned before that
-    remaining logic lands, not rediscovered as a ledger bug after.
+    Exactly one event, never a mislabeled `IntentVetoed`. Since issue #340
+    promoted the last SPEC S10.3 check, a permissive context genuinely reaches
+    this branch, so the approving path is exercised end-to-end rather than
+    through a stubbed pipeline.
     """
     from windbreak.riskkernel import checks as checks_module
 

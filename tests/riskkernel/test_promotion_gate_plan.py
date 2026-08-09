@@ -34,6 +34,20 @@ ASSUMPTIONS this file makes explicit (renegotiate with the architect if wrong):
    on the PAPER rung -- never cached across calls -- so a
    ``GatePlanChanged`` registered between two promotion attempts is picked up
    by the very next attempt without rebuilding the kernel.
+
+Issue #244 (RED -- neither ``windbreak.ledger.events.PromotionBlocked`` nor
+``RiskKernel``'s ``ledger_blocked_promotions`` keyword exist yet, so this file
+fails collection today with an ``ImportError: cannot import name
+'PromotionBlocked' from 'windbreak.ledger.events'``) adds an opt-in audit
+event on the fail-closed PAPER promotion path: with
+``ledger_blocked_promotions=True``, a ``GatePlanUnavailableError`` raised by
+``_gate_for`` before any ledger write records exactly one
+``PromotionBlocked(source_mode="PAPER", target_mode="LIVE_MICRO",
+reason=str(err))`` and then re-raises, mode unchanged. The default
+(``False``) is the pre-#244 behavior: no event. A new module-private
+constant, ``windbreak.riskkernel.process._PAPER_PROMOTION_TARGET``, names the
+PAPER rung's promotion target and is drift-guarded against
+``windbreak.riskkernel.modes._next_rung(Mode.PAPER)``.
 """
 
 from __future__ import annotations
@@ -49,9 +63,14 @@ import pytest
 
 from windbreak.config import EvaluationConfig
 from windbreak.evaluation.preregistration import build_gate_plan, register_gate_plan
+from windbreak.ledger.events import PromotionBlocked
 from windbreak.ledger.store import SqliteLedgerStore
-from windbreak.riskkernel.modes import Mode, ModeStateMachine
-from windbreak.riskkernel.process import InMemoryKernelLedgerWriter, RiskKernel
+from windbreak.riskkernel.modes import Mode, ModeStateMachine, _next_rung
+from windbreak.riskkernel.process import (
+    _PAPER_PROMOTION_TARGET,
+    InMemoryKernelLedgerWriter,
+    RiskKernel,
+)
 from windbreak.riskkernel.promotion import (
     SIGNIFICANCE_OVERRIDE_ACK_PHRASE,
     GateEvidence,
@@ -125,6 +144,7 @@ def _kernel_at(
     *,
     ceiling: Mode = Mode.LIVE,
     gate_plan_store: LedgerStore | None = None,
+    ledger_blocked_promotions: bool = False,
 ) -> RiskKernel:
     """Build a `RiskKernel` parked at `mode`, ceilinged at `ceiling`.
 
@@ -133,6 +153,9 @@ def _kernel_at(
         ceiling: The configured `mode_ceiling`.
         gate_plan_store: The ledger the kernel reads its PAPER gate plan from,
             or `None` to leave the kernel with no plan source wired.
+        ledger_blocked_promotions: Whether the kernel should ledger a
+            `PromotionBlocked` audit event on a fail-closed PAPER promotion
+            attempt (issue #244). Defaults to `False` (current behavior).
 
     Returns:
         A `RiskKernel` wired to a fresh `InMemoryKernelLedgerWriter`.
@@ -142,6 +165,7 @@ def _kernel_at(
         InMemoryKernelLedgerWriter(),
         mode_machine=machine,
         gate_plan_store=gate_plan_store,
+        ledger_blocked_promotions=ledger_blocked_promotions,
     )
 
 
@@ -649,3 +673,200 @@ def test_importing_evaluation_live_divergence_then_riskkernel_process_succeeds()
     )
 
     assert result.returncode == 0, result.stderr
+
+
+# --- Issue #244: optional PromotionBlocked audit event on fail-closed PAPER ----
+# --- promotion, gated by `ledger_blocked_promotions` -----------------------------
+
+
+def _promotion_blocked_events(kernel: RiskKernel) -> list[PromotionBlocked]:
+    """Return every `PromotionBlocked` event recorded on `kernel`'s writer.
+
+    Args:
+        kernel: The kernel whose in-memory ledger writer is inspected.
+
+    Returns:
+        The recorded `PromotionBlocked` events, in recording order.
+    """
+    return [
+        event
+        for event in kernel.ledger_writer.events
+        if isinstance(event, PromotionBlocked)
+    ]
+
+
+def test_ledger_blocked_promotions_records_promotion_blocked_when_no_store_wired() -> (
+    None
+):
+    """With `ledger_blocked_promotions=True` and no plan store wired, a PAPER
+    promotion attempt still raises `GatePlanUnavailableError`, but now records
+    exactly one `PromotionBlocked` event carrying the source/target modes and
+    the raised error's message, and the mode stays unchanged.
+    """
+    kernel = _kernel_at(
+        Mode.PAPER,
+        ceiling=Mode.LIVE,
+        gate_plan_store=None,
+        ledger_blocked_promotions=True,
+    )
+
+    with pytest.raises(GatePlanUnavailableError):
+        kernel.request_promotion(_paper_evidence())
+
+    blocked = _promotion_blocked_events(kernel)
+    assert len(blocked) == 1
+    assert blocked[0].payload["source_mode"] == "PAPER"
+    assert blocked[0].payload["target_mode"] == "LIVE_MICRO"
+    assert "no gate plan store wired" in blocked[0].payload["reason"]
+    assert kernel.mode is Mode.PAPER
+
+
+def test_ledger_blocked_promotions_records_promotion_blocked_when_store_empty(
+    tmp_path: Path,
+) -> None:
+    """With `ledger_blocked_promotions=True` and a wired-but-empty plan store,
+    the fail-closed promotion attempt records one `PromotionBlocked` whose
+    reason names the missing registration.
+    """
+    store = SqliteLedgerStore(tmp_path / "empty_blocked.db")
+    kernel = _kernel_at(
+        Mode.PAPER,
+        ceiling=Mode.LIVE,
+        gate_plan_store=store,
+        ledger_blocked_promotions=True,
+    )
+
+    with pytest.raises(GatePlanUnavailableError):
+        kernel.request_promotion(_paper_evidence())
+
+    blocked = _promotion_blocked_events(kernel)
+    assert len(blocked) == 1
+    assert "no registered gate plan" in blocked[0].payload["reason"]
+    store.close()
+
+
+def test_ledger_blocked_promotions_records_promotion_blocked_on_tampered_registration(
+    tmp_path: Path,
+) -> None:
+    """With `ledger_blocked_promotions=True` and a tampered registration, the
+    fail-closed promotion attempt still records one `PromotionBlocked` whose
+    reason names the unreadable registration, and the raised error's
+    `__cause__` is still the underlying `ValueError`/`TypeError` -- ledgering
+    the audit event never swallows or replaces the original cause chain.
+    """
+    store = _tampered_gate_plan_store(tmp_path)
+    kernel = _kernel_at(
+        Mode.PAPER,
+        ceiling=Mode.LIVE,
+        gate_plan_store=store,
+        ledger_blocked_promotions=True,
+    )
+
+    with pytest.raises(GatePlanUnavailableError) as exc_info:
+        kernel.request_promotion(_paper_evidence())
+
+    blocked = _promotion_blocked_events(kernel)
+    assert len(blocked) == 1
+    assert "unreadable" in blocked[0].payload["reason"]
+    assert isinstance(exc_info.value.__cause__, (ValueError, TypeError))
+
+
+def test_ledger_blocked_promotions_records_nothing_on_a_successful_promotion(
+    tmp_path: Path,
+) -> None:
+    """With `ledger_blocked_promotions=True` but a valid registered plan and
+    passing evidence, promotion proceeds normally: the kernel records exactly
+    one `PromotionEvaluated` and zero `PromotionBlocked` -- the flag must
+    never fire a false positive on the success path.
+    """
+    store = SqliteLedgerStore(tmp_path / "blocked_flag_success.db")
+    _register(store, _DEFAULT_CONFIG, now=_counter_clock())
+    kernel = _kernel_at(
+        Mode.PAPER,
+        ceiling=Mode.LIVE,
+        gate_plan_store=store,
+        ledger_blocked_promotions=True,
+    )
+
+    decision = kernel.request_promotion(_paper_evidence())
+
+    assert decision.approved is True
+    assert kernel.mode is Mode.LIVE_MICRO
+    evaluated = [
+        event
+        for event in kernel.ledger_writer.events
+        if event.event_type == "PromotionEvaluated"
+    ]
+    assert len(evaluated) == 1
+    assert _promotion_blocked_events(kernel) == []
+    store.close()
+
+
+def test_ledger_blocked_promotions_defaults_to_off_recording_nothing() -> None:
+    """The default (omitted `ledger_blocked_promotions`) is `False`: a PAPER
+    kernel's fail-closed promotion attempt records no events at all,
+    identically to the pre-#244 behavior -- an explicit regression guard for
+    the default-off contract.
+    """
+    kernel = _kernel_at(Mode.PAPER, ceiling=Mode.LIVE, gate_plan_store=None)
+
+    with pytest.raises(GatePlanUnavailableError):
+        kernel.request_promotion(_paper_evidence())
+
+    assert kernel.ledger_writer.events == []
+
+
+def test_ledger_blocked_promotions_is_plumbed_through_from_events() -> None:
+    """`RiskKernel.from_events(..., ledger_blocked_promotions=True)` forwards
+    the flag verbatim: a kernel rebuilt via `from_events` and parked at PAPER
+    still records one `PromotionBlocked` on the fail-closed path, proving the
+    flag survives the replay constructor rather than only `__init__`.
+    """
+    machine = ModeStateMachine(mode_ceiling=Mode.LIVE, mode=Mode.PAPER)
+    kernel = RiskKernel.from_events(
+        [],
+        InMemoryKernelLedgerWriter(),
+        mode_machine=machine,
+        gate_plan_store=None,
+        ledger_blocked_promotions=True,
+    )
+
+    with pytest.raises(GatePlanUnavailableError):
+        kernel.request_promotion(_paper_evidence())
+
+    assert len(_promotion_blocked_events(kernel)) == 1
+
+
+def test_paper_promotion_target_constant_matches_next_rung_of_paper() -> None:
+    """Drift guard: the named `_PAPER_PROMOTION_TARGET` module constant stays
+    equal to the mode ladder's own one-rung-up target for `Mode.PAPER`, so the
+    two never silently diverge if the ladder is ever reordered.
+    """
+    assert _PAPER_PROMOTION_TARGET is _next_rung(Mode.PAPER)
+
+
+def test_promotion_blocked_event_round_trips_through_a_real_sqlite_ledger(
+    tmp_path: Path,
+) -> None:
+    """A ledger containing a `PromotionBlocked` record still verifies and
+    round-trips cleanly through a real, hash-chained `SqliteLedgerStore` --
+    proving the new event type is a first-class, chain-safe ledger citizen,
+    not merely a shape that satisfies the in-memory writer.
+    """
+    store = SqliteLedgerStore(tmp_path / "promotion_blocked_tolerance.db")
+    store.append(
+        PromotionBlocked(
+            component="riskkernel",
+            source_mode="PAPER",
+            target_mode="LIVE_MICRO",
+            reason="no gate plan store wired; promotion blocked (fail-closed)",
+        )
+    )
+
+    store.verify_chain()
+
+    records = store.read_all()
+    assert len(records) == 1
+    payload = json.loads(records[0].payload_json)
+    assert payload["data"]["source_mode"] == "PAPER"
+    store.close()

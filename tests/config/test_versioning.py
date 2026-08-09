@@ -18,6 +18,7 @@ from windbreak.config import (
     WindbreakConfig,
     config_hash,
     diff_configs,
+    flatten,
     format_diff,
     load_config,
 )
@@ -115,6 +116,20 @@ def test_diff_identical_configs_is_empty() -> None:
     assert not diff.added
     assert not diff.removed
     assert not diff.changed
+
+
+def test_flatten_pins_ensemble_and_vote_ensemble_as_distinct_dotted_paths() -> None:
+    """Decision pin (issue #240): ``forecast.ensemble`` (legacy SPEC S16
+    triage/promotion set) and ``forecast.vote_ensemble`` (vote-stage
+    per-member provenance, issues #184/#191) are two distinct fields, neither
+    a rename of the other -- both dotted leaf paths must appear in the
+    flattened config, protecting config-hash stability against a future
+    rename/merge of the two fields.
+    """
+    flat = flatten(WindbreakConfig())
+
+    assert "forecast.ensemble.0.provider" in flat
+    assert "forecast.vote_ensemble.0.provider" in flat
 
 
 def test_format_diff_human_readable() -> None:

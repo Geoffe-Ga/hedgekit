@@ -99,6 +99,15 @@ class RiskConfig:
             human acknowledgement, or ``None`` to require none (paper mode).
         kill_after_consecutive_mismatches: Number of consecutive reconciliation
             ``BREACH`` outcomes that auto-engages the kill switch (issue #35).
+        verification_balance_tolerance_micros: The admissible available-cash
+            drift, in micros, before the live verifier grades a reconciliation
+            ``BREACH`` (issue #236). Defaults to ``0`` -- a fail-closed
+            exact-match: any drift at all is a breach until an operator loosens
+            it.
+        verification_position_tolerance_centis: The admissible per-ticker
+            position drift, in contract-centis, before the live verifier grades
+            a ``BREACH`` (issue #236). Defaults to ``0`` -- fail-closed
+            exact-match, as above.
     """
 
     min_net_edge_ppm: int = 30000
@@ -123,6 +132,8 @@ class RiskConfig:
     clock_skew_max_seconds: int = 2
     require_human_ack_above_micros: int | None = None
     kill_after_consecutive_mismatches: int = 3
+    verification_balance_tolerance_micros: int = 0
+    verification_position_tolerance_centis: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,27 +202,121 @@ def _default_triage_model() -> ModelRef:
 
 
 def _default_vote_ensemble() -> tuple[EnsembleMemberConfig, ...]:
-    """Return the default three-member vote ensemble (issue #184).
+    """Return the default three-member vote ensemble (issue #191).
 
-    Pinned to the forecast engine's own ``DEFAULT_VOTE_ENSEMBLE`` triple so a
-    config file omitting ``vote_ensemble`` reproduces the pre-#184 vote-stage
-    provenance exactly.
+    Pinned to the real, operator-pinned live triple -- mirror-equal in
+    provenance to the forecast engine's own ``DEFAULT_VOTE_ENSEMBLE`` -- so a
+    config file omitting ``vote_ensemble`` and the forecast engine's built-in
+    default drive the vote stage with identical ensemble provenance and ordering.
     """
     return (
-        EnsembleMemberConfig("openai", "gpt-5-forecast", "2024-06-01"),
-        EnsembleMemberConfig("anthropic", "claude-forecast", "2024-04-01"),
-        EnsembleMemberConfig("openai", "gpt-5-forecast-mini", "2024-06-01"),
+        EnsembleMemberConfig("openai", "gpt-5-2025-08-07", "2024-09-30"),
+        EnsembleMemberConfig("anthropic", "claude-sonnet-4-5-20250929", "2025-07-31"),
+        EnsembleMemberConfig("openai", "gpt-5-mini-2025-08-07", "2024-05-31"),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class FutureSearchProviderSettings:
+    """The FutureSearch research-forecaster provider's config-schema section.
+
+    The config-schema mirror of
+    :class:`windbreak.forecast.providers.futuresearch.FutureSearchProviderConfig`,
+    with SPEC-integer-units-only leaves. ``endpoint_url`` and
+    ``pinned_forecaster_versions`` have no natural real-world default, so -- like
+    :class:`AlertSink` and :class:`ModelRef` elsewhere in this schema -- they
+    default to the repo's "operator must fill this in" placeholder idiom rather
+    than an invented, plausible-looking endpoint/version.
+
+    Attributes:
+        endpoint_url: The forecast endpoint the provider POSTs to.
+        pinned_forecaster_versions: The operator-pinned forecaster versions a
+            reported version must belong to (else drift).
+        api_key_env: The environment variable a live transport reads the API
+            key from.
+        per_call_ceiling_micros: The reported-cost fallback, in micros.
+        reject_on_version_drift: Whether an unpinned reported version rejects
+            (strict) or proceeds with a logged warning.
+    """
+
+    endpoint_url: str = "configured-by-operator"
+    pinned_forecaster_versions: tuple[str, ...] = ("pinned-by-operator",)
+    api_key_env: str = "FUTURESEARCH_API_KEY"
+    per_call_ceiling_micros: int = 2000000
+    reject_on_version_drift: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchSettings:
+    """The live web-research config-schema section (issue #192).
+
+    Backs the :class:`windbreak.forecast.providers.search_live.LiveSearchTransport`
+    / :class:`windbreak.forecast.providers.fetch_live.LiveFetchTransport` pair
+    and the outbound-allowlist host derivation in
+    :func:`windbreak.net.allowlist.allowlist_from_config`. Per SPEC §6.1 every
+    leaf is an integer, string, or tuple of strings -- never a float.
+
+    ``search_endpoint_url`` and ``allowed_research_hosts`` have no safe
+    real-world default, so -- like :class:`AlertSink`, :class:`ModelRef`, and
+    :class:`FutureSearchProviderSettings` -- they default to the "operator must
+    fill this in" placeholder idiom and fail *closed*: an unconfigured
+    deployment's live-research egress allowlist contributes zero hosts rather
+    than an invented, plausible-looking one.
+
+    Attributes:
+        search_endpoint_url: The search endpoint a live search POSTs to.
+        search_api_key_env: The environment variable a live recorder reads the
+            search API key from; never a secret itself, only the var's *name*.
+        allowed_research_hosts: The hosts a live fetch may reach, added to the
+            outbound allowlist.
+        fetch_timeout_seconds: The per-fetch timeout, in whole seconds.
+        fetch_max_bytes: The maximum accepted fetched-body size, in bytes.
+        allowed_content_types: The response media types a live fetch accepts.
+    """
+
+    search_endpoint_url: str = "configured-by-operator"
+    search_api_key_env: str = "RESEARCH_SEARCH_API_KEY"
+    allowed_research_hosts: tuple[str, ...] = ()
+    fetch_timeout_seconds: int = 30
+    fetch_max_bytes: int = 2_000_000
+    allowed_content_types: tuple[str, ...] = ("text/html",)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderGateConfig:
+    """Per-provider live-eligibility promotion thresholds (issue #194, SPEC S13/S16).
+
+    Backs :class:`windbreak.forecast.providers.track_record.ProviderTrackRecordGate`:
+    a voting provider is proven (may back a live order) only once its historical
+    track record clears both bars. The defaults deliberately equal
+    :class:`EvaluationConfig`'s own promotion thresholds
+    (``min_resolved_for_calibration`` / ``brier_skill_required_ppm``) -- the same
+    statistical bar, applied per provider rather than to the ensemble.
+
+    Attributes:
+        min_resolved: Minimum resolved forecasts a provider needs to be proven.
+        min_brier_skill_ppm: Minimum Brier skill over baseline, in ppm, a
+            provider needs to be proven.
+    """
+
+    min_resolved: int = 150
+    min_brier_skill_ppm: int = 10000
 
 
 @dataclass(frozen=True, slots=True)
 class ForecastConfig:
     """Ensemble, triage, budget, and calibration-canary forecasting policy.
 
-    ``vote_ensemble`` (issue #184) supersedes the legacy ``ensemble`` field for
-    the vote stage: ``ensemble`` remains the triage/promotion ``ModelRef`` set,
-    while ``vote_ensemble`` names the per-member provenance the vote stage drives
-    a provider with.
+    ``vote_ensemble`` (issue #184) is the authoritative vote-stage ensemble:
+    each :class:`EnsembleMemberConfig` member carries its own provider
+    provenance, and the vote stage drives providers from this field alone. The
+    legacy ``ensemble`` field is the SPEC S16 triage/promotion ``ModelRef`` set,
+    retained verbatim for YAML-key and config-hash stability and deprecated for
+    vote purposes (ADR-0006, issue #240); it no longer sources vote-stage
+    behaviour. Both fields still contribute to the outbound network allowlist.
+    ``futuresearch`` (issue #189) configures the hosted research-forecaster
+    provider. ``provider_gate`` (issue #194) sets the per-provider track-record
+    thresholds a voting provider must clear to be live-eligible.
     """
 
     ensemble: tuple[ModelRef, ...] = field(default_factory=_default_ensemble)
@@ -224,6 +329,11 @@ class ForecastConfig:
     vote_ensemble: tuple[EnsembleMemberConfig, ...] = field(
         default_factory=_default_vote_ensemble
     )
+    futuresearch: FutureSearchProviderSettings = field(
+        default_factory=FutureSearchProviderSettings
+    )
+    research: ResearchSettings = field(default_factory=ResearchSettings)
+    provider_gate: ProviderGateConfig = field(default_factory=ProviderGateConfig)
 
 
 @dataclass(frozen=True, slots=True)

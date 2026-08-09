@@ -19,6 +19,29 @@ then hand a concrete plan back to the conductor (`scripts/ralph/PROMPT.md`, run 
 `.claude/commands/ralph-tick.md`). You do **not** write code, tests, or docs —
 you read, reason, and dispatch.
 
+## Model & fallback
+
+You run on **Fable** (`model: fable` in this file's frontmatter). Planning is the
+highest-leverage decision in a tick — one wrong design compounds across every
+specialist that executes it — so the architect gets the strongest judgment-driven
+model. Every other write-agent runs on **Opus**.
+
+Fable capacity is metered separately from Opus, so a tick must **degrade, never
+stall**, when Fable credits run out and a dispatch to this agent fails to launch:
+
+1. **In-session (preferred).** The conductor re-dispatches immediately with a
+   per-invocation model override — `Agent(subagent_type: ralph-chief-architect,
+   model: "opus")`. A per-invocation `model` outranks this file's frontmatter, so
+   no file edit is needed and the tick continues on Opus.
+2. **For the rest of the run.** Flip the pin once, so later ticks skip the failing
+   Fable attempt entirely: `./scripts/ralph/architect-model.sh opus` (and
+   `./scripts/ralph/architect-model.sh fable` to restore). With no argument the
+   script prints the current pin.
+
+Falling back is a **capacity** decision, never a weakened gate: an Opus architect
+plans to the same standard, and every rule in
+[`shared/house-rules.md`](shared/house-rules.md) applies unchanged.
+
 ## Scope
 
 - **Owns**: design approach for the issue, the file/module touch-list, the TDD
@@ -53,10 +76,11 @@ you read, reason, and dispatch.
    - **documentation** → new public API, changed behavior, README/docstring gaps
    - **migration** → any schema/model change needs a matching migration
      (schema drift without a migration is a broken deploy — always call it out)
-5. **Emit the plan** (the deliverable) — see Output Contract. Name the repo
-   **skills** each specialist should load (e.g. `security`, `testing`,
-   `mutation-testing`, `frontend-aesthetics`, `documentation`) so the hands invoke
-   the project's craft instead of improvising.
+5. **Emit the plan** (the deliverable) — see Output Contract. Name a repo
+   **skill** for a specialist to load only when the task needs a repo-specific
+   procedure (e.g. `mutation-testing`). Do not name a skill for ordinary craft:
+   testing, documentation, error handling, and security hygiene are expected by
+   default, not delegated to a file.
 
 ## Output Contract (return this; do not write files)
 

@@ -58,6 +58,16 @@ exactly, or confirm/rename via the handoff):
     banned ``type: ignore`` to force a not-yet-existing keyword argument
     through mypy, or a test-only file editing the production schema itself.
     See the note near the bottom of this file.
+
+Issue #192 additionally derives hosts from ``config.forecast.research``
+(``windbreak.config.schema.ResearchSettings``, itself new in #192): the parsed
+host of ``research.search_endpoint_url`` and every entry of
+``research.allowed_research_hosts``, both additive with the exchange- and
+forecast-provider-host derivation above. The default, unconfigured
+``ResearchSettings()`` (a placeholder endpoint URL, an empty
+``allowed_research_hosts`` tuple) contributes zero hosts, mirroring every
+other "operator must fill this in" default's fail-closed behavior elsewhere
+in this module.
 """
 
 from __future__ import annotations
@@ -67,7 +77,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from windbreak.config.schema import ModelRef, WindbreakConfig
+from windbreak.config.schema import (
+    EnsembleMemberConfig,
+    ForecastConfig,
+    ModelRef,
+    ResearchSettings,
+    WindbreakConfig,
+)
 from windbreak.net.allowlist import (
     EgressDeniedError,
     OutboundAllowlist,
@@ -268,6 +284,194 @@ def test_allowlist_from_config_forwards_the_recorder() -> None:
         allowlist.require("https://evil.example.com/steal")
 
     assert any(event.event_type == "EgressDenied" for event in recorder.events)
+
+
+# --- allowlist_from_config: vote_ensemble provider derivation (issue #240) -----
+#
+# Issue #240 documents the split between the legacy triage/promotion
+# ``ForecastConfig.ensemble`` (``ModelRef``) and the vote-stage per-member
+# ``ForecastConfig.vote_ensemble`` (``EnsembleMemberConfig``, issues #184/#191)
+# and repoints the egress allowlist to union in hosts for providers named by
+# *either* field -- additive-only, so legacy ``ensemble`` providers still
+# contribute hosts and the default config's derived host set is unchanged.
+
+
+def test_vote_ensemble_openai_member_absent_from_ensemble_admits_host() -> None:
+    """A ``vote_ensemble`` member naming a provider absent from the legacy
+    ``ensemble`` still contributes that provider's host -- the allowlist must
+    union both fields, not derive from ``ensemble`` alone.
+    """
+    default_forecast = WindbreakConfig().forecast
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        forecast=dataclasses.replace(
+            default_forecast,
+            ensemble=(ModelRef("anthropic", "pinned-by-operator"),),
+            vote_ensemble=(
+                EnsembleMemberConfig("openai", "gpt-5-2025-08-07", "2024-09-30"),
+            ),
+        ),
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require(f"https://{_OPENAI_HOST}/v1/responses")
+
+
+def test_vote_ensemble_anthropic_member_absent_from_ensemble_admits_host() -> None:
+    """Mirror of the openai case above, with the providers swapped -- guards
+    against a fix that hardcodes one specific provider name rather than
+    genuinely unioning ``vote_ensemble`` providers into the host set.
+    """
+    default_forecast = WindbreakConfig().forecast
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        forecast=dataclasses.replace(
+            default_forecast,
+            ensemble=(ModelRef("openai", "pinned-by-operator"),),
+            vote_ensemble=(
+                EnsembleMemberConfig(
+                    "anthropic", "claude-sonnet-4-5-20250929", "2025-07-31"
+                ),
+            ),
+        ),
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require(f"https://{_ANTHROPIC_HOST}/v1/messages")
+
+
+def test_vote_ensemble_unrecognized_provider_contributes_no_host() -> None:
+    """A ``vote_ensemble`` member naming a provider absent from
+    ``_FORECAST_PROVIDER_HOSTS`` contributes no host -- fail closed on an
+    unrecognized provider, exactly like the legacy ``ensemble``/``triage_model``
+    derivation.
+    """
+    default_forecast = WindbreakConfig().forecast
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        forecast=dataclasses.replace(
+            default_forecast,
+            vote_ensemble=(EnsembleMemberConfig("futuresearch", "x", "y"),),
+        ),
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    with pytest.raises(EgressDeniedError):
+        allowlist.require("https://futuresearch.example.com/v1/x")
+
+
+def test_allowlist_from_config_default_forecast_host_set_is_unchanged() -> None:
+    """`WindbreakConfig()`'s default forecast host set is exactly the
+    unchanged two-provider set -- proves the default configuration's derived
+    allowlist is byte-identical before and after the ``vote_ensemble`` union,
+    since the default ``vote_ensemble``'s providers (``openai``/``anthropic``)
+    are already covered by the default ``ensemble``.
+    """
+    allowlist = allowlist_from_config(WindbreakConfig())
+
+    allowlist.require(f"https://{_ANTHROPIC_HOST}/v1/messages")
+    allowlist.require(f"https://{_OPENAI_HOST}/v1/responses")
+    with pytest.raises(EgressDeniedError):
+        allowlist.require("https://evil.example.com/steal")
+
+
+def test_legacy_ensemble_still_admits_hosts_with_empty_vote_ensemble() -> None:
+    """With ``vote_ensemble`` emptied to ``()``, the legacy ``ensemble``
+    providers still contribute their hosts -- the union is additive, not a
+    replacement of the legacy derivation.
+    """
+    default_forecast = WindbreakConfig().forecast
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        forecast=dataclasses.replace(
+            default_forecast,
+            ensemble=(ModelRef("anthropic", "pinned-by-operator"),),
+            vote_ensemble=(),
+        ),
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require(f"https://{_ANTHROPIC_HOST}/v1/messages")
+
+
+# --- allowlist_from_config: live-research host derivation (issue #192) ---------
+
+
+def test_allowlist_from_config_derives_the_research_search_endpoint_host() -> None:
+    """``config.forecast.research.search_endpoint_url``'s host is admitted,
+    exactly like the exchange and per-model forecast-provider hosts.
+    """
+    research = ResearchSettings(search_endpoint_url="https://search.example/v1/search")
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        forecast=dataclasses.replace(WindbreakConfig().forecast, research=research),
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require("https://search.example/v1/search")
+
+
+def test_allowlist_from_config_derives_each_allowed_research_host() -> None:
+    """Every host named in ``config.forecast.research.allowed_research_hosts``
+    is admitted.
+    """
+    research = ResearchSettings(
+        allowed_research_hosts=("news.example", "wire-service.example")
+    )
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        forecast=dataclasses.replace(WindbreakConfig().forecast, research=research),
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require("https://news.example/article")
+    allowlist.require("https://wire-service.example/article")
+
+
+def test_allowlist_from_config_default_research_settings_contributes_no_host() -> None:
+    """`WindbreakConfig()`'s default, unconfigured
+    ``forecast.research`` (a placeholder endpoint URL and an empty
+    ``allowed_research_hosts`` tuple) contributes zero hosts -- an
+    unconfigured live-research deployment fails closed rather than silently
+    admitting some plausible-looking default host.
+    """
+    allowlist = allowlist_from_config(WindbreakConfig())
+
+    with pytest.raises(EgressDeniedError):
+        allowlist.require("https://search.example/v1/search")
+    with pytest.raises(EgressDeniedError):
+        allowlist.require("https://configured-by-operator/x")
+
+
+def test_allowlist_from_config_research_hosts_additive() -> None:
+    """A configured research section adds to -- never replaces -- the
+    existing exchange and forecast-provider host derivation.
+    """
+    research = ResearchSettings(allowed_research_hosts=("news.example",))
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        forecast=dataclasses.replace(WindbreakConfig().forecast, research=research),
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require(f"https://{_KALSHI_HOST}/trade-api/v2/markets")
+    allowlist.require(f"https://{_ANTHROPIC_HOST}/v1/messages")
+    allowlist.require("https://news.example/article")
+
+
+def test_allowlist_from_config_research_settings_fixture_assumption() -> None:
+    """Fixture assumption: ``ForecastConfig``'s default ``research`` field is
+    a bare ``ResearchSettings()`` -- the host-derivation tests above build
+    their overrides against that same default via ``dataclasses.replace``.
+    """
+    assert ForecastConfig().research == ResearchSettings()
 
 
 # --- ModelRef sanity (documents the fixture assumption above) ------------------

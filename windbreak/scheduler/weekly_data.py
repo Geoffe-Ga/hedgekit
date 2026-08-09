@@ -7,6 +7,15 @@ result into a rendered weekly report, wiring *real*
 :class:`~windbreak.evaluation.costs.CostMeter` in place of the #55
 ``evaluation=None, costs=None`` placeholder the scheduler wrote before.
 
+Issue #255 additionally wires the three original #48 stub sections
+(``## Equity vs floor``, ``## Positions``, ``## Decisions``) with real data:
+the same ``records`` are folded through the canonical
+:func:`~windbreak.ledger.rebuild.equity_curve_read_model` /
+:func:`~windbreak.ledger.rebuild.positions_read_model` /
+:func:`~windbreak.ledger.rebuild.selector_decisions_read_model` builders and
+rendered by the :mod:`windbreak.reports.sections` line renderers, replacing the
+``No data yet.`` placeholder those three sections previously hardcoded.
+
 Every ``ForecastCreated`` record folds into a :class:`FixtureForecast` with
 ``created_sequence`` sourced from the record's ``sequence_number``, its
 ``baseline_executable_price_pips`` and research cost read verbatim off the
@@ -36,7 +45,17 @@ from windbreak.evaluation.costs import aggregate_research_costs
 from windbreak.evaluation.registry import EvaluationInputs, FixtureForecast
 from windbreak.evaluation.report import build_evaluation_report, render_weekly_report
 from windbreak.evaluation.temporal import TemporalContext
+from windbreak.ledger.rebuild import (
+    equity_curve_read_model,
+    positions_read_model,
+    selector_decisions_read_model,
+)
 from windbreak.numeric.types import ProbabilityPpm
+from windbreak.reports.sections import (
+    render_decision_lines,
+    render_equity_lines,
+    render_position_lines,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -191,4 +210,7 @@ def weekly_report_body(records: list[LedgerRecord], *, today: date) -> str:
         today=today,
         evaluation=build_evaluation_report(inputs),
         costs=cost_meter,
+        equity_lines=render_equity_lines(equity_curve_read_model(records)),
+        position_lines=render_position_lines(positions_read_model(records)),
+        decision_lines=render_decision_lines(selector_decisions_read_model(records)),
     )

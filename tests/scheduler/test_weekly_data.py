@@ -371,6 +371,137 @@ def test_weekly_report_body_raises_value_error_on_a_legacy_v1_forecast_created_p
         weekly_report_body(store.read_all(), today=date(2026, 1, 5))
 
 
+# ---------------------------------------------------------------------------
+# 5. Real equity/position/decision wiring into the three original #48 stub
+#    sections (issue #255): `weekly_report_body` builds their bodies via the
+#    canonical `equity_curve_read_model` / `positions_read_model` /
+#    `selector_decisions_read_model` rebuild folds over the same `records`
+#    it already holds, and passes them through to `render_weekly_report`.
+# ---------------------------------------------------------------------------
+
+
+def test_weekly_report_body_wires_equity_position_decision_sections(
+    tmp_path: Path,
+) -> None:
+    """A ledger carrying one `EquitySampled`, one `PositionsSnapshotRecorded`,
+    and one `SelectorDecisionRecorded` record renders their content under the
+    three respective stub headings -- the signed equity buffer, the position's
+    ticker, and the decision's reason -- instead of the `No data yet.`
+    placeholder those three sections still hardcode today.
+    """
+    from windbreak.ledger.events import (
+        PositionsSnapshotRecorded,
+        SelectorDecisionRecorded,
+    )
+    from windbreak.scheduler.weekly_data import weekly_report_body
+
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    store.append(
+        EquitySampled(
+            component=_COMPONENT,
+            equity_micros=11_000_000,
+            floor_micros=10_000_000,
+            epoch_s=1700,
+        )
+    )
+    store.append(
+        PositionsSnapshotRecorded(
+            component=_COMPONENT,
+            positions=[
+                {
+                    "ticker": "MKT-DEEP",
+                    "quantity_centis": 200,
+                    "average_price_pips": 4600,
+                }
+            ],
+        )
+    )
+    store.append(
+        SelectorDecisionRecorded(
+            component=_COMPONENT,
+            forecast_id="fc-0001",
+            market_ticker="MKT-DEEP",
+            intent_count=1,
+            reasons=["net_edge_below_minimum"],
+        )
+    )
+
+    body = weekly_report_body(store.read_all(), today=date(2026, 1, 5))
+
+    equity_section = body.split("## Equity vs floor", 1)[1].split("## Positions", 1)[0]
+    positions_section = body.split("## Positions", 1)[1].split("## Decisions", 1)[0]
+    decisions_section = body.split("## Decisions", 1)[1].split("## Evaluation", 1)[0]
+
+    assert "buffer_micros=+1000000" in equity_section
+    assert "No data yet." not in equity_section
+    assert "MKT-DEEP" in positions_section
+    assert "No data yet." not in positions_section
+    assert "net_edge_below_minimum" in decisions_section
+    assert "No data yet." not in decisions_section
+
+
+def test_weekly_report_body_positions_section_uses_only_the_latest_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Two `PositionsSnapshotRecorded` records fold to only the latest
+    snapshot's content under `## Positions` -- the earlier snapshot's ticker
+    never appears, mirroring `positions_read_model`'s own latest-wins
+    contract.
+    """
+    from windbreak.ledger.events import PositionsSnapshotRecorded
+    from windbreak.scheduler.weekly_data import weekly_report_body
+
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    store.append(
+        PositionsSnapshotRecorded(
+            component=_COMPONENT,
+            positions=[
+                {"ticker": "MKT-OLD", "quantity_centis": 10, "average_price_pips": 100}
+            ],
+        )
+    )
+    store.append(
+        PositionsSnapshotRecorded(
+            component=_COMPONENT,
+            positions=[
+                {"ticker": "MKT-NEW", "quantity_centis": 20, "average_price_pips": 200}
+            ],
+        )
+    )
+
+    body = weekly_report_body(store.read_all(), today=date(2026, 1, 5))
+
+    positions_section = body.split("## Positions", 1)[1].split("## Decisions", 1)[0]
+    assert "MKT-NEW" in positions_section
+    assert "MKT-OLD" not in positions_section
+
+
+def test_weekly_report_body_over_an_empty_ledger_renders_honest_zero_counts(
+    tmp_path: Path,
+) -> None:
+    """An empty ledger (zero records) renders the three sections' honest
+    zero-count bodies (`equity_samples=0`, `snapshots=0`,
+    `decision_events=0`) -- never the `No data yet.` placeholder those three
+    headings hardcode today, and never a crash.
+    """
+    from windbreak.scheduler.weekly_data import weekly_report_body
+
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+
+    body = weekly_report_body(store.read_all(), today=date(2026, 1, 5))
+
+    equity_section = body.split("## Equity vs floor", 1)[1].split("## Positions", 1)[0]
+    positions_section = body.split("## Positions", 1)[1].split("## Decisions", 1)[0]
+    decisions_section = body.split("## Decisions", 1)[1].split("## Evaluation", 1)[0]
+
+    assert "equity_samples=0" in equity_section
+    assert "snapshots=0" in positions_section
+    assert "decision_events=0" in decisions_section
+    assert "No data yet." not in equity_section
+    assert "No data yet." not in positions_section
+    assert "No data yet." not in decisions_section
+
+
 def test_weekly_report_body_names_the_missing_baseline_key_when_only_it_is_absent(
     tmp_path: Path,
 ) -> None:

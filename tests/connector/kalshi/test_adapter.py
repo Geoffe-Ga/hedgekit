@@ -199,6 +199,70 @@ def test_get_order_book_fetched_at_equals_the_injected_clock(
     assert book.fetched_at == clock()
 
 
+@pytest.mark.parametrize("ticker", ["FAKE-PERP", "KXSCALAR-24DEC"])
+def test_get_order_book_refuses_non_binary_products_before_fetching_the_book(
+    kalshi_fixture_connector: KalshiConnector,
+    fake_kalshi_session: Any,
+    ticker: str,
+) -> None:
+    """A perpetual/scalar ticker is refused before the venue is ever asked.
+
+    SPEC S7.1 rejects non-binary product surfaces unconditionally: a perpetual
+    or scalar ticker must never reach the exchange's `/orderbook` route at
+    all, mirroring the `gate_product` check `get_market` already applies.
+    Asserting only `UnknownMarketError` here would be a false green -- today
+    that error is already raised, but only because the fake session's
+    orderbook route 404s for these tickers, not because the product gate
+    fired first. The `.calls` assertion is what proves the gate runs before
+    the fetch.
+    """
+    with pytest.raises(UnknownMarketError):
+        kalshi_fixture_connector.get_order_book(ticker)
+
+    orderbook_calls = [
+        call for call in fake_kalshi_session.calls if call["url"].endswith("/orderbook")
+    ]
+    assert orderbook_calls == []
+
+
+@pytest.mark.parametrize(
+    "ticker", ["KXFED-24DEC", "FAKE-PERP", "KXSCALAR-24DEC", "NOPE"]
+)
+def test_get_order_book_never_ledgers_product_refused_events(
+    kalshi_fixture_connector: KalshiConnector,
+    ledger: InMemoryEventLedgerWriter,
+    ticker: str,
+) -> None:
+    """A single-ticker order-book lookup must not ledger refusals for the venue.
+
+    Like ``get_market``, ``get_order_book`` is a targeted lookup rather than a
+    venue-wide scan, so it must never emit ``PRODUCT_REFUSED`` events -- doing
+    so would let repeated single-ticker lookups flood the ledger with
+    duplicates that only ``list_markets`` is meant to produce (SPEC S7.1 "one
+    refusal per refused product").
+    """
+    with suppress(UnknownMarketError):
+        kalshi_fixture_connector.get_order_book(ticker)
+
+    assert ledger.events_by_type(PRODUCT_REFUSED_EVENT) == ()
+
+
+def test_get_order_book_raises_unknown_when_allowed_binary_has_no_book(
+    kalshi_fixture_connector: KalshiConnector,
+) -> None:
+    """An allowed binary with no recorded book still raises `UnknownMarketError`.
+
+    `KXWEA-24DEC` is an allowed binary in `markets.json` with no
+    `orderbook_KXWEA-24DEC.json` fixture, so the fake session 404s its
+    `/orderbook` route. This pins the `KalshiApiError` -> `UnknownMarketError`
+    translation for a ticker that clears the product gate but still has no
+    book at the venue, once the gate lets allowed binaries through to the
+    fetch.
+    """
+    with pytest.raises(UnknownMarketError):
+        kalshi_fixture_connector.get_order_book("KXWEA-24DEC")
+
+
 # --- get_exchange_status -------------------------------------------------
 
 

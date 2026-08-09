@@ -76,27 +76,32 @@ The weekly report stub (below) is also (re-)written each tick.
 **Known limitation -- today's tick never actually fills.** The `approve`
 stage composes the real `RiskKernel.evaluate_intent` with the real
 `ApprovalPipeline.approve` (`KernelApproval` in `windbreak/scheduler/loop.py`).
-Right now that seam can never mint an approval token, for two independent
-reasons:
+Right now that seam can never mint an approval token, for **one** remaining
+reason. Two earlier causes have been removed: issue #340 made
+`jurisdiction_product_eligibility` a real check (it passes over a market with
+eligible metadata), and issue #342 wired real exchange-status and
+pipeline-heartbeat evidence, so `exchange_status_ok` and
+`pipeline_heartbeat_ok` now evaluate genuine observations and pass on a healthy
+exchange.
 
-- One SPEC S10.3 pre-trade check (`jurisdiction_product_eligibility`) is still
-  an unconditional-veto stub.
-- `exchange_status_ok` and `pipeline_heartbeat_ok` are now real checks (issue
-  #110), but the loop honestly supplies no exchange-status feed and no
-  pipeline heartbeat (`exchange_status=None`, `pipeline_heartbeat_epoch_s=None`),
-  so both fail closed and veto today.
-- The reconciliation checks fail closed on `verification=None`, which is
-  exactly what the loop honestly supplies today -- no live exchange
-  verification cycle runs in PAPER yet.
+The remaining cause is verification: the three reconciliation checks fail
+closed on `verification=None`, which is exactly what the loop honestly supplies
+today -- no read-only exchange verification cycle runs in PAPER yet.
+
+Note the status **value** is read from the connector every tick and never
+synthesized, so a `paused` or `closed` exchange still vetoes -- with the
+distinct reason `exchange not open for trading` rather than `stale or missing`,
+so an operator can tell "the venue is shut" from "we have no reading".
 
 So a real PAPER tick ledgers a full decision trail (snapshot, forecast,
 selector decision, and an `IntentVetoed`) but routes nothing and fills
 nothing; `filled_centis` on every tick's outcome is `0`. Don't be surprised
 to see nothing but vetoes in `/decisions` or `selector_decisions.json` --
 that is the expected, honestly-ledgered state of the loop today. The first
-real, kernel-approved paper fill activates once the remaining stub is retired
-and live exchange-status, heartbeat, and verification feeds are wired into the
-loop in place of today's fail-closed `None`s.
+real, kernel-approved paper fill activates once a read-only verification feed
+is wired into the loop in place of today's fail-closed `None`. Exchange status
+and the pipeline heartbeat are already real (issue #342); verification is the
+last one outstanding.
 
 **Known limitation -- the kill switch does not stop the PAPER loop yet.**
 `windbreak kill --state-dir <dir>` and `windbreak rearm --state-dir <dir>` write
@@ -149,6 +154,7 @@ Routes:
 | `/positions` | The latest open-positions snapshot. |
 | `/equity` | The equity curve vs. the configured capital floor. |
 | `/decisions` | The interleaved selector decisions, including skip/veto reasons. |
+| `/providers` | The fleet-observability provider panel: one summary per provider (id, canary status; resolved count and Brier skill from the #194 track-record fold; abstention rate and per-provider `cost_per_forecast` from the #281 per-provider vote-cost fold) plus a fleet-wide cost-per-forecast line. Any figure falls back to `n/a` only for a provider its respective fold does not (yet) cover. See [Provider operations](#provider-operations) below. |
 | `GET /acks` | The pending human acknowledgements awaiting an operator (SPEC S10.8). |
 | `POST /ack` | Grant a pending acknowledgement — JSON body `{"approval_id": "<32-hex>"}`. |
 
@@ -209,7 +215,7 @@ read-model files -- the same projection functions the dashboard reads live:
 windbreak rebuild --ledger-path /path/to/state/ledger.db --output-dir /path/to/state/read-models
 ```
 
-This writes (or overwrites) six files into `--output-dir`:
+This writes (or overwrites) eleven files into `--output-dir`:
 
 - `config_versions.json` -- every `ConfigLoaded` event.
 - `mode_history.json` -- every `ModeHeartbeat` event.
@@ -220,6 +226,18 @@ This writes (or overwrites) six files into `--output-dir`:
 - `equity_curve.json` -- every `EquitySampled` sample, in ledger order.
 - `selector_decisions.json` -- the interleaved `SelectorDecisionRecorded` /
   `IntentApproved` / `IntentVetoed` trail, in ledger order.
+- `execution_quality.json` -- every `ExecutionQualityRecorded` row, in ledger
+  order (issue #58).
+- `live_divergence.json` -- the interleaved `LiveDivergenceSampled` /
+  `LiveDivergenceBreached` trail, in ledger order (issue #58).
+- `canary_status.json` -- the LATEST `CanaryVerdictRecorded` per provider,
+  keyed at that provider's first-seen list position (issue #195; see
+  [Provider operations](#provider-operations) below).
+- `forecasts.json` -- every `ForecastCreated` row, in ledger order (issue
+  #195), feeding the fleet cost-per-forecast/abstention fold.
+- `provider_vote_costs.json` -- the per-provider vote-cost aggregate folded
+  from `ProviderVoteRecorded` events (issue #281), feeding the `/providers`
+  panel's real per-provider `cost_per_forecast` and `abstain_rate`.
 
 `rebuild` verifies the ledger's hash chain before projecting; a corrupted
 chain fails closed with a nonzero exit code and the offending sequence number
@@ -270,12 +288,18 @@ pass.
 
 ### Known limitations (summary)
 
-- The real Risk Kernel currently vetoes every intent (the
-  `jurisdiction_product_eligibility` check is still an unconditional-veto stub;
-  the now-real `exchange_status_ok`/`pipeline_heartbeat_ok` checks and the
-  reconciliation checks all fail closed on the `None` status/heartbeat/
-  verification the loop honestly supplies), so no PAPER tick fills yet --
-  expect vetoes, not fills, in the ledger and dashboard.
+- The real Risk Kernel currently vetoes every intent, but no longer because of
+  a stub: issue #340 made `jurisdiction_product_eligibility` a real check. The
+  three remaining causes are all honest `None` feeds -- the
+  `exchange_status_ok`/`pipeline_heartbeat_ok` checks and the three
+  reconciliation checks fail closed on the `None` status, heartbeat, and
+  verification the loop supplies. So no PAPER tick fills yet: expect vetoes, not
+  fills, in the ledger and dashboard.
+- On a **live Kalshi** path the jurisdiction check vetoes for an additional
+  reason: Kalshi publishes no eligibility signal, so `normalize_market` stamps
+  every market `jurisdiction_status="unknown"`, which fails closed by design
+  (SPEC §20 Q3, unresolved). Only a market carrying real eligibility metadata --
+  as the paper fixture books do -- can clear that check.
 - `windbreak kill`/`windbreak rearm` do not stop or gate the PAPER loop today
   (`kill_integration=None`); use process signals to stop the loop.
 - `windbreak run --process dashboard` boots the HTTP dashboard server directly
@@ -284,3 +308,267 @@ pass.
   `--token` CLI flag.
 - Weekly reports are structural stubs (`No data yet.` bodies); the real
   report content is a later pass.
+
+## Provider operations
+
+Fleet-observability provider canaries (issue #195, SPEC S8.4/S16 extended
+per-provider) run one small reference battery per forecast provider and
+ledger every verdict, so silent per-provider answer drift or forecaster
+version drift is caught before it poisons a live forecast. The battery is
+driven entirely by the operator-run `scripts/run-canaries.sh` (a thin wrapper
+over `scripts/run_canaries.py`, which owns every `requests`/environment
+access on this path -- CI never dials a live forecaster) -- never by CI, and
+never by the PAPER/live heartbeat loop itself (see the known limitation at
+the end of this section).
+
+A battery is described by a `--spec-file` JSON document: a `"providers"` list,
+each entry carrying `provider`, `questions` (a list of
+`{"question_id", "prompt", "reference_ppm"}` objects), `pinned_versions` (the
+operator-accepted forecaster version strings for that provider), and either an
+`"observation"` object (`{"observed_ppm": {...}, "reported_version": "..."}`,
+replay mode) or an `"endpoint"`/`"host"` pair (record mode; the outbound URL
+must resolve to `host` exactly, or the run fails closed with
+`EgressDeniedError`).
+
+### Rotate provider keys
+
+In `--record` mode, each provider's live API key is read from its
+`<PROVIDER>_API_KEY` environment variable (the provider identifier
+upper-cased plus the `_API_KEY` suffix, e.g. `FUTURESEARCH_API_KEY` --
+`scripts/run_canaries.py`'s `_API_KEY_ENV_SUFFIX` constant), injected as an
+`x-api-key` send-time HTTP header, and never printed, logged, or written to
+any cassette or ledger row.
+
+1. Export the new key under that exact variable name -- never a literal in
+   any command, script, or commit:
+
+   ```bash
+   export FUTURESEARCH_API_KEY=replace-with-a-real-key
+   ```
+
+2. Validate the rotation by re-running that provider's battery in record
+   mode, which dials the live endpoint once with the new key:
+
+   ```bash
+   scripts/run-canaries.sh --record \
+       --spec-file provider_canaries.record.json \
+       --ledger-path var/ledger.db
+   ```
+
+3. Confirm the process exits `0` and prints `provider=<name> canary=OK
+   drift_score_ppm=<n>` for the rotated provider (the exact
+   `provider=<p> canary=<STATUS> drift_score_ppm=<n>` line every verdict
+   prints). A wrong or expired key surfaces as a live HTTP failure from the
+   provider's endpoint, not a silent pass; a genuine drift line (`ANSWER_DRIFT`
+   / `VERSION_DRIFT`) means the key worked but the provider itself drifted --
+   treat that as [drift](#respond-to-canary-drift--provider-version-drift), not
+   a rotation failure.
+4. Revoke the old key at the provider's own dashboard once the new key is
+   confirmed working; this script cannot do that for you.
+
+Never echo the key value in any of the above -- the script deliberately never
+prints it either (`scripts/run-canaries.sh`'s own `--record` banner names the
+required variable, not its value).
+
+### Respond to canary drift / provider version drift
+
+A drift breach dispatches one `AlertType.CANARY_DRIFT` alert and ledgers one
+`CanaryVerdictRecorded` event (`status` one of `OK` / `ANSWER_DRIFT` /
+`VERSION_DRIFT`). Running via `scripts/run-canaries.sh`, the alert prints to
+stderr as `ALERT AlertType.CANARY_DRIFT: <message>` and the process exits `1`
+the moment any provider drifts:
+
+- An answer-drift message reads `Provider <p> answer-drift: Canary drift <n>
+  ppm exceeded tolerance <t> ppm; worst question <id>`.
+- A version-drift message reads `Provider <p> version-drift: reported
+  forecaster version '<v>' is off the pinned set [...]`.
+
+1. **Read the alert** to identify the provider and the drift kind
+   (`answer` vs. `version`).
+2. **Inspect durable state** -- either the ledger read models:
+
+   ```bash
+   windbreak rebuild --ledger-path var/ledger.db --output-dir var/read-models
+   cat var/read-models/canary_status.json    # latest verdict per provider
+   ```
+
+   or the live dashboard's `/providers` route, started with
+   `windbreak run --process dashboard --ledger-path var/ledger.db` and
+   bearer-gated via `WINDBREAK_DASHBOARD_TOKEN` (see
+   [Observing via the dashboard](#observing-via-the-dashboard) above), which
+   folds the same `canary_status.json` / `forecasts.json` projections through
+   `render_provider_panel`.
+3. **For VERSION drift**, decide: accept the new version by adding it to that
+   provider's `pinned_versions` list in the canary `--spec-file`, or treat it
+   as a vendor regression and investigate upstream before accepting anything.
+   (FutureSearch's *live* forecaster has its own, separate pin --
+   `config.forecast.futuresearch.pinned_forecaster_versions` -- which gates
+   real forecasts, not the canary battery; update it too if the version bump
+   is legitimate for live forecasting, not only for canaries.)
+4. **For ANSWER drift**, investigate the underlying prompt/response
+   regression (a silent vendor model swap not reflected in the reported
+   version, a prompt-template change, etc.).
+5. **Re-run the battery until it exits `0`**:
+
+   ```bash
+   scripts/run-canaries.sh --spec-file provider_canaries.json --ledger-path var/ledger.db
+   ```
+
+   every printed line should read `canary=OK`.
+
+Per SPEC S8.6, `CanaryGate.is_live_blocked` is fail-closed and never
+auto-adapts: a drifting provider is blocked from live eligibility until an
+operator acknowledges it (`CanaryGate.acknowledge`), and a breach on the
+*global* (pinned-canary-model) dimension blocks every provider closed, not
+just the one that drifted -- a provider query ORs its own window with the
+global one.
+
+**Known limitation -- no persistent, wired gate to acknowledge against yet.**
+`scripts/run_canaries.py`'s CLI never passes a `gate=` argument to
+`windbreak.scheduler.canaries.run_canaries`, so each invocation of
+`scripts/run-canaries.sh` scores against a brand-new, in-memory `CanaryGate()`
+-- there is no cross-run block state, and therefore nothing to acknowledge via
+this script. `CanaryGate.acknowledge()` is a real, tested primitive (used
+directly by the test suite) that a future, persistent composition root will
+drive, but no `windbreak` CLI verb or dashboard route calls it today. The
+practical operator loop today is exactly steps 3-5 above: fix the root cause
+(or accept the version), then re-run the battery until every provider reads
+`canary=OK`. Separately, `windbreak.forecast.pipeline.run_pipeline`'s own
+`canary_gate` seam is real and unit-tested, but `windbreak/scheduler/loop.py`'s
+PAPER-tick `_forecast_stage` calls `run_pipeline(...)` without a `canary_gate`
+argument -- so canary drift does not yet block a live PAPER-loop tick
+end-to-end; today the battery is a standalone, operator-run detector, not (yet)
+an in-loop gate.
+
+### Respond to budget exhaustion
+
+`windbreak.forecast.budget.ResearchBudget` enforces SPEC S16's three research
+spend ceilings, mirrored in config at `config.forecast.budget.per_forecast_micros`
+(default 3,000,000 micros / $3), `config.forecast.budget.per_day_micros`
+(default 20,000,000 micros / $20), and `config.forecast.budget.max_pages`
+(default 20 pages per forecast). Two events name the two ways a run can be
+halted:
+
+- `BUDGET_DAY_EXHAUSTED` -- `ResearchBudget.ensure_day_open` halts a run
+  **before any research is attempted** once the current UTC day's cumulative
+  spend is at or above the per-day ceiling; raises `DailyBudgetExhaustedError`.
+- `BUDGET_FORECAST_EXCEEDED` -- `ResearchBudget.charge_forecast` charges a
+  single forecast's cost into the day bucket **first** (so a breaching
+  forecast still counts against the day), then raises
+  `PerForecastBudgetExceededError` only if that forecast's own cost *strictly
+  exceeds* the per-forecast ceiling (an exactly-equal cost passes).
+
+The day bucket is keyed by the run's UTC calendar date
+(`datetime.astimezone(UTC).date().isoformat()`) -- it resets, not decays, at
+each UTC midnight; there is no manual reset lever and no partial-day rollover.
+
+When either error is raised: check which UTC day is exhausted (the error's
+`utc_day` field) and how much was spent (`spent_micros`/`cost_micros` vs.
+`budget_micros`); a day-exhaustion halt clears itself automatically at the
+next UTC midnight, while a per-forecast breach is a signal to look at that
+one forecast's research cost (an unusually expensive research stage, a
+runaway page-fetch loop bounded by `max_pages`, etc.) rather than the whole
+day's spend.
+
+**How the loop enforces this (issue #339).** `build_paper_deps` constructs
+**one** `ResearchBudget` per process from `config.forecast.budget` and carries
+it on `PaperTickDeps`, so its per-UTC-day spend bucket accumulates across every
+tick that bundle runs. There is deliberately no `budget` parameter on
+`build_paper_deps`: config is the single source, so there is no injection door
+through which an unlimited or absent budget could arrive.
+
+A halted tick appends exactly one `ResearchBudgetHalted` ledger row (component
+`scheduler`) carrying `halt_kind` (`per_day` or `per_forecast`), `utc_day`,
+`spent_micros`, and `budget_micros`. It then **skips the forecast, select, and
+approve stages** but still emits its heartbeat, equity sample, positions
+snapshot, and weekly report -- so a budget-halted loop stays observably alive
+and flat rather than dying. Its ledger differs from a normal tick's by exactly
+two absent rows: `ForecastCreated` and `SelectorDecisionRecorded`. No
+`ForecastCreated` row is fabricated for a tick where the forecast engine never
+ran; in a hash-chained audit ledger an honest gap beats an invented record.
+
+**Operator arithmetic.** With the SPEC defaults -- a 20,000,000-micro day
+ceiling against the fixed 3,000,000-micro per-forecast research charge -- a UTC
+day permits **7 charged forecasts** before research halts for the rest of that
+day. Raising the ceiling is a config edit to
+`config.forecast.budget.per_day_micros`; there is no runtime lever and no
+partial-day rollover.
+
+**Caveat -- the day counter is process-local.** Day spend lives in memory on the
+budget instance and is never persisted, so restarting the loop (crash, deploy,
+manual bounce) resets the day's spend to zero and the ceiling can be re-spent.
+This is fail-*open* across restarts and is the one gap in the guarantee above.
+Durable day-spend rehydration is deliberately out of scope here, because the
+obvious source -- summing `ForecastCreated.research_cost_micros` -- records a
+fixed constant rather than the true charged amount, so it would under-count and
+still fail open, just less visibly.
+
+**Caveat -- a negative ceiling now aborts startup.** The YAML loader applies no
+range checks, so a negative `per_forecast_micros`/`per_day_micros`/`max_pages`
+reaches the composition root intact and `ResearchBudget` rejects it with a
+`ValueError` while `--paper` is starting. That is the intended fail-closed
+outcome: a loop that cannot determine its ceiling must not run. A **zero**
+ceiling is legal and means "immediately exhausted" -- it silently halts all
+research, which is fail-closed but easy to mistake for a hung loop.
+
+### Add / remove a provider
+
+**Adding** a provider to the canary battery:
+
+1. Add its entry to the canary `--spec-file` JSON's `"providers"` list:
+   `provider`, `questions` (one `{"question_id", "prompt", "reference_ppm"}`
+   object per reference question), and `pinned_versions`.
+2. Record and validate its first live observation once, in record mode (see
+   [Rotate provider keys](#rotate-provider-keys) above for the key-export
+   step) -- this is the only "recording" step provider canaries have; it is
+   distinct from, and does not use, the LLM vote-ensemble cassette recorders
+   (`scripts/record-cassettes.sh`, `scripts/record-research-cassettes.sh`,
+   issues #191/#192), which record a different surface (ensemble-member vote
+   completions, not provider canary endpoints):
+
+   ```bash
+   scripts/run-canaries.sh --record \
+       --spec-file provider_canaries.record.json \
+       --ledger-path var/ledger.db
+   ```
+
+3. Run the full battery in (the default, offline) replay mode and confirm the
+   new provider's line reads `canary=OK`:
+
+   ```bash
+   scripts/run-canaries.sh --spec-file provider_canaries.json --ledger-path var/ledger.db
+   ```
+
+4. Confirm it appears:
+
+   ```bash
+   windbreak rebuild --ledger-path var/ledger.db --output-dir var/read-models
+   ```
+
+   then check `var/read-models/canary_status.json` for the new `"provider"`
+   entry, or hit the dashboard's `/providers` route, or check the weekly
+   report's `## Providers` section (`windbreak.reports.providers`'s
+   `provider=<p> resolved=<n> ...` line) once that section is wired to real
+   data (see the known limitation below).
+
+**Retiring** a provider:
+
+1. Remove its entry from the `--spec-file` so future battery runs stop
+   appending fresh verdicts for it.
+
+**Known limitation -- retirement leaves a stale, not an absent, entry.** The
+`canary_status.json` fold (`canary_status_read_model`) is append-only and
+keeps the LATEST verdict per provider ever ledgered; there is no tombstone or
+removal event. A retired provider's last verdict therefore stays visible in
+`canary_status.json` and on the `/providers` dashboard panel indefinitely --
+"confirm it is gone" is not literally achievable with today's tooling.
+Instead, treat a `canary_status.json` / `GET /providers` entry whose
+`created_at` predates the retirement date as the retirement signal, until a
+future retirement/tombstone mechanism ships. Similarly, the weekly report's
+`## Providers` section (`windbreak.reports.providers.render_provider_lines`)
+is a real, unit-tested renderer, but no production composition root supplies
+its `provider_lines` argument yet (`windbreak/scheduler/loop.py` writes the
+PAPER-loop's weekly report via the plain `maybe_write_weekly` stub path, not
+`windbreak.evaluation.report.generate_weekly_report`) -- so today the weekly
+report's `## Providers` section always renders its `No data yet.` fallback,
+regardless of what the ledger holds.

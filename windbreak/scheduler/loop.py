@@ -14,15 +14,15 @@ appending one audit event to the ledger at every stage, plus a per-tick
 
 The approval seam is the load-bearing safety boundary: :class:`KernelApproval`
 composes the *real* ``RiskKernel.evaluate_intent`` with the *real*
-``ApprovalPipeline.approve``. Today that can never mint a token -- the
-``jurisdiction_product_eligibility`` SPEC S10.3 check is still an
-unconditional-veto stub, the now-real ``exchange_status_ok`` /
-``pipeline_heartbeat_ok`` checks (issue #110) fail closed on the ``None`` exchange
-status and pipeline heartbeat this loop honestly supplies, and the three
-reconciliation checks fail closed on the ``verification=None`` this loop honestly
-supplies (no live exchange verification cycle runs in PAPER yet) -- so the real
-tick never fills. The fill leg is proven separately by driving the gateway with a
-genuinely minted token through a doubled seam.
+``ApprovalPipeline.approve``. Every SPEC S10.3 check is now real (issue
+#340 promoted the last one) and the loop now observes real exchange status
+and stamps a real pipeline heartbeat each tick (issue #342), so
+``exchange_status_ok`` and ``pipeline_heartbeat_ok`` evaluate genuine evidence
+and can pass. The PAPER tick still never fills, for one remaining honest
+reason: the three reconciliation checks fail closed on the ``verification=None``
+this loop supplies, because no read-only verification cycle runs in PAPER
+yet. The fill leg is proven separately by driving the gateway with a genuinely
+minted token through a doubled seam.
 
 Money and equity fields are scaled integers (micros/centis/pips), never floats
 (SPEC S6.1); this package is on ``scripts/lint_no_floats.py``'s denylist.
@@ -34,21 +34,37 @@ import secrets
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 from windbreak.config import config_hash
 from windbreak.connector.freshness import is_fresh
+from windbreak.connector.interface import UnknownMarketError
 from windbreak.connector.paper import PaperExchange
+from windbreak.forecast.budget import (
+    BUDGET_DAY_EXHAUSTED_EVENT,
+    BUDGET_FORECAST_EXCEEDED_EVENT,
+    DailyBudgetExhaustedError,
+    PerForecastBudgetExceededError,
+    ResearchBudget,
+)
 from windbreak.forecast.cassettes import ReplayCassette
-from windbreak.forecast.pipeline import run_pipeline
+from windbreak.forecast.pipeline import (
+    PROVIDER_VOTE_COSTED_EVENT,
+    InMemoryForecastLedger,
+    run_pipeline,
+)
 from windbreak.forecast.records import BaselineQuoteSnapshot
 from windbreak.forecast.sandbox import build_research_tools
 from windbreak.ledger.events import (
     EquitySampled,
+    ExchangeStatusObserved,
     ForecastCreated,
     MarketSnapshotRecorded,
     ModeHeartbeat,
+    PipelineHeartbeatRecorded,
     PositionsSnapshotRecorded,
+    ProviderVoteRecorded,
+    ResearchBudgetHalted,
     SelectorDecisionRecorded,
 )
 from windbreak.ledger.store import SqliteLedgerStore
@@ -61,6 +77,7 @@ from windbreak.reports.weekly import maybe_write_weekly
 from windbreak.riskkernel.context import (
     AccountState,
     EvaluationContext,
+    ExchangeTradingStatus,
     FeeBounds,
     MarketView,
     RiskLimits,
@@ -73,6 +90,11 @@ from windbreak.riskkernel.reservations import (
     ReservationLedger,
 )
 from windbreak.riskkernel.tokens import TokenIssuer
+from windbreak.scheduler.eligibility import (
+    project_exchange_status,
+    project_jurisdiction,
+    project_product_type,
+)
 from windbreak.scheduler.weekly_data import weekly_report_body
 from windbreak.selector import select
 from windbreak.selector.types import (
@@ -88,7 +110,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
-    from windbreak.connector.models import OrderBookSnapshot
+    from windbreak.connector.models import NormalizedMarket, OrderBookSnapshot
+    from windbreak.forecast.budget import BudgetEvent
     from windbreak.forecast.cassettes import LlmTransport
     from windbreak.forecast.records import ForecastRecord
     from windbreak.forecast.sandbox import ResearchTools
@@ -104,6 +127,12 @@ _COMPONENT = "scheduler"
 #: The calibration-map version tag echoed into every selector decision.
 _CALIBRATION_MAP_VERSION = "v0"
 
+#: ``halt_kind`` stamped on a halt caused by the UTC day's budget running out.
+_HALT_KIND_PER_DAY = "per_day"
+
+#: ``halt_kind`` stamped on a halt caused by one forecast breaching its ceiling.
+_HALT_KIND_PER_FORECAST = "per_forecast"
+
 #: A full parts-per-million share (100%), used for the total-position ceiling the
 #: SPEC S16 ``RiskConfig`` has no dedicated field for.
 _FULL_PPM = 1_000_000
@@ -118,13 +147,13 @@ _DEFAULT_FORECAST_TTL_SECONDS = 3600
 _DEFAULT_VERIFICATION_TTL_SECONDS = 3600
 
 #: Default max admissible exchange-status age, in seconds (SPEC S7.3
-#: approval/submission snapshot TTL range). The PAPER loop supplies
-#: ``exchange_status=None`` data, so this only bounds a future live cycle.
+#: approval/submission snapshot TTL range). The PAPER loop observes a real
+#: status every tick (issue #342), so this genuinely bounds that evidence.
 _DEFAULT_EXCHANGE_STATUS_TTL_SECONDS = 30
 
 #: Default max admissible pipeline-heartbeat age, in seconds. The PAPER loop
-#: supplies ``pipeline_heartbeat_epoch_s=None`` data, so this only bounds a
-#: future live cycle.
+#: stamps a real heartbeat every tick (issue #342), so this genuinely bounds
+#: how long a stalled pipeline may go unnoticed.
 _DEFAULT_PIPELINE_HEARTBEAT_TTL_SECONDS = 60
 
 #: The slippage-model id stamped on the selector's per-contract buffer input.
@@ -241,6 +270,73 @@ class _SqliteKernelLedgerWriter:
             event: The event to persist.
         """
         self._store.append(event)
+
+
+class _SqliteBudgetLedgerWriter:
+    """A research-budget ledger writer that appends to a `SqliteLedgerStore`.
+
+    The persisting counterpart of
+    :class:`~windbreak.forecast.budget.InMemoryBudgetLedger` (which that module
+    documents as test-only), so a fail-closed research halt joins the same
+    hash-chained ledger as every other stage of the tick.
+
+    The budget engine's own :class:`~windbreak.forecast.budget.BudgetEvent` is a
+    different shape from a ledger :class:`~windbreak.ledger.events.Event`, so
+    this writer is the translation seam between them. Translation is *total*:
+    each of the two breach kinds maps onto a typed ``ResearchBudgetHalted`` row,
+    and any other kind raises rather than silently dropping an audit row.
+    """
+
+    def __init__(self, store: SqliteLedgerStore) -> None:
+        """Bind the writer to a ledger store.
+
+        Args:
+            store: The append-only store every halt event is persisted to.
+        """
+        self._store = store
+
+    def record(self, event: BudgetEvent) -> None:
+        """Append a budget breach to the ledger as a typed halt event.
+
+        Payload keys are read by subscript, never ``.get`` with a default, so a
+        payload-shape drift surfaces as a loud ``KeyError`` rather than a
+        silently zeroed audit row. Note the two kinds name the spent amount
+        differently: the per-day payload carries ``spent_micros`` (the day's
+        cumulative spend) while the per-forecast payload carries ``cost_micros``
+        (the single breaching forecast's cost).
+
+        Args:
+            event: The budget event to persist.
+
+        Raises:
+            ValueError: If ``event`` is neither of the two breach kinds.
+        """
+        payload = event.payload
+        if event.event_type == BUDGET_DAY_EXHAUSTED_EVENT:
+            self._store.append(
+                ResearchBudgetHalted(
+                    component=_COMPONENT,
+                    market_ticker="",
+                    halt_kind=_HALT_KIND_PER_DAY,
+                    utc_day=cast("str", payload["utc_day"]),
+                    spent_micros=cast("int", payload["spent_micros"]),
+                    budget_micros=cast("int", payload["budget_micros"]),
+                )
+            )
+            return
+        if event.event_type == BUDGET_FORECAST_EXCEEDED_EVENT:
+            self._store.append(
+                ResearchBudgetHalted(
+                    component=_COMPONENT,
+                    market_ticker=cast("str", payload["market_ticker"]),
+                    halt_kind=_HALT_KIND_PER_FORECAST,
+                    utc_day=cast("str", payload["utc_day"]),
+                    spent_micros=cast("int", payload["cost_micros"]),
+                    budget_micros=cast("int", payload["budget_micros"]),
+                )
+            )
+            return
+        raise ValueError(f"unhandled budget event type {event.event_type!r}")
 
 
 # --- small, individually-tested composition seams -------------------------------
@@ -427,6 +523,10 @@ def build_evaluation_context(
     now_epoch_s: int,
     verification: VerificationSnapshot | None,
     instrument_whitelist: frozenset[str],
+    market: NormalizedMarket | None,
+    exchange_status: ExchangeTradingStatus | None,
+    exchange_status_epoch_s: int | None,
+    pipeline_heartbeat_epoch_s: int | None,
 ) -> EvaluationContext:
     """Compose the evaluation context a PAPER-mode approval reads.
 
@@ -437,44 +537,66 @@ def build_evaluation_context(
     the reconciliation checks rather than open (mirroring
     :class:`~windbreak.riskkernel.context.EvaluationContext`'s own contract).
 
-    For the same fail-closed reason the PAPER loop honestly supplies
-    ``exchange_status=None`` / ``exchange_status_epoch_s=None`` and
-    ``pipeline_heartbeat_epoch_s=None``: it has no live exchange-status feed or
-    pipeline heartbeat, so ``exchange_status_ok`` and ``pipeline_heartbeat_ok``
-    veto on the honest ``None`` rather than being fed a fabricated liveness
-    reading (mirroring ``verification=None``).
+    The exchange status and pipeline heartbeat are caller-supplied rather than
+    hardcoded (issue #342), so the loop can pass genuine observations. They are
+    still ``| None``, and a caller with nothing to report must pass ``None``
+    rather than a placeholder: both checks fail closed on it. In particular the
+    heartbeat must be stamped by an earlier stage and never set to this
+    function's own ``now_epoch_s`` -- a heartbeat equal to ``now`` can never go
+    stale, which would make its check unfalsifiable and strictly worse than the
+    ``None`` it replaced.
 
     Args:
         config: The configuration whose capital/risk sections map to the limits.
         now_epoch_s: The kernel's current wall clock, in epoch seconds.
         verification: The latest verification snapshot, or ``None`` (fail-closed).
         instrument_whitelist: The tradable-ticker set for this tick.
+        market: The market being evaluated, or ``None`` when it could not be
+            resolved -- which fails closed exactly like ``verification=None``.
+            Its connector eligibility metadata is projected onto the kernel's
+            own enums here, so the connector's ``"unknown"`` becomes ``None``
+            and can never masquerade as eligible (issue #340).
+        exchange_status: The observed exchange trading status, or ``None`` when
+            none could be observed -- which fails closed (issue #342).
+        exchange_status_epoch_s: Epoch second the status was observed, or
+            ``None``. Freshness is measured against this, never against the
+            tick's own clock, so a failed read cannot read as fresh.
+        pipeline_heartbeat_epoch_s: Epoch second the pipeline was last observed
+            alive, or ``None``. Stamped by an earlier stage, never by this
+            function -- a heartbeat equal to ``now`` could never go stale and
+            would make its check unfalsifiable.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
     """
-    market = MarketView(
+    market_view = MarketView(
         quote_snapshot_epoch_s=now_epoch_s,
         forecast_epoch_s=now_epoch_s,
         visible_depth=None,
         exchange_clock_epoch_s=now_epoch_s,
         open_position=None,
-        exchange_status=None,
-        exchange_status_epoch_s=None,
+        exchange_status=exchange_status,
+        exchange_status_epoch_s=exchange_status_epoch_s,
+        jurisdiction_status=project_jurisdiction(
+            market.jurisdiction_status if market is not None else None
+        ),
+        product_type=project_product_type(
+            market.market_type if market is not None else None
+        ),
     )
     fees = FeeBounds(max_trading_fee=MoneyMicros(0), max_settlement_fee=MoneyMicros(0))
     return EvaluationContext(
         mode=Mode.PAPER,
         limits=_build_limits(config, instrument_whitelist),
         account=_zero_account(),
-        market=market,
+        market=market_view,
         fees=fees,
         now_epoch_s=now_epoch_s,
         used_intent_ids=frozenset(),
         used_idempotency_keys=frozenset(),
         verification=verification,
         acknowledged_intent_ids=frozenset(),
-        pipeline_heartbeat_epoch_s=None,
+        pipeline_heartbeat_epoch_s=pipeline_heartbeat_epoch_s,
     )
 
 
@@ -505,6 +627,16 @@ class PaperTickDeps:
             gathers citations through.
         report_dir: Where the weekly report stub is written each tick.
         clock: The injected zero-arg epoch-second clock, for determinism.
+        budget: The research spend guard every tick's forecast runs under. This
+            is the bundle's one deliberately *mutable* member: the frozen
+            dataclass forbids rebinding the field, not mutating the object it
+            holds, and that is load-bearing. The instance is built once per
+            process in :func:`build_paper_deps`, so its per-UTC-day spend bucket
+            accumulates across every ``run_single_tick`` call against this
+            bundle -- which is the only thing making the per-day ceiling mean
+            anything on an always-on loop. :func:`dataclasses.replace` shares
+            the same instance by design, so swapping the ``approval`` seam
+            cannot reset the day.
     """
 
     config: WindbreakConfig
@@ -519,6 +651,7 @@ class PaperTickDeps:
     research_tools: ResearchTools
     report_dir: Path
     clock: Callable[[], int]
+    budget: ResearchBudget
 
 
 def _default_clock() -> int:
@@ -658,9 +791,41 @@ def _build_gateway(
         wal=WriteAheadLog(wal_path),
         ledger_reader=store,
         reconciliation_source=exchange,
+        status_source=exchange,
     )
     gateway.recover()
     return gateway
+
+
+def _build_research_budget(
+    store: SqliteLedgerStore, config: WindbreakConfig
+) -> ResearchBudget:
+    """Build the loop's one research spend guard from configuration.
+
+    Config is the single source of the three ceilings, and there is deliberately
+    no way to inject a budget from outside: that is what makes an unlimited or
+    absent budget unrepresentable rather than merely discouraged. All three
+    ceilings are already scaled integers on the config, so they pass through
+    untouched -- no arithmetic, and therefore no float, enters this path.
+
+    Args:
+        store: The ledger store a fail-closed halt is recorded to.
+        config: The active configuration supplying the three ceilings.
+
+    Returns:
+        The process-lived research budget.
+
+    Raises:
+        ValueError: If any configured ceiling is negative -- aborting startup
+            rather than degrading to an unenforceable budget.
+    """
+    caps = config.forecast.budget
+    return ResearchBudget(
+        per_forecast_micros=caps.per_forecast_micros,
+        per_day_micros=caps.per_day_micros,
+        max_pages=caps.max_pages,
+        ledger=_SqliteBudgetLedgerWriter(store),
+    )
 
 
 def build_paper_deps(
@@ -695,7 +860,13 @@ def build_paper_deps(
         A fully wired :class:`PaperTickDeps`.
     """
     resolved_clock = clock if clock is not None else _default_clock
-    exchange = PaperExchange.from_fixture_dir(books_dir)
+    # The exchange must observe on the same clock the tick reads, or its status
+    # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
+    # freshness against two unrelated timelines (issue #342).
+    exchange = PaperExchange.from_fixture_dir(
+        books_dir,
+        clock=lambda: datetime.fromtimestamp(resolved_clock(), UTC),
+    )
     ticker = next(iter(exchange.markets))
     store = SqliteLedgerStore(ledger_path)
     key = secrets.token_bytes(_SIGNING_KEY_BYTES)
@@ -720,6 +891,7 @@ def build_paper_deps(
         research_tools=_resolve_research_tools(research_tools, ledger_path),
         report_dir=report_dir,
         clock=resolved_clock,
+        budget=_build_research_budget(store, config),
     )
 
 
@@ -738,6 +910,9 @@ class TickOutcome:
             contract-centis (``0`` whenever the real kernel vetoes, as it always
             does today).
         equity_micros: The sampled account equity this tick, in micros.
+        research_halted: Whether this tick's research was halted fail-closed on
+            a budget ceiling. When ``True`` no forecast exists, so
+            ``forecast_id`` is ``""`` and no selector decision was made.
     """
 
     beat: int
@@ -745,6 +920,7 @@ class TickOutcome:
     intent_count: int
     filled_centis: int
     equity_micros: int
+    research_halted: bool = False
 
 
 def _snapshot_stage(deps: PaperTickDeps) -> OrderBookSnapshot:
@@ -782,12 +958,31 @@ def _baseline_pips(order_book: OrderBookSnapshot) -> int:
 
 def _forecast_stage(
     deps: PaperTickDeps, order_book: OrderBookSnapshot, created_at: datetime
-) -> ForecastRecord:
+) -> ForecastRecord | None:
     """Run the forecast pipeline and ledger the forecast event.
 
     The ledgered ``ForecastCreated`` carries the forecast's ``research_cost_micros``
     and ``market_price_baseline_pips`` (issue #188), the two fields the weekly
     evaluation/cost-meter fold reads verbatim off the payload.
+
+    The vote stage is driven from ``config.forecast.vote_ensemble`` -- the
+    authoritative vote-stage ensemble (ADR-0006), threaded here so an operator's
+    configured ensemble is the one the PAPER loop actually calls (issue #294).
+    It is passed through verbatim, never defaulted away: the default config's
+    ensemble is provenance-identical to the engine's own
+    :data:`~windbreak.forecast.providers.DEFAULT_VOTE_ENSEMBLE`, so the default
+    path is byte-identical, while an operator who empties the field gets zero
+    votes and a fail-closed abstention rather than a silent fallback to a
+    triple they configured away.
+
+    Research runs under the bundle's budget (issue #339). On a budget breach the
+    pipeline raises, and this stage answers ``None`` rather than fabricating a
+    forecast: in a hash-chained audit ledger an honest gap beats a
+    ``ForecastCreated`` row for a tick where the engine provably never ran. The
+    ``except`` deliberately names exactly the two budget errors -- widening it
+    would dress an unrelated pipeline failure up as a benign budget halt. It
+    ledgers nothing itself, because the budget's own ledger writer has already
+    appended the durable ``ResearchBudgetHalted`` row before raising.
 
     Args:
         deps: The tick's dependency bundle.
@@ -795,7 +990,9 @@ def _forecast_stage(
         created_at: The injected creation instant, for determinism.
 
     Returns:
-        The produced forecast record.
+        The produced forecast record, or ``None`` when research halted
+        fail-closed on the budget -- in which case neither a ``ForecastCreated``
+        nor any ``ProviderVoteRecorded`` row is appended for this tick.
     """
     market = deps.exchange.get_market(deps.ticker)
     baseline = BaselineQuoteSnapshot(
@@ -803,13 +1000,20 @@ def _forecast_stage(
         price_pips=_baseline_pips(order_book),
         fetched_at=order_book.fetched_at,
     )
-    forecast = run_pipeline(
-        market,
-        baseline,
-        transport=deps.transport,
-        created_at=created_at,
-        research_tools=deps.research_tools,
-    )
+    vote_ledger = InMemoryForecastLedger()
+    try:
+        forecast = run_pipeline(
+            market,
+            baseline,
+            transport=deps.transport,
+            created_at=created_at,
+            research_tools=deps.research_tools,
+            ledger=vote_ledger,
+            budget=deps.budget,
+            ensemble=deps.config.forecast.vote_ensemble,
+        )
+    except (DailyBudgetExhaustedError, PerForecastBudgetExceededError):
+        return None
     deps.store.append(
         ForecastCreated(
             component=_COMPONENT,
@@ -822,7 +1026,42 @@ def _forecast_stage(
             market_price_baseline_pips=forecast.market_price_baseline_pips,
         )
     )
+    _ledger_provider_votes(deps, forecast.forecast_id, vote_ledger)
     return forecast
+
+
+def _ledger_provider_votes(
+    deps: PaperTickDeps, forecast_id: str, vote_ledger: InMemoryForecastLedger
+) -> None:
+    """Fold buffered per-vote cost events into ``ProviderVoteRecorded`` rows.
+
+    The pipeline buffers one :data:`PROVIDER_VOTE_COSTED_EVENT` per ensemble
+    member driven into ``vote_ledger``; this composition-root fold stamps each
+    with the tick's own ``forecast_id`` and appends it to the durable store, in
+    emission order, immediately after the tick's ``ForecastCreated`` (issue
+    #281). A run that abstains before the vote stage buffers zero events, so
+    zero ``ProviderVoteRecorded`` rows are appended.
+
+    Args:
+        deps: The tick's dependency bundle (its ``store`` receives the rows).
+        forecast_id: The tick's forecast id, stamped on every appended row.
+        vote_ledger: The in-memory ledger the pipeline buffered vote costs into.
+    """
+    for event in vote_ledger.events_by_type(PROVIDER_VOTE_COSTED_EVENT):
+        payload = event.payload
+        deps.store.append(
+            ProviderVoteRecorded(
+                component=_COMPONENT,
+                forecast_id=forecast_id,
+                market_ticker=cast("str", payload["market_ticker"]),
+                provider=cast("str", payload["provider"]),
+                model_version=cast("str", payload["model_version"]),
+                vote_index=cast("int", payload["vote_index"]),
+                cost_micros=cast("int", payload["cost_micros"]),
+                outcome=cast("str", payload["outcome"]),
+                failure_code=cast("str", payload["failure_code"]),
+            )
+        )
 
 
 def _position_input(deps: PaperTickDeps) -> PositionReadModelInput:
@@ -933,29 +1172,57 @@ def _route_intent(
     return result.ack.filled.value if result.ack is not None else 0
 
 
-def _approve_stage(deps: PaperTickDeps, decision: SelectorDecision) -> int:
+def _approve_stage(
+    deps: PaperTickDeps, decision: SelectorDecision, heartbeat_epoch_s: int
+) -> int:
     """Approve each emitted intent through the seam; route any minted token.
 
-    With the real kernel the approval always vetoes (no token minted), so no
-    order ever routes; the routing path exists for the doubled-seam fill-leg
-    proof. Issue #110's ``exchange_status_ok`` / ``pipeline_heartbeat_ok`` are
-    now real, but PAPER fills stay gated: the ``jurisdiction_product_eligibility``
-    stub still vetoes, and the honest ``verification=None`` plus the ``None``
-    exchange status / pipeline heartbeat this loop supplies make those two
-    now-real checks veto too.
+    Reads the exchange status once, here at decision time rather than at
+    composition time, so its freshness is measured from a genuine observation
+    (issue #342). The status *value* comes from the connector and is never
+    synthesized, so a paused or closed exchange still vetoes.
+
+    PAPER fills nonetheless stay gated: ``verification=None`` still fails the
+    three reconciliation checks, so ``filled_centis`` remains ``0``.
+
+    A market the exchange cannot resolve becomes ``None`` rather than an
+    exception, so an unknown ticker vetoes the tick instead of aborting it.
 
     Args:
         deps: The tick's dependency bundle.
         decision: The selector's decision carrying any emitted intents.
+        heartbeat_epoch_s: The instant an earlier stage observed the pipeline
+            alive.
 
     Returns:
         The total quantity filled this tick, in contract-centis.
     """
+    try:
+        market: NormalizedMarket | None = deps.exchange.get_market(deps.ticker)
+    except UnknownMarketError:
+        market = None
+    observed = deps.exchange.get_exchange_status()
+    status_epoch_s = int(observed.fetched_at.timestamp())
+    deps.store.append(
+        ExchangeStatusObserved(
+            component=_COMPONENT,
+            status=observed.status,
+            observed_at_epoch_s=status_epoch_s,
+        )
+    )
+    # A second clock read, deliberately not the tick-start `now_epoch_s`:
+    # freshness must be judged at evaluation time, so a slow forecast stage can
+    # legitimately age the heartbeat out rather than being masked by a reading
+    # taken before it ran.
     context = build_evaluation_context(
         deps.config,
         now_epoch_s=deps.clock(),
         verification=None,
         instrument_whitelist=frozenset({deps.ticker}),
+        market=market,
+        exchange_status=project_exchange_status(observed.status),
+        exchange_status_epoch_s=status_epoch_s,
+        pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
     )
     filled = 0
     for intent in decision.intents:
@@ -1050,6 +1317,60 @@ def _equity_and_positions_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
     return equity.value
 
 
+def _heartbeat_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
+    """Ledger a pipeline heartbeat and return the instant it attests to.
+
+    Called after the snapshot stage, so the heartbeat is stamped only once the
+    tick has proven the pipeline genuinely running -- an attestation rather than
+    a constant. It is deliberately NOT stamped inside the approval context: a
+    heartbeat equal to the approval's own ``now`` could never be stale, which
+    would make ``pipeline_heartbeat_ok`` unfalsifiable and therefore worse than
+    the ``None`` it replaces.
+
+    Args:
+        deps: The tick's dependency bundle.
+        now_epoch_s: The tick's clock reading.
+
+    Returns:
+        The epoch second the pipeline was observed alive.
+    """
+    deps.store.append(
+        PipelineHeartbeatRecorded(component=_COMPONENT, heartbeat_epoch_s=now_epoch_s)
+    )
+    return now_epoch_s
+
+
+def _decide_and_approve(
+    deps: PaperTickDeps,
+    order_book: OrderBookSnapshot,
+    forecast: ForecastRecord | None,
+    created_at: datetime,
+    heartbeat_epoch_s: int,
+) -> tuple[str, int, int]:
+    """Select and approve against a forecast, or short-circuit a halted tick.
+
+    Narrows the optional forecast in one place so the select and approve stages
+    keep their existing non-optional contracts.
+
+    Args:
+        deps: The tick's dependency bundle.
+        order_book: The current book snapshot the selector reads.
+        forecast: The tick's forecast, or ``None`` when research halted.
+        created_at: The injected creation instant, for determinism.
+        heartbeat_epoch_s: The instant an earlier stage observed the pipeline
+            alive, threaded through to the approval context.
+
+    Returns:
+        A ``(forecast_id, intent_count, filled_centis)`` triple -- ``("", 0, 0)``
+        when research halted, since no forecast exists to select against.
+    """
+    if forecast is None:
+        return "", 0, 0
+    decision = _select_stage(deps, order_book, forecast, created_at)
+    filled = _approve_stage(deps, decision, heartbeat_epoch_s)
+    return forecast.forecast_id, len(decision.intents), filled
+
+
 def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     """Drive one PAPER tick end to end, ledgering every stage (SPEC S5.3).
 
@@ -1061,7 +1382,17 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     carries genuine evaluation and cost-meter data (issue #188), built lazily so
     the fold is paid for only on the genuine per-week write. Every stage appends
     an audit event to the shared hash-chained ledger. With the real kernel the
-    approval always vetoes, so no order ever routes and ``filled_centis`` is ``0``.
+    approval still vetoes every intent -- on the honest ``None`` verification,
+    exchange status, and pipeline heartbeat this loop supplies, not on a stub --
+    so no order routes and ``filled_centis`` is ``0``.
+
+    A tick whose per-forecast or per-UTC-day research budget is exhausted halts
+    fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row, skips
+    the forecast, select, and approve stages, and still emits its heartbeat,
+    equity sample, positions snapshot, and weekly report -- so the loop stays
+    observably alive and flat rather than dying on an uncaught budget error.
+    Its ledger therefore differs from a normal tick's by exactly two absent
+    rows: ``ForecastCreated`` and ``SelectorDecisionRecorded``.
 
     Args:
         deps: The fully wired dependency bundle.
@@ -1073,9 +1404,11 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     now_epoch_s = deps.clock()
     created_at = datetime.fromtimestamp(now_epoch_s, UTC)
     order_book = _snapshot_stage(deps)
+    heartbeat_epoch_s = _heartbeat_stage(deps, now_epoch_s)
     forecast = _forecast_stage(deps, order_book, created_at)
-    decision = _select_stage(deps, order_book, forecast, created_at)
-    filled = _approve_stage(deps, decision)
+    forecast_id, intent_count, filled = _decide_and_approve(
+        deps, order_book, forecast, created_at, heartbeat_epoch_s
+    )
     deps.store.append(
         ModeHeartbeat(component=_COMPONENT, mode=Mode.PAPER.name, beat=beat)
     )
@@ -1088,8 +1421,9 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     )
     return TickOutcome(
         beat=beat,
-        forecast_id=forecast.forecast_id,
-        intent_count=len(decision.intents),
+        forecast_id=forecast_id,
+        intent_count=intent_count,
         filled_centis=filled,
         equity_micros=equity,
+        research_halted=forecast is None,
     )

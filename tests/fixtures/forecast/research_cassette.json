@@ -1,0 +1,26 @@
+{
+  "placeholder-hash-research-search-1": {
+    "request": {
+      "method": "POST",
+      "url": "https://search.example/v1/search",
+      "body": "{\"max_results\":5,\"query\":\"example subquestion text\"}"
+    },
+    "response": {
+      "status_code": 200,
+      "body": "{\"results\": [\"https://research.local/example-article\"]}",
+      "content_type": "application/json"
+    }
+  },
+  "placeholder-hash-research-fetch-1": {
+    "request": {
+      "method": "GET",
+      "url": "https://research.local/example-article",
+      "body": ""
+    },
+    "response": {
+      "status_code": 200,
+      "body": "<html><head><script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"@type\": \"NewsArticle\", \"datePublished\": \"2024-11-20T09:00:00Z\"}</script></head><body><p>Example article prose for the committed research cassette fixture.</p></body></html>",
+      "content_type": "text/html; charset=utf-8"
+    }
+  }
+}

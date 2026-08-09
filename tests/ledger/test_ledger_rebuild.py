@@ -49,6 +49,19 @@ control ledger holding only the `ConfigLoaded`/`ModeHeartbeat` rows. The test
 imports the three new event classes locally (mirroring this module's own
 `mode_history_read_model` local-import precedent below) so this single test's
 `ImportError` does not break collection of the rest of the file.
+
+Issue #195 grows `rebuild()`'s always-written output-file set to ten:
+`canary_status.json` (the latest-per-provider `CanaryVerdictRecorded`
+projection) and `forecasts.json` (every `ForecastCreated` row, for the
+weekly-report/dashboard fleet-cost and abstention-rate fold) join the eight
+already documented above. `test_rebuild_writes_only_the_documented_read_model_files`
+is updated in place (a CONSCIOUS, minimal update -- `rebuild()`'s output-file
+set is exhaustively pinned there, so a ninth/tenth file must extend that same
+list) to include both; dedicated projection-function tests for
+`canary_status_read_model`/`forecasts_read_model` live in
+`tests/ledger/test_canary_rebuild.py`, mirroring this module's own
+`test_scheduler_rebuild.py` sibling-file precedent for a single issue's new
+projections.
 """
 
 from __future__ import annotations
@@ -119,11 +132,10 @@ def test_rebuild_writes_only_the_documented_read_model_files(
     Every read model is written unconditionally (empty here where no source
     events are present) -- the original three plus the three PAPER-loop read
     models issue #48 adds (`positions.json`, `equity_curve.json`,
-    `selector_decisions.json`), plus the two live-divergence read models
+    `selector_decisions.json`), the two live-divergence read models
     issue #58 wires up (`execution_quality.json`, `live_divergence.json`,
-    PR #199 review fix). This currently FAILS: `rebuild()` never calls
-    `execution_quality_read_model` / `live_divergence_read_model`, so neither
-    new file is produced at all.
+    PR #199 review fix), and the per-provider vote-cost read model issue #281
+    adds (`provider_vote_costs.json`).
     """
     db_path = tmp_path / "ledger.db"
     output_dir = tmp_path / "out"
@@ -135,13 +147,16 @@ def test_rebuild_writes_only_the_documented_read_model_files(
 
     produced = sorted(path.name for path in output_dir.iterdir())
     assert produced == [
+        "canary_status.json",
         "config_versions.json",
         "equity_curve.json",
         "execution_quality.json",
+        "forecasts.json",
         "gateway_events.json",
         "live_divergence.json",
         "mode_history.json",
         "positions.json",
+        "provider_vote_costs.json",
         "selector_decisions.json",
     ]
 
@@ -243,6 +258,8 @@ def test_rebuild_on_empty_ledger_produces_valid_empty_read_models(
     assert json.loads((output_dir / "mode_history.json").read_text()) == []
     assert json.loads((output_dir / "execution_quality.json").read_text()) == []
     assert json.loads((output_dir / "live_divergence.json").read_text()) == []
+    assert json.loads((output_dir / "canary_status.json").read_text()) == []
+    assert json.loads((output_dir / "forecasts.json").read_text()) == []
 
 
 def test_rebuild_skips_unknown_event_types_without_error(

@@ -40,6 +40,22 @@ Boundary-testing choice (the `>=` gate)
     Both edges are asserted explicitly below because a `>` vs `>=` mutant is
     otherwise invisible to any test that only exercises the interior of each
     region.
+
+TriageModel injection choice (issue #192)
+    The formerly-private `_TriageModel`/`_TRIAGE_MODEL` become a public
+    `TriageModel` NamedTuple and a module-level `_DEFAULT_TRIAGE_MODEL`
+    default, threaded as an optional `model=`/`triage_model=` keyword through
+    `run_stage0_prior`/`run_triaged_pipeline`. The tests below pin: omitting
+    the keyword yields a request byte-identical to today's pinned
+    `("openai", "gpt-5-triage-mini")` model; an injected model changes the
+    sent `LlmRequest`'s `provider`/`model_version`; and the STOP/PROCEED
+    ledger payloads gain `triage_provider`/`triage_model_version` provenance
+    fields. A final replay test drives Stage-0 under a `TriageModel` built
+    from a `windbreak.config.schema.ModelRef`-shaped pair
+    (`TriageModel(cfg.forecast.triage_model.provider,
+    cfg.forecast.triage_model.model)`), proving the config -> forecast wiring
+    shape without `windbreak.forecast.triage` itself ever importing
+    `windbreak.config` (the SPEC S8.3 sandbox boundary).
 """
 
 from __future__ import annotations
@@ -50,6 +66,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from windbreak.forecast.cassettes import (
+    CassetteMissError,
     ForbiddenLiveTransport,
     RecordingCassette,
     ReplayCassette,
@@ -65,6 +82,7 @@ from windbreak.forecast.triage import (
     TRIAGE_STOP_EVENT,
     TRIAGE_THRESHOLD_PPM,
     InMemoryTriageLedger,
+    TriageModel,
     TriagePrior,
     run_stage0_prior,
     run_triaged_pipeline,
@@ -122,6 +140,38 @@ class _CountingTransport:
         """
         self.call_count += 1
         return self._transport.complete(request)
+
+
+class _RequestRecordingTransport:
+    """A minimal `LlmTransport` double recording every full `LlmRequest`.
+
+    Unlike `_CountingTransport` (which only counts calls), this double keeps
+    every `LlmRequest` it was called with, so a test can assert on the exact
+    `provider`/`model_version`/`prompt` a call sent -- pinning `TriageModel`
+    injection (issue #192).
+    """
+
+    def __init__(self, response: str = "500000") -> None:
+        """Store the fixed response every `complete` call returns.
+
+        Args:
+            response: The fixed Stage-0 response text (a bare integer ppm
+                string) every call returns.
+        """
+        self._response = response
+        self.calls: list[LlmRequest] = []
+
+    def complete(self, request: LlmRequest) -> str:
+        """Record `request`, then return the fixed canned response.
+
+        Args:
+            request: The completion request to record.
+
+        Returns:
+            The fixed response text.
+        """
+        self.calls.append(request)
+        return self._response
 
 
 # --- Constants: SPEC-mandated exact values ---------------------------------------
@@ -196,6 +246,315 @@ def test_stage0_prior_accepts_inclusive_range_edges(
     prior = run_stage0_prior(market, baseline, transport=transport)
 
     assert prior.prior_ppm == int(response)
+
+
+# --- TriageModel: NamedTuple shape and default (issue #192) ----------------------
+
+
+def test_triage_model_is_a_named_tuple_with_provider_and_model_version_fields() -> None:
+    """`TriageModel` exposes exactly `{provider, model_version}` -- mirroring
+    the formerly-private `_TriageModel` field names verbatim.
+    """
+    model = TriageModel("openai", "gpt-5-triage-mini")
+
+    assert model.provider == "openai"
+    assert model.model_version == "gpt-5-triage-mini"
+    assert isinstance(model, tuple)
+    assert tuple(model) == ("openai", "gpt-5-triage-mini")
+
+
+def test_default_triage_model_module_constant_matches_the_pinned_stage0_model() -> None:
+    """`_DEFAULT_TRIAGE_MODEL` is exactly `TriageModel("openai",
+    "gpt-5-triage-mini")` -- the pre-#192 pinned Stage-0 model, unchanged.
+    """
+    import windbreak.forecast.triage as triage_module
+
+    assert (
+        TriageModel("openai", "gpt-5-triage-mini")
+        == triage_module._DEFAULT_TRIAGE_MODEL
+    )
+
+
+# --- run_stage0_prior: model= injection (issue #192) ------------------------------
+
+
+def test_run_stage0_prior_without_model_kwarg_uses_the_pinned_default(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """Omitting `model=` entirely sends a request on the pinned default
+    `("openai", "gpt-5-triage-mini")` model -- byte-identical to before
+    `model=` existed as a keyword at all.
+    """
+    transport = _RequestRecordingTransport()
+
+    run_stage0_prior(market, baseline, transport=transport)
+
+    assert transport.calls[0].provider == "openai"
+    assert transport.calls[0].model_version == "gpt-5-triage-mini"
+
+
+def test_run_stage0_prior_explicit_default_model_is_byte_identical_to_omitted(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """Passing `model=TriageModel("openai", "gpt-5-triage-mini")` explicitly
+    sends the identical request as omitting `model=` altogether.
+    """
+    transport_omitted = _RequestRecordingTransport()
+    transport_explicit = _RequestRecordingTransport()
+
+    run_stage0_prior(market, baseline, transport=transport_omitted)
+    run_stage0_prior(
+        market,
+        baseline,
+        transport=transport_explicit,
+        model=TriageModel("openai", "gpt-5-triage-mini"),
+    )
+
+    assert transport_omitted.calls[0] == transport_explicit.calls[0]
+    assert (
+        transport_omitted.calls[0].request_hash()
+        == transport_explicit.calls[0].request_hash()
+    )
+
+
+def test_run_stage0_prior_injected_model_changes_the_sent_request(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """An injected `model=` changes the sent `LlmRequest`'s `provider` and
+    `model_version` away from the pinned default.
+    """
+    transport = _RequestRecordingTransport()
+    custom_model = TriageModel("anthropic", "claude-triage-custom")
+
+    run_stage0_prior(market, baseline, transport=transport, model=custom_model)
+
+    assert transport.calls[0].provider == "anthropic"
+    assert transport.calls[0].model_version == "claude-triage-custom"
+
+
+def test_run_stage0_prior_injected_model_yields_a_different_request_hash(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """An injected, non-default model produces a request hash distinct from
+    the default model's request -- the model provenance really is hashed into
+    the request.
+    """
+    transport_default = _RequestRecordingTransport()
+    transport_custom = _RequestRecordingTransport()
+
+    run_stage0_prior(market, baseline, transport=transport_default)
+    run_stage0_prior(
+        market,
+        baseline,
+        transport=transport_custom,
+        model=TriageModel("anthropic", "claude-triage-custom"),
+    )
+
+    assert (
+        transport_default.calls[0].request_hash()
+        != transport_custom.calls[0].request_hash()
+    )
+
+
+def test_run_stage0_prior_still_parses_the_response_with_an_injected_model(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """Injecting a custom model does not change Stage-0's response-parsing
+    contract: the returned `TriagePrior` still carries the parsed ppm and the
+    fixed Stage-0 cost.
+    """
+    transport = _RequestRecordingTransport("520000")
+    custom_model = TriageModel("anthropic", "claude-triage-custom")
+
+    prior = run_stage0_prior(market, baseline, transport=transport, model=custom_model)
+
+    assert prior == TriagePrior(prior_ppm=520_000, cost_micros=60_000)
+
+
+# --- run_triaged_pipeline: triage_model= threading (issue #192) ------------------
+
+
+def test_run_triaged_pipeline_threads_triage_model_into_the_stage0_request(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    research_tools: ResearchTools,
+) -> None:
+    """`run_triaged_pipeline`'s `triage_model=` reaches Stage-0's sent request,
+    on both the STOP and PROCEED paths.
+    """
+    transport = _RequestRecordingTransport("460000")
+    custom_model = TriageModel("anthropic", "claude-triage-custom")
+
+    run_triaged_pipeline(
+        market,
+        baseline,
+        triage_transport=transport,
+        full_transport=ForbiddenLiveTransport(),
+        ledger=InMemoryTriageLedger(),
+        created_at=created_at,
+        research_tools=research_tools,
+        triage_model=custom_model,
+    )
+
+    assert transport.calls[0].provider == "anthropic"
+    assert transport.calls[0].model_version == "claude-triage-custom"
+
+
+def test_stop_event_payload_carries_the_default_triage_model_provenance(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    make_fake_vote_transport: FakeVoteTransportFactory,
+    research_tools: ResearchTools,
+) -> None:
+    """With `triage_model=` omitted, a STOP event's payload names the pinned
+    default model's provider and version.
+    """
+    ledger = InMemoryTriageLedger()
+
+    run_triaged_pipeline(
+        market,
+        baseline,
+        triage_transport=make_fake_vote_transport(("460000",)),
+        full_transport=ForbiddenLiveTransport(),
+        ledger=ledger,
+        created_at=created_at,
+        research_tools=research_tools,
+    )
+
+    payload = ledger.events_by_type(TRIAGE_STOP_EVENT)[0].payload
+    assert payload["triage_provider"] == "openai"
+    assert payload["triage_model_version"] == "gpt-5-triage-mini"
+    assert json.dumps(payload)
+    assert all(isinstance(v, int | str | bool) for v in payload.values())
+
+
+def test_stop_event_payload_carries_an_injected_triage_model_provenance(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    make_fake_vote_transport: FakeVoteTransportFactory,
+    research_tools: ResearchTools,
+) -> None:
+    """An injected `triage_model=` is reflected in the STOP event's payload."""
+    ledger = InMemoryTriageLedger()
+    custom_model = TriageModel("anthropic", "claude-triage-custom")
+
+    run_triaged_pipeline(
+        market,
+        baseline,
+        triage_transport=make_fake_vote_transport(("460000",)),
+        full_transport=ForbiddenLiveTransport(),
+        ledger=ledger,
+        created_at=created_at,
+        research_tools=research_tools,
+        triage_model=custom_model,
+    )
+
+    payload = ledger.events_by_type(TRIAGE_STOP_EVENT)[0].payload
+    assert payload["triage_provider"] == "anthropic"
+    assert payload["triage_model_version"] == "claude-triage-custom"
+
+
+def test_proceed_event_payload_carries_an_injected_triage_model_provenance(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    make_fake_vote_transport: FakeVoteTransportFactory,
+    research_tools: ResearchTools,
+) -> None:
+    """An injected `triage_model=` is also reflected in the PROCEED event's
+    payload.
+    """
+    ledger = InMemoryTriageLedger()
+    custom_model = TriageModel("anthropic", "claude-triage-custom")
+
+    run_triaged_pipeline(
+        market,
+        baseline,
+        triage_transport=make_fake_vote_transport(("600000",)),
+        full_transport=make_fake_vote_transport(),
+        ledger=ledger,
+        created_at=created_at,
+        research_tools=research_tools,
+        triage_model=custom_model,
+    )
+
+    payload = ledger.events_by_type(TRIAGE_PROCEED_EVENT)[0].payload
+    assert payload["triage_provider"] == "anthropic"
+    assert payload["triage_model_version"] == "claude-triage-custom"
+    assert json.dumps(payload)
+    assert all(isinstance(v, int | str | bool) for v in payload.values())
+
+
+# --- Config -> forecast wiring replay (issue #192) --------------------------------
+
+
+def test_run_stage0_prior_replays_over_a_config_shaped_triage_model(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    tmp_path: Path,
+) -> None:
+    """Stage-0 runs, record-then-replay, under a `TriageModel` built from a
+    `ModelRef`-shaped `(provider, model)` pair -- the exact structural
+    translation an operator-facing config->forecast wiring layer would apply
+    (`TriageModel(cfg.forecast.triage_model.provider,
+    cfg.forecast.triage_model.model)`) -- proving the model is a plain
+    structural NamedTuple `windbreak.forecast.triage` never needs
+    `windbreak.config` to build.
+
+    The recorded/replayed cassette is built dynamically against a fake
+    transport (mirroring this module's own
+    `test_proceed_path_cassette_replay_matches_recording`), rather than
+    reloaded from the committed `tests/fixtures/forecast/
+    triage_stage0_cassette.json` placeholder fixture: that file's key is a
+    human-readable placeholder (never a real 64-char request hash, exactly
+    like `futuresearch_cassette.json`), so it backs only the
+    hash-independent structural checks in `test_cassettes.py`'s sibling
+    suite, not a byte-precise replay hit here.
+    """
+    # A minimal, local stand-in for a `windbreak.config.schema.ModelRef` pair
+    # (`provider`, `model`) -- imported nowhere from `windbreak.config`.
+    config_triage_model_provider = "openai"
+    config_triage_model_version = "gpt-5-triage-mini"
+    model = TriageModel(config_triage_model_provider, config_triage_model_version)
+
+    cassette_path = tmp_path / "triage_stage0.json"
+    recorder = RecordingCassette(
+        transport=_RequestRecordingTransport("510000"), path=cassette_path
+    )
+    recorded = run_stage0_prior(market, baseline, transport=recorder, model=model)
+
+    replay = ReplayCassette.from_path(cassette_path)
+    replayed = run_stage0_prior(market, baseline, transport=replay, model=model)
+
+    assert replayed == recorded == TriagePrior(prior_ppm=510_000, cost_micros=60_000)
+
+
+def test_triage_stage0_cassette_fixture_loads_without_error(fixture_dir: Path) -> None:
+    """The committed `triage_stage0_cassette.json` fixture parses without
+    error via `ReplayCassette.from_path` -- a structural smoke test mirroring
+    `test_from_path_loads_committed_fixture_without_error` in
+    `tests/forecast/providers/test_http_cassettes.py`.
+    """
+    ReplayCassette.from_path(fixture_dir / "triage_stage0_cassette.json")
+
+
+def test_triage_stage0_cassette_fixture_misses_on_any_real_request(
+    fixture_dir: Path,
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+) -> None:
+    """The fixture's key is a human-readable placeholder, never a real
+    64-char `request_hash()`, so any real Stage-0 request is a guaranteed
+    miss against it -- proving the file cannot be mistaken for a live replay
+    source.
+    """
+    replay = ReplayCassette.from_path(fixture_dir / "triage_stage0_cassette.json")
+
+    with pytest.raises(CassetteMissError):
+        run_stage0_prior(market, baseline, transport=replay)
 
 
 # --- should_run_full_pipeline: gating boundaries (mutation-critical `>=`) --------

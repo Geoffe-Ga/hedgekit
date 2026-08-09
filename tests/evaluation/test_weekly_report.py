@@ -1,6 +1,19 @@
 """Failing-first tests for `render_weekly_report` / `generate_weekly_report`
 (issue #55, RED).
 
+Issue #195 adds a fourth optional section, `## Providers` (fleet
+observability): `render_weekly_report` gains a keyword-only
+`provider_lines: str | None = None` -- the pre-rendered body
+`windbreak.reports.providers.render_provider_lines` produces, embedded
+verbatim, mirroring `evaluation`/`costs`'s own "pre-built object, `None` ->
+`No data yet.` fallback" contract exactly for `evaluation` (whose body is
+likewise produced by a call the caller makes, not by `render_weekly_report`
+itself: `evaluation.render_text()`). This is a CONSCIOUS, minimal update to
+three pre-existing "no data yet" occurrence-count assertions below (each
+grows by exactly one, since every existing call site in this file omits the
+new keyword and therefore hits its `None` -> fallback default) -- noted at
+each touched assertion.
+
 Neither symbol exists yet on `windbreak.evaluation.report`, so every test below
 imports them as the FIRST statement inside the test body (matching this
 package's established RED convention; see `test_preregistration.py` /
@@ -131,7 +144,10 @@ def test_render_weekly_report_includes_stub_headings_and_both_new_sections() -> 
     assert str(MoneyMicros(7_000_000)) in body
     assert str(MoneyMicros(-1_500_000)) in body
 
-    assert body.count("No data yet.") == 3
+    # Issue #195: a fourth "## Providers" section joins the three original
+    # stub headings, defaulting to "No data yet." here since this call
+    # supplies no `provider_lines` -- 3 stub sections + 1 Providers fallback.
+    assert body.count("No data yet.") == 4
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +167,9 @@ def test_render_weekly_report_shows_no_data_yet_for_both_none_arguments() -> Non
 
     assert "## Evaluation" in body
     assert "## Cost meter" in body
-    assert body.count("No data yet.") == 5
+    # Issue #195: was 5 (3 stub + evaluation + costs); +1 for the new
+    # "## Providers" section's own `provider_lines=None` -> fallback.
+    assert body.count("No data yet.") == 6
 
 
 def test_render_weekly_report_evaluation_and_costs_fall_back_independently() -> None:
@@ -166,15 +184,236 @@ def test_render_weekly_report_evaluation_and_costs_fall_back_independently() -> 
 
     body_costs_only = render_weekly_report(today=today, evaluation=None, costs=costs)
     assert str(MoneyMicros(3_500_000)) in body_costs_only
-    # 3 stub sections + the evaluation section's own fallback = 4.
-    assert body_costs_only.count("No data yet.") == 4
+    # Issue #195: 3 stub sections + the evaluation section's own fallback +
+    # the new Providers section's own fallback (no `provider_lines` supplied
+    # here either) = 5 (was 4).
+    assert body_costs_only.count("No data yet.") == 5
 
     evaluation = _empty_evaluation_report()
     body_evaluation_only = render_weekly_report(
         today=today, evaluation=evaluation, costs=None
     )
     assert evaluation.render_text() in body_evaluation_only
-    assert body_evaluation_only.count("No data yet.") == 4
+    assert body_evaluation_only.count("No data yet.") == 5
+
+
+# ---------------------------------------------------------------------------
+# 2b. render_weekly_report: the new `## Providers` section (issue #195).
+# ---------------------------------------------------------------------------
+
+
+def test_render_weekly_report_providers_section_defaults_to_no_data_yet() -> None:
+    """With no `provider_lines` supplied, the `## Providers` section renders
+    the same `No data yet.` fallback every other data-less section uses --
+    never an error or a silently omitted heading.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    body = render_weekly_report(today=date(2024, 3, 4), evaluation=None, costs=None)
+
+    assert "## Providers" in body
+    providers_section = body.split("## Providers", 1)[1]
+    assert "No data yet." in providers_section
+
+
+def test_render_weekly_report_embeds_provider_lines_verbatim_when_supplied() -> None:
+    """A supplied `provider_lines` string is embedded verbatim under
+    `## Providers`, exactly like `evaluation.render_text()` is embedded under
+    `## Evaluation`.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    provider_lines = (
+        "provider=futuresearch resolved=212 brier_skill_ppm=+14200 "
+        "cost_per_forecast=n/a abstain_rate=9% canary=OK"
+    )
+
+    body = render_weekly_report(
+        today=date(2024, 3, 4),
+        evaluation=None,
+        costs=None,
+        provider_lines=provider_lines,
+    )
+
+    assert "## Providers" in body
+    assert provider_lines in body
+    providers_section = body.split("## Providers", 1)[1]
+    assert "No data yet." not in providers_section
+
+
+# ---------------------------------------------------------------------------
+# 2c. render_weekly_report: the equity/position/decision line params
+#     (issue #255) embed verbatim under their existing #48 stub headings,
+#     mirroring the `## Providers` embed-or-fallback contract (2b above) for
+#     the three ORIGINAL stub sections instead of a fourth new one. Every
+#     call site above omits these three new keywords too, so none of the
+#     "No data yet." occurrence-count assertions in sections 1-2 change: the
+#     three stub headings already contributed exactly one "No data yet." each
+#     to those counts, and still do when their new param defaults to `None`.
+# ---------------------------------------------------------------------------
+
+
+def test_render_weekly_report_equity_lines_section_defaults_to_no_data_yet() -> None:
+    """With no `equity_lines` supplied, `## Equity vs floor` still renders the
+    shared `No data yet.` fallback -- never an error or an omitted heading.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    body = render_weekly_report(today=date(2024, 3, 4), evaluation=None, costs=None)
+
+    section = body.split("## Equity vs floor", 1)[1].split("## Positions", 1)[0]
+    assert "No data yet." in section
+
+
+def test_render_weekly_report_embeds_equity_lines_verbatim_when_supplied() -> None:
+    """A supplied `equity_lines` string is embedded verbatim under `## Equity
+    vs floor`, exactly like `provider_lines` is embedded under `## Providers`.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    equity_lines = (
+        "equity_samples=1\n"
+        "epoch_s=1700 equity_micros=11000000 floor_micros=10000000 "
+        "buffer_micros=+1000000"
+    )
+
+    body = render_weekly_report(
+        today=date(2024, 3, 4),
+        evaluation=None,
+        costs=None,
+        equity_lines=equity_lines,
+    )
+
+    section = body.split("## Equity vs floor", 1)[1].split("## Positions", 1)[0]
+    assert equity_lines in section
+    assert "No data yet." not in section
+
+
+def test_render_weekly_report_position_lines_section_defaults_to_no_data_yet() -> None:
+    """With no `position_lines` supplied, `## Positions` still renders the
+    shared `No data yet.` fallback.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    body = render_weekly_report(today=date(2024, 3, 4), evaluation=None, costs=None)
+
+    section = body.split("## Positions", 1)[1].split("## Decisions", 1)[0]
+    assert "No data yet." in section
+
+
+def test_render_weekly_report_embeds_position_lines_verbatim_when_supplied() -> None:
+    """A supplied `position_lines` string is embedded verbatim under
+    `## Positions`.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    position_lines = (
+        "snapshots=1\n"
+        "open_positions=1\n"
+        "ticker=MKT-DEEP quantity_centis=200 average_price_pips=4600"
+    )
+
+    body = render_weekly_report(
+        today=date(2024, 3, 4),
+        evaluation=None,
+        costs=None,
+        position_lines=position_lines,
+    )
+
+    section = body.split("## Positions", 1)[1].split("## Decisions", 1)[0]
+    assert position_lines in section
+    assert "No data yet." not in section
+
+
+def test_render_weekly_report_decision_lines_section_defaults_to_no_data_yet() -> None:
+    """With no `decision_lines` supplied, `## Decisions` still renders the
+    shared `No data yet.` fallback.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    body = render_weekly_report(today=date(2024, 3, 4), evaluation=None, costs=None)
+
+    section = body.split("## Decisions", 1)[1].split("## Evaluation", 1)[0]
+    assert "No data yet." in section
+
+
+def test_render_weekly_report_embeds_decision_lines_verbatim_when_supplied() -> None:
+    """A supplied `decision_lines` string is embedded verbatim under
+    `## Decisions`.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    decision_lines = (
+        "decision_events=1\n"
+        "event=SelectorDecisionRecorded subject=MKT-DEEP "
+        "reasons=net_edge_below_minimum"
+    )
+
+    body = render_weekly_report(
+        today=date(2024, 3, 4),
+        evaluation=None,
+        costs=None,
+        decision_lines=decision_lines,
+    )
+
+    section = body.split("## Decisions", 1)[1].split("## Evaluation", 1)[0]
+    assert decision_lines in section
+    assert "No data yet." not in section
+
+
+def test_render_weekly_report_equity_position_decision_lines_are_independent() -> None:
+    """The three new params are independent, not all-or-nothing: supplying
+    only `equity_lines` leaves `## Positions`/`## Decisions` on their own
+    fallback, and supplying all three lands each body under its own heading
+    with no cross-contamination between sections.
+    """
+    from windbreak.evaluation.report import render_weekly_report
+
+    today = date(2024, 3, 4)
+
+    equity_only_body = render_weekly_report(
+        today=today, evaluation=None, costs=None, equity_lines="equity_samples=0"
+    )
+    equity_section = equity_only_body.split("## Equity vs floor", 1)[1].split(
+        "## Positions", 1
+    )[0]
+    positions_section = equity_only_body.split("## Positions", 1)[1].split(
+        "## Decisions", 1
+    )[0]
+    decisions_section = equity_only_body.split("## Decisions", 1)[1].split(
+        "## Evaluation", 1
+    )[0]
+    assert "equity_samples=0" in equity_section
+    assert "No data yet." not in equity_section
+    assert "No data yet." in positions_section
+    assert "No data yet." in decisions_section
+
+    all_three_body = render_weekly_report(
+        today=today,
+        evaluation=None,
+        costs=None,
+        equity_lines="equity_samples=0",
+        position_lines="snapshots=0",
+        decision_lines="decision_events=0",
+    )
+    equity_section = all_three_body.split("## Equity vs floor", 1)[1].split(
+        "## Positions", 1
+    )[0]
+    positions_section = all_three_body.split("## Positions", 1)[1].split(
+        "## Decisions", 1
+    )[0]
+    decisions_section = all_three_body.split("## Decisions", 1)[1].split(
+        "## Evaluation", 1
+    )[0]
+    assert "equity_samples=0" in equity_section
+    assert "snapshots=0" not in equity_section
+    assert "snapshots=0" in positions_section
+    assert "decision_events=0" not in positions_section
+    assert "decision_events=0" in decisions_section
+    assert "equity_samples=0" not in decisions_section
+    assert "No data yet." not in equity_section
+    assert "No data yet." not in positions_section
+    assert "No data yet." not in decisions_section
 
 
 # ---------------------------------------------------------------------------

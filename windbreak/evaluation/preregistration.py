@@ -18,7 +18,10 @@ the paper clock only when the plan's identity actually changes:
   nothing) if the injected clock is not strictly monotonic.
 
 :func:`latest_gate_plan_registration` reconstructs the most recent registration
-from the ledger alone.
+from the ledger alone. Because the promotion path calls it repeatedly, it reads
+through the optional :class:`~windbreak.ledger.store.LatestRecordLookup`
+capability when the store declares one (an index-backed reverse read) and only
+falls back to a full ledger scan otherwise (issue #246).
 
 Dependency direction. This module is a runtime *leaf consumer*: it holds
 one-way runtime edges to :mod:`windbreak.evaluation.registry` (for
@@ -62,6 +65,7 @@ from windbreak.ledger.events import (
 from windbreak.ledger.events import (
     canonical_json,
 )
+from windbreak.ledger.store import LatestRecordLookup
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -904,8 +908,9 @@ def _registration_from_record(record: LedgerRecord) -> GatePlanRegistration:
 def latest_gate_plan_registration(store: LedgerStore) -> GatePlanRegistration | None:
     """Return the most recent gate-plan registration in the ledger, or ``None``.
 
-    Scans the whole ledger, keeping the last record whose ``event_type`` is a
-    registration event, and reconstructs its registration from the envelope.
+    Locates the newest registration record (see
+    :func:`_latest_registration_record` for the two lookup paths) and
+    reconstructs its registration from the envelope.
 
     Args:
         store: The ledger to read.
@@ -919,10 +924,36 @@ def latest_gate_plan_registration(store: LedgerStore) -> GatePlanRegistration | 
             plan hash does not match the stored one (fail-closed on a corrupt or
             tampered payload).
     """
+    latest = _latest_registration_record(store)
+    if latest is None:
+        return None
+    return _registration_from_record(latest)
+
+
+def _latest_registration_record(store: LedgerStore) -> LedgerRecord | None:
+    """Find the newest ``GatePlanRegistered``/``GatePlanChanged`` row.
+
+    ``RiskKernel.request_promotion`` drives this at least twice per PAPER
+    promotion attempt, so the cost matters (issue #246): a store declaring the
+    optional :class:`~windbreak.ledger.store.LatestRecordLookup` capability
+    answers it with a single index-backed reverse read, while any other store --
+    including every hand-rolled :class:`~windbreak.ledger.store.LedgerStore`
+    double, which is exactly why that capability is a separate protocol rather
+    than a widening of ``LedgerStore`` -- falls back to the original full scan.
+    Both paths return the same record, so the dispatch is a pure optimization
+    and never a behavioral fork.
+
+    Args:
+        store: The ledger to read.
+
+    Returns:
+        The highest-sequence registration record, or ``None`` if the ledger
+        holds none.
+    """
+    if isinstance(store, LatestRecordLookup):
+        return store.latest_record_of_types(_REGISTRATION_EVENT_TYPES)
     latest: LedgerRecord | None = None
     for record in store.read_all():
         if record.event_type in _REGISTRATION_EVENT_TYPES:
             latest = record
-    if latest is None:
-        return None
-    return _registration_from_record(latest)
+    return latest

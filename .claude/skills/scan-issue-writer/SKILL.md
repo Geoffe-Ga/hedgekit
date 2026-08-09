@@ -6,9 +6,8 @@ description: >-
   "run the <name> scan", "create issues from this analysis", or passes a
   prompts/scans/*.md file. Handles dedupe, priority labeling, and max-issue
   caps so the Ralph loop never starves and never bloats. Do NOT use for
-  implementing fixes (use stay-green), reviewing PRs (use
-  comprehensive-pr-review), or closing/triaging existing issues (use
-  backlog-grooming).
+  implementing fixes (use stay-green) or closing/triaging existing issues
+  (use backlog-grooming).
 metadata:
   author: Geoff
   version: 1.0.0

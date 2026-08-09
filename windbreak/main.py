@@ -32,8 +32,10 @@ from windbreak.config import (
 from windbreak.drills.catalog import DRILL_NAMES
 from windbreak.drills.context import bind_paper_context, bind_production_context
 from windbreak.ledger import (
+    ChainIntegrityError,
     SqliteLedgerStore,
     anchor_command,
+    events_from_records,
     rebuild_command,
     verify_command,
 )
@@ -47,9 +49,12 @@ if TYPE_CHECKING:
     from types import FrameType
 
     from windbreak.config import ConfigLoadEvent, ScreenerConfig, WindbreakConfig
+    from windbreak.connector.interface import MarketConnector
     from windbreak.dashboard.app import DashboardStatus
+    from windbreak.ledger import Event, LedgerStore
     from windbreak.riskkernel.kill import KillIntegration
-    from windbreak.riskkernel.process import RiskKernel
+    from windbreak.riskkernel.process import KernelLedgerWriter, RiskKernel
+    from windbreak.riskkernel.verification import ReadOnlyVerifier
 
 #: Operating mode reported in every heartbeat line. Matches the RESEARCH state
 #: of the SPEC mode machine; windbreak ships research-only for now.
@@ -214,8 +219,9 @@ def _add_run_arguments(run_parser: argparse.ArgumentParser) -> None:
         "--snapshot-fixture-dir",
         default=None,
         help=(
-            "Directory of exchange JSON fixtures to snapshot each beat "
-            "(default: snapshotting is off)."
+            "Directory of exchange JSON fixtures to snapshot each beat; for "
+            "--process riskkernel it is the read-only exchange the kernel's "
+            "verifier observes each beat (default: snapshotting is off)."
         ),
     )
     run_parser.add_argument(
@@ -1195,6 +1201,9 @@ def _run_heartbeat(args: argparse.Namespace) -> int:
 
 def _build_risk_kernel(
     config: WindbreakConfig,
+    *,
+    ledger_store: LedgerStore | None = None,
+    verification_connector: MarketConnector | None = None,
 ) -> tuple[RiskKernel, KillIntegration]:
     """Compose a live :class:`RiskKernel` wired to its :class:`KillIntegration`.
 
@@ -1207,6 +1216,54 @@ def _build_risk_kernel(
     the exact defect this wiring closes -- so the single-machine invariant is
     load-bearing, not incidental.
 
+    With a ``ledger_store`` the kernel persists its events to the real
+    hash-chained ledger and replays durable kill state from it at startup (issue
+    #235): the store's chain is verified fail-closed up front, its records are
+    reconstructed into an event history, and both the switch and the kernel are
+    rebuilt over that history through a single composition path (an empty history
+    -- the no-``ledger_store`` case -- is equivalent to a fresh build). The
+    replay *order* is load-bearing:
+    :meth:`~windbreak.riskkernel.kill.KillSwitch.from_events` restores only the
+    kill counter and never transitions, then
+    :meth:`~windbreak.riskkernel.process.RiskKernel.from_events` drives the one
+    shared machine to ``KILLED`` on an unrearmed history -- so the two never race
+    to transition the single machine.
+
+    That same ``ledger_store`` is also handed to the kernel as its
+    ``gate_plan_store`` (issue #246), so a PAPER -> LIVE_MICRO promotion reads
+    its three plan-sourced thresholds from the pre-registered, content-addressed
+    gate plan already on that ledger. Without this the CLI-composed kernel would
+    fail closed with ``GatePlanUnavailableError`` on *every* PAPER promotion even
+    with a perfectly good registration on disk. It stays fail-closed where it
+    should: with no ``ledger_store`` there is no plan source, and the promotion
+    is refused rather than falling back to the live config.
+
+    With a ``verification_connector`` the kernel's per-beat verification cycle
+    becomes live (issue #288, superseding issue #236's frozen-startup snapshot):
+    a :class:`LedgerExpectationSource` folds the replayed ``history`` once into a
+    scoped baseline -- cash seeded from the last non-breach verification event
+    *the kernel itself recorded*, positions from the last positions snapshot *it
+    recorded* (a shared ledger also carries other components' rows, so only
+    ``component="riskkernel"`` rows may seed this safety-critical baseline; none
+    records such a snapshot today, so positions always falls through) -- falling
+    back per dimension to that connector's own startup
+    balances/positions/open-orders where the ledger carries no such fact, a
+    :class:`VerificationTolerances` is composed from
+    ``risk.verification_balance_tolerance_micros`` /
+    ``risk.verification_position_tolerance_centis``, and a
+    :class:`ReadOnlyVerifier` -- sharing **both** the kernel's ledger writer and
+    the kill switch's one :class:`AlertDispatcher` -- is forwarded to
+    :meth:`RiskKernel.from_events`. The shared writer means each cycle's
+    verification *event* lands on the same hash-chained ledger the kernel
+    persists to; the shared dispatcher means mismatch and jurisdiction *alerts*
+    fan out through the same sink chain the kill switch uses (log-only in this
+    composition, whose dispatcher has no persisting sinks). This is what makes the
+    ``AUTO_RECONCILIATION`` auto-kill trigger *live* rather than
+    composed-but-dormant: a sustained reconciliation ``BREACH`` now feeds the
+    shared monitor and engages the shared kill switch. With no connector the
+    verifier is ``None`` and the composition is byte-identical to its
+    pre-issue-#236 shape.
+
     The kernel imports are local (mirroring :func:`_run_drill` /
     :func:`_build_paper_on_beat`) so the RESEARCH heartbeat path never imports
     the kernel eagerly. ``ops.state_dir`` is created up front, fail-closed: a
@@ -1215,9 +1272,19 @@ def _build_risk_kernel(
 
     Args:
         config: The loaded configuration. ``ops.state_dir`` roots the kill/re-arm
-            file protocol, ``mode_ceiling`` caps the shared machine, and
+            file protocol, ``mode_ceiling`` caps the shared machine,
             ``risk.kill_after_consecutive_mismatches`` sets the auto-kill
-            threshold.
+            threshold, and ``risk.verification_balance_tolerance_micros`` /
+            ``risk.verification_position_tolerance_centis`` set the live
+            verifier's per-dimension drift tolerances.
+        ledger_store: The append-only ledger the kernel persists to, replays
+            durable kill state from (issue #235), and reads its registered PAPER
+            gate plan from (issue #246), or ``None`` to run against a log-only
+            writer with no replay (an empty history) and no plan source.
+        verification_connector: The read-only market connector the live verifier
+            observes the venue through (issue #236), or ``None`` to compose no
+            verifier -- leaving the per-beat verification cycle a no-op exactly
+            as before.
 
     Returns:
         The composed kernel and the kill integration it shares, so a caller can
@@ -1225,6 +1292,8 @@ def _build_risk_kernel(
 
     Raises:
         OSError: If ``ops.state_dir`` cannot be created (fail-closed startup).
+        ChainIntegrityError: If a supplied ``ledger_store``'s hash chain fails
+            verification (fail-closed replay).
     """
     from windbreak.riskkernel.kill import (
         KillFileWatcher,
@@ -1233,25 +1302,110 @@ def _build_risk_kernel(
         ReconciliationMismatchMonitor,
     )
     from windbreak.riskkernel.modes import Mode, ModeStateMachine
-    from windbreak.riskkernel.process import LoggingKernelLedgerWriter, RiskKernel
+    from windbreak.riskkernel.process import (
+        LoggingKernelLedgerWriter,
+        PersistingKernelLedgerWriter,
+        RiskKernel,
+    )
 
     state_dir = Path(config.ops.state_dir).expanduser()
     state_dir.mkdir(parents=True, exist_ok=True)
     machine = ModeStateMachine(mode_ceiling=Mode.from_config(config.mode_ceiling))
-    writer = LoggingKernelLedgerWriter()
-    switch = KillSwitch(
-        machine,
-        writer,
-        AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
-        state_dir=state_dir,
+    if ledger_store is not None:
+        ledger_store.verify_chain()
+        history: tuple[Event, ...] = events_from_records(ledger_store.read_all())
+        writer: KernelLedgerWriter = PersistingKernelLedgerWriter(ledger_store)
+    else:
+        writer = LoggingKernelLedgerWriter()
+        history = ()
+    # One dispatcher shared by the kill switch's HALT_KILL alerts and (when a
+    # verification connector is wired) the verifier's mismatch/jurisdiction
+    # alerts, so both fan out through the same ledger-writing sink chain.
+    dispatcher = AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter())
+    switch = KillSwitch.from_events(
+        history, machine, writer, dispatcher, state_dir=state_dir
     )
     watcher = KillFileWatcher(switch, state_dir)
     monitor = ReconciliationMismatchMonitor(
         switch, threshold=config.risk.kill_after_consecutive_mismatches
     )
     integration = KillIntegration(switch=switch, watcher=watcher, monitor=monitor)
-    kernel = RiskKernel(writer, mode_machine=machine, kill_integration=integration)
+    verifier = _build_verifier(
+        config, verification_connector, dispatcher, writer, history
+    )
+    kernel = RiskKernel.from_events(
+        history,
+        writer,
+        mode_machine=machine,
+        verifier=verifier,
+        kill_integration=integration,
+        gate_plan_store=ledger_store,
+    )
     return kernel, integration
+
+
+def _build_verifier(
+    config: WindbreakConfig,
+    verification_connector: MarketConnector | None,
+    dispatcher: AlertDispatcher,
+    writer: KernelLedgerWriter,
+    history: tuple[Event, ...],
+) -> ReadOnlyVerifier | None:
+    """Compose the live read-only verifier, or ``None`` when unconfigured.
+
+    Projects a scoped ledger-derived baseline the verifier reconciles the venue
+    against each beat (issue #288, superseding the frozen-startup-snapshot seam
+    of issue #236): a :class:`LedgerExpectationSource` folds ``history`` once,
+    seeding cash from the last non-breach verification event *the kernel itself
+    recorded* and positions from the last positions snapshot *it recorded*, and
+    falling back -- per dimension, independently -- to
+    ``verification_connector``'s own startup state where the ledger carries no
+    such fact. Only ``component="riskkernel"`` rows may seed, because a shared
+    ledger also carries e.g. the PAPER loop's simulated position snapshots; no
+    component records a ``riskkernel``-stamped snapshot today, so positions is
+    connector-fallback in practice (see :class:`LedgerExpectationSource`). The
+    per-dimension tolerances come from ``config.risk``. The verifier shares
+    ``dispatcher`` and ``writer`` with the kill switch so its alerts and events
+    reach the same sinks and hash-chained ledger.
+
+    Args:
+        config: The loaded configuration supplying the balance/position drift
+            tolerances.
+        verification_connector: The read-only market connector to observe (and
+            the per-dimension fallback source), or ``None`` to compose no
+            verifier.
+        dispatcher: The alert dispatcher shared with the kill switch.
+        writer: The kernel ledger writer shared with the kill switch.
+        history: The replayed startup event history the baseline is seeded from
+            (empty when there is no ledger store to replay).
+
+    Returns:
+        The composed :class:`ReadOnlyVerifier`, or ``None`` when
+        ``verification_connector`` is ``None``.
+    """
+    if verification_connector is None:
+        return None
+    from windbreak.numeric.types import ContractCentis, MoneyMicros
+    from windbreak.riskkernel.verification import (
+        LedgerExpectationSource,
+        ReadOnlyVerifier,
+        VerificationTolerances,
+    )
+
+    return ReadOnlyVerifier(
+        connector=verification_connector,
+        expectation_source=LedgerExpectationSource(history, verification_connector),
+        tolerances=VerificationTolerances(
+            balance_tolerance=MoneyMicros(
+                config.risk.verification_balance_tolerance_micros
+            ),
+            position_tolerance=ContractCentis(
+                config.risk.verification_position_tolerance_centis
+            ),
+        ),
+        dispatcher=dispatcher,
+        ledger_writer=writer,
+    )
 
 
 def _kernel_heartbeat_interval(args: argparse.Namespace) -> int:
@@ -1277,17 +1431,24 @@ def _run_riskkernel(args: argparse.Namespace) -> int:
 
     Reuses :func:`_load_and_ledger_config`'s config-load front half, then builds
     the kernel and its kill integration via :func:`_build_risk_kernel` -- catching
-    an uncreatable state dir (``OSError``) or a bad mode ceiling (``ValueError``)
-    as a fatal error that logs ``FATAL`` and returns 1 *before* the loop is
-    entered, so a fail-closed startup emits no heartbeat. This is the routing
-    divergence (issue #144) from the RESEARCH heartbeat loop the other
-    ``--process`` choices run: it drives a real :class:`RiskKernel` whose file
-    watcher polls ``ops.state_dir`` for a ``KILL`` file each beat.
+    an uncreatable state dir (``OSError``), a bad mode ceiling (``ValueError``),
+    or a tampered ledger (``ChainIntegrityError``) as a fatal error that logs
+    ``FATAL`` and returns 1 *before* the loop is entered, so a fail-closed startup
+    emits no heartbeat. This is the routing divergence (issue #144) from the
+    RESEARCH heartbeat loop the other ``--process`` choices run: it drives a real
+    :class:`RiskKernel` whose file watcher polls ``ops.state_dir`` for a ``KILL``
+    file each beat.
+
+    With ``--ledger-path`` the kernel is built over a real
+    :class:`~windbreak.ledger.store.SqliteLedgerStore` so its events persist and a
+    durable ``KILLED`` state is replayed at startup (issue #235). The store is
+    closed in a ``finally`` -- even when the build fails closed -- so a later
+    reopen (the next run's replay) is never blocked by a lingering handle.
 
     Args:
         args: Parsed ``run`` arguments carrying ``config``, ``process`` (always
-            ``riskkernel`` when routed here), ``heartbeat_interval``, and
-            ``max_beats``.
+            ``riskkernel`` when routed here), ``heartbeat_interval``,
+            ``max_beats``, and ``ledger_path``.
 
     Returns:
         The process exit code (0 on a clean shutdown, 1 on a fatal config or
@@ -1296,9 +1457,77 @@ def _run_riskkernel(args: argparse.Namespace) -> int:
     config = _load_and_ledger_config(args)
     if config is None:
         return 1
+    store = (
+        SqliteLedgerStore(args.ledger_path) if args.ledger_path is not None else None
+    )
     try:
-        kernel, _integration = _build_risk_kernel(config)
-    except (OSError, ValueError) as exc:
+        return _drive_risk_kernel(args, config, ledger_store=store)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _snapshot_connector(args: argparse.Namespace) -> MarketConnector | None:
+    """Build the read-only verification connector from ``--snapshot-fixture-dir``.
+
+    Mirrors :func:`_run_preflight`'s local-import ``FakeExchange`` construction.
+    Called inside :func:`_drive_risk_kernel`'s fail-closed ``try`` so a missing
+    or malformed fixture directory raises there (issue #236).
+
+    Args:
+        args: Parsed ``run`` arguments carrying ``snapshot_fixture_dir``.
+
+    Returns:
+        A :class:`~windbreak.connector.fake.FakeExchange` over the fixture
+        directory, or ``None`` when ``--snapshot-fixture-dir`` was not given.
+    """
+    if args.snapshot_fixture_dir is None:
+        return None
+    from windbreak.connector import FakeExchange
+
+    return FakeExchange.from_fixture_dir(args.snapshot_fixture_dir)
+
+
+def _drive_risk_kernel(
+    args: argparse.Namespace,
+    config: WindbreakConfig,
+    *,
+    ledger_store: LedgerStore | None,
+) -> int:
+    """Build the kernel over ``ledger_store`` and drive its bounded loop.
+
+    The inner half of :func:`_run_riskkernel`, split out so the store's
+    open/close lifecycle stays a single ``try``/``finally`` there while this
+    function owns the fail-closed build and the run. A build that raises
+    (uncreatable state dir, bad ceiling, or a tampered ledger chain) logs
+    ``FATAL`` and returns 1 before the loop is entered, emitting no heartbeat.
+
+    When ``--snapshot-fixture-dir`` is given, a read-only
+    :class:`~windbreak.connector.fake.FakeExchange` is built over it *inside*
+    this same fail-closed ``try`` and wired as the kernel's verification
+    connector (issue #236): a missing or malformed fixture directory raises
+    ``FileNotFoundError``/``JSONDecodeError`` -- subclasses of ``OSError`` /
+    ``ValueError`` already caught here -- so a bad snapshot dir fails closed
+    identically to an uncreatable state dir, never entering the kernel loop.
+
+    Args:
+        args: Parsed ``run`` arguments carrying ``process``, ``max_beats``,
+            ``heartbeat_interval``, and ``snapshot_fixture_dir``.
+        config: The loaded configuration the kernel is composed from.
+        ledger_store: The ledger the kernel persists to and replays from, or
+            ``None`` for the log-only, replay-free path.
+
+    Returns:
+        The process exit code (0 on a clean shutdown, 1 on a fatal build error).
+    """
+    try:
+        verification_connector = _snapshot_connector(args)
+        kernel, _integration = _build_risk_kernel(
+            config,
+            ledger_store=ledger_store,
+            verification_connector=verification_connector,
+        )
+    except (OSError, ValueError, ChainIntegrityError) as exc:
         _LOGGER.critical("FATAL: %s", exc)
         return 1
     state = ShutdownState()

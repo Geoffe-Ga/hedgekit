@@ -453,6 +453,34 @@ def test_collect_model_votes_custom_ensemble_overrides_default_and_call_count(
     assert [vote.probability_ppm for vote in votes] == [111_111, 222_222]
 
 
+def test_collect_model_votes_excludes_abstaining_member_from_returned_votes(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    make_fake_vote_transport: FakeVoteTransportFactory,
+) -> None:
+    """`collect_model_votes` excludes an abstaining member's vote from its
+    returned tuple (issue #241): the middle response abstains, so exactly
+    two (not three) votes survive, and neither surviving vote carries the
+    abstainer's 500_000 ppm probability. `ParsedVote.abstain` is parsed
+    today but dead-ends before it ever reaches `collect_model_votes`'
+    return value, so this currently fails with all three votes surviving.
+    """
+    responses = (
+        '{"probability_ppm": 300000, "rationale_summary": "alpha evidence", '
+        '"abstain": false}',
+        '{"probability_ppm": 500000, "rationale_summary": "beta evidence", '
+        '"abstain": true}',
+        '{"probability_ppm": 700000, "rationale_summary": "gamma evidence", '
+        '"abstain": false}',
+    )
+    transport = make_fake_vote_transport(responses)
+
+    votes = collect_model_votes(market, baseline, transport=transport)
+
+    assert [vote.probability_ppm for vote in votes] == [300_000, 700_000]
+    assert len(votes) == 2
+
+
 class _CountingTransport:
     """An `LlmTransport` double counting calls, then delegating (mirrors
     `tests/forecast/test_triage.py`'s `_CountingTransport`).

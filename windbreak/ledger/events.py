@@ -1133,6 +1133,260 @@ class GateComputationMismatch(Event):
         _derive_typed_event(self, payload)
 
 
+@dataclass(frozen=True)
+class CanaryVerdictRecorded(Event):
+    """Records one provider's canary verdict (fleet observability, issue #195).
+
+    The scheduler's ``run_canaries`` composition root appends one of these per
+    provider per canary battery run (SPEC S8.4/S16 extended per-provider), so a
+    later ledger fold surfaces each provider's live drift status. Like every
+    concrete event its ``event_type`` is the literal class name
+    ``"CanaryVerdictRecorded"``, derived via :func:`_derive_typed_event`, and
+    every payload leaf is int/str/bool/list -- never a float.
+
+    Attributes:
+        provider: The provider this verdict is for.
+        status: The verdict status
+            (``ProviderCanaryStatus.name``: ``"OK"``/``"ANSWER_DRIFT"``/
+            ``"VERSION_DRIFT"``).
+        drift_kind: The drift kind (``"answer"``, ``"version"``, or ``""`` for a
+            clean ``OK`` verdict -- never ``None``, matching this module's
+            inapplicable-string convention).
+        drift_score_ppm: The scored answer-drift distance, in ppm.
+        tolerance_ppm: The drift tolerance the score was gated against, in ppm.
+        reported_version: The forecaster version the provider reported.
+        pinned_versions: The provider's operator-pinned version strings (plural:
+            a pin set may accept more than one accepted version).
+    """
+
+    provider: str
+    status: str
+    drift_kind: str
+    drift_score_ppm: int
+    tolerance_ppm: int
+    reported_version: str
+    pinned_versions: list[str]
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "provider": self.provider,
+            "status": self.status,
+            "drift_kind": self.drift_kind,
+            "drift_score_ppm": self.drift_score_ppm,
+            "tolerance_ppm": self.tolerance_ppm,
+            "reported_version": self.reported_version,
+            "pinned_versions": self.pinned_versions,
+        }
+        _derive_typed_event(self, payload)
+
+
+@dataclass(frozen=True)
+class PromotionBlocked(Event):
+    """Records a fail-closed PAPER->LIVE_MICRO promotion attempt (issue #244).
+
+    Emitted when a PAPER promotion is refused before any gate is evaluated
+    because no readable pre-registered gate plan was available (the fail-closed
+    path of issue #185, whose deliberate no-event default this event opts into
+    per follow-up #185). Like every concrete event its ``event_type`` is the
+    literal class name ``"PromotionBlocked"``, derived via
+    :func:`_derive_typed_event`, and every payload leaf is a ``str``. It is only
+    emitted when the Risk Kernel is opted in via its ``ledger_blocked_promotions``
+    flag; the default kernel fails closed silently as before.
+
+    Attributes:
+        source_mode: The mode promotion was requested from (``Mode.name``;
+            ``"PAPER"`` on the only path that emits this event).
+        target_mode: The mode promotion was toward (``Mode.name``;
+            ``"LIVE_MICRO"``), stamped from the ladder even though the live gate
+            -- and thus its ``.target`` -- could not be built.
+        reason: The human-readable fail-closed message from the raised
+            ``GatePlanUnavailableError`` (e.g. why no plan was readable).
+    """
+
+    source_mode: str
+    target_mode: str
+    reason: str
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "source_mode": self.source_mode,
+            "target_mode": self.target_mode,
+            "reason": self.reason,
+        }
+        _derive_typed_event(self, payload)
+
+
+@dataclass(frozen=True)
+class ProviderVoteRecorded(Event):
+    """Records one ensemble member's per-vote cost outcome (issue #281).
+
+    The scheduler's ``_forecast_stage`` composition root appends one of these
+    per ensemble member driven per paper tick (per-provider vote-cost signal),
+    so a later ledger fold surfaces each provider's charged spend, abstention
+    rate, and cost-per-forecast. Like every concrete event its ``event_type``
+    is the literal class name ``"ProviderVoteRecorded"``, derived via
+    :func:`_derive_typed_event`, and every payload leaf is int/str -- never a
+    float, never ``None``.
+
+    Attributes:
+        forecast_id: The forecast this vote belongs to.
+        market_ticker: The forecast's market ticker.
+        provider: The provider identifier that cast the vote (the default
+            ensemble repeats a provider across distinct model versions).
+        model_version: The provider's pinned model version (unique per member).
+        vote_index: The zero-based index of this vote in the driven ensemble.
+        cost_micros: The vote's billed cost, in micros (charged even when the
+            vote was discarded).
+        outcome: The vote outcome (``"voted"``/``"abstained"``/``"discarded"``).
+        failure_code: The discard failure code, or ``""`` for a non-discard
+            (``"voted"``/``"abstained"``) -- never ``None``, matching this
+            module's inapplicable-string convention (see
+            :class:`CanaryVerdictRecorded` ``drift_kind``).
+    """
+
+    forecast_id: str
+    market_ticker: str
+    provider: str
+    model_version: str
+    vote_index: int
+    cost_micros: int
+    outcome: str
+    failure_code: str
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "forecast_id": self.forecast_id,
+            "market_ticker": self.market_ticker,
+            "provider": self.provider,
+            "model_version": self.model_version,
+            "vote_index": self.vote_index,
+            "cost_micros": self.cost_micros,
+            "outcome": self.outcome,
+            "failure_code": self.failure_code,
+        }
+        _derive_typed_event(self, payload)
+
+
+@dataclass(frozen=True)
+class ResearchBudgetHalted(Event):
+    """Records a fail-closed research halt on a budget ceiling (issue #339).
+
+    Appended by the scheduler's PAPER composition root when the always-on loop's
+    :class:`~windbreak.forecast.budget.ResearchBudget` refuses to spend: either
+    the UTC day's cumulative research budget is exhausted, or one forecast's
+    research cost strictly exceeds the per-forecast ceiling. The halt is the
+    durable audit record that research stopped *and why*, so an operator can
+    tell a budget halt apart from a quiet loop. Like every concrete event its
+    ``event_type`` is the literal class name ``"ResearchBudgetHalted"``, derived
+    via :func:`_derive_typed_event`, and every payload leaf is int/str -- never
+    a float, never ``None``.
+
+    Attributes:
+        market_ticker: The breaching forecast's market ticker for a
+            ``"per_forecast"`` halt, or ``""`` for a ``"per_day"`` halt, which
+            is not attributable to any single market -- never ``None``, matching
+            this module's inapplicable-string convention (see
+            :class:`ProviderVoteRecorded` ``failure_code``).
+        halt_kind: Which ceiling halted research: ``"per_day"`` or
+            ``"per_forecast"``.
+        utc_day: The halt's UTC calendar day, as an ISO ``YYYY-MM-DD`` string;
+            the same key the budget buckets spend under.
+        spent_micros: For a ``"per_day"`` halt, the day's cumulative spend at
+            the halt; for a ``"per_forecast"`` halt, the single breaching
+            forecast's research cost. In micros.
+        budget_micros: The ceiling that was breached, in micros.
+    """
+
+    market_ticker: str
+    halt_kind: str
+    utc_day: str
+    spent_micros: int
+    budget_micros: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "market_ticker": self.market_ticker,
+            "halt_kind": self.halt_kind,
+            "utc_day": self.utc_day,
+            "spent_micros": self.spent_micros,
+            "budget_micros": self.budget_micros,
+        }
+        _derive_typed_event(self, payload)
+
+
+@dataclass(frozen=True)
+class ExchangeStatusObserved(Event):
+    """Records one observation of the exchange's trading status (issue #342).
+
+    Appended by the scheduler each tick, at the instant the status is read, so
+    the evidence the ``exchange_status_ok`` check consumed is auditable after
+    the fact. The ``status`` string is the connector's own value, never
+    synthesized; ``observed_at_epoch_s`` is when the observation happened, which
+    is what the freshness check measures against.
+
+    Attributes:
+        status: The exchange's raw trading status (``"open"``/``"paused"``/
+            ``"closed"``), verbatim from the connector.
+        observed_at_epoch_s: Epoch second the status was observed.
+    """
+
+    status: str
+    observed_at_epoch_s: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "status": self.status,
+            "observed_at_epoch_s": self.observed_at_epoch_s,
+        }
+        _derive_typed_event(self, payload)
+
+
+@dataclass(frozen=True)
+class PipelineHeartbeatRecorded(Event):
+    """Records that the tick pipeline was alive at an instant (issue #342).
+
+    Stamped once per tick, after the snapshot stage has proven the pipeline is
+    genuinely running, and read by the ``pipeline_heartbeat_ok`` check. It is a
+    distinct concept from :class:`ModeHeartbeat`, which carries the operating
+    mode and beat number but no instant, and which is appended too late in the
+    tick to serve as evidence for the approve stage.
+
+    Attributes:
+        heartbeat_epoch_s: Epoch second at which the pipeline was observed
+            alive.
+    """
+
+    heartbeat_epoch_s: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {"heartbeat_epoch_s": self.heartbeat_epoch_s}
+        _derive_typed_event(self, payload)
+
+
 #: Maps each event_type string to its class, so a persisted envelope can be
 #: reconstructed as ``EVENT_TYPES[event_type](component=..., **data)``.
 EVENT_TYPES: dict[str, type[Event]] = {
@@ -1164,4 +1418,10 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "GatePlanRegistered": GatePlanRegistered,
     "GatePlanChanged": GatePlanChanged,
     "GateComputationMismatch": GateComputationMismatch,
+    "CanaryVerdictRecorded": CanaryVerdictRecorded,
+    "PromotionBlocked": PromotionBlocked,
+    "ProviderVoteRecorded": ProviderVoteRecorded,
+    "ResearchBudgetHalted": ResearchBudgetHalted,
+    "ExchangeStatusObserved": ExchangeStatusObserved,
+    "PipelineHeartbeatRecorded": PipelineHeartbeatRecorded,
 }

@@ -30,6 +30,7 @@ from windbreak.dashboard.views import (
     render_execution_quality,
     render_live_divergence,
     render_positions,
+    render_provider_panel,
 )
 
 if TYPE_CHECKING:
@@ -57,6 +58,10 @@ _DECISIONS_PATH = "/decisions"
 #: behind the same bearer auth as ``/`` and rendered from the read-models source.
 _EXECUTION_PATH = "/execution"
 _DIVERGENCE_PATH = "/divergence"
+
+#: The fleet-observability provider-panel view path (issue #195), gated behind
+#: the same bearer auth and rendered from the read-models source.
+_PROVIDERS_PATH = "/providers"
 
 #: The human-acknowledgement surface paths (issue #57): ``POST /ack`` grants a
 #: named pending acknowledgement, ``GET /acks`` renders the pending ones. Both
@@ -189,6 +194,7 @@ _VIEWS: dict[str, _ViewSpec] = {
     _DIVERGENCE_PATH: _ViewSpec(
         "divergence", "live_divergence", render_live_divergence
     ),
+    _PROVIDERS_PATH: _ViewSpec("providers", "provider_panel", render_provider_panel),
 }
 
 

@@ -14,6 +14,10 @@ citations, and a fingerprint of the raw response.
 The module is stdlib-only and float-free, and -- per the SPEC S8.3 sandbox
 boundary -- never imports ``windbreak.config``: its member is accepted
 structurally via :class:`EnsembleMemberLike`.
+
+The parsed vote's ``abstain`` flag is threaded onto the returned
+:class:`ProviderForecast`; the aggregation path excludes an abstaining member
+from the median (issue #241).
 """
 
 from __future__ import annotations
@@ -96,4 +100,5 @@ class FixtureVoteProvider:
             model_version=self._member.model_version,
             training_cutoff=self._member.training_cutoff,
             response_fingerprint=fingerprint,
+            abstain=parsed.abstain,
         )

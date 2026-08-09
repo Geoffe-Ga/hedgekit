@@ -8,7 +8,7 @@
 
 # Linters / formatters / type-checkers
 ruff==0.15.1
-mypy==1.19.1
+mypy==2.3.0
 types-PyYAML==6.0.12.20250915
 types-requests==2.33.0.20260518
 
@@ -21,7 +21,7 @@ radon==6.0.1
 xenon==0.9.3
 
 # Mutation testing
-mutmut==2.5.1
+mutmut==3.7.0
 
 # Test runner + coverage
 pytest==9.0.3  # CVE-2025-71176 fixed in 9.0.3 (was 9.0.2); nearest clean patch

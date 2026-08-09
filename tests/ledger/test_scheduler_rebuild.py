@@ -94,7 +94,7 @@ def _append_full_scheduler_ledger(store: SqliteLedgerStore) -> None:
             payload_schema_version=1,
             payload={
                 "intent_id": "intent-0001",
-                "reasons": ["blocked on #110 (exchange status feed)"],
+                "reasons": ["balance verification stale or missing"],
             },
         )
     )

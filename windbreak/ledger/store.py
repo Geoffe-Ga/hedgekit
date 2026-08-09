@@ -11,6 +11,15 @@ detect corruption of any single column.
 The store only ever inserts and reads rows -- it exposes no mutation path
 by design, which is what makes the log trustworthy as an audit trail. The
 package's SQL is statically checked to remain insert-and-select only.
+
+Beyond the four :class:`LedgerStore` operations every store supports, a store
+may additionally declare the *optional*, narrow :class:`LatestRecordLookup`
+capability: an indexed reverse read answering "the newest record of these event
+types" without replaying the whole log (issue #246). It is deliberately a
+separate protocol rather than three more lines on :class:`LedgerStore`, because
+:class:`LedgerStore` is satisfied structurally by hand-rolled doubles that must
+keep working untouched; a consumer duck-type dispatches onto the capability when
+present and falls back to a full scan when it is not.
 """
 
 from __future__ import annotations
@@ -20,15 +29,13 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
-from windbreak.ledger.events import GENESIS_PREV_HASH
+from windbreak.ledger.events import GENESIS_PREV_HASH, Event
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection, Iterable
     from pathlib import Path
-
-    from windbreak.ledger.events import Event
 
 #: DDL creating the eight-column §12 ledger row if it does not yet exist.
 _CREATE_TABLE_SQL = (
@@ -57,9 +64,32 @@ _SELECT_ALL_SQL = (
     "FROM ledger ORDER BY sequence_number"
 )
 
+#: Covering index backing :meth:`SqliteLedgerStore.latest_record_of_types`.
+#: Without it, "newest row of type X" walks the primary key backwards until it
+#: meets a match -- and the rows that read is asked about (a gate-plan
+#: registration, written once at startup) sit near the *front* of a ledger that
+#: grows without bound, so the walk degenerates to a full scan. The composite
+#: ``(event_type, sequence_number)`` order lets SQLite seek straight to the last
+#: entry for a type. Created on first use, like the table itself.
+_CREATE_EVENT_TYPE_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS ledger_event_type_sequence "
+    "ON ledger (event_type, sequence_number)"
+)
+
 _SELECT_LAST_SQL = (
     "SELECT sequence_number, event_hash FROM ledger "
     "ORDER BY sequence_number DESC LIMIT 1"
+)
+
+#: Newest row of ONE event type. Held to a single, fully literal statement with
+#: one bound parameter -- rather than a dynamically assembled ``IN (?, ?, ...)``
+#: -- so the package's SQL stays statically auditable and free of string-built
+#: queries; a caller wanting several types issues this read once per type and
+#: keeps the highest sequence number.
+_SELECT_LATEST_OF_TYPE_SQL = (
+    "SELECT sequence_number, event_type, created_at, component, "
+    "payload_json, payload_schema_version, prev_hash, event_hash "
+    "FROM ledger WHERE event_type = ? ORDER BY sequence_number DESC LIMIT 1"
 )
 
 
@@ -128,6 +158,69 @@ class LedgerRecord:
     event_hash: str
 
 
+def events_from_records(records: Iterable[LedgerRecord]) -> tuple[Event, ...]:
+    """Reconstruct base :class:`~windbreak.ledger.events.Event` objects from rows.
+
+    The read-side companion of :meth:`SqliteLedgerStore.append`: each persisted
+    :class:`LedgerRecord` carries a canonical envelope JSON of
+    ``{"component", "data", "schema_version"}``, from which a base ``Event`` is
+    rebuilt so a restarting :class:`~windbreak.riskkernel.process.RiskKernel` or
+    :class:`~windbreak.riskkernel.kill.KillSwitch` can fold real ledger history
+    (issue #235).
+
+    The result is a materialized tuple, never a lazy generator: a folding caller
+    (e.g. ``RiskKernel.from_events``) walks the history more than once, and an
+    exhausted single-pass iterator would silently fold to nothing on the second
+    walk -- failing open on a safety-critical replay. Reconstruction is
+    fail-closed: a malformed envelope (not a mapping, or missing any of
+    ``component`` / ``data`` / ``schema_version``) raises ``ValueError`` rather
+    than fabricating a wrong event, chaining the underlying decode/lookup error
+    as its cause.
+
+    Args:
+        records: The persisted records to reconstruct events from, in order.
+
+    Returns:
+        The reconstructed events as a tuple, one per input record, in order.
+
+    Raises:
+        ValueError: If any record's envelope is malformed or missing a required
+            key (fail-closed).
+    """
+    return tuple(_event_from_record(record) for record in records)
+
+
+def _event_from_record(record: LedgerRecord) -> Event:
+    """Reconstruct one base ``Event`` from a persisted record's envelope.
+
+    Args:
+        record: The record whose ``payload_json`` envelope is rebuilt into an
+            ``Event``.
+
+    Returns:
+        The reconstructed :class:`~windbreak.ledger.events.Event`.
+
+    Raises:
+        ValueError: If the envelope is malformed (not a mapping) or missing any
+            of ``component`` / ``data`` / ``schema_version`` (fail-closed),
+            chaining the underlying error as its cause.
+    """
+    try:
+        envelope: dict[str, object] = json.loads(record.payload_json)
+        component = envelope["component"]
+        payload = envelope["data"]
+        schema_version = envelope["schema_version"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        msg = f"malformed ledger envelope at sequence_number={record.sequence_number}"
+        raise ValueError(msg) from exc
+    return Event(
+        event_type=record.event_type,
+        component=cast("str", component),
+        payload_schema_version=cast("int", schema_version),
+        payload=cast("dict[str, object]", payload),
+    )
+
+
 @dataclass(frozen=True)
 class ChainHead:
     """The current head (last row) of the ledger's hash chain.
@@ -178,6 +271,29 @@ class LedgerStore(Protocol):
         """Release the underlying storage resources."""
 
 
+@runtime_checkable
+class LatestRecordLookup(Protocol):
+    """Optional capability: an indexed reverse read over event types (issue #246).
+
+    Kept deliberately narrow and *separate* from :class:`LedgerStore`. Consumers
+    (currently
+    :func:`windbreak.evaluation.preregistration.latest_gate_plan_registration`)
+    ``isinstance``-dispatch onto this protocol when a store provides it and fall
+    back to a full :meth:`LedgerStore.read_all` scan when it does not, so a store
+    that never grew the method -- every hand-rolled double in the test suite --
+    keeps working unchanged.
+
+    ``runtime_checkable`` makes the ``isinstance`` dispatch legal; note it
+    verifies only that the attribute exists, never its signature, which is the
+    intended duck-type semantics here.
+    """
+
+    def latest_record_of_types(
+        self, event_types: Collection[str]
+    ) -> LedgerRecord | None:
+        """Return the highest-sequence record whose type is in ``event_types``."""
+
+
 class SqliteLedgerStore:
     """A :class:`LedgerStore` persisted to a WAL-journaled SQLite database.
 
@@ -203,6 +319,7 @@ class SqliteLedgerStore:
         self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_CREATE_TABLE_SQL)
+        self._conn.execute(_CREATE_EVENT_TYPE_INDEX_SQL)
 
     def append(self, event: Event) -> int:
         """Append an event as the next record in the chain.
@@ -262,6 +379,41 @@ class SqliteLedgerStore:
         """
         rows = self._conn.execute(_SELECT_ALL_SQL).fetchall()
         return [LedgerRecord(*row) for row in rows]
+
+    def latest_record_of_types(
+        self, event_types: Collection[str]
+    ) -> LedgerRecord | None:
+        """Return the newest record whose ``event_type`` is in ``event_types``.
+
+        Satisfies the optional :class:`LatestRecordLookup` capability. Issues one
+        index-backed ``ORDER BY sequence_number DESC LIMIT 1`` read per requested
+        type and keeps the highest-sequence hit, so a caller looking for "the
+        latest gate-plan registration" no longer materializes the entire ledger
+        on every promotion attempt (issue #246). Types are queried in sorted
+        order purely so the emitted statement sequence is deterministic -- the
+        answer is order-independent by construction.
+
+        An empty ``event_types`` matches nothing and returns ``None`` without
+        touching the database, rather than emitting a degenerate query.
+
+        Args:
+            event_types: The event types to match. Duplicates are collapsed.
+
+        Returns:
+            The matching :class:`LedgerRecord` with the largest
+            ``sequence_number``, or ``None`` when no row matches.
+        """
+        latest: LedgerRecord | None = None
+        for event_type in sorted(set(event_types)):
+            row = self._conn.execute(
+                _SELECT_LATEST_OF_TYPE_SQL, (event_type,)
+            ).fetchone()
+            if row is None:
+                continue
+            record = LedgerRecord(*row)
+            if latest is None or record.sequence_number > latest.sequence_number:
+                latest = record
+        return latest
 
     def verify_chain(self) -> None:
         """Verify sequence contiguity and hash linkage across the chain.

@@ -45,10 +45,12 @@ the fixture-injection system) instead of via pytest's dependency injection,
 since every matrix cell is a plain zero-argument callable, not a fixture
 consumer. `ScriptedFaultSession`'s response queue is *global* FIFO
 (fine for the linear call sequences in `test_client_resilience.py`, but this
-module's cells frequently need one route to fault while a sibling route
-(`/exchange/status`) stays clean); this module's local `_RouteQueueSession`
-gives each URL-suffix route its own independent queue for exactly that
-reason. The two schema-drift fixtures
+module's cells frequently need one route to fault while sibling routes
+(`/exchange/status`, and -- since `get_order_book` gates the product
+allowlist via a `/markets` fetch before fetching the book, #278 -- `/markets`
+too) stay clean); this module's local `_RouteQueueSession` gives each
+URL-suffix route its own independent queue for exactly that reason. The two
+schema-drift fixtures
 (`tests/fixtures/exchange/kalshi/faults/orderbook_drift_money_fee.json` and
 `orderbook_drift_cosmetic.json`) are reused verbatim for `get_order_book`'s
 schema-drift cell and its cosmetic-tolerance supplement; every other
@@ -679,6 +681,7 @@ def _kalshi_get_order_book_rate_limit() -> None:
             "/exchange/status": [
                 _Resp(200, {"exchange_active": True, "trading_active": True})
             ],
+            "/markets": [_Resp(200, _read_kalshi_fixture("markets.json"))],
             "/orderbook": [
                 _Resp(429, {"error": "slow down"}),
                 _Resp(200, _read_kalshi_fixture("orderbook_KXFED-24DEC.json")),
@@ -700,6 +703,7 @@ def _kalshi_get_order_book_malformed() -> None:
             "/exchange/status": [
                 _Resp(200, {"exchange_active": True, "trading_active": True})
             ],
+            "/markets": [_Resp(200, _read_kalshi_fixture("markets.json"))],
             "/orderbook": [_JsonRaisingResp(ValueError("truncated body"))],
         }
     )
@@ -730,6 +734,7 @@ def _kalshi_get_order_book_schema_drift() -> None:
             "/exchange/status": [
                 _Resp(200, {"exchange_active": True, "trading_active": True})
             ],
+            "/markets": [_Resp(200, _read_kalshi_fixture("markets.json"))],
             "/orderbook": [_Resp(200, drift_payload)],
         }
     )
@@ -1467,6 +1472,7 @@ def test_kalshi_order_book_cosmetic_schema_drift_is_tolerated_not_halted() -> No
             "/exchange/status": [
                 _Resp(200, {"exchange_active": True, "trading_active": True})
             ],
+            "/markets": [_Resp(200, _read_kalshi_fixture("markets.json"))],
             "/orderbook": [_Resp(200, drift_payload)],
         }
     )

@@ -58,7 +58,7 @@ CANARY_ACK_EVENT = "CANARY_ACK"
 class _CanaryModel(NamedTuple):
     """The pinned canary model's provenance strings.
 
-    Mirrors :class:`windbreak.forecast.triage._TriageModel`: pinning the
+    Mirrors :class:`windbreak.forecast.triage.TriageModel`: pinning the
     provider/version keeps each canary request byte-stable across runs.
 
     Attributes:
@@ -224,13 +224,18 @@ def _canary_prompt(question: CanaryQuestion) -> str:
     )
 
 
-def _parse_observed_ppm(response: str) -> int:
+def parse_observed_ppm(response: str) -> int:
     """Parse a canary response into a validated ppm observation, fail-closed.
 
     Mirrors :func:`windbreak.forecast.triage._parse_prior_ppm`'s contract with a
     package-local implementation: the response must be a bare integer string
     within ``[0, 1_000_000]``; a non-integer (e.g. ``"0.5"`` or ``"maybe"``) or
     an out-of-range value fails loudly rather than silently defaulting.
+
+    This is the single canonical observed-ppm contract shared across the module
+    boundary: ``scripts/run_canaries.py`` reuses it so the operator-run replay
+    and live-record paths validate observations identically to this in-package
+    gate (issue #195 review parity fix), which is why it is public.
 
     Args:
         response: The raw canary completion text.
@@ -283,7 +288,7 @@ def run_canary_set(
             prompt=_canary_prompt(question),
         )
         response = transport.complete(request)
-        observed[question.question_id] = _parse_observed_ppm(response)
+        observed[question.question_id] = parse_observed_ppm(response)
     return observed
 
 
@@ -334,6 +339,69 @@ def score_canary_run(
     )
 
 
+#: The ``drift_kind`` payload leaf stamped on a per-provider answer-drift breach
+#: (an observed-probability distance past tolerance).
+_DRIFT_KIND_ANSWER = "answer"
+
+#: The ``drift_kind`` payload leaf stamped on a per-provider version-drift breach
+#: (a reported forecaster version off its pinned set).
+_DRIFT_KIND_VERSION = "version"
+
+
+@dataclass(slots=True)
+class _DriftWindow:
+    """One drift dimension's mutable block window: its drift and ack instants.
+
+    A single such window keys off either the global (pinned-canary-model)
+    dimension or one provider. Its semantics are the pre-#195 gate's, lifted
+    verbatim into a reusable helper so the keyed map cannot diverge from the
+    global path.
+
+    Attributes:
+        drifted_at: The start of the current unacknowledged block window, or
+            ``None`` when no drift is active.
+        acked_at: The acknowledgement instant closing the window, or ``None``
+            when the active drift is unacknowledged.
+    """
+
+    drifted_at: datetime | None = None
+    acked_at: datetime | None = None
+
+    def register_breach(self, checked_at: datetime) -> None:
+        """Open or extend this window for a breach checked at ``checked_at``.
+
+        A fresh breach at or after the last acknowledgement re-arms the window
+        (a new unacknowledged drift opens); otherwise the earliest breach
+        instant is kept, so a later, still-unacknowledged breach never pushes
+        the window forward.
+
+        Args:
+            checked_at: When the breaching canary run was checked.
+        """
+        if self.acked_at is not None and checked_at >= self.acked_at:
+            self.drifted_at = checked_at
+            self.acked_at = None
+        elif self.drifted_at is None or checked_at < self.drifted_at:
+            self.drifted_at = checked_at
+
+    def is_blocked(self, created_at: datetime) -> bool:
+        """Return whether a record created at ``created_at`` is blocked here.
+
+        Args:
+            created_at: The record's creation instant.
+
+        Returns:
+            ``True`` when this window has drifted, the record was created at or
+            after the drift instant, and the drift is either unacknowledged or
+            the record predates the acknowledgement.
+        """
+        return (
+            self.drifted_at is not None
+            and created_at >= self.drifted_at
+            and (self.acked_at is None or created_at < self.acked_at)
+        )
+
+
 class CanaryGate:
     """The live-eligibility gate driven by canary drift (SPEC S8.4/S16).
 
@@ -343,6 +411,15 @@ class CanaryGate:
     until an operator acknowledges the drift. Acknowledging closes the window;
     a later breach at or after that acknowledgement re-arms the gate, opening a
     fresh block window at the new breach instant.
+
+    Issue #195 layers a per-provider drift dimension onto the original global
+    (pinned-canary-model) dimension. Each dimension is an independent
+    :class:`_DriftWindow` keyed in :attr:`_windows`, where the key ``None`` is
+    the global dimension and a provider string is that provider's dimension.
+    The global path stays byte-identical: a ``provider=None`` call carries none
+    of the new ``provider``/``drift_kind`` payload leaves and re-uses the exact
+    global window logic. A provider query fails closed for everyone when the
+    global window blocks (``is_live_blocked(provider=p)`` ORs the two windows).
     """
 
     def __init__(
@@ -355,24 +432,51 @@ class CanaryGate:
                 within band; a score strictly above it breaches.
         """
         self._drift_tolerance_ppm = drift_tolerance_ppm
-        self._drifted_at: datetime | None = None
-        self._acked_at: datetime | None = None
+        #: One block window per drift dimension: ``None`` is the global
+        #: (pinned-canary-model) dimension, a provider string is that provider's.
+        self._windows: dict[str | None, _DriftWindow] = {}
 
-    def _breach_payload(self, result: CanaryRunResult) -> dict[str, object]:
-        """Build the JSON-safe ``CANARY_DRIFT`` payload leaves.
+    def _window(self, key: str | None) -> _DriftWindow:
+        """Return the drift window for ``key``, creating it on first use.
+
+        Args:
+            key: The drift dimension (``None`` for global, else a provider).
+
+        Returns:
+            The (possibly freshly created) window for the dimension.
+        """
+        window = self._windows.get(key)
+        if window is None:
+            window = _DriftWindow()
+            self._windows[key] = window
+        return window
+
+    def _answer_breach_payload(
+        self, result: CanaryRunResult, provider: str | None
+    ) -> dict[str, object]:
+        """Build the JSON-safe ``CANARY_DRIFT`` payload for an answer breach.
+
+        The global (``provider=None``) payload is byte-identical to the pre-#195
+        breach payload; a per-provider breach adds the ``provider`` and
+        ``drift_kind="answer"`` leaves.
 
         Args:
             result: The scored canary run that breached.
+            provider: The provider whose run breached, or ``None`` for global.
 
         Returns:
             A mapping of int/str leaves (never a float).
         """
-        return {
+        payload: dict[str, object] = {
             "drift_score_ppm": result.drift_score_ppm,
             "tolerance_ppm": self._drift_tolerance_ppm,
             "worst_question_id": result.worst_question_id,
             "question_count": len(result.distances_ppm),
         }
+        if provider is not None:
+            payload["provider"] = provider
+            payload["drift_kind"] = _DRIFT_KIND_ANSWER
+        return payload
 
     def _ok_payload(self, result: CanaryRunResult) -> dict[str, object]:
         """Build the JSON-safe ``CANARY_OK`` payload leaves.
@@ -389,47 +493,29 @@ class CanaryGate:
             "question_count": len(result.distances_ppm),
         }
 
-    def _register_breach(
-        self,
-        result: CanaryRunResult,
-        *,
-        checked_at: datetime,
-        alerts: CanaryAlertEmitter,
-        ledger: CanaryLedgerWriter,
-    ) -> None:
-        """Fire the alert, ledger the breach, and record the drift instant.
+    def _answer_drift_message(
+        self, result: CanaryRunResult, provider: str | None
+    ) -> str:
+        """Build the answer-drift alert message for global or a provider.
 
-        The drift instant marks the start of the current unacknowledged block
-        window. An acknowledgement closes that window; a subsequent breach at or
-        after the ack re-arms the gate, opening a fresh window at the new breach
-        instant. Within a single open window a later, still-unacknowledged breach
-        never pushes the window forward, so records created during the drift stay
-        blocked.
+        The global message is byte-identical to the pre-#195 text; a
+        per-provider message prefixes it with the provider and drift kind.
 
         Args:
             result: The scored canary run that breached.
-            checked_at: When the canary run was checked.
-            alerts: The alert emitter to dispatch through.
-            ledger: The canary-event ledger writer.
+            provider: The provider whose run breached, or ``None`` for global.
+
+        Returns:
+            The alert body.
         """
-        message = (
+        base = (
             f"Canary drift {result.drift_score_ppm} ppm exceeded tolerance "
             f"{self._drift_tolerance_ppm} ppm; worst question "
             f"{result.worst_question_id}"
         )
-        alerts.dispatch(AlertType.CANARY_DRIFT, message)
-        ledger.record(
-            CanaryEvent(
-                CANARY_DRIFT_EVENT, self._breach_payload(result), _iso_z(checked_at)
-            )
-        )
-        if self._acked_at is not None and checked_at >= self._acked_at:
-            # A fresh breach at or after the last ack re-arms the gate: a new
-            # unacknowledged drift window opens and blocks live eligibility again.
-            self._drifted_at = checked_at
-            self._acked_at = None
-        elif self._drifted_at is None or checked_at < self._drifted_at:
-            self._drifted_at = checked_at
+        if provider is None:
+            return base
+        return f"Provider {provider} {_DRIFT_KIND_ANSWER}-drift: {base}"
 
     def apply_run(
         self,
@@ -438,6 +524,7 @@ class CanaryGate:
         checked_at: datetime,
         alerts: CanaryAlertEmitter,
         ledger: CanaryLedgerWriter,
+        provider: str | None = None,
     ) -> bool:
         """Apply a scored canary run to the gate, returning whether it breached.
 
@@ -445,62 +532,157 @@ class CanaryGate:
         band (``>`` decides a breach). A breach dispatches exactly one
         ``CANARY_DRIFT`` alert and ledgers one ``CANARY_DRIFT`` event; a
         within-band run ledgers one ``CANARY_OK`` event and touches nothing else.
+        With ``provider`` supplied the breach blocks only that provider's window
+        and stamps the ``provider``/``drift_kind="answer"`` payload leaves; with
+        ``provider=None`` the global (pinned-canary-model) window is used and the
+        payload stays byte-identical to the pre-#195 form.
 
         Args:
             result: The scored canary run to apply.
             checked_at: When the canary run was checked (keyword-only).
             alerts: The alert emitter to dispatch a breach through (keyword-only).
             ledger: The canary-event ledger writer (keyword-only).
+            provider: The provider whose run this is, or ``None`` for the global
+                dimension (keyword-only).
 
         Returns:
             ``True`` if the run breached tolerance, else ``False``.
         """
         if result.drift_score_ppm > self._drift_tolerance_ppm:
-            self._register_breach(
-                result, checked_at=checked_at, alerts=alerts, ledger=ledger
+            alerts.dispatch(
+                AlertType.CANARY_DRIFT,
+                self._answer_drift_message(result, provider),
             )
+            ledger.record(
+                CanaryEvent(
+                    CANARY_DRIFT_EVENT,
+                    self._answer_breach_payload(result, provider),
+                    _iso_z(checked_at),
+                )
+            )
+            self._window(provider).register_breach(checked_at)
             return True
         ledger.record(
             CanaryEvent(CANARY_OK_EVENT, self._ok_payload(result), _iso_z(checked_at))
         )
         return False
 
-    def acknowledge(self, *, acked_at: datetime, ledger: CanaryLedgerWriter) -> None:
+    def apply_version_drift(
+        self,
+        provider: str,
+        reported_version: str,
+        pinned_versions: tuple[str, ...],
+        *,
+        checked_at: datetime,
+        alerts: CanaryAlertEmitter,
+        ledger: CanaryLedgerWriter,
+    ) -> bool:
+        """Gate a provider on its reported forecaster version (SPEC S8.4/T14).
+
+        A reported version that IS in the pinned set is a no-op (no alert, no
+        ledgered event, no block). An off-pin version blocks that provider,
+        dispatches exactly one ``CANARY_DRIFT`` alert naming the provider and the
+        version drift kind, and ledgers one ``CANARY_DRIFT`` event carrying the
+        ``provider``, ``drift_kind="version"``, and reported/pinned version
+        leaves (all int/str/bool, never a float).
+
+        Args:
+            provider: The provider whose reported version is being gated.
+            reported_version: The forecaster version the provider reported.
+            pinned_versions: The operator-pinned versions considered valid.
+            checked_at: When the version was observed (keyword-only).
+            alerts: The alert emitter to dispatch a breach through (keyword-only).
+            ledger: The canary-event ledger writer (keyword-only).
+
+        Returns:
+            ``True`` if the version drifted off the pinned set, else ``False``.
+        """
+        if reported_version in pinned_versions:
+            return False
+        message = (
+            f"Provider {provider} {_DRIFT_KIND_VERSION}-drift: reported "
+            f"forecaster version {reported_version!r} is off the pinned set "
+            f"{list(pinned_versions)}"
+        )
+        alerts.dispatch(AlertType.CANARY_DRIFT, message)
+        payload: dict[str, object] = {
+            "provider": provider,
+            "drift_kind": _DRIFT_KIND_VERSION,
+            "reported_version": reported_version,
+            "pinned_versions": list(pinned_versions),
+        }
+        ledger.record(CanaryEvent(CANARY_DRIFT_EVENT, payload, _iso_z(checked_at)))
+        self._window(provider).register_breach(checked_at)
+        return True
+
+    def acknowledge(
+        self,
+        *,
+        acked_at: datetime,
+        ledger: CanaryLedgerWriter,
+        provider: str | None = None,
+    ) -> None:
         """Acknowledge an active drift, restoring eligibility for new records.
+
+        Acknowledging restores eligibility only for the named dimension's
+        records created at or after ``acked_at``; the two dimensions are
+        orthogonal, so acking one provider never touches the global window (or
+        any sibling provider). The global (``provider=None``) ack payload stays
+        byte-identical to the pre-#195 form.
 
         Args:
             acked_at: The acknowledgement instant; records created at or after
                 it are no longer blocked (keyword-only).
             ledger: The canary-event ledger writer (keyword-only).
+            provider: The provider whose drift is acknowledged, or ``None`` for
+                the global dimension (keyword-only).
 
         Raises:
-            ValueError: If the gate has no active drift to acknowledge.
+            ValueError: If the named dimension has no active drift.
         """
-        if self._drifted_at is None:
+        window = self._windows.get(provider)
+        if window is None or window.drifted_at is None:
             msg = "cannot acknowledge: no active canary drift"
             raise ValueError(msg)
-        self._acked_at = acked_at
+        window.acked_at = acked_at
         payload: dict[str, object] = {
-            "drifted_at": _iso_z(self._drifted_at),
+            "drifted_at": _iso_z(window.drifted_at),
             "acked_at": _iso_z(acked_at),
         }
+        if provider is not None:
+            payload["provider"] = provider
         ledger.record(CanaryEvent(CANARY_ACK_EVENT, payload, _iso_z(acked_at)))
 
-    def is_live_blocked(self, *, created_at: datetime) -> bool:
+    def _is_dimension_blocked(self, key: str | None, created_at: datetime) -> bool:
+        """Return whether a single drift dimension blocks ``created_at``.
+
+        Args:
+            key: The drift dimension (``None`` for global, else a provider).
+            created_at: The record's creation instant.
+
+        Returns:
+            ``True`` when that dimension's window exists and blocks the record.
+        """
+        window = self._windows.get(key)
+        return window is not None and window.is_blocked(created_at)
+
+    def is_live_blocked(
+        self, *, created_at: datetime, provider: str | None = None
+    ) -> bool:
         """Return whether a record created at ``created_at`` is drift-blocked.
 
-        A record is blocked when the gate has drifted, the record was created at
-        or after the drift instant, and the drift is either unacknowledged or the
-        record predates the acknowledgement.
+        The global (pinned-canary-model) window blocks every record; a provider
+        query additionally consults that provider's own window, so it fails
+        closed whenever either the provider OR the global dimension has drifted.
 
         Args:
             created_at: The record's creation instant (keyword-only).
+            provider: The provider the record would run under, or ``None`` to
+                query the global dimension alone (keyword-only).
 
         Returns:
             ``True`` if the record is blocked from live eligibility.
         """
-        return (
-            self._drifted_at is not None
-            and created_at >= self._drifted_at
-            and (self._acked_at is None or created_at < self._acked_at)
-        )
+        if self._is_dimension_blocked(None, created_at):
+            return True
+        return provider is not None and self._is_dimension_blocked(provider, created_at)

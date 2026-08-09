@@ -242,3 +242,114 @@ def test_vote_aggregate_field_names_match_the_contract() -> None:
         "ci_low_ppm",
         "ci_high_ppm",
     }
+
+
+# --- Heterogeneous-provider dispersion invariants (issue #194) ---------------------
+#
+# `aggregate_votes` derives dispersion purely from `probability_ppm` values, never
+# from `provider` identity -- these properties pin that no accidental
+# provenance-based branching creeps in as the provider-gate work (issue #194) adds
+# a research-forecaster provider (`futuresearch`) alongside the existing LLM
+# providers (`openai` / `anthropic`) to the vote-collection path.
+
+#: Two LLM providers plus one research-forecaster provider, deliberately
+#: heterogeneous (not all from the same "family") so relabeling and permuting
+#: genuinely mixes provider kinds rather than just LLM-vs-LLM.
+_PROVIDER_OPENAI = "openai"
+_PROVIDER_ANTHROPIC = "anthropic"
+_PROVIDER_FUTURESEARCH = "futuresearch"
+
+#: Two distinct cyclic label orderings used to prove relabeling invariance:
+#: the same probabilities, attributed to a different provider at each index.
+_PROVIDER_LABELS_A: tuple[str, ...] = (
+    _PROVIDER_OPENAI,
+    _PROVIDER_ANTHROPIC,
+    _PROVIDER_FUTURESEARCH,
+)
+_PROVIDER_LABELS_B: tuple[str, ...] = (
+    _PROVIDER_FUTURESEARCH,
+    _PROVIDER_OPENAI,
+    _PROVIDER_ANTHROPIC,
+)
+
+
+def _mk_labeled_votes(
+    values: list[int], providers: tuple[str, ...]
+) -> tuple[ModelVote, ...]:
+    """Build one valid, pinned-provenance vote per value, cycling providers.
+
+    Args:
+        values: The probabilities, in ppm, to build one vote per.
+        providers: The provider labels to cycle through by index, so a
+            multi-vote set mixes provider families (e.g. an LLM vote next to
+            a `futuresearch` research-forecaster vote).
+
+    Returns:
+        One `ModelVote` per value, in order, each with valid pinned
+        provenance and its `provider` field set from `providers`.
+    """
+    return tuple(
+        mk_vote(value, provider=providers[index % len(providers)])
+        for index, value in enumerate(values)
+    )
+
+
+@given(st.lists(st.integers(min_value=0, max_value=_MAX_PPM), min_size=1, max_size=7))
+def test_vote_dispersion_is_invariant_under_provider_relabeling(
+    values: list[int],
+) -> None:
+    """Relabeling which provider produced which vote (same probabilities, same
+    order) never changes the dispersion: aggregation depends only on the
+    probability values, never on provider identity."""
+    votes_a = _mk_labeled_votes(values, _PROVIDER_LABELS_A)
+    votes_b = _mk_labeled_votes(values, _PROVIDER_LABELS_B)
+
+    assert (
+        aggregate_votes(votes_a).vote_dispersion_ppm
+        == aggregate_votes(votes_b).vote_dispersion_ppm
+    )
+
+
+@given(st.lists(st.integers(min_value=0, max_value=_MAX_PPM), min_size=1, max_size=7))
+def test_vote_dispersion_is_invariant_under_order_permutation_with_mixed_providers(
+    values: list[int],
+) -> None:
+    """Reversing a heterogeneous (LLM + research-forecaster) vote set's order
+    never changes the dispersion."""
+    votes = _mk_labeled_votes(values, _PROVIDER_LABELS_A)
+    reordered = tuple(reversed(votes))
+
+    assert (
+        aggregate_votes(votes).vote_dispersion_ppm
+        == aggregate_votes(reordered).vote_dispersion_ppm
+    )
+
+
+@given(st.lists(st.integers(min_value=0, max_value=_MAX_PPM), min_size=1, max_size=7))
+def test_vote_dispersion_is_bounded_by_raw_spread_with_mixed_providers(
+    values: list[int],
+) -> None:
+    """For a heterogeneous provider mix, dispersion stays within
+    `[0, ci_high - ci_low]`, exactly as for a single-provider vote set."""
+    votes = _mk_labeled_votes(values, _PROVIDER_LABELS_A)
+
+    result = aggregate_votes(votes)
+
+    assert 0 <= result.vote_dispersion_ppm <= result.ci_high_ppm - result.ci_low_ppm
+
+
+@given(
+    st.integers(min_value=0, max_value=_MAX_PPM),
+    st.integers(min_value=1, max_value=7),
+)
+def test_all_equal_probabilities_have_zero_dispersion_regardless_of_provider_mix(
+    value: int, count: int
+) -> None:
+    """All-equal probabilities produce zero dispersion whether every vote
+    comes from one provider or the set is split across a heterogeneous mix of
+    LLM and research-forecaster providers."""
+    votes = _mk_labeled_votes([value] * count, _PROVIDER_LABELS_A)
+
+    result = aggregate_votes(votes)
+
+    assert result.vote_dispersion_ppm == 0

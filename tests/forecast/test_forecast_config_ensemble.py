@@ -18,6 +18,16 @@ the loader itself is untouched).
 below fails collection with `ImportError: cannot import name
 'EnsembleMemberConfig' from 'windbreak.config.schema'` -- the expected Gate 1
 RED state for issue #184.
+
+Issue #191 repins `_DEFAULT_VOTE_ENSEMBLE` (and the production
+`_default_vote_ensemble()`/`DEFAULT_VOTE_ENSEMBLE` it mirrors) from the
+pre-#191 placeholder triple to the real, pinned three-provider triple
+(`gpt-5-2025-08-07` / `claude-sonnet-4-5-20250929` / `gpt-5-mini-2025-08-07`).
+Until #191 lands, `ForecastConfig()`'s actual `vote_ensemble` default is
+still the old triple, so the tests below asserting equality with the new
+`_DEFAULT_VOTE_ENSEMBLE` fail with an `AssertionError` naming the mismatched
+tuple, not a collection error -- the expected Gate 1 RED state for issue
+#191.
 """
 
 from __future__ import annotations
@@ -30,18 +40,18 @@ import yaml
 
 from windbreak.config import load_config
 from windbreak.config.schema import EnsembleMemberConfig, ForecastConfig, ModelRef
+from windbreak.forecast.providers import DEFAULT_VOTE_ENSEMBLE
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-#: Today's three pipeline ensemble members (mirroring
+#: The #191 pinned three-provider vote-ensemble triple (mirroring
 #: `windbreak.forecast.providers.DEFAULT_VOTE_ENSEMBLE`), which
-#: `ForecastConfig.vote_ensemble` must default to so no existing behavior
-#: changes for a config file that omits the key.
+#: `ForecastConfig.vote_ensemble` must default to.
 _DEFAULT_VOTE_ENSEMBLE = (
-    EnsembleMemberConfig("openai", "gpt-5-forecast", "2024-06-01"),
-    EnsembleMemberConfig("anthropic", "claude-forecast", "2024-04-01"),
-    EnsembleMemberConfig("openai", "gpt-5-forecast-mini", "2024-06-01"),
+    EnsembleMemberConfig("openai", "gpt-5-2025-08-07", "2024-09-30"),
+    EnsembleMemberConfig("anthropic", "claude-sonnet-4-5-20250929", "2025-07-31"),
+    EnsembleMemberConfig("openai", "gpt-5-mini-2025-08-07", "2024-05-31"),
 )
 
 
@@ -91,6 +101,27 @@ def test_forecast_config_default_vote_ensemble_is_the_three_pipeline_members() -
     changes nothing about the pre-#184 pipeline's behavior.
     """
     assert ForecastConfig().vote_ensemble == _DEFAULT_VOTE_ENSEMBLE
+
+
+def test_default_vote_ensemble_mirrors_the_forecast_engine_default() -> None:
+    """`windbreak.forecast.providers.DEFAULT_VOTE_ENSEMBLE` and
+    `ForecastConfig()`'s default `vote_ensemble` stay mirror-equal in
+    provenance (`provider`/`model_version`/`training_cutoff`), so wiring
+    either into the vote stage yields identical ensemble provenance. Compared
+    field-by-field (not via `==`) because `EnsembleMember` and
+    `EnsembleMemberConfig` are distinct dataclasses across the SPEC S8.3
+    sandbox boundary -- generated dataclass equality never holds across
+    distinct types even when every field matches.
+    """
+    engine_provenance = tuple(
+        (member.provider, member.model_version, member.training_cutoff)
+        for member in DEFAULT_VOTE_ENSEMBLE
+    )
+    config_provenance = tuple(
+        (member.provider, member.model_version, member.training_cutoff)
+        for member in ForecastConfig().vote_ensemble
+    )
+    assert engine_provenance == config_provenance
 
 
 def test_forecast_config_existing_ensemble_field_is_unchanged() -> None:

@@ -1,0 +1,14 @@
+{
+  "placeholder-hash-futuresearch-1": {
+    "request": {
+      "method": "POST",
+      "url": "https://futuresearch.example/v1/forecast",
+      "body": "{\"ticker\": \"EXAMPLE-TICKER\"}"
+    },
+    "response": {
+      "status_code": 200,
+      "body": "{\"probability\": 0.5}",
+      "latency_seconds": 0.42
+    }
+  }
+}

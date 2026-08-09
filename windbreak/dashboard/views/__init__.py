@@ -27,6 +27,7 @@ from windbreak.dashboard.views.models import (
     build_ledger_read_models_source,
 )
 from windbreak.dashboard.views.positions import render_positions
+from windbreak.dashboard.views.providers import render_provider_panel
 
 __all__ = [
     "DashboardReadModels",
@@ -36,4 +37,5 @@ __all__ = [
     "render_execution_quality",
     "render_live_divergence",
     "render_positions",
+    "render_provider_panel",
 ]

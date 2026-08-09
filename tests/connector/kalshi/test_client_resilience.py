@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from windbreak.connector.interface import UnknownMarketError
 from windbreak.connector.kalshi.adapter import KalshiConnector
 from windbreak.connector.kalshi.client import KalshiApiError, KalshiClient
 from windbreak.connector.resilience import (
@@ -158,11 +157,12 @@ class _SingleRouteSession:
 
 
 class _MaintenanceSession:
-    """Serves a scripted `/exchange/status` flag pair plus clean data routes.
+    """Serves a scripted `/exchange/status` flag pair plus the real fixtures.
 
     Backs `_ensure_operational` tests: the order book and markets/events
-    routes always return a minimal, schema-clean payload, so only the
-    exchange-status flags vary between test cases.
+    routes serve the real recorded fixtures (`markets.json` / `events.json` /
+    `orderbook_KXFED-24DEC.json`), so only the exchange-status flags vary
+    between test cases.
     """
 
     def __init__(self, *, exchange_active: bool, trading_active: bool) -> None:
@@ -185,7 +185,7 @@ class _MaintenanceSession:
         params: Mapping[str, object] | None = None,
         timeout: int | None = None,
     ) -> _MaintenanceSession._Response:
-        """Route by URL suffix to the status flags or a clean data payload.
+        """Route by URL suffix to the status flags or a fixture data payload.
 
         Args:
             url: The full request URL `KalshiClient` built.
@@ -199,11 +199,11 @@ class _MaintenanceSession:
         if url.endswith("/exchange/status"):
             return self._Response(200, self._status)
         if url.endswith("/orderbook"):
-            return self._Response(200, {"orderbook": {"yes": [], "no": []}})
+            return self._Response(200, _read_fixture("orderbook_KXFED-24DEC.json"))
         if url.endswith("/markets"):
-            return self._Response(200, {"markets": [], "cursor": ""})
+            return self._Response(200, _read_fixture("markets.json"))
         if url.endswith("/events"):
-            return self._Response(200, {"events": []})
+            return self._Response(200, _read_fixture("events.json"))
         return self._Response(404, {"error": "not found"})
 
     class _Response:
@@ -708,19 +708,20 @@ def test_get_market_raises_maintenance_halt_when_not_open(
 def test_get_market_proceeds_normally_when_exchange_is_open(
     ledger: InMemoryEventLedgerWriter, clock: Callable[[], datetime]
 ) -> None:
-    """An `"open"` exchange status lets `get_market` fetch normally (or 404)."""
+    """An `"open"` exchange status lets `get_market` fetch the real catalog."""
     session = _MaintenanceSession(exchange_active=True, trading_active=True)
     client = KalshiClient(
         base_url=_FAKE_BASE_URL, allowlist=_FAKE_ALLOWLIST, timeout=5, session=session
     )
     connector = KalshiConnector(client, ledger, clock=clock)
 
-    # The clean `/markets` route serves an empty page, so the ticker is absent
-    # (UnknownMarketError) -- but never a MaintenanceHaltError, and the venue
-    # was consulted (the market fetch was reached).
-    with pytest.raises(UnknownMarketError):
-        connector.get_market("KXFED-24DEC")
+    # The `/markets` route now serves the real recorded catalog, so the known
+    # binary ticker is found and normalized -- never a MaintenanceHaltError,
+    # and the venue was consulted (the market fetch was reached).
+    market = connector.get_market("KXFED-24DEC")
 
+    assert market.ticker == "KXFED-24DEC"
+    assert market.market_type == "fully_collateralized_binary"
     assert ledger.events_by_type(CONNECTOR_HALT_EVENT) == ()
     assert any(url.endswith("/markets") for url in session.calls)
 
@@ -744,12 +745,15 @@ def test_get_order_book_proceeds_normally_when_exchange_is_open(
 def test_list_markets_proceeds_normally_when_exchange_is_open(
     ledger: InMemoryEventLedgerWriter, clock: Callable[[], datetime]
 ) -> None:
-    """An `"open"` exchange status never blocks `list_markets`."""
+    """An `"open"` exchange status lets `list_markets` fetch the real catalog."""
     session = _MaintenanceSession(exchange_active=True, trading_active=True)
     client = KalshiClient(
         base_url=_FAKE_BASE_URL, allowlist=_FAKE_ALLOWLIST, timeout=5, session=session
     )
     connector = KalshiConnector(client, ledger, clock=clock)
 
-    assert connector.list_markets() == ()
+    markets = connector.list_markets()
+
+    assert markets
+    assert any(market.ticker == "KXFED-24DEC" for market in markets)
     assert ledger.events_by_type(CONNECTOR_HALT_EVENT) == ()

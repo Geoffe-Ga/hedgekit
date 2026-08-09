@@ -1,15 +1,17 @@
 """Renderer for the PAPER-loop positions view (issue #48).
 
-Renders the latest ``PositionsSnapshotRecorded`` read-model row into an HTML
-table of each held position's ticker and quantity. Every ledger-derived value is
-HTML-escaped (:func:`windbreak.dashboard.views._html.escape`) before output.
+Renders the latest ``PositionsSnapshotRecorded`` read-model row into a
+column-labelled HTML table (``<table>``/``<thead>``/``<tbody>``, issue #275) of
+each held position's ticker, quantity, and average price. Every ledger-derived
+value is HTML-escaped (:func:`windbreak.dashboard.views._html.escape`) before
+output.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-from windbreak.dashboard.views._html import escape, section
+from windbreak.dashboard.views._html import table
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -17,24 +19,23 @@ if TYPE_CHECKING:
 #: The section heading the positions view renders under.
 _TITLE = "Positions"
 
+#: The position keys rendered, in column order. One tuple serves as both the
+#: header labels and the cell lookup keys so a header can never drift out of
+#: step with the value beneath it.
+_COLUMNS = ("ticker", "quantity_centis", "average_price_pips")
 
-def _position_row(position: Mapping[str, object]) -> str:
-    """Render one position into an escaped table row.
+
+def _position_values(position: Mapping[str, object]) -> tuple[object, ...]:
+    """Extract one position's cell values in column order.
 
     Args:
-        position: One position mapping (``ticker``/``quantity_centis``/
-            ``average_price_pips``) from a snapshot's ``data.positions``.
+        position: One position mapping from a snapshot's ``data.positions``.
 
     Returns:
-        An HTML ``<tr>`` with the ticker, quantity, and average price escaped.
+        The position's :data:`_COLUMNS` values, unescaped (the table helper
+        escapes every cell).
     """
-    return (
-        "<tr>"
-        f"<td>{escape(position.get('ticker'))}</td>"
-        f"<td>{escape(position.get('quantity_centis'))}</td>"
-        f"<td>{escape(position.get('average_price_pips'))}</td>"
-        "</tr>"
-    )
+    return tuple(position.get(column) for column in _COLUMNS)
 
 
 def render_positions(rows: list[dict[str, object]]) -> str:
@@ -45,12 +46,11 @@ def render_positions(rows: list[dict[str, object]]) -> str:
             snapshot); an empty list renders the "no data yet" placeholder.
 
     Returns:
-        An HTML section fragment listing each held position's ticker and
-        quantity, all values HTML-escaped.
+        An HTML section containing a table of each held position under
+        :data:`_COLUMNS` headers, all values HTML-escaped.
     """
     if not rows:
-        return section(_TITLE, [])
+        return table(_TITLE, _COLUMNS, [])
     data = cast("Mapping[str, object]", rows[-1]["data"])
     positions = cast("list[Mapping[str, object]]", data.get("positions", []))
-    body = [_position_row(position) for position in positions]
-    return section(_TITLE, body)
+    return table(_TITLE, _COLUMNS, [_position_values(row) for row in positions])

@@ -32,6 +32,15 @@ the `INSERT` all run for real, then forces `COMMIT` *itself* to fail, pinning
 that `append` still ROLLBACKs -- rather than COMMITs -- the already-inserted
 row. A mutant swapping `append`'s except-clause `ROLLBACK` for `COMMIT` would
 persist that row and so fail this test's snapshot-equality assertion.
+
+Issue #235 (replay durable kill state on `windbreak run --process riskkernel`
+startup) adds `events_from_records`, the read-side companion this module does
+not yet define: reconstructing base `Event`s from persisted `LedgerRecord`s so
+a rebuilt `RiskKernel`/`KillSwitch` can fold real ledger history. It does not
+exist on the real, not-yet-updated `store.py` module yet, so importing it
+below fails collection with `ImportError: cannot import name
+'events_from_records' from 'windbreak.ledger.store'` -- the expected Gate 1
+RED state for issue #235.
 """
 
 from __future__ import annotations
@@ -44,12 +53,20 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from windbreak.ledger.events import GENESIS_PREV_HASH, ConfigLoaded, ModeHeartbeat
+from windbreak.ledger.events import (
+    GENESIS_PREV_HASH,
+    ConfigLoaded,
+    Event,
+    ModeHeartbeat,
+    canonical_json,
+)
 from windbreak.ledger.store import (
     ChainHead,
+    LatestRecordLookup,
     LedgerRecord,
     SqliteLedgerStore,
     compute_event_hash,
+    events_from_records,
 )
 
 if TYPE_CHECKING:
@@ -527,3 +544,185 @@ def test_append_rolls_back_when_commit_itself_fails_after_insert(
     assert recovery_sequence == 2
     assert [record.sequence_number for record in store.read_all()] == [1, 2]
     store.verify_chain()
+
+
+# --- events_from_records: reconstructing Events from persisted rows (#235) -----
+
+
+def test_events_from_records_round_trips_a_typed_events_fields(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """`events_from_records` reconstructs a base `Event` whose `event_type`,
+    `component`, `payload_schema_version`, and `payload` exactly match the
+    original typed event appended through the store -- the round trip issue
+    #235's ledger-replay startup path depends on.
+    """
+    store = ledger_store_factory()
+    original = ModeHeartbeat(component="riskkernel", mode="RESEARCH", beat=1)
+    store.append(original)
+
+    events = events_from_records(store.read_all())
+
+    assert isinstance(events, tuple)
+    assert len(events) == 1
+    rebuilt = events[0]
+    assert rebuilt.event_type == original.event_type
+    assert rebuilt.component == original.component
+    assert rebuilt.payload_schema_version == original.payload_schema_version
+    assert rebuilt.payload == original.payload
+
+
+def test_events_from_records_of_an_empty_ledger_returns_an_empty_tuple(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """An empty ledger's records fold to an empty tuple, not `None` or a
+    list -- so a caller can iterate the result unconditionally.
+    """
+    store = ledger_store_factory()
+
+    assert events_from_records(store.read_all()) == ()
+
+
+def test_events_from_records_raises_value_error_on_an_envelope_missing_data() -> None:
+    """A record whose envelope is missing the required `"data"` key raises
+    `ValueError` -- the fail-closed contract issue #235's kill-replay startup
+    path depends on: a corrupt or malformed envelope must never silently
+    reconstruct a wrong `Event` (e.g. one with a fabricated empty payload).
+    """
+    malformed_payload_json = canonical_json(
+        {"component": "riskkernel", "schema_version": 1}
+    )
+    record = LedgerRecord(
+        sequence_number=1,
+        event_type="ModeHeartbeat",
+        created_at="2024-01-01T00:00:00.000000+00:00",
+        component="riskkernel",
+        payload_json=malformed_payload_json,
+        payload_schema_version=1,
+        prev_hash=GENESIS_PREV_HASH,
+        event_hash="a" * 64,
+    )
+
+    with pytest.raises(ValueError):
+        events_from_records([record])
+
+
+# --- issue #246: indexed reverse lookup of the newest record of given types -----
+#
+# `latest_gate_plan_registration` scans the WHOLE ledger (`read_all()`) at least
+# twice per promotion attempt just to find the last registration row.
+# `SqliteLedgerStore.latest_record_of_types` answers that question with a single
+# indexed `ORDER BY sequence_number DESC LIMIT 1` read, and is declared through
+# the NARROW, optional `LatestRecordLookup` capability protocol -- deliberately
+# separate from `LedgerStore`, which several hand-rolled test doubles implement
+# structurally and which must therefore stay exactly as wide as it is.
+#
+# Neither the method nor the protocol exists yet, so this module's import of
+# `LatestRecordLookup` fails collection with `ImportError: cannot import name
+# 'LatestRecordLookup' from 'windbreak.ledger.store'` -- the expected Gate 1 RED
+# state for issue #246.
+
+
+def test_latest_record_of_types_returns_none_for_an_empty_ledger(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """An empty ledger has no record of any type, so the lookup returns `None`
+    rather than raising -- the caller distinguishes "absent" from "corrupt".
+    """
+    store = ledger_store_factory()
+
+    assert store.latest_record_of_types({"ConfigLoaded"}) is None
+
+
+def test_latest_record_of_types_returns_none_when_no_row_matches(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """A non-empty ledger holding no row of the requested types returns `None`,
+    never the newest row of some other type (which would be a wrong answer the
+    fail-closed gate-plan read would then trust).
+    """
+    store = ledger_store_factory()
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+
+    assert store.latest_record_of_types({"ModeHeartbeat"}) is None
+
+
+def test_latest_record_of_types_returns_the_highest_sequence_match(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """Among several matching rows the newest (highest `sequence_number`) wins,
+    and every one of the eight persisted columns round-trips identically to the
+    same row read back through `read_all` -- the scan this read supersedes.
+    """
+    store = ledger_store_factory()
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=1))
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=2))
+
+    latest = store.latest_record_of_types({"ModeHeartbeat"})
+
+    assert latest == store.read_all()[2]
+
+
+def test_latest_record_of_types_spans_every_requested_type(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """With more than one requested type the newest row across the WHOLE set
+    wins -- the property the two-event gate-plan vocabulary
+    (`GatePlanRegistered` / `GatePlanChanged`) depends on.
+    """
+    store = ledger_store_factory()
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=1))
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+
+    latest = store.latest_record_of_types({"ModeHeartbeat", "ConfigLoaded"})
+
+    assert latest is not None
+    assert latest.sequence_number == 2
+    assert latest.event_type == "ConfigLoaded"
+
+
+def test_latest_record_of_types_returns_none_for_an_empty_type_set(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """Asking for no types at all matches nothing, so the lookup returns `None`
+    without emitting a degenerate `IN ()` query.
+    """
+    store = ledger_store_factory()
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+
+    assert store.latest_record_of_types(frozenset()) is None
+
+
+def test_sqlite_ledger_store_satisfies_the_optional_lookup_capability() -> None:
+    """`SqliteLedgerStore` structurally satisfies `LatestRecordLookup`, which is
+    how `latest_gate_plan_registration` duck-type dispatches onto the indexed
+    read instead of the full scan.
+    """
+    assert issubclass(SqliteLedgerStore, LatestRecordLookup)
+
+
+def test_latest_record_lookup_is_not_satisfied_by_a_bare_ledger_store() -> None:
+    """A hand-rolled `LedgerStore` double that predates the capability does NOT
+    satisfy `LatestRecordLookup` -- proof the new capability is separately
+    declared and that widening `LedgerStore` itself was not required.
+    """
+
+    class _BareStore:
+        """A minimal structural `LedgerStore` with no indexed lookup."""
+
+        def append(self, event: Event) -> int:
+            """Raise; this double is never appended to."""
+            raise NotImplementedError(event)
+
+        def read_all(self) -> list[LedgerRecord]:
+            """Return no records."""
+            return []
+
+        def verify_chain(self) -> None:
+            """Do nothing; the double has no chain."""
+
+        def close(self) -> None:
+            """Do nothing; the double holds no resources."""
+
+    assert not isinstance(_BareStore(), LatestRecordLookup)

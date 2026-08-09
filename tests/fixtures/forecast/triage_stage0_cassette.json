@@ -1,0 +1,10 @@
+{
+  "placeholder-hash-triage-stage0-1": {
+    "request": {
+      "provider": "openai",
+      "model_version": "gpt-5-triage-mini",
+      "prompt": "example stage-0 triage prompt"
+    },
+    "response": "500000"
+  }
+}
