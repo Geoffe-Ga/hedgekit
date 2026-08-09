@@ -399,6 +399,211 @@ def test_fee_model_from_series_rejects_a_negative_fee_leaf(bad_leaf: str) -> Non
         _fee_model_from_series(payload)
 
 
+#: Every ``*_fee_bps`` leaf `_fee_model_from_series` reads, in the order the
+#: parser reads them.
+_FEE_LEAVES: tuple[str, ...] = ("maker_fee_bps", "taker_fee_bps", "settlement_fee_bps")
+
+
+def _series_document(**overrides: object) -> dict[str, dict[str, object]]:
+    """Build a well-formed `/series/{ticker}` document with distinct fee leaves.
+
+    The three fee leaves are deliberately distinct and non-zero. The recorded
+    `series_KXFED.json` cannot pin the leaf-to-field mapping: two of its three
+    leaves are `0`, so a parser that read `settlement_fee_bps` into
+    `maker_fee_ppm` would produce the byte-identical model (issue #167's
+    coinciding-fixture trap).
+
+    Args:
+        overrides: Series-block keys to replace with a malformed value.
+
+    Returns:
+        A parsed series document ready for `_fee_model_from_series`.
+    """
+    series: dict[str, object] = {
+        "ticker": "KXDISTINCT",
+        "fee_type": "quadratic",
+        "fee_schedule_id": "kxdistinct-v1",
+        "maker_fee_bps": 3,
+        "taker_fee_bps": 700,
+        "settlement_fee_bps": 11,
+    }
+    series.update(overrides)
+    return {"series": series}
+
+
+class _BoolFeeLeafSeriesSession:
+    """Serve a `/series/KXBOOL` document whose `taker_fee_bps` leaf is `True`.
+
+    A venue that ships a JSON `true` where a basis-point count belongs is the
+    payload the leaf guard exists for. Putting it on the real transport proves
+    the refusal at `get_fee_model` -- the method the sizing and cost paths
+    actually call -- rather than only at the parse helper.
+    """
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: Mapping[str, str] | None = None,
+        timeout: int | None = None,
+    ) -> _PagedResponse:
+        """Serve the bool-leaf series document for `KXBOOL`; 404 for anything else.
+
+        Args:
+            url: The request URL built by `KalshiClient`.
+            params: Query parameters (accepted, not used to route).
+            timeout: The forwarded request timeout (accepted, not used).
+
+        Returns:
+            The bool-leaf series document, or a 404 for any other route.
+        """
+        if url.endswith("/series/KXBOOL"):
+            return _PagedResponse(200, _series_document(taker_fee_bps=True))
+        return _PagedResponse(404, {"error": "unknown series"})
+
+
+def test_fee_model_from_series_scales_each_distinct_leaf_into_its_own_ppm_field() -> (
+    None
+):
+    """Each bps leaf lands in its own ppm field, scaled by exactly 100.
+
+    The positive control for the leaf guard: it must refuse malformed leaves
+    *without* refusing or misfiling well-formed ones. Three distinct, non-zero
+    leaves make both the mapping and the scale observable -- 3, 700 and 11 bps
+    give 300, 70_000 and 1_100 ppm, three values no swap or off-by-one factor
+    can reproduce.
+    """
+    fee_model = _fee_model_from_series(_series_document())
+
+    assert fee_model == FeeModel(
+        schedule_id="kxdistinct-v1",
+        maker_fee_ppm=300,
+        taker_fee_ppm=70_000,
+        settlement_fee_ppm=1_100,
+    )
+
+
+@pytest.mark.parametrize("leaf", _FEE_LEAVES)
+@pytest.mark.parametrize("value", [True, False])
+def test_fee_model_from_series_refuses_a_bool_fee_leaf(leaf: str, value: bool) -> None:
+    """A `bool` fee leaf is refused by name, never coerced to a 1 or 0 rate.
+
+    `bool` is an `int` subclass, so a naive `isinstance(value, int)` check lets
+    `True` through as 1 bps (100 ppm) and -- worse -- `False` through as a
+    *zero fee*. A fee silently read as zero understates cost everywhere it
+    flows: P&L, the sizing bound, and the research budget's ceilings. Neither
+    value is a schedule the venue advertised, so both fail closed.
+
+    The message is asserted exactly, not by substring: without the guard a
+    non-int leaf still raises `UnknownFeeModelError`, but from the outer
+    "not a shape this adapter models" wrapper. Only the exact text
+    distinguishes the guard doing its job from the wrapper catching the debris.
+    """
+    with pytest.raises(UnknownFeeModelError) as excinfo:
+        _fee_model_from_series(_series_document(**{leaf: value}))
+
+    assert str(excinfo.value) == f"series fee leaf {leaf!r} must be an int, got bool"
+
+
+@pytest.mark.parametrize(
+    ("value", "type_name"),
+    [("700", "str"), (7.0, "float"), (None, "NoneType"), ([700], "list")],
+)
+def test_fee_model_from_series_refuses_a_non_int_fee_leaf(
+    value: object, type_name: str
+) -> None:
+    """A non-int fee leaf is refused by the leaf guard, naming the type it got.
+
+    Each of these would otherwise be *silently transformed* before anything
+    checked it: `"700" * 100` is a 300-character string, `[700] * 100` is a
+    700-element list, and `7.0 * 100` is a float on a package that forbids
+    them. All are eventually refused downstream, but by accident and under a
+    message that names the wrong culprit -- so the exact text is what proves
+    the leaf guard, not the fallback, made the decision.
+    """
+    with pytest.raises(UnknownFeeModelError) as excinfo:
+        _fee_model_from_series(_series_document(taker_fee_bps=value))
+
+    assert str(excinfo.value) == (
+        f"series fee leaf 'taker_fee_bps' must be an int, got {type_name}"
+    )
+
+
+def test_get_fee_model_refuses_a_bool_fee_leaf_served_over_the_transport(
+    ledger: InMemoryEventLedgerWriter, clock: Callable[[], datetime]
+) -> None:
+    """A venue-served `true` fee leaf is refused by `get_fee_model` itself.
+
+    The leaf guard raises inside the `try` that wraps `FeeModel` construction,
+    so this also pins that `UnknownFeeModelError` is *not* swallowed and
+    re-messaged on the way out to the caller.
+
+    Deliberately no `MARKET_MALFORMED` event: unlike `list_markets`, which
+    degrades one bad row so a scan survives it, a fee lookup is a targeted
+    single-series read with nothing to skip past -- there is no fee model to
+    return, and the caller must not size without one. It fails closed by
+    raising, matching `_gated_raw_market`'s rule that a targeted lookup never
+    floods the ledger.
+    """
+    client = KalshiClient(
+        base_url="https://fake.test",
+        timeout=5,
+        session=_BoolFeeLeafSeriesSession(),
+        resilience=None,
+        allowlist=OutboundAllowlist(frozenset({"fake.test"})),
+    )
+    connector = KalshiConnector(client, ledger, clock=clock)
+
+    with pytest.raises(UnknownFeeModelError) as excinfo:
+        connector.get_fee_model("KXBOOL-24DEC")
+
+    assert str(excinfo.value) == (
+        "series fee leaf 'taker_fee_bps' must be an int, got bool"
+    )
+    assert ledger.events_by_type(MARKET_MALFORMED_EVENT) == ()
+
+
+@pytest.mark.parametrize(
+    "missing", ["fee_type", "fee_schedule_id", "maker_fee_bps", "taker_fee_bps"]
+)
+def test_fee_model_from_series_refuses_a_document_missing_a_required_field(
+    missing: str,
+) -> None:
+    """A series document missing any required fee field is refused, naming it.
+
+    A missing leaf is the third malformed shape, alongside a wrong-typed and a
+    negative one, and the most dangerous to default: reading an absent
+    `taker_fee_bps` as 0 would price every trade as fee-free. The parser
+    indexes rather than `.get`s, so the absence surfaces as a `KeyError` that
+    fails closed under the field's own name.
+    """
+    payload = _series_document()
+    del payload["series"][missing]
+
+    with pytest.raises(UnknownFeeModelError) as excinfo:
+        _fee_model_from_series(payload)
+
+    assert str(excinfo.value) == (
+        f"series document is missing a required fee field: {missing!r}"
+    )
+
+
+def test_fee_model_from_series_refuses_a_non_mapping_series_block() -> None:
+    """A `series` block that is not a mapping fails closed, not on a raw TypeError.
+
+    The exact `TypeError` text CPython raises for indexing a list with a string
+    is not this module's contract, so the cause's *type* is asserted instead of
+    its wording.
+    """
+    with pytest.raises(UnknownFeeModelError) as excinfo:
+        _fee_model_from_series({"series": ["KXDISTINCT"]})
+
+    assert str(excinfo.value).startswith(
+        "series document is missing a required fee field: "
+    )
+    assert isinstance(excinfo.value.__cause__, TypeError)
+
+
 # --- get_balance_semantics (issue #18) --------------------------------------
 
 
