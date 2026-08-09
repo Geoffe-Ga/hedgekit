@@ -178,7 +178,16 @@ def _parse_server_date(headers: Mapping[str, str]) -> datetime | None:
         parsed = parsedate_to_datetime(raw)
     except (TypeError, ValueError):
         return None
-    if parsed.tzinfo is None:
+    # Naive means `tzinfo is None` *or* a `tzinfo` whose `utcoffset()` returns
+    # None -- Python's own definition; `utcoffset()` reports both in one call.
+    # Testing `tzinfo is None` alone (issue #346) sent the second shape to
+    # `astimezone`, which does not raise on a naive value but silently reads
+    # its wall clock as the *host's* local time -- so the exchange instant
+    # would skew by whatever offset the machine runs at, differing between a
+    # developer's laptop and CI. Both naive shapes belong on the same branch:
+    # an HTTP-date is GMT (RFC 9110 S5.6.7), which is a fact about the
+    # protocol, not about the machine that parsed it.
+    if parsed.utcoffset() is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
 
