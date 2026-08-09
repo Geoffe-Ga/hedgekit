@@ -93,8 +93,13 @@ forbidden_modules =
 #      `windbreak.order_gateway` (the sole intended trading consumer, issue #37's
 #      `PaperSubmitter`), `windbreak.connector` (where `PaperExchange` itself is
 #      defined and already re-exported), and `windbreak.scheduler` (which
-#      constructs a `PaperExchange` ONLY inside its `build_paper_deps` PAPER
-#      factory -- the boundary's intent, keeping the paper fake out of the
+#      constructs a `PaperExchange` -- or, in live-book mode, the
+#      `LiveBookPaperExchange` subclass -- ONLY inside its `build_paper_deps`
+#      PAPER factory and that factory's own `_build_paper_exchange` helper.
+#      `windbreak.main` reaches live venue books through
+#      `windbreak.connector.live`, which carries no order surface, so the CLI
+#      still never imports the order-submission client
+#      -- the boundary's intent, keeping the paper fake out of the
 #      RESEARCH/LIVE trading path, is preserved because the RESEARCH loop never
 #      imports `windbreak.scheduler` at all) are deliberately absent from
 #      `source_modules`.
