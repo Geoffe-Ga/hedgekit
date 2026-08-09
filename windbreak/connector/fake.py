@@ -75,28 +75,59 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _parse_dt(value: str) -> datetime:
-    """Parse an ISO-8601 timestamp into a UTC-normalized datetime.
+def _parse_dt(value: str, *, field: str) -> datetime:
+    """Parse an offset-bearing ISO-8601 fixture timestamp into a UTC datetime.
+
+    The offset is required, exactly as in
+    :func:`windbreak.connector.kalshi.normalize._parse_dt` -- a test double that
+    accepts what production refuses teaches the wrong contract. ``fromisoformat``
+    returns a *naive* datetime for an offsetless string and ``.astimezone(UTC)``
+    does not raise on one: it reads the wall clock as the **host's** local time,
+    so the same checked-in fixture would mean different instants on a
+    developer's laptop and in UTC-running CI (issue #392). A fixture whose
+    meaning depends on the machine reading it is not a fixture, so this refuses
+    rather than guessing an offset.
 
     Args:
-        value: An ISO-8601 string, e.g. ``2024-12-01T00:00:00.000000Z``.
+        value: An ISO-8601 string carrying a UTC offset, e.g.
+            ``2024-12-01T00:00:00.000000Z``.
+        field: The fixture field name ``value`` came from, named in the error so
+            the offending entry is locatable.
 
     Returns:
         The timezone-aware datetime, normalized to UTC.
+
+    Raises:
+        ValueError: If ``value`` is not parseable as ISO-8601, or parses to a
+            naive (offsetless) datetime.
     """
-    return datetime.fromisoformat(value).astimezone(UTC)
+    parsed = datetime.fromisoformat(value)
+    # Naive means `tzinfo is None` *or* a `tzinfo` whose `utcoffset()` returns
+    # None -- Python's own definition, reported by `utcoffset()` in one call.
+    if parsed.utcoffset() is None:
+        raise ValueError(
+            f"Fixture timestamp field {field!r} carries no UTC offset: {value!r}. "
+            "An offsetless timestamp would be read against the host's local "
+            "timezone, so the fixture is refused rather than loaded against a "
+            "guessed offset."
+        )
+    return parsed.astimezone(UTC)
 
 
-def _parse_optional_dt(value: str | None) -> datetime | None:
-    """Parse an optional ISO-8601 timestamp, preserving ``None``.
+def _parse_optional_dt(value: str | None, *, field: str) -> datetime | None:
+    """Parse an optional offset-bearing ISO-8601 timestamp, preserving ``None``.
 
     Args:
-        value: An ISO-8601 string, or None.
+        value: An ISO-8601 string carrying a UTC offset, or None.
+        field: The fixture field name ``value`` came from, named in the error.
 
     Returns:
         The parsed UTC datetime, or None when ``value`` is None.
+
+    Raises:
+        ValueError: If ``value`` is present and offsetless or unparseable.
     """
-    return None if value is None else _parse_dt(value)
+    return None if value is None else _parse_dt(value, field=field)
 
 
 def _market_from_dict(data: Mapping[str, Any]) -> NormalizedMarket:
@@ -108,8 +139,10 @@ def _market_from_dict(data: Mapping[str, Any]) -> NormalizedMarket:
         title=data["title"],
         resolution_criteria=data["resolution_criteria"],
         category=data["category"],
-        close_time=_parse_dt(data["close_time"]),
-        expected_resolution_time=_parse_optional_dt(data["expected_resolution_time"]),
+        close_time=_parse_dt(data["close_time"], field="close_time"),
+        expected_resolution_time=_parse_optional_dt(
+            data["expected_resolution_time"], field="expected_resolution_time"
+        ),
         market_type=data["market_type"],
         price_tick_pips=data["price_tick_pips"],
         min_order_contract_centis=data["min_order_contract_centis"],
@@ -134,7 +167,7 @@ def _book_from_dict(ticker: str, data: Mapping[str, Any]) -> OrderBookSnapshot:
         ticker=ticker,
         yes_bids=tuple(_level_from_dict(level) for level in data["yes_bids"]),
         yes_asks=tuple(_level_from_dict(level) for level in data["yes_asks"]),
-        fetched_at=_parse_dt(data["fetched_at"]),
+        fetched_at=_parse_dt(data["fetched_at"], field="fetched_at"),
     )
 
 
@@ -146,7 +179,7 @@ def _fill_from_dict(data: Mapping[str, Any]) -> Fill:
         side=_SIDE_BY_NAME[data["side"]],
         price=PricePips(data["price"]),
         quantity=ContractCentis(data["quantity"]),
-        ts=_parse_dt(data["ts"]),
+        ts=_parse_dt(data["ts"], field="ts"),
     )
 
 
@@ -187,9 +220,9 @@ def _load_exchange(directory: Path) -> tuple[ExchangeStatus, datetime]:
     data = _read_json(directory.joinpath("exchange.json"))
     status = ExchangeStatus(
         status=_STATUS_BY_NAME[data["status"]],
-        fetched_at=_parse_dt(data["status_fetched_at"]),
+        fetched_at=_parse_dt(data["status_fetched_at"], field="status_fetched_at"),
     )
-    return status, _parse_dt(data["exchange_time"])
+    return status, _parse_dt(data["exchange_time"], field="exchange_time")
 
 
 def _load_balances(directory: Path) -> BalanceSnapshot:
@@ -198,7 +231,7 @@ def _load_balances(directory: Path) -> BalanceSnapshot:
     return BalanceSnapshot(
         total=MoneyMicros(data["total"]),
         available=MoneyMicros(data["available"]),
-        fetched_at=_parse_dt(data["fetched_at"]),
+        fetched_at=_parse_dt(data["fetched_at"], field="fetched_at"),
     )
 
 
