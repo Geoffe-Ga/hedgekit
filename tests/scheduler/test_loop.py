@@ -226,6 +226,7 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -254,6 +255,7 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -283,6 +285,7 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -316,6 +319,7 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -340,6 +344,7 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -380,6 +385,7 @@ def test_build_evaluation_context_never_stamps_the_quote_with_its_own_clock(
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=quote_epoch_s,
+        open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -649,6 +655,7 @@ def _context_with(*, status, status_epoch_s: int | None, heartbeat_epoch_s: int 
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
         quote_snapshot_epoch_s=None,
+        open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -945,6 +952,7 @@ def _exposure_context(*, equity_start_of_day, visible_depth):
         exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
         pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
         quote_snapshot_epoch_s=None,
+        open_position=None,
         equity_start_of_day=equity_start_of_day,
         visible_depth=visible_depth,
     )
@@ -1246,3 +1254,212 @@ def test_the_loop_no_longer_carries_its_own_position_fold() -> None:
     from windbreak.scheduler import loop
 
     assert not hasattr(loop, "_positions_from_fills")
+
+
+# --- Issue #373: the real open position reaches `reduce_only_provable` --------
+
+
+def _paper_exchange_holding_yes():
+    """Build a `PaperExchange` whose only holding is a YES-side position.
+
+    Returns:
+        The `PaperExchange`, already filled on the YES side of `MKT-DEEP`.
+    """
+    from windbreak.connector import paper
+    from windbreak.numeric import ContractCentis, PricePips
+
+    exchange = paper.PaperExchange.from_fixture_dir(_books_fixture_dir() / "deep_walk")
+    exchange.place_order(
+        paper.PaperOrderIntent(
+            _DEEP_WALK_TICKER, "yes", PricePips(4700), ContractCentis(100)
+        ),
+        approval_token=object(),
+    )
+    return exchange
+
+
+def _paper_exchange_holding_both_sides():
+    """Build a `PaperExchange` holding `MKT-DEEP` on both YES and NO.
+
+    `get_positions` refuses to net the two legs (`TwoSidedPositionError`),
+    because a netted YES-plus-NO reports flat while both legs and their
+    collateral are live.
+
+    Returns:
+        The `PaperExchange`, filled on both sides of one ticker.
+    """
+    from windbreak.connector import paper
+    from windbreak.numeric import ContractCentis, PricePips
+
+    exchange = _paper_exchange_holding_yes()
+    exchange.place_order(
+        paper.PaperOrderIntent(
+            _DEEP_WALK_TICKER,
+            "no",
+            PricePips(_NO_FILL_PRICE_PIPS),
+            ContractCentis(100),
+        ),
+        approval_token=object(),
+    )
+    return exchange
+
+
+def _flat_paper_exchange():
+    """Build a `PaperExchange` that has never filled, so it is genuinely flat.
+
+    Returns:
+        The unfilled `PaperExchange`.
+    """
+    from windbreak.connector import paper
+
+    return paper.PaperExchange.from_fixture_dir(_books_fixture_dir() / "deep_walk")
+
+
+def _position_context(open_position):
+    """Build a PAPER context carrying the given open position.
+
+    Every other feed is the loop's own production wiring; only the figure issue
+    #373 supplies varies, so each assertion below isolates it.
+
+    Args:
+        open_position: The `ContractCentis` holding, or `None` when it could
+            not be determined.
+
+    Returns:
+        The composed `EvaluationContext`.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+    from windbreak.scheduler.loop import build_evaluation_context
+
+    return build_evaluation_context(
+        WindbreakConfig(),
+        now_epoch_s=DEFAULT_NOW_EPOCH_S,
+        verification=None,
+        instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=ExchangeTradingStatus.OPEN,
+        exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+        quote_snapshot_epoch_s=DEFAULT_NOW_EPOCH_S,
+        open_position=open_position,
+        equity_start_of_day=None,
+        visible_depth=None,
+    )
+
+
+def test_a_real_yes_holding_lets_a_close_within_it_prove_reduce_only() -> None:
+    """The connector's own YES holding reaches the check, and a close passes.
+
+    This is the positive half of issue #373: before it, `open_position` was a
+    hardcoded `None`, so `reduce_only_provable` vetoed *every* close on every
+    tick -- correctly, but permanently, because the kernel had never been told
+    what the account holds. The position is read straight off
+    `PaperExchange.get_positions()`, the process's one definition of
+    "position" (issue #361), so the check and the ledgered snapshot can never
+    disagree.
+    """
+    from windbreak.numeric import ContractCentis
+    from windbreak.scheduler.loop import read_open_position_centis
+
+    exchange = _paper_exchange_holding_yes()
+    held = exchange.get_positions()[0].quantity
+
+    position = read_open_position_centis(exchange, ticker=_DEEP_WALK_TICKER)
+    context = _position_context(position)
+    within = make_intent(action="sell_to_close", size=ContractCentis(held.value))
+    beyond = make_intent(action="sell_to_close", size=ContractCentis(held.value + 1))
+
+    assert position == held
+    assert held.value > 0
+    assert context.market.open_position == held
+    assert _check_named("reduce_only_provable")(within, context).vetoed is False
+    assert _check_named("reduce_only_provable")(beyond, context).vetoed is True
+
+
+def test_a_two_sided_holding_stays_none_and_keeps_vetoing() -> None:
+    """An indeterminate position fails closed -- never a fabricated zero.
+
+    `PaperExchange.get_positions` refuses to net a YES leg against a NO leg,
+    because the netted answer reports flat while both legs and their collateral
+    are live. The loop must carry that refusal through as `None`: substituting
+    zero would be a *claim* that the account is flat, which is exactly the
+    fabricated healthy zero the connector declined to invent.
+    """
+    from windbreak.numeric import ContractCentis
+    from windbreak.scheduler.loop import read_open_position_centis
+
+    position = read_open_position_centis(
+        _paper_exchange_holding_both_sides(), ticker=_DEEP_WALK_TICKER
+    )
+    context = _position_context(position)
+    close = make_intent(action="sell_to_close", size=ContractCentis(1))
+
+    assert position is None
+    assert context.market.open_position is None
+    assert _check_named("reduce_only_provable")(close, context).vetoed is True
+
+
+def test_a_genuinely_flat_account_reports_zero_and_still_vetoes_every_close() -> None:
+    """An observed absence of fills is zero, and zero still admits no close.
+
+    Zero and `None` are not interchangeable in general -- `None` is absent
+    evidence, zero is a claim -- but here the claim is one the connector
+    actually makes: `get_positions` answered, and it reported no row for this
+    ticker, which its own contract defines as genuinely flat. The distinction
+    costs nothing in permissiveness: a close of any positive size exceeds zero,
+    so the check vetoes exactly as it does on `None`.
+    """
+    from windbreak.numeric import ContractCentis
+    from windbreak.scheduler.loop import read_open_position_centis
+
+    exchange = _flat_paper_exchange()
+
+    position = read_open_position_centis(exchange, ticker=_DEEP_WALK_TICKER)
+    context = _position_context(position)
+    close = make_intent(action="sell_to_close", size=ContractCentis(1))
+
+    assert exchange.get_positions() == ()
+    assert position == ContractCentis(0)
+    assert _check_named("reduce_only_provable")(close, context).vetoed is True
+
+
+def test_a_long_no_holding_lands_signed_and_never_proves_a_yes_close() -> None:
+    """The YES-frame sign survives, so a NO holding cannot license a YES close.
+
+    `get_positions` reports a long NO as a *negative* YES-frame quantity. That
+    sign must reach the check verbatim: taking its magnitude would claim a
+    YES-side close reduces a NO-side holding, which is false -- it opens a
+    second position. `intent.size <= open_position` is then unsatisfiable for
+    any positive size, which is the fail-closed answer.
+    """
+    from windbreak.numeric import ContractCentis
+    from windbreak.scheduler.loop import read_open_position_centis
+
+    position = read_open_position_centis(
+        _paper_exchange_holding_no(), ticker=_DEEP_WALK_TICKER
+    )
+    context = _position_context(position)
+    close = make_intent(action="sell_to_close", size=ContractCentis(1))
+
+    assert position == ContractCentis(_NO_HOLDING_YES_FRAME_CENTIS)
+    assert position.value < 0
+    assert _check_named("reduce_only_provable")(close, context).vetoed is True
+
+
+def test_an_unknown_ticker_reports_flat_rather_than_another_markets_holding() -> None:
+    """The position is selected by ticker, never taken from whichever row exists.
+
+    A single-market loop makes this easy to get wrong by reading `positions[0]`.
+    The `two_ticker_isolation` fixture holds two markets, so a positional read
+    would hand the kernel the wrong market's exposure.
+    """
+    from windbreak.numeric import ContractCentis
+    from windbreak.scheduler.loop import read_open_position_centis
+
+    exchange = _paper_exchange_holding_yes()
+
+    position = read_open_position_centis(exchange, ticker="MKT-ABSENT")
+
+    assert exchange.get_positions()[0].ticker == _DEEP_WALK_TICKER
+    assert position == ContractCentis(0)

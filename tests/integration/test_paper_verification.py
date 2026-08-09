@@ -88,6 +88,15 @@ _SHALLOW_SIDE_CENTIS = 300
 #: start-of-day equity the loop ledgers every tick, and today's zero realized
 #: loss is below its 2% threshold.
 #:
+#: Issue #373 re-examined this tuple reason by reason and left it unchanged, on
+#: purpose rather than by omission: threading the real `open_position` cannot
+#: move either survivor, because `make_intent`'s default action is `buy` -- an
+#: *opening* action, which `reduce_only_provable` approves outright and which
+#: `_is_derisking_close` can never exempt from `concentration_limits`. What
+#: changed is proven directly instead, in
+#: `test_loop_production_context_carries_the_venues_own_open_position` and in
+#: `tests/scheduler/test_loop.py`'s issue-#373 section.
+#:
 #: Compared with exact equality on purpose, mirroring
 #: `tests/scheduler/test_loop.py::_EXPECTED_VETO_REASONS`. Never soften it to a
 #: membership check: it is the repo's designated measurement of what actually
@@ -135,6 +144,7 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
     from windbreak.scheduler.eligibility import project_exchange_status
     from windbreak.scheduler.loop import (
         build_evaluation_context,
+        read_open_position_centis,
         start_of_day_equity_micros,
         visible_depth_centis,
     )
@@ -152,6 +162,7 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
         exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
         pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
+        open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
         equity_start_of_day=start_of_day_equity_micros(
             deps.store.read_all(), now_epoch_s=now_epoch_s
         ),
@@ -533,3 +544,45 @@ def test_loop_context_vetoes_a_book_aged_past_its_quote_ttl(
 
     assert fresh.decision.reasons == _SURVIVING_VETO_REASONS
     assert stale.decision.reasons == _STALE_QUOTE_VETO_REASONS
+
+
+def test_loop_production_context_carries_the_venues_own_open_position(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """`open_position` is the connector's answer, never a hardcoded `None` (#373).
+
+    Before this issue the loop passed `open_position=None` outright, so
+    `reduce_only_provable` vetoed every close forever. The fixture account has
+    never filled, so the venue's honest answer here is `ContractCentis(0)` --
+    an *observed* flat, distinguishable from the `None` that means "could not
+    be determined". Both still veto a close; only one of them is evidence.
+
+    Args:
+        books_dir: The shared books-fixture directory.
+        cassette_path: The empty recorded-cassette path.
+        report_dir: Where weekly-report stubs would be written.
+        paper_config: The PAPER-ceilinged configuration.
+        research_tools_factory: Builds the offline research tools double.
+        tmp_path: The pytest scratch directory.
+    """
+    from windbreak.scheduler.loop import run_single_tick
+
+    deps = _build_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools_factory=research_tools_factory,
+    )
+    run_single_tick(deps, beat=1)
+
+    context = _production_context(deps)
+
+    assert deps.exchange.get_positions() == ()
+    assert context.market.open_position == ContractCentis(0)

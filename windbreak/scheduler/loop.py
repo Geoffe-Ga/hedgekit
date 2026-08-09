@@ -725,6 +725,59 @@ def visible_depth_centis(order_book: OrderBookSnapshot) -> ContractCentis:
     return ContractCentis(min(bid_depth, ask_depth))
 
 
+def read_open_position_centis(
+    exchange: PaperExchange, *, ticker: str
+) -> ContractCentis | None:
+    """Return what the venue says this account holds in ``ticker``, or ``None``.
+
+    The one figure ``reduce_only_provable`` proves a close against, read from
+    :meth:`~windbreak.connector.paper.PaperExchange.get_positions` -- the
+    process's single definition of "position" (issue #361) -- so the check and
+    the ledgered ``PositionsSnapshotRecorded`` row can never disagree about what
+    is held.
+
+    Three answers, and the distinction between the last two is the whole point
+    of issue #373:
+
+    * **The venue's own signed quantity** when a row exists for ``ticker``,
+      passed through verbatim in the YES frame. The sign is *not* stripped: a
+      long NO reports negative, and taking its magnitude would claim a YES-side
+      close reduces a NO-side holding when in fact it opens a second position.
+      Left signed, ``intent.size <= open_position`` is unsatisfiable for any
+      positive size, which is the fail-closed answer.
+    * **Zero** when the venue answered and reported no row for ``ticker``. That
+      is an observed absence of fills, which the connector's own contract
+      defines as genuinely flat -- evidence, not a gap, exactly as an empty book
+      is ``0`` depth rather than unknown depth (issue #364). It costs nothing in
+      permissiveness: every positive-size close exceeds zero.
+    * **``None``** when the venue *refused* to describe itself --
+      :class:`~windbreak.connector.paper.TwoSidedPositionError`, raised for a
+      ticker filled on both sides because the only single-row answer is a netted
+      one and a netted YES-plus-NO reports flat while both legs and their
+      collateral are live. Substituting zero here would be a *claim* that the
+      account is flat: precisely the fabricated healthy zero the connector just
+      declined to invent. The check keeps vetoing, and the loud half of the
+      response is :func:`_verification_stage`'s forced ``BREACH``.
+
+    Args:
+        exchange: The paper exchange whose fill log defines the holding.
+        ticker: The market whose holding this tick evaluates against.
+
+    Returns:
+        The signed YES-frame holding in contract-centis, ``0`` when the venue
+        reports the account flat there, or ``None`` when it cannot be
+        determined.
+    """
+    try:
+        positions = exchange.get_positions()
+    except TwoSidedPositionError:
+        return None
+    for position in positions:
+        if position.ticker == ticker:
+            return position.quantity
+    return ContractCentis(0)
+
+
 def _human_ack_micros(config: WindbreakConfig) -> MoneyMicros | None:
     """Return the configured human-ack notional threshold, or ``None``.
 
@@ -862,6 +915,7 @@ def build_evaluation_context(
     exchange_status_epoch_s: int | None,
     pipeline_heartbeat_epoch_s: int | None,
     quote_snapshot_epoch_s: int | None,
+    open_position: ContractCentis | None,
     equity_start_of_day: MoneyMicros | None,
     visible_depth: ContractCentis | None,
 ) -> EvaluationContext:
@@ -895,6 +949,14 @@ def build_evaluation_context(
     the SPEC S7.3 snapshot-TTL guarantee, the one check standing between the
     kernel and an order priced off a stale book. A caller holding no book
     passes ``None`` and the check keeps vetoing.
+
+    The open position is caller-supplied too (issue #373), from
+    :func:`read_open_position_centis`. It was a hardcoded ``None``, so
+    ``reduce_only_provable`` vetoed every close on every tick -- correctly, but
+    permanently, because the kernel had never been told what the account holds.
+    ``None`` remains the answer whenever the holding genuinely cannot be
+    determined, and it must never be softened to zero: zero is a *claim* that
+    the account is flat, and an indeterminate position is not a flat one.
 
     The start-of-day equity and the visible depth are caller-supplied for the
     same reason (issue #364), and both loosen a real exposure limit when they
@@ -930,6 +992,11 @@ def build_evaluation_context(
             ``fetched_at``, never from the tick's clock: a quote stamped
             ``now`` is zero seconds old by construction and ``quote_freshness``
             could never veto.
+        open_position: The signed YES-frame holding in this tick's market, in
+            contract-centis, or ``None`` when the venue could not describe it
+            -- which fails closed (issue #373). A venue-reported flat account is
+            ``0``, not ``None``: an observed absence of fills is evidence, and
+            it proves no close either way.
         equity_start_of_day: The current UTC day's first ledgered equity
             sample, or ``None`` when the day has none yet -- which fails closed
             (issue #364).
@@ -946,7 +1013,7 @@ def build_evaluation_context(
         forecast_epoch_s=now_epoch_s,
         visible_depth=visible_depth,
         exchange_clock_epoch_s=now_epoch_s,
-        open_position=None,
+        open_position=open_position,
         exchange_status=exchange_status,
         exchange_status_epoch_s=exchange_status_epoch_s,
         jurisdiction_status=project_jurisdiction(
@@ -1841,6 +1908,14 @@ def _approve_stage(
     reading only became honest once :func:`build_paper_deps` anchored the
     replay, so the recording's frozen literals age against this run's clock.
 
+    Threads the venue's own open position (issue #373), read here rather than
+    taken from :func:`_equity_and_positions_stage`, which runs *after* this
+    stage on purpose: the position an approval is proven against must be the
+    one held before this tick's fills, not after them. A venue that refuses to
+    describe its holding yields ``None`` and ``reduce_only_provable`` keeps
+    vetoing -- see :func:`read_open_position_centis` for why zero would be a
+    fabrication rather than a fallback.
+
     A market the exchange cannot resolve becomes ``None`` rather than an
     exception, so an unknown ticker vetoes the tick instead of aborting it.
 
@@ -1883,6 +1958,7 @@ def _approve_stage(
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
+        open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
         equity_start_of_day=read_start_of_day_equity_micros(
             deps.store, now_epoch_s=now_epoch_s
         ),
