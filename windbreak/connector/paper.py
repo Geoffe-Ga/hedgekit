@@ -65,6 +65,18 @@ turns that refusal into an absent reading, and ``clock_skew_limit`` vetoes with
 one indefinitely; the always-on path is :class:`LiveBookPaperExchange`, whose
 venue clock is the venue's.
 
+Cursor semantics (issue #387, SPEC S7.5.1) settle which of those two triggers
+production can actually reach. The PAPER loop's replay cursor is **stationary**:
+:meth:`PaperExchange.advance` has no production caller, so a run prices and
+fills against the one recorded step it opened on, and only an empty recording
+can exhaust the cursor. That is a decision, not an oversight, and it is
+load-bearing here: a resting remainder never fills in production, recorded depth
+is not consumed by a fill, and the recording's later steps are read for their
+instants (the substantiated span above) rather than for their books. SPEC S7.5.1
+is the canonical account of why the alternative reading -- one step per tick --
+was rejected, and of the consequences this one accepts; it is deliberately not
+restated here.
+
 Consistency guard (issues #18, #362): the constructor rejects any fixture whose
 :class:`~windbreak.connector.semantics.BalanceSemantics` claims a behavior this
 simulator does not implement (see :data:`_SEMANTICS_REQUIREMENTS`). A taker walk
@@ -1087,6 +1099,18 @@ class PaperExchange:
         Each ticker's current step is processed against its resting orders (a
         recorded trade-through fills, appending one :class:`Fill` per resting
         order that fills), and its cursor advances by one.
+
+        **Harness API: no production code calls this** (SPEC S7.5.1, issue
+        #387). The PAPER loop's replay cursor is stationary -- a tick prices and
+        fills against the one recorded step the cursor stands on -- so this
+        method is how the §17.4 fill-model suites drive a recorded tape, not how
+        a run consumes one. It is public because those suites exercise the real
+        connector rather than a double, and because that is the honest name for
+        what it does; it is *not* a step the scheduler is expected to take.
+        ``tests/connector/test_paper_replay_semantics.py`` fails if a caller
+        appears under ``windbreak/``. Advancing per tick was considered and
+        rejected; SPEC S7.5.1 records why, and the consequences the stationary
+        reading accepts.
 
         Returns:
             True if any session still has an unconsumed step after advancing;

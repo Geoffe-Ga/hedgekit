@@ -3099,11 +3099,14 @@ def _verification_stage(deps: PaperTickDeps) -> None:
     is booked into the ledger first (issues #365 and #390), so the expectation
     the cycle diffs against has already absorbed what the ledger can explain.
     Booking here rather than beside the routing call catches activity from
-    *every* source -- a taker walk on a placed order, a remainder resting behind
-    it, and a resting order filled by ``PaperExchange.advance`` alike -- and does
-    it at the one moment the answer is needed. Booking is idempotent on the
-    venue's fill id and order id, so re-entering this stage never advances the
-    expectation past cash the venue moved once or an order it rested once.
+    *every* source -- a taker walk on a placed order and a remainder resting
+    behind it alike -- and does it at the one moment the answer is needed. A
+    recorded trade-through fill is a third source in principle, but only for a
+    harness that steps the replay itself: the loop's cursor is stationary (SPEC
+    S7.5.1, issue #387), so no ``PaperExchange.advance`` fill arises in a run.
+    Booking is idempotent on the venue's fill id and order id, so re-entering
+    this stage never advances the expectation past cash the venue moved once or
+    an order it rested once.
 
     The booking reads the venue's *discrete reports* -- executions, and orders
     arriving on the resting book; the cycle reads the venue's *aggregate*
@@ -3253,6 +3256,18 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     say the same thing N times. The verification cycle in particular runs before
     any candidate is touched, so a breach halts the kernel ahead of the whole
     universe rather than part-way through it.
+
+    The tick does **not** step the replay cursor, and that is a decision rather
+    than an omission (issue #387, SPEC S7.5.1). A fixture run therefore prices,
+    fills, and allocates against the one recorded step it opened on for the life
+    of the process; ``PaperExchange.advance`` is harness API with no caller
+    here, and the always-on path whose market data genuinely advances is
+    ``LiveBookPaperExchange``, which reads the venue's real books. Stepping the
+    cursor per tick was considered and rejected -- S7.5.1 is the canonical
+    account of why, and of the consequences the stationary reading accepts, so
+    the argument is not restated here. Instead,
+    ``tests/integration/test_paper_replay_cursor.py`` fails if the answer
+    changes here.
 
     Every mention of "positions snapshot" below carries one standing exception,
     stated once here rather than repeated: a connector that refuses to describe
