@@ -752,15 +752,34 @@ tick that bundle runs. There is deliberately no `budget` parameter on
 `build_paper_deps`: config is the single source, so there is no injection door
 through which an unlimited or absent budget could arrive.
 
-A halted tick appends exactly one `ResearchBudgetHalted` ledger row (component
+A halted market appends exactly one `ResearchBudgetHalted` ledger row (component
 `scheduler`) carrying `halt_kind` (`per_day` or `per_forecast`), `utc_day`,
-`spent_micros`, and `budget_micros`. It then **skips the forecast, select, and
-approve stages** but still emits its heartbeat, equity sample, positions
-snapshot, and weekly report -- so a budget-halted loop stays observably alive
-and flat rather than dying. Its ledger differs from a normal tick's by exactly
-two absent rows: `ForecastCreated` and `SelectorDecisionRecorded`. No
-`ForecastCreated` row is fabricated for a tick where the forecast engine never
-ran; in a hash-chained audit ledger an honest gap beats an invented record.
+`spent_micros`, and `budget_micros`. The tick then **skips that market's
+forecast, select, and approve stages and stops walking its remaining
+candidates**, but still emits its heartbeat, equity sample, positions snapshot,
+and weekly report -- so a budget-halted loop stays observably alive and flat
+rather than dying. Its ledger differs from an unhalted tick's by the
+`ForecastCreated` and `SelectorDecisionRecorded` rows of the halting market and
+every market after it. No `ForecastCreated` row is fabricated for a market where
+the forecast engine never ran; in a hash-chained audit ledger an honest gap
+beats an invented record.
+
+**How many forecasts one tick can buy (issue #345).** A tick no longer forecasts
+one hardcoded ticker: it screens the venue's market universe and forecasts up to
+`config.screener.max_candidates_per_tick` of the markets that pass (default
+`3`). The screen itself is free -- the four §16 filters are integer comparisons
+over market metadata and a book, with no model calls -- so it is the *candidate
+bound*, not the screen, that caps a tick's research bill at
+`max_candidates_per_tick x per_forecast_micros`. The default `3` is
+`per_day_micros // per_forecast_micros` at their own defaults, so a single tick
+cannot plan to spend more than a whole worst-case day. Raising
+`max_candidates_per_tick` without raising `per_day_micros` simply moves the
+day's halt earlier in the day; a value below `1` is refused at startup by
+`build_paper_deps`.
+
+Markets the walk did not reach get **no** `ScreenDecisionRecorded` row. That is
+deliberate: the ledger states which markets were examined and does not claim a
+verdict on markets the tick never looked at.
 
 **Operator arithmetic.** With the SPEC defaults -- a 20,000,000-micro day
 ceiling against the fixed 3,000,000-micro per-forecast research charge -- a UTC

@@ -263,10 +263,12 @@ def _add_paper_loop_arguments(run_parser: argparse.ArgumentParser) -> None:
         "--paper-live-ticker",
         default=None,
         help=(
-            "Trade this market off the exchange's LIVE order books, with fills "
+            "Read this market off the exchange's LIVE order books, with fills "
             "still simulated (default: replay the fixture directory's recorded "
             "books). One market only; read-only market data, no credentials, "
-            "and no order ever leaves the process."
+            "and no order ever leaves the process. This names the session's "
+            "market universe, not a guaranteed trade: the loop screens it every "
+            "tick and will not forecast a market that fails the screen."
         ),
     )
     run_parser.add_argument(
@@ -976,6 +978,19 @@ def _resolve_paper_market_data(
     market name, so the mode and the market cannot disagree: naming a market
     *is* selecting live books, and there is no combination that half-selects
     one. The loop then either gets both halves or neither (issue #343).
+
+    Issue #345 gave the PAPER loop a real market universe, and it deliberately
+    added no second flag. The venue surface this builds is a *one-market*
+    universe -- :class:`~windbreak.connector.paper.LiveBookPaperExchange` binds
+    exactly the named ticker -- so what the flag selects is unchanged; what
+    changed is that the loop now *screens* that market every tick rather than
+    assuming it. An operator who names a market with too little depth, too far
+    a horizon, or a blocklisted category gets a ledgered
+    ``ScreenDecisionRecorded`` saying so and no forecast, instead of a forecast
+    on a market the §16 filters would have refused. Adding a second flag to
+    widen the live universe would only reintroduce the two-flag combination
+    issue #343 removed; widening it belongs to the venue surface, where the
+    single-ticker limit actually lives.
 
     Nothing here holds a credential. Kalshi's market-data routes are public and
     :class:`~windbreak.connector.kalshi.client.KalshiClient` never attaches an

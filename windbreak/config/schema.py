@@ -231,7 +231,36 @@ class RiskConfig:
 
 @dataclass(frozen=True, slots=True)
 class ScreenerConfig:
-    """Market-screening filters applied before forecasting."""
+    """Market-screening filters, and the bound on what survives them.
+
+    The four filter leaves are SPEC §16's own. ``max_candidates_per_tick`` is
+    windbreak's addition (issue #345): the screen now runs over the venue's whole
+    market universe each tick, and this is the ceiling on how many of the markets
+    that pass it are actually forecast.
+
+    The bound exists because a candidate is not free. Since issue #399 every
+    ensemble vote books real money against
+    :class:`ForecastBudget`'s per-forecast and per-day ceilings, so an unbounded
+    universe is an unbounded bill whose only stopping condition is a fail-closed
+    halt. The default of ``3`` is derived rather than invented: it is
+    ``per_day_micros // per_forecast_micros`` at their own defaults
+    (``20_000_000 // 6_000_000``), i.e. the most forecasts a *worst-case* day can
+    afford at all. A tick therefore cannot plan to spend more than a whole day's
+    research budget, and raising either ceiling is what raises this bound --
+    never the other way round.
+
+    Attributes:
+        category_blocklist: Topical categories no market may be screened in from.
+        min_volume_24h_micros: The trailing-24h volume floor, in micros.
+        min_depth_contract_centis: The two-sided book-depth floor, in
+            contract-centis.
+        horizon_days: The inclusive whole-day resolution-horizon window.
+        max_candidates_per_tick: The most screened markets one tick forecasts.
+            Must be at least one;
+            :func:`windbreak.scheduler.screening.require_candidate_bound` refuses
+            a lower value at startup rather than leaving an always-idle loop
+            that looks healthy from the outside.
+    """
 
     category_blocklist: tuple[str, ...] = (
         "sports",
@@ -242,6 +271,7 @@ class ScreenerConfig:
     min_volume_24h_micros: int = 5000000000
     min_depth_contract_centis: int = 10000
     horizon_days: HorizonDays = field(default_factory=HorizonDays)
+    max_candidates_per_tick: int = 3
 
 
 @dataclass(frozen=True, slots=True)

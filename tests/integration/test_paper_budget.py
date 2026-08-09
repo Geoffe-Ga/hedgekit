@@ -44,6 +44,7 @@ import pytest
 
 from tests.integration.conftest import (
     FIXED_NOW_EPOCH_S,
+    FIXTURE_SCREENER_CONFIG,
     NullSearchTransport,
     ledger_path_for,
     read_event_type_payload_pairs,
@@ -82,6 +83,11 @@ _HALT_KIND_PER_FORECAST = "per_forecast"
 
 #: The ledger event a fail-closed research halt appends.
 _HALT_EVENT_TYPE = "ResearchBudgetHalted"
+
+#: The sole market the shared `deep_walk` books fixture offers, and so the one
+#: market every tick here screens in. Named locally because since issue #345 the
+#: tick screens a universe rather than carrying a ticker of its own.
+_TICKER = "MKT-DEEP"
 
 
 class _CountingSearchTransport(NullSearchTransport):
@@ -124,6 +130,13 @@ def _fixed_clock() -> int:
 def _budgeted_config(**ceilings: int) -> WindbreakConfig:
     """Build a PAPER-ceilinged config whose research budget is set explicitly.
 
+    Carries `FIXTURE_SCREENER_CONFIG` for the same reason `paper_config` does
+    (see its note in `tests/integration/conftest.py`): since issue #345 a tick
+    forecasts only markets that pass the screen, and the `deep_walk` fixture
+    fails the production depth and horizon defaults -- so a config built here
+    without it would screen `MKT-DEEP` out and every budget scenario below would
+    be measuring the screener rather than the research ceilings.
+
     Args:
         **ceilings: `ForecastBudget` field overrides (`per_forecast_micros`,
             `per_day_micros`, `max_pages`); unset fields keep SPEC §16 defaults.
@@ -137,6 +150,7 @@ def _budgeted_config(**ceilings: int) -> WindbreakConfig:
         capital=CapitalConfig(floor_micros=0),
         risk=RiskConfig(),
         forecast=ForecastConfig(budget=ForecastBudget(**ceilings)),
+        screener=FIXTURE_SCREENER_CONFIG,
     )
 
 
@@ -307,7 +321,7 @@ def test_forecast_stage_passes_the_deps_budget_to_run_pipeline(
         }
     ]
     assert outcome.research_halted is True
-    assert outcome.forecast_id == ""
+    assert outcome.forecast_ids == ()
     deps.store.verify_chain()
 
 
@@ -473,12 +487,19 @@ def test_unexhausted_budget_leaves_the_tick_ledger_payloads_byte_identical(
     assert projections[0] == projections[1] == projections[2]
     assert _event_types(legs[0]) == [
         "RecoveryCompleted",
-        "MarketSnapshotRecorded",
+        # Issue #345: the tick opens by screening the venue's market universe,
+        # ledgering one verdict per market examined -- here exactly one, since
+        # `deep_walk` offers the single market `MKT-DEEP`. It comes first
+        # because screening is free and must precede every paid stage.
+        "ScreenDecisionRecorded",
         "PipelineHeartbeatRecorded",
         # Issue #353: the tick now runs one read-only verification cycle before
         # it decides anything, and that cycle records exactly one event -- here
-        # a clean pass, since nothing has traded yet.
+        # a clean pass, since nothing has traded yet. It runs ahead of the whole
+        # universe (issue #345), so the snapshot of the one screened market now
+        # follows it rather than opening the tick.
         "VerificationPassed",
+        "MarketSnapshotRecorded",
         "ForecastCreated",
         "SelectorDecisionRecorded",
         "ExchangeStatusObserved",
@@ -531,7 +552,7 @@ def test_a_per_forecast_ceiling_breach_halts_the_tick_and_ledgers_per_forecast(
     assert "SelectorDecisionRecorded" not in _event_types(deps)
     assert _payloads_of(deps, _HALT_EVENT_TYPE) == [
         {
-            "market_ticker": deps.ticker,
+            "market_ticker": _TICKER,
             "halt_kind": _HALT_KIND_PER_FORECAST,
             "utc_day": _FIXED_UTC_DAY,
             "spent_micros": _EXPECTED_RESEARCH_COST_MICROS,
