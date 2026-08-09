@@ -275,6 +275,26 @@ Every response schema-validated; unknown fields affecting money/risk halt tradin
 
 A first-class adapter that replays recorded real order books and simulates fills **pessimistically** (full model in §17.4): taker fills walk the recorded book and pay live-schedule fees plus a slippage haircut (default +25% of modeled fees); resting orders fill only when the recorded market *trades through* the limit price (touch ≠ fill), approximating queue position and adverse selection.
 
+### 7.5.1 Replay cursor semantics (normative)
+
+This section is the canonical statement of *why* the replay cursor is what it is. Code docstrings state the contract they need locally and cite S7.5.1 for the reasoning rather than re-deriving it, so the argument below has exactly one copy to keep true.
+
+A recorded session is a *sequence* of steps, and the PAPER loop reads exactly one of them. The replay cursor is **stationary**: `run_single_tick` never advances the replay cursor, so a tick prices, fills, and allocates against the single recorded step the cursor stands on, for the life of the process. `PaperExchange.advance()` is harness API — the §17.4 fill-model suites drive a recorded tape through it — and has no production caller.
+
+The alternative reading, one step per tick, is **rejected**, for three reasons that compound:
+
+- **It would make the freshness clock measure a cadence mismatch rather than an age.** A recording is re-dated onto the run's clock by one shared offset so its books age honestly against §7.4's TTLs. A cursor stepped per tick moves the book stamp by the *recording's* step spacing while the wall clock moves by the *beat interval*, and those are unrelated rates. A tape sampled every 5 minutes replayed by a loop beating every 5 seconds hands the second tick a book stamped 295 seconds **after** the instant it is being priced at — refused for every TTL, however generous, because a future-dated quote fails closed. `quote_freshness` would then be reporting the gap between two cadences, and the same defect propagates to every `now − stamp` reading downstream.
+- **It would make simulated P&L a function of run length.** Fills, and therefore the paper track record, would depend on how many ticks had elapsed rather than on what the recording witnessed — the objection that already rejected wall-clock cursor advancement for replay exhaustion.
+- **The always-on path with genuinely advancing market data already exists.** It is `LiveBookPaperExchange` (§7.5): the venue's real books, paper money, and no recording to run out of. A committed recording is not a live venue and must not be made to impersonate one.
+
+Consequences, stated here so they are decided rather than discovered:
+
+- **A resting remainder never fills in production.** Trade-through allocation runs only when a step is consumed, so the only fills a PAPER tick books are the taker walk's and any remainder rests indefinitely. That is the pessimistic direction and the same honest absence `LiveBookPaperExchange` already accepts for want of a trade tape.
+- **The recording's later steps remain load-bearing.** Their instants bound the span an anchored replay can substantiate a venue clock over, so truncating the tape shortens that span even though the stationary cursor never reads those books. The format keeps carrying them because something reads them.
+- **Recorded depth is not consumed by a fill**, so two ticks inside the same freshness window walk the same levels again. `quote_ttl_seconds` (default 10s) is what bounds that window, and it is the reason this is bounded rather than harmless: widening the quote TTL materially, or expecting a fixture replay to accrue a long paper track record, requires revisiting this first. The track record accrues on the live-book path.
+
+This settles semantics that were already implemented; it does not change the §17.4 fill model and so triggers no gate-plan re-registration (§13.6).
+
 ### 7.6 Acceptance criteria
 
 Recorded-fixture contract tests for every endpoint including error/rate-limit/malformed/schema-drift cases; fixed-point preservation with no float conversion anywhere in the path; balance-semantics test suite green; PaperExchange property test — no simulated fill is ever better than the recorded book allows.
