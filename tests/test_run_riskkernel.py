@@ -83,7 +83,7 @@ import pytest
 import yaml
 
 from tests.riskkernel.conftest import make_context, make_intent
-from windbreak.config import OpsConfig, RiskConfig, WindbreakConfig
+from windbreak.config import EvaluationConfig, OpsConfig, RiskConfig, WindbreakConfig
 from windbreak.connector.interface import UnknownMarketError
 from windbreak.connector.models import (
     BalanceSemantics,
@@ -106,12 +106,14 @@ from windbreak.connector.semantics import (
     PartialFillRepresentation,
     UnsettledProceeds,
 )
+from windbreak.evaluation.preregistration import build_gate_plan, register_gate_plan
 from windbreak.ledger.events import KillEngaged, KillReArmed
 from windbreak.ledger.store import SqliteLedgerStore, events_from_records
 from windbreak.main import _build_risk_kernel, main
 from windbreak.numeric.types import MoneyMicros
 from windbreak.riskkernel.kill import KILL_FILENAME, KillTrigger
 from windbreak.riskkernel.modes import Mode
+from windbreak.riskkernel.promotion import GateEvidence, GatePlanUnavailableError
 from windbreak.riskkernel.verification import VerificationOutcome
 
 #: A fixed epoch for every seeded `KillEngaged` below, so this module never
@@ -306,6 +308,95 @@ def test_build_risk_kernel_returns_research_mode_kernel_wired_with_kill_integrat
     assert integration.watcher is not None
     assert integration.monitor is not None
     assert state_dir.is_dir()
+
+
+# --- issue #246: the composition root wires the ledger as the gate plan store ---
+#
+# `_build_risk_kernel` builds the kernel with `RiskKernel.from_events(...)` and
+# no `gate_plan_store=`, so the `--process riskkernel` kernel fails closed with
+# `GatePlanUnavailableError` on every PAPER promotion -- even when
+# `--ledger-path` supplied a real `SqliteLedgerStore` that already holds the
+# pre-registered plan. These two tests pin the wiring behaviorally (a promotion
+# that reads the registered plan, and the fail-closed default when no ledger
+# store was supplied at all) rather than by inspecting a private attribute.
+
+#: Evidence satisfying every RESEARCH->PAPER criterion, used to walk the
+#: composition root's fresh-RESEARCH kernel onto the PAPER rung so the
+#: plan-sourced PAPER gate is the very next thing evaluated.
+_RESEARCH_ALL_PASSING = GateEvidence(
+    forecast_count=50,
+    adversarial_suite_green=True,
+    days_without_unhandled_errors=14,
+    ledger_rebuild_verified=True,
+)
+
+#: Evidence satisfying every PAPER->LIVE_MICRO criterion at the default
+#: `EvaluationConfig` thresholds the registered plan snapshots, so the only way
+#: this promotion can fail is an unavailable gate plan.
+_PAPER_ALL_PASSING = GateEvidence(
+    resolved_realtime_forecast_count=300,
+    independent_event_group_count=100,
+    brier_skill_ppm=10_000,
+    brier_skill_ci_lower_ppm=1,
+    paper_pnl_net_micro_usd=1,
+    paper_window_days=90,
+    paper_max_drawdown_ppm=0,
+    calibration_slope_ppm=1_000_000,
+    kernel_invariant_failure_count=0,
+)
+
+
+def _register_default_gate_plan(store: SqliteLedgerStore) -> None:
+    """Register the default-config `GatePlan` into `store` at a fixed epoch.
+
+    Args:
+        store: The ledger the registration event is appended to.
+    """
+    plan = build_gate_plan(
+        EvaluationConfig(), paper_fill_model_version="run-riskkernel-test-v1"
+    )
+    register_gate_plan(plan, store, now=lambda: _FIXED_EPOCH_S)
+
+
+def test_build_risk_kernel_wires_the_ledger_store_as_the_gate_plan_store(
+    tmp_path: Path,
+) -> None:
+    """A `ledger_store` holding a registered gate plan is also the kernel's
+    plan source: a PAPER promotion reads its three plan-sourced thresholds from
+    that ledger and clears, instead of failing closed.
+    """
+    config = _config_with_state_dir(tmp_path / "state", mode_ceiling="live_micro")
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    try:
+        _register_default_gate_plan(store)
+        kernel, _integration = _build_risk_kernel(config, ledger_store=store)
+        kernel.request_promotion(_RESEARCH_ALL_PASSING)
+        assert kernel.mode is Mode.PAPER
+
+        decision = kernel.request_promotion(_PAPER_ALL_PASSING)
+
+        assert decision.approved is True
+        assert kernel.mode is Mode.LIVE_MICRO
+    finally:
+        store.close()
+
+
+def test_build_risk_kernel_without_a_ledger_store_still_fails_closed_on_paper(
+    tmp_path: Path,
+) -> None:
+    """With no `ledger_store` there is no plan source to wire, so the PAPER
+    promotion still fails closed -- the wiring must forward the store it was
+    given, never fabricate one.
+    """
+    config = _config_with_state_dir(tmp_path / "state", mode_ceiling="live_micro")
+    kernel, _integration = _build_risk_kernel(config)
+    kernel.request_promotion(_RESEARCH_ALL_PASSING)
+    assert kernel.mode is Mode.PAPER
+
+    with pytest.raises(GatePlanUnavailableError):
+        kernel.request_promotion(_PAPER_ALL_PASSING)
+
+    assert kernel.mode is Mode.PAPER
 
 
 # --- AC#2: a KILL file halts the kernel with no HTTP/dashboard involved ---------
