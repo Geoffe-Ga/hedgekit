@@ -9,8 +9,6 @@ injected seam (never real HTTP; SPEC S7.1: CI runs offline).
 
 from __future__ import annotations
 
-import os
-import time
 from datetime import UTC, datetime, tzinfo
 from email.utils import format_datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -29,7 +27,7 @@ from windbreak.connector.kalshi.client import (
 from windbreak.net.allowlist import OutboundAllowlist
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Mapping
 
     import requests
 
@@ -237,35 +235,6 @@ class _OffsetlessTimezone(tzinfo):
             `None`, always.
         """
         return None
-
-
-@pytest.fixture
-def local_timezone_utc_minus_5() -> Iterator[None]:
-    """Pin the process's local timezone to a fixed UTC-05:00 for one test.
-
-    `datetime.astimezone()` silently interprets a *naive* datetime as **local**
-    time. A test distinguishing "stamped UTC" from "reinterpreted as local" is
-    therefore a false green on a UTC host -- which most CI runners are -- since
-    both paths then yield the same instant. Pinning a fixed-offset zone (`EST5`
-    carries no DST rule, so it is UTC-05:00 on every date) makes the correct
-    and buggy results differ by five hours on every host, in CI and locally
-    alike.
-
-    Yields:
-        None, with `TZ` pinned. The previous `TZ` and the interpreter's cached
-        zone are both restored on exit, whether or not the test raises.
-    """
-    previous = os.environ.get("TZ")
-    os.environ["TZ"] = "EST5"
-    time.tzset()
-    try:
-        yield
-    finally:
-        if previous is None:
-            del os.environ["TZ"]
-        else:
-            os.environ["TZ"] = previous
-        time.tzset()
 
 
 @pytest.mark.usefixtures("local_timezone_utc_minus_5")

@@ -421,7 +421,7 @@ def _trade_print_from_dict(data: Mapping[str, Any]) -> TradePrint:
     return TradePrint(
         price=PricePips(data["price"]),
         quantity=ContractCentis(data["quantity"]),
-        ts=_parse_dt(data["ts"]),
+        ts=_parse_dt(data["ts"], field="ts"),
     )
 
 

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from windbreak.connector.fake import _parse_dt
 from windbreak.connector.interface import UnknownMarketError
 from windbreak.connector.models import NormalizedMarket
 from windbreak.connector.semantics import (
@@ -301,3 +302,41 @@ def test_every_market_fixture_round_trips_through_normalized_market(
     assert markets
     for market in markets:
         assert isinstance(market, NormalizedMarket)
+
+
+# --- issue #392: the fixture loader refuses an offsetless timestamp -----------
+#
+# `FakeExchange` is a test double, but a double that disagrees with production
+# teaches the wrong lesson: `windbreak/connector/kalshi/normalize.py` refuses an
+# offsetless exchange timestamp rather than reading its wall clock as the
+# host's local time, so the fixture loader must refuse identically. Both tests
+# pin a UTC-05:00 host (`local_timezone_utc_minus_5`, tests/connector/
+# conftest.py) because on a UTC host the misreading is the identity -- an
+# unpinned assertion here could never fail.
+
+
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_offsetless_fixture_timestamp_is_refused_naming_the_field_and_value() -> None:
+    """An offsetless fixture timestamp raises, naming both field and value.
+
+    Pre-fix this returned `2024-12-19T00:00:00+00:00` under the pinned host --
+    five hours late and a day later than the fixture says -- and `19:00Z` on a
+    UTC host. A fixture whose meaning depends on the machine reading it is not
+    a fixture, so the loader refuses instead of guessing an offset.
+    """
+    with pytest.raises(ValueError, match=r"close_time.*2024-12-18T19:00:00"):
+        _parse_dt("2024-12-18T19:00:00", field="close_time")
+
+
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_offset_bearing_fixture_timestamp_converts_to_one_fixed_instant() -> None:
+    """A timestamp carrying an offset converts by *its* offset, not the host's.
+
+    The `-05:00` here coincides with the pinned host offset only by
+    construction; what the assertion pins is that the string's own offset is
+    what moves the clock, and that the refusal above did not over-reach into
+    rejecting every non-`Z` timestamp.
+    """
+    assert _parse_dt("2024-12-18T14:00:00-05:00", field="close_time") == datetime(
+        2024, 12, 18, 19, tzinfo=UTC
+    )

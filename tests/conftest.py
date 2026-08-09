@@ -1,4 +1,4 @@
-"""Process-wide signal-handler hygiene shared across the test suite (issue #65).
+"""Process-wide state hygiene shared across the test suite (issues #65, #392).
 
 ``windbreak.main._install_signal_handlers`` mutates process-global signal
 dispositions via ``signal.signal(...)`` without saving or restoring the
@@ -8,11 +8,19 @@ the pytest process itself, with a hijacked SIGINT/SIGTERM handler. This
 conftest installs an autouse fixture that snapshots and restores both
 dispositions around every test in the suite, so no individual test module
 has to opt in.
+
+Issue #392 adds the opt-in ``local_timezone_utc_minus_5`` fixture. It lives here
+rather than in one package's conftest because three packages need the same pin:
+``tests/connector/kalshi`` (the ``Date``-header and Kalshi-timestamp guards),
+``tests/connector`` (the ``FakeExchange`` fixture loader), and ``tests/selector``
+(the bundle loader).
 """
 
 from __future__ import annotations
 
+import os
 import signal
+import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -57,3 +65,37 @@ def restore_signal_handlers() -> Iterator[None]:
     """
     with preserved_signal_handlers():
         yield
+
+
+@pytest.fixture
+def local_timezone_utc_minus_5() -> Iterator[None]:
+    """Pin the process's local timezone to a fixed UTC-05:00 for one test.
+
+    `datetime.astimezone()` silently interprets a *naive* datetime as **local**
+    time. A test distinguishing "read as UTC" from "reinterpreted as local" is
+    therefore a false green on a UTC host -- which most CI runners are -- since
+    both paths then yield the same instant. Pinning a fixed-offset zone (`EST5`
+    carries no DST rule, so it is UTC-05:00 on every date) makes the correct
+    and buggy results differ by five hours on every host, in CI and locally
+    alike.
+
+    Shared here rather than per-module because several packages need the same
+    pin: issue #346's `Date`-header guard in `kalshi/client.py`, and issue
+    #392's offsetless-timestamp refusal in `kalshi/normalize.py`,
+    `connector/fake.py`, and `tests/selector/fixture_loader.py`.
+
+    Yields:
+        None, with `TZ` pinned. The previous `TZ` and the interpreter's cached
+        zone are both restored on exit, whether or not the test raises.
+    """
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "EST5"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()

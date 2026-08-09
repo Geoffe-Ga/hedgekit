@@ -92,28 +92,71 @@ _STATUS_PAUSED: Final = "paused"
 _STATUS_CLOSED: Final = "closed"
 
 
-def _parse_dt(value: str) -> datetime:
-    """Parse an ISO-8601 timestamp into a UTC-normalized datetime.
+def _parse_dt(value: str, *, field: str) -> datetime:
+    """Parse an offset-bearing ISO-8601 timestamp into a UTC datetime.
+
+    The offset is required, not defaulted. ``datetime.fromisoformat`` returns a
+    *naive* datetime for an offsetless string, and ``.astimezone(UTC)`` does not
+    raise on a naive value -- it reads the wall clock as the **host's** local
+    time, so the same payload would yield different instants on a developer's
+    laptop and in UTC-running CI (issue #392). For a market-lifecycle field such
+    as ``close_time`` that misreading can shift the instant across a date
+    boundary and make a closed market read as open.
+
+    Assuming UTC instead would only trade a loud wrong answer for a quiet one:
+    an exchange timestamp with no offset is unprovable evidence about when the
+    market closes, and unprovable evidence must never read as healthy (SPEC S1.1
+    invariant 2). So this refuses, and the caller vetoes: ``normalize_market``'s
+    ``ValueError`` degrades to a ledgered ``MARKET_MALFORMED`` event in
+    :meth:`~windbreak.connector.kalshi.adapter.KalshiConnector.list_markets`,
+    skipping that one market rather than aborting the scan.
 
     Args:
-        value: An ISO-8601 string, e.g. ``2024-12-18T19:00:00Z``.
+        value: An ISO-8601 string carrying a UTC offset, e.g.
+            ``2024-12-18T19:00:00Z`` or ``2024-12-18T14:00:00-05:00``.
+        field: The raw Kalshi field name ``value`` came from, named in the error
+            so an operator reading the ledgered event can locate it.
 
     Returns:
         The timezone-aware datetime, normalized to UTC.
+
+    Raises:
+        ValueError: If ``value`` is not parseable as ISO-8601, or parses to a
+            naive (offsetless) datetime.
     """
-    return datetime.fromisoformat(value).astimezone(UTC)
+    parsed = datetime.fromisoformat(value)
+    # Naive means `tzinfo is None` *or* a `tzinfo` whose `utcoffset()` returns
+    # None -- Python's own definition, which `utcoffset()` reports in one call
+    # (issue #346's finding, applied here at parse time).
+    if parsed.utcoffset() is None:
+        raise ValueError(
+            f"Kalshi timestamp field {field!r} carries no UTC offset: {value!r}. "
+            "An offsetless exchange timestamp is unprovable evidence -- reading "
+            "its wall clock as the host's local time would silently shift the "
+            "instant by the host's offset -- so the market is refused rather "
+            "than normalized against a guessed timezone."
+        )
+    return parsed.astimezone(UTC)
 
 
-def _parse_optional_dt(value: str | None) -> datetime | None:
-    """Parse an optional ISO-8601 timestamp, preserving ``None``.
+def _parse_optional_dt(value: str | None, *, field: str) -> datetime | None:
+    """Parse an optional offset-bearing ISO-8601 timestamp, preserving ``None``.
+
+    ``None`` means the venue stated no such time, which is a fact about the
+    market rather than an unprovable instant, so it passes through untouched.
+    A *present* value is held to :func:`_parse_dt`'s offset requirement.
 
     Args:
-        value: An ISO-8601 string, or None.
+        value: An ISO-8601 string carrying a UTC offset, or None.
+        field: The raw Kalshi field name ``value`` came from, named in the error.
 
     Returns:
         The parsed UTC datetime, or None when ``value`` is None.
+
+    Raises:
+        ValueError: If ``value`` is present and offsetless or unparseable.
     """
-    return None if value is None else _parse_dt(value)
+    return None if value is None else _parse_dt(value, field=field)
 
 
 def payload_hash(raw: Mapping[str, object]) -> str:
@@ -225,12 +268,20 @@ def normalize_market(
     via the adapter's ``MARKET_MALFORMED`` path rather than silently reading as
     zero volume.
 
+    ``close_time`` and ``expected_expiration_time`` must carry a UTC offset; an
+    offsetless timestamp is refused by :func:`_parse_dt` and degrades via that
+    same ``MARKET_MALFORMED`` path, rather than being read against whatever
+    timezone the host happens to run in (issue #392).
+
     Args:
         raw_market: The raw Kalshi market payload (a ``/markets`` list entry).
         raw_event: The market's parent event payload, or None when standalone.
 
     Returns:
         The normalized market.
+
+    Raises:
+        ValueError: If a timestamp field carries no UTC offset.
     """
     market = _as_mapping(raw_market)
     group_id = market["event_ticker"] if _is_grouped(raw_event) else None
@@ -241,9 +292,9 @@ def normalize_market(
         title=market["title"],
         resolution_criteria=market["rules_primary"],
         category=market["category"],
-        close_time=_parse_dt(market["close_time"]),
+        close_time=_parse_dt(market["close_time"], field="close_time"),
         expected_resolution_time=_parse_optional_dt(
-            market.get("expected_expiration_time")
+            market.get("expected_expiration_time"), field="expected_expiration_time"
         ),
         market_type=_NORMALIZED_MARKET_TYPE,
         price_tick_pips=_tick_pips(market),

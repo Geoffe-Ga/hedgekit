@@ -173,6 +173,86 @@ def test_raw_exchange_payload_hash_matches_payload_hash_of_the_raw_market() -> N
     assert market.raw_exchange_payload_hash == payload_hash(raw)
 
 
+# --- issue #392: offsetless timestamps are refused, never read as host-local ---
+#
+# Every test below is pinned to a fixed UTC-05:00 host by
+# `local_timezone_utc_minus_5` (tests/connector/conftest.py). The pin is what
+# makes these assertions mean something: `datetime.fromisoformat` returns a
+# *naive* datetime for an offsetless string, and `.astimezone(UTC)` on a naive
+# value does not raise -- it reads the wall clock as the **host's** local time.
+# On a UTC host (which CI is) that misreading is the identity, so an unpinned
+# test here would be a permanent false green.
+
+
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_offsetless_close_time_is_refused_naming_the_field_and_value() -> None:
+    """An offsetless `close_time` is refused, not silently read as host-local.
+
+    `"2024-12-18T19:00:00"` carries no offset. The pre-fix code returned
+    `2024-12-19T00:00:00+00:00` under this fixture's UTC-05:00 host -- five
+    hours late and across the date boundary, which can make a closed market
+    read as open -- while returning `19:00Z` on a UTC host. Neither is provable
+    from the payload, so the parse refuses.
+
+    The refusal must be unconditional, not "only when the host is not UTC": the
+    pinned zone rules out an implementation that merely compares local time to
+    UTC, and the raised `ValueError` rules out both the old silent shift and a
+    "just assume UTC" fix that would return an unprovable instant.
+    """
+    raw = _raw_binary(close_time="2024-12-18T19:00:00")
+
+    with pytest.raises(ValueError, match=r"close_time.*2024-12-18T19:00:00"):
+        normalize_market(raw, None)
+
+
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_offsetless_expected_expiration_time_is_refused_naming_its_own_field() -> None:
+    """The optional-timestamp path refuses too, and names *its* field.
+
+    `_parse_optional_dt` preserves `None`, so its offsetless branch is a
+    separate path from `close_time`'s. The error must name
+    `expected_expiration_time` -- an operator reading the ledgered
+    `MARKET_MALFORMED` event has only this message to locate the bad field.
+    """
+    raw = _raw_binary(expected_expiration_time="2024-12-18T20:00:00")
+
+    with pytest.raises(ValueError, match=r"expected_expiration_time"):
+        normalize_market(raw, None)
+
+
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_offset_bearing_timestamps_normalize_to_the_same_instant_on_any_host() -> None:
+    """A timestamp that *does* carry an offset still converts, host-irrelevant.
+
+    A non-UTC offset (`-05:00`) is used deliberately: it proves the conversion
+    reads the offset in the string rather than the host's zone, and that the
+    refusal above did not over-reach into rejecting every non-`Z` timestamp.
+    """
+    raw = _raw_binary(
+        close_time="2024-12-18T14:00:00-05:00",
+        expected_expiration_time="2024-12-18T20:00:00+00:00",
+    )
+
+    market = normalize_market(raw, None)
+
+    assert market.close_time == datetime(2024, 12, 18, 19, tzinfo=UTC)
+    assert market.expected_resolution_time == datetime(2024, 12, 18, 20, tzinfo=UTC)
+
+
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_absent_expected_expiration_time_stays_none_rather_than_refusing() -> None:
+    """An *absent* optional timestamp is still `None`, not an offsetless refusal.
+
+    Kalshi omits `expected_expiration_time` on markets with no announced
+    resolution time. Absence is a stated fact about the market, not unprovable
+    evidence about an instant, so it must keep flowing through untouched.
+    """
+    raw = _raw_binary()
+    del raw["expected_expiration_time"]
+
+    assert normalize_market(raw, None).expected_resolution_time is None
+
+
 # --- payload_hash ------------------------------------------------------
 
 
