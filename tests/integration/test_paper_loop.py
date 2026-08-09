@@ -296,7 +296,9 @@ def test_run_single_tick_weekly_report_wires_live_forecast(
         record for record in records if record.event_type == "ForecastCreated"
     )
     forecast_payload = json.loads(forecast_record.payload_json)["data"]
-    assert forecast_payload["forecast_id"] == outcome.forecast_id
+    # One screened market (`deep_walk` offers only `MKT-DEEP`), so the tick's
+    # per-market `forecast_ids` tuple is exactly the one ledgered id.
+    assert outcome.forecast_ids == (forecast_payload["forecast_id"],)
     assert "research_cost_micros" in forecast_payload, (
         "ForecastCreated payload is still the pre-#188 shape: "
         f"{sorted(forecast_payload)}"
@@ -309,7 +311,7 @@ def test_run_single_tick_weekly_report_wires_live_forecast(
     body = report_files[0].read_text(encoding="utf-8")
 
     evaluation_section = body.split("## Evaluation", 1)[1].split("## Cost meter", 1)[0]
-    assert outcome.forecast_id in evaluation_section
+    assert outcome.forecast_ids[0] in evaluation_section
 
     cost_section = body.split("## Cost meter", 1)[1]
     assert str(_EXPECTED_RESEARCH_COST_MICROS) in cost_section

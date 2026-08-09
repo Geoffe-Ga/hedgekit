@@ -208,7 +208,11 @@ def test_live_market_data_builds_a_live_book_session(
     )
 
     assert isinstance(deps.exchange, LiveBookPaperExchange)
-    assert deps.ticker == _TICKER
+    # `live_ticker` still binds exactly one market, and since issue #345 that is
+    # observable only as the universe the tick will screen: the deps bundle no
+    # longer carries a ticker of its own, so the exchange's market set is what
+    # says which market the live session was bound to.
+    assert tuple(deps.exchange.markets) == (_TICKER,)
     assert deps.exchange.market_data is live_market_data
 
 

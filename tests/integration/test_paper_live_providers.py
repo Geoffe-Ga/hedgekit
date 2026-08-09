@@ -42,6 +42,7 @@ import pytest
 
 from tests.integration.conftest import (
     FIXED_NOW_EPOCH_S,
+    FIXTURE_SCREENER_CONFIG,
     ledger_path_for,
     read_event_type_payload_pairs,
 )
@@ -81,6 +82,11 @@ _VOTE_EVENT = "ProviderVoteRecorded"
 
 #: The ledger event a produced forecast appends.
 _FORECAST_EVENT = "ForecastCreated"
+
+#: The sole market the shared `deep_walk` books fixture offers, and so the one
+#: market a tick here screens in. Named locally because since issue #345 the
+#: deps bundle screens a universe instead of carrying a ticker of its own.
+_TICKER = "MKT-DEEP"
 
 
 def _fixed_clock() -> int:
@@ -259,6 +265,12 @@ def _config(
 ) -> WindbreakConfig:
     """Build a PAPER-ceilinged config selecting a provider transport mode.
 
+    Carries `FIXTURE_SCREENER_CONFIG` for the reason set out in
+    `tests/integration/conftest.py`: since issue #345 a tick forecasts only
+    markets that pass the screen, and `deep_walk` fails the production depth and
+    horizon defaults -- so without it the end-to-end scenarios below would
+    forecast nothing and prove nothing about the provider transport.
+
     Args:
         mode: The provider transport mode to select.
         **retry: `ProviderRetryConfig` field overrides.
@@ -270,6 +282,7 @@ def _config(
         mode_ceiling="paper",
         capital=CapitalConfig(floor_micros=0),
         risk=RiskConfig(),
+        screener=FIXTURE_SCREENER_CONFIG,
         forecast=ForecastConfig(
             # No shrink-to-market, so an aggregated probability that equals the
             # canned vote proves it came off the provider response rather than
@@ -574,7 +587,7 @@ def test_the_configured_retry_policy_reaches_the_wrapped_provider(
 
     with pytest.raises(ProviderHTTPError):
         deps.provider_factory(deps.transport, member).forecast(
-            deps.exchange.get_market(deps.ticker),
+            deps.exchange.get_market(_TICKER),
             _baseline(deps),
             0,
             (),
@@ -587,16 +600,17 @@ def _baseline(deps: object) -> object:
     """Build a baseline quote snapshot for a direct provider call.
 
     Args:
-        deps: The dependency bundle whose ticker/book the baseline is struck on.
+        deps: The dependency bundle whose exchange the `_TICKER` book is read
+            from.
 
     Returns:
         A `BaselineQuoteSnapshot`.
     """
     from windbreak.forecast.records import BaselineQuoteSnapshot
 
-    book = deps.exchange.get_order_book(deps.ticker)
+    book = deps.exchange.get_order_book(_TICKER)
     return BaselineQuoteSnapshot(
-        snapshot_id=f"{deps.ticker}-baseline",
+        snapshot_id=f"{_TICKER}-baseline",
         price_pips=50_000,
         fetched_at=book.fetched_at,
     )
@@ -632,7 +646,7 @@ def test_a_retryable_fault_is_retried_up_to_the_configured_attempts(
 
     with pytest.raises(ProviderHTTPError):
         deps.provider_factory(deps.transport, member).forecast(
-            deps.exchange.get_market(deps.ticker), _baseline(deps), 0, ()
+            deps.exchange.get_market(_TICKER), _baseline(deps), 0, ()
         )
 
     assert failing.calls == 3

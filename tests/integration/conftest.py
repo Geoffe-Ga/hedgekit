@@ -36,10 +36,51 @@ from pathlib import Path
 
 import pytest
 
-from windbreak.config.schema import CapitalConfig, RiskConfig, WindbreakConfig
+from windbreak.config.schema import (
+    CapitalConfig,
+    HorizonDays,
+    RiskConfig,
+    ScreenerConfig,
+    WindbreakConfig,
+)
 
 #: The shared `deep_walk` books fixture (issue #19): sole ticker `MKT-DEEP`.
 _BOOKS_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "books" / "deep_walk"
+
+#: The two-market `two_ticker_isolation` fixture: `MKT-ISO-A` and `MKT-ISO-B`.
+#: The universe scenarios (issue #345) need an exchange offering more than one
+#: market, since a one-market universe cannot distinguish "iterates the
+#: screened set" from the single hardcoded ticker it replaced.
+_TWO_TICKER_BOOKS_DIR = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "books" / "two_ticker_isolation"
+)
+
+#: The screening thresholds this suite's *fixture* books are screened under.
+#:
+#: Since issue #345 the PAPER tick screens its market universe before spending
+#: any research money, so a fixture that fails the screen produces a tick that
+#: correctly forecasts nothing -- and every scenario downstream of a forecast
+#: would be testing the screen rather than itself. The stock fixtures fail the
+#: production defaults on two independent filters, and in both cases the
+#: fixture is what is unrealistic, not the threshold:
+#:
+#: * **Depth.** `deep_walk` rests 300 contract-centis against a 10 000 floor.
+#:   The books are deliberately tiny so their taker-walk arithmetic is readable
+#:   by hand; inflating them to clear a production floor would rewrite the very
+#:   fill mechanics several suites pin exactly.
+#: * **Horizon.** The fixtures close on a frozen 2025 literal while the suites
+#:   run against two different fixed clocks (2023-11-14 and 2024-12-24), whose
+#:   [2, 120]-day windows do not overlap. No single close-time literal can sit
+#:   inside both, so no re-dating fixes this.
+#:
+#: Widening the window here is therefore a statement about the fixtures, not a
+#: relaxed guard: `ScreenerConfig()`'s production defaults are untouched, and
+#: `tests/scheduler/test_screening.py` pins the filters' real behaviour.
+FIXTURE_SCREENER_CONFIG = ScreenerConfig(
+    min_volume_24h_micros=0,
+    min_depth_contract_centis=100,
+    horizon_days=HorizonDays(min=2, max=1_000),
+)
 
 #: A fixed, non-advancing "current instant" every deps-builder call in this
 #: suite agrees on, so two independently-built `PaperTickDeps` (over separate
@@ -84,6 +125,12 @@ class NullSearchTransport:
         raise AssertionError(
             f"NullSearchTransport.fetch unexpectedly called for {url!r}"
         )
+
+
+@pytest.fixture
+def two_ticker_books_dir() -> Path:
+    """Return the two-market `two_ticker_isolation` books-fixture directory."""
+    return _TWO_TICKER_BOOKS_DIR
 
 
 @pytest.fixture
@@ -143,6 +190,7 @@ def paper_config() -> WindbreakConfig:
         mode_ceiling="paper",
         capital=CapitalConfig(floor_micros=0),
         risk=RiskConfig(),
+        screener=FIXTURE_SCREENER_CONFIG,
     )
 
 
@@ -167,6 +215,30 @@ def research_tools_factory(tmp_path: Path):
         )
 
     return _build
+
+
+def candidate_for(deps, ticker: str):
+    """Build the `MarketCandidate` a tick's screen would produce for `ticker`.
+
+    Since issue #345 the per-market stages take a screened candidate rather than
+    `deps.ticker` plus a separately-fetched book, because the screen and every
+    later stage must judge one observation. This helper reproduces that pairing
+    for tests that drive a single stage directly instead of running a whole
+    tick.
+
+    Args:
+        deps: The wired `PaperTickDeps`.
+        ticker: The market to build a candidate for.
+
+    Returns:
+        The `MarketCandidate` for that market, over its current book.
+    """
+    from windbreak.scheduler.screening import MarketCandidate
+
+    return MarketCandidate(
+        market=deps.exchange.get_market(ticker),
+        order_book=deps.exchange.get_order_book(ticker),
+    )
 
 
 def read_event_type_payload_pairs(records: list[object]) -> list[tuple[str, dict]]:

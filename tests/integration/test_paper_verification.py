@@ -173,13 +173,13 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
         visible_depth_centis,
     )
 
-    order_book = deps.exchange.get_order_book(deps.ticker)
+    order_book = deps.exchange.get_order_book(_TICKER)
     return build_evaluation_context(
         deps.config,
         now_epoch_s=now_epoch_s,
         verification=deps.kernel.latest_verification,
-        instrument_whitelist=frozenset({deps.ticker}),
-        market=deps.exchange.get_market(deps.ticker),
+        instrument_whitelist=frozenset({_TICKER}),
+        market=deps.exchange.get_market(_TICKER),
         exchange_status=project_exchange_status(
             deps.exchange.get_exchange_status().status
         ),
@@ -188,7 +188,7 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
         exchange_clock_epoch_s=read_exchange_clock_epoch_s(deps.exchange),
         forecast_epoch_s=DEFAULT_NOW_EPOCH_S,
-        open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
+        open_position=read_open_position_centis(deps.exchange, ticker=_TICKER),
         equity_start_of_day=start_of_day_equity_micros(
             deps.store.read_all(), now_epoch_s=now_epoch_s
         ),
@@ -349,7 +349,7 @@ def test_loop_production_context_vetoes_carry_no_verification_reason(
     run_single_tick(deps, beat=1)
 
     context = _production_context(deps)
-    outcome = deps.approval.decide(make_intent(market_ticker=deps.ticker), context)
+    outcome = deps.approval.decide(make_intent(market_ticker=_TICKER), context)
 
     assert outcome.decision.reasons == _SURVIVING_VETO_REASONS
     assert _RECONCILIATION_VETO_REASONS.isdisjoint(outcome.decision.reasons)
@@ -412,7 +412,7 @@ def test_loop_supplies_its_own_ledgered_equity_baseline_and_book_depth(
     assert context.account.equity_start_of_day == after
     assert context.market.visible_depth == ContractCentis(_SHALLOW_SIDE_CENTIS)
     assert context.market.visible_depth == visible_depth_centis(
-        deps.exchange.get_order_book(deps.ticker)
+        deps.exchange.get_order_book(_TICKER)
     )
 
 
@@ -560,13 +560,13 @@ def test_loop_context_vetoes_a_book_aged_past_its_quote_ttl(
     run_single_tick(deps, beat=1)
 
     fresh = deps.approval.decide(
-        make_intent(market_ticker=deps.ticker),
+        make_intent(market_ticker=_TICKER),
         _production_context(deps, now_epoch_s=epoch[0]),
     )
 
     epoch[0] = DEFAULT_NOW_EPOCH_S + paper_config.risk.quote_ttl_seconds + 1
     stale = deps.approval.decide(
-        make_intent(market_ticker=deps.ticker),
+        make_intent(market_ticker=_TICKER),
         _production_context(deps, now_epoch_s=epoch[0]),
     )
 
