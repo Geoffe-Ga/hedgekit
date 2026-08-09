@@ -22,14 +22,11 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Final, NamedTuple, NoReturn
 
 from windbreak.forecast.providers.base import (
-    ProviderResponseRejectedError,
+    ProviderHTTPError,
+    ProviderMalformedResponseError,
     fingerprint_response,
 )
 from windbreak.forecast.providers.http_cassettes import HttpRequest
-from windbreak.forecast.sanitize import (
-    RESPONSE_FAILURE_HTTP_STATUS,
-    RESPONSE_FAILURE_MALFORMED_VOTE_JSON,
-)
 
 if TYPE_CHECKING:
     from windbreak.forecast.cassettes import LlmRequest
@@ -76,17 +73,22 @@ class ChatEnvelope(NamedTuple):
     fingerprint: str
 
 
-def reject(failure_code: str, fingerprint: str) -> NoReturn:
-    """Raise a fingerprint-only rejection, never leaking the raw response text.
+def reject_malformed(fingerprint: str) -> NoReturn:
+    """Raise a fingerprint-only malformed-response rejection (issue #269).
+
+    Screen-side and therefore never retried: an unparseable envelope will not
+    parse any better on a second call. Carries only the fingerprint, never the
+    raw response text, and keeps the pre-#269
+    :data:`~windbreak.forecast.sanitize.RESPONSE_FAILURE_MALFORMED_VOTE_JSON`
+    wire code, so the discard/ledger path is byte-unchanged by the finer type.
 
     Args:
-        failure_code: The ``RESPONSE_FAILURE_*`` code describing the failure.
         fingerprint: The rejected response's sha256 fingerprint.
 
     Raises:
-        ProviderResponseRejectedError: Always.
+        ProviderMalformedResponseError: Always.
     """
-    raise ProviderResponseRejectedError(failure_code, fingerprint)
+    raise ProviderMalformedResponseError(fingerprint)
 
 
 def reject_constant(token: str) -> NoReturn:
@@ -152,23 +154,28 @@ def fetch_envelope(
         The parsed envelope paired with its response fingerprint.
 
     Raises:
-        ProviderResponseRejectedError: On a non-2xx status, a malformed body, a
-            non-object payload, or a non-finite JSON constant.
+        ProviderHTTPError: On a non-2xx status, carrying that status code so
+            :func:`~windbreak.forecast.providers.retry.is_retryable_status` can
+            tell a transient ``429``/``5xx`` from a permanent ``4xx``
+            (issue #269).
+        ProviderMalformedResponseError: On a malformed body, a non-object
+            payload, or a non-finite JSON constant -- screen-side, never
+            retried.
     """
     response = transport.send(
         HttpRequest(method=_REQUEST_METHOD, url=endpoint_url, body=body)
     )
     fingerprint = fingerprint_response(response.body)
     if not (_HTTP_SUCCESS_MIN <= response.status_code < _HTTP_SUCCESS_MAX_EXCLUSIVE):
-        reject(RESPONSE_FAILURE_HTTP_STATUS, fingerprint)
+        raise ProviderHTTPError(response.status_code, fingerprint)
     try:
         payload = json.loads(
             response.body, parse_float=Decimal, parse_constant=reject_constant
         )
     except ValueError:
-        reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
+        reject_malformed(fingerprint)
     if not isinstance(payload, dict):
-        reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
+        reject_malformed(fingerprint)
     return ChatEnvelope(payload=payload, fingerprint=fingerprint)
 
 
@@ -186,12 +193,12 @@ def require_first_element(
         The array's first element.
 
     Raises:
-        ProviderResponseRejectedError: If the value is absent, not a JSON array,
-            or an empty array.
+        ProviderMalformedResponseError: If the value is absent, not a JSON
+            array, or an empty array.
     """
     value = payload.get(key)
     if not isinstance(value, list) or not value:
-        reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
+        reject_malformed(fingerprint)
     return value[0]
 
 
@@ -206,10 +213,10 @@ def require_object(value: object, fingerprint: str) -> dict[str, object]:
         ``value`` when it is a JSON object.
 
     Raises:
-        ProviderResponseRejectedError: If ``value`` is not a JSON object.
+        ProviderMalformedResponseError: If ``value`` is not a JSON object.
     """
     if not isinstance(value, dict):
-        reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
+        reject_malformed(fingerprint)
     return value
 
 
@@ -224,8 +231,8 @@ def require_text(value: object, fingerprint: str) -> str:
         ``value`` when it is a string.
 
     Raises:
-        ProviderResponseRejectedError: If ``value`` is not a string.
+        ProviderMalformedResponseError: If ``value`` is not a string.
     """
     if not isinstance(value, str):
-        reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
+        reject_malformed(fingerprint)
     return value

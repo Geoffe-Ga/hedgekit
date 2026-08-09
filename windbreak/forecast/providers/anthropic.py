@@ -30,12 +30,11 @@ from typing import TYPE_CHECKING
 from windbreak.forecast.providers._llm_http import (
     build_chat_request_body,
     fetch_envelope,
-    reject,
+    reject_malformed,
     require_first_element,
     require_object,
     require_text,
 )
-from windbreak.forecast.sanitize import RESPONSE_FAILURE_MALFORMED_VOTE_JSON
 
 if TYPE_CHECKING:
     from windbreak.forecast.cassettes import LlmRequest
@@ -65,7 +64,7 @@ def _extract_completion_text(payload: dict[str, object], fingerprint: str) -> st
         The first text content block's text, verbatim.
 
     Raises:
-        ProviderResponseRejectedError: If ``content`` is missing/empty/not an
+        ProviderMalformedResponseError: If ``content`` is missing/empty/not an
             array, its first element is not an object, that object's ``type`` is
             not ``"text"``, or its ``text`` is missing or not a string.
     """
@@ -73,7 +72,7 @@ def _extract_completion_text(payload: dict[str, object], fingerprint: str) -> st
         require_first_element(payload, _CONTENT_KEY, fingerprint), fingerprint
     )
     if block.get(_TYPE_KEY) != _TEXT_TYPE:
-        reject(RESPONSE_FAILURE_MALFORMED_VOTE_JSON, fingerprint)
+        reject_malformed(fingerprint)
     return require_text(block.get(_TEXT_KEY), fingerprint)
 
 
@@ -109,7 +108,8 @@ class AnthropicMessagesTransport:
             The extracted ``content[0]["text"]`` completion text, verbatim.
 
         Raises:
-            ProviderResponseRejectedError: On a non-2xx status, a malformed
+            ProviderHTTPError: On a non-2xx status, carrying that status code.
+            ProviderMalformedResponseError: On a malformed
                 body, a non-finite JSON constant, or an unexpected envelope
                 shape; the error carries the failure code and fingerprint only.
         """
