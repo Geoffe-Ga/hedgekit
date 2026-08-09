@@ -559,6 +559,120 @@ def test_report_research_costs_zero_denominator_yields_none_and_omits_key(
     _assert_json_safe_leaves(payload)
 
 
+def test_report_research_costs_empty_boundary_omits_both_per_unit_keys(
+    created_at: datetime,
+) -> None:
+    """Spend with nothing resolved and nothing profitable reports NO per-unit cost.
+
+    The empty boundary (issue #317): money has been spent, but both denominators
+    are zero, so neither unit cost exists. Both fields must be `None` and both
+    keys must be *absent* from the ledgered payload -- never present with a
+    flattering `0`, which a downstream expectancy check would read as "research
+    is free". The payload's key set is asserted exactly, so an extra key
+    carrying a bogus default fails here even though it would slip past a
+    per-key `not in` check on the two keys we happen to name.
+    """
+    ledger = InMemoryBudgetLedger()
+
+    report = report_research_costs(
+        total_research_cost_micros=7_000_000,
+        resolved_forecast_count=0,
+        profitable_trade_count=0,
+        ledger=ledger,
+        at=created_at,
+    )
+
+    assert report.total_research_cost_micros == 7_000_000
+    assert report.resolved_forecast_count == 0
+    assert report.profitable_trade_count == 0
+    assert report.cost_per_resolved_forecast_micros is None
+    assert report.cost_per_profitable_trade_micros is None
+
+    events = ledger.events_by_type(COST_REPORT_EVENT)
+    assert len(events) == 1
+    payload = events[0].payload
+    assert set(payload) == {
+        "total_research_cost_micros",
+        "resolved_forecast_count",
+        "profitable_trade_count",
+    }
+    assert payload["total_research_cost_micros"] == 7_000_000
+    assert payload["resolved_forecast_count"] == 0
+    assert payload["profitable_trade_count"] == 0
+    _assert_json_safe_leaves(payload)
+
+
+def test_report_research_costs_zero_resolved_keeps_the_profitable_key(
+    created_at: datetime,
+) -> None:
+    """A zero `resolved_forecast_count` drops only ITS key, not the other one.
+
+    The mirror of the zero-`profitable_trade_count` case above: exercising each
+    denominator's zero arm independently is what proves the two omissions are
+    two separate decisions rather than one shared "any zero, drop everything"
+    branch. `9_000_000 / 4` is `2_250_000`, distinct from the total and from
+    every count, so an arm that reported the wrong figure could not read as
+    correct by coincidence.
+    """
+    ledger = InMemoryBudgetLedger()
+
+    report = report_research_costs(
+        total_research_cost_micros=9_000_000,
+        resolved_forecast_count=0,
+        profitable_trade_count=4,
+        ledger=ledger,
+        at=created_at,
+    )
+
+    assert report.cost_per_resolved_forecast_micros is None
+    assert report.cost_per_profitable_trade_micros == 2_250_000
+
+    events = ledger.events_by_type(COST_REPORT_EVENT)
+    assert len(events) == 1
+    payload = events[0].payload
+    assert set(payload) == {
+        "total_research_cost_micros",
+        "resolved_forecast_count",
+        "profitable_trade_count",
+        "cost_per_profitable_trade_micros",
+    }
+    assert payload["cost_per_profitable_trade_micros"] == 2_250_000
+    assert payload["resolved_forecast_count"] == 0
+    assert payload["profitable_trade_count"] == 4
+    _assert_json_safe_leaves(payload)
+
+
+def test_report_research_costs_pins_each_per_unit_key_to_its_own_denominator(
+    created_at: datetime,
+) -> None:
+    """With both denominators non-zero AND distinct, each key carries its own figure.
+
+    The two per-unit costs are deliberately different numbers (`12_000_000 / 3`
+    is `4_000_000`; `12_000_000 / 2` is `6_000_000`), so writing one arm's value
+    under the other arm's key -- invisible whenever the two counts coincide --
+    fails here. The two denominators are likewise echoed back under distinct
+    values, so a payload that hard-codes or crosses a count is caught too.
+    """
+    ledger = InMemoryBudgetLedger()
+
+    report = report_research_costs(
+        total_research_cost_micros=12_000_000,
+        resolved_forecast_count=3,
+        profitable_trade_count=2,
+        ledger=ledger,
+        at=created_at,
+    )
+
+    assert report.cost_per_resolved_forecast_micros == 4_000_000
+    assert report.cost_per_profitable_trade_micros == 6_000_000
+
+    payload = ledger.events_by_type(COST_REPORT_EVENT)[0].payload
+    assert payload["cost_per_resolved_forecast_micros"] == 4_000_000
+    assert payload["cost_per_profitable_trade_micros"] == 6_000_000
+    assert payload["resolved_forecast_count"] == 3
+    assert payload["profitable_trade_count"] == 2
+
+
 def test_report_research_costs_negative_inputs_raise_value_error(
     created_at: datetime,
 ) -> None:
