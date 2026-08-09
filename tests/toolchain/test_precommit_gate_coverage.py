@@ -92,7 +92,10 @@ _GATE1_EXCLUDED_HOOKS: dict[str, str] = {
         "main'), not of the tree's quality, so running it from a quality gate "
         "is a category error: a developer running check-all.sh while sitting "
         "on main would get a red Gate 1 that says nothing about the code. CI "
-        "skips it by name for the same reason (issue #127). The policy is not "
+        "needs the exclusion for a reason of its own -- push-event runs attach "
+        "HEAD to main, so the hook fails on every merge (issue #127) -- and "
+        "inherits it from here, since issue #406 removed CI's standalone "
+        "pre-commit step and with it the second skip list. The policy is not "
         "weakened -- the hook still fires at commit time via `pre-commit "
         "install`, which is where a branch policy belongs. Named in "
         "GATE1_SKIPPED_HOOKS in scripts/precommit.sh."
@@ -141,6 +144,24 @@ _SKIP_GUARD = re.compile(r"command -v[ \t]+pre-commit")
 
 #: A whole-line shell comment (including the shebang).
 _COMMENT_LINE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
+
+#: The CI job that must run Gate 1. Named rather than searched for across all
+#: jobs so that renaming it away is a decision someone has to make on purpose.
+_CI_QUALITY_JOB = "quality"
+
+#: Gate 1 as CI invokes it. Anchored to the start of a line (optionally with
+#: arguments) so the script must be *executed*: a substring test would be
+#: satisfied by the path appearing inside an `echo`, a comment, or a skipped
+#: branch, which is the "assertion that cannot fail" shape this module exists
+#: to keep out.
+_CI_GATE1_INVOCATION = re.compile(
+    r"^[ \t]*\./scripts/check-all\.sh(?:[ \t].*)?$", re.MULTILINE
+)
+
+#: A whole-hook-set pre-commit run written directly into the workflow. Gate 1
+#: already runs this exact invocation via `scripts/precommit.sh`, so a second
+#: one is duplicated work rather than added coverage (issue #406).
+_CI_STANDALONE_HOOK_SET = re.compile(r"pre-commit run --all-files")
 
 
 def _precommit_script_source() -> str:
@@ -210,29 +231,46 @@ def _hooks_unreachable_by_stage() -> set[str]:
     return unreachable
 
 
-def _ci_precommit_skip_list() -> set[str]:
-    """Return the SKIP list CI applies to its whole-file pre-commit run.
+def _ci_workflow() -> dict[str, Any]:
+    """Return the parsed CI workflow.
 
     Returns:
-        The hook ids named in the `SKIP` env of the CI step that runs
-        `pre-commit run --all-files`.
-
-    Raises:
-        AssertionError: If no such CI step is found.
+        `.github/workflows/ci.yml` as a mapping.
     """
     with _CI_WORKFLOW_PATH.open(encoding="utf-8") as handle:
         workflow: dict[str, Any] = yaml.safe_load(handle)
+    return workflow
 
-    for job in workflow["jobs"].values():
-        for step in job.get("steps", []):
-            if "pre-commit run --all-files" in str(step.get("run", "")):
-                skip = str(step.get("env", {}).get("SKIP", ""))
-                return {name.strip() for name in skip.split(",") if name.strip()}
 
-    raise AssertionError(
-        f"{_CI_WORKFLOW_PATH} has no step running `pre-commit run --all-files` "
-        "-- Gate 1's hook set is defined to be a superset of that step's"
-    )
+def _ci_run_commands(job_name: str | None = None) -> list[str]:
+    """Return the shell bodies of CI's `run:` steps.
+
+    Args:
+        job_name: Restrict to this job. `None` covers every job.
+
+    Returns:
+        The `run` body of each matching step, in workflow order.
+
+    Raises:
+        AssertionError: If `job_name` names a job the workflow does not define.
+    """
+    jobs: dict[str, Any] = _ci_workflow()["jobs"]
+
+    if job_name is not None:
+        assert job_name in jobs, (
+            f"{_CI_WORKFLOW_PATH} defines no {job_name!r} job (jobs: "
+            f"{sorted(jobs)}) -- the Gate 1 invocation is pinned to that job"
+        )
+        selected = [jobs[job_name]]
+    else:
+        selected = list(jobs.values())
+
+    return [
+        str(step["run"])
+        for job in selected
+        for step in job.get("steps", [])
+        if "run" in step
+    ]
 
 
 def test_precommit_gate_script_exists_and_is_executable() -> None:
@@ -442,28 +480,60 @@ def test_every_gate1_exclusion_carries_a_stated_reason(hook_id: str) -> None:
     )
 
 
-def test_gate1_skip_list_matches_ci_skip_list() -> None:
-    """Gate 1 and CI skip exactly the same hooks.
+def test_ci_runs_gate1_so_cis_hook_set_is_gate1s() -> None:
+    """CI's quality job runs `./scripts/check-all.sh`.
 
-    Gate 1's contract is to be a superset of CI's pre-commit job. Both run
-    `pre-commit run --all-files` against the same pinned config, so the only
-    way they can disagree is via their SKIP lists -- pinning them equal makes
-    "local green implies CI green" a construction guarantee for the hook set
-    rather than something rediscovered on a red build.
+    This replaces an equality assertion between two SKIP lists -- Gate 1's and
+    a standalone `Pre-commit (all files)` step CI used to carry (issue #406).
+    That step ran the identical hook set a second time on every matrix leg, so
+    removing it cost no coverage; what it did carry was a second skip list,
+    and two lists that must agree can drift.
 
-    Note for whoever closes #406: that issue removes CI's now-redundant
-    standalone `Pre-commit (all files)` step, at which point
-    `_ci_precommit_skip_list` finds no matching step and this test fails --
-    deliberately, so the change cannot happen silently. Replace it rather
-    than delete it: assert that CI's quality job invokes
-    `./scripts/check-all.sh`, which is what makes CI's hook set Gate 1's.
-    That is stronger than this assertion, because afterwards only one skip
-    list exists and two lists can no longer drift apart.
+    Asserting the invocation instead is strictly stronger. CI's hook set is
+    now Gate 1's hook set by construction rather than by matching
+    configuration: there is exactly one skip list in the repository
+    (`GATE1_SKIPPED_HOOKS` in `scripts/precommit.sh`, pinned to a stated
+    reason by the exclusion registry above), and nothing left for it to
+    disagree with. If Gate 1 stops running the hook set, both the local gate
+    and CI lose it together and the tests above fail -- there is no
+    arrangement in which CI silently checks something Gate 1 does not.
     """
-    assert _gate1_skip_list() == _ci_precommit_skip_list(), (
-        f"Gate 1 skips {sorted(_gate1_skip_list())} but CI skips "
-        f"{sorted(_ci_precommit_skip_list())}; a hook skipped locally and run "
-        "in CI is exactly the divergence issue #401 closes"
+    commands = _ci_run_commands(_CI_QUALITY_JOB)
+
+    assert any(_CI_GATE1_INVOCATION.search(command) for command in commands), (
+        f"the {_CI_QUALITY_JOB!r} job in {_CI_WORKFLOW_PATH} does not run "
+        "./scripts/check-all.sh. That invocation is what makes CI's hook set "
+        "Gate 1's; without it CI's coverage is whatever its steps happen to "
+        f"name, which is the drift issue #401 closes. Steps run: {commands!r}"
+    )
+
+
+def test_ci_does_not_run_the_hook_set_a_second_time() -> None:
+    """CI dispatches the whole hook set once per leg, through Gate 1.
+
+    `./scripts/check-all.sh` already runs `pre-commit run --all-files` via
+    `scripts/precommit.sh`, so a standalone step doing the same thing is pure
+    duplication: it measured 18s/29s/27s across the 3.11/3.12/3.13 legs --
+    74s of runner time per PR, ~29s of it on the critical path -- for zero
+    additional hooks (issue #406).
+
+    This is a duplication guard, not a coverage ceiling. It forbids only the
+    whole-set invocation, which Gate 1 is defined to provide; a CI step
+    running some *narrower* pre-commit selection for a reason of its own is
+    untouched by this assertion.
+    """
+    duplicated = [
+        command
+        for command in _ci_run_commands()
+        if _CI_STANDALONE_HOOK_SET.search(command)
+    ]
+
+    assert not duplicated, (
+        f"{_CI_WORKFLOW_PATH} runs `pre-commit run --all-files` directly in "
+        f"{len(duplicated)} step(s), on top of ./scripts/check-all.sh, which "
+        "already runs that exact invocation through scripts/precommit.sh. "
+        "That is the same hook set twice per matrix leg for no added "
+        f"coverage (issue #406). Duplicated step(s): {duplicated!r}"
     )
 
 

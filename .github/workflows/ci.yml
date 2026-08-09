@@ -53,21 +53,23 @@ jobs:
           pip install -c constraints-quality.txt -r requirements-dev.txt
           pip install -e . -c constraints-quality.txt
 
+      # This step runs the WHOLE pre-commit hook set, via scripts/precommit.sh
+      # (issue #401) — every hook in .pre-commit-config.yaml over --all-files,
+      # skipping no-commit-to-branch by name for the reason recorded in issue
+      # #127: actions/checkout attaches HEAD to main on push-event runs, so the
+      # hook would fail on every merge, a category error given the commit
+      # already passed its PR gates.
+      #
+      # A standalone "Pre-commit (all files)" step used to run that identical
+      # invocation a second time, per matrix leg — 18s/29s/27s on the
+      # 3.11/3.12/3.13 legs, 74s of runner time per PR for zero additional
+      # hooks. It was removed in issue #406. CI's hook set is now Gate 1's by
+      # construction, and one skip list exists in the repo instead of two that
+      # have to agree. tests/toolchain/test_precommit_gate_coverage.py pins
+      # both halves: that this step exists, and that nothing re-adds the
+      # duplicate.
       - name: Quality gate (identical to local)
         run: ./scripts/check-all.sh
-
-      - name: Pre-commit (all files)
-        # no-commit-to-branch guards LOCAL commit-time only. On push-event runs
-        # actions/checkout attaches HEAD to main, so the hook fails on every
-        # merge (a category error — the commit already passed its PR gates),
-        # while PR-event runs pass via the detached merge ref. Skipping it here
-        # is not a gate-weakening: every other hook still runs, and the hook
-        # itself stays active for local commits. Issue #127.
-        env:
-          SKIP: no-commit-to-branch
-        run: |
-          pip install -c constraints-quality.txt pre-commit
-          pre-commit run --all-files --show-diff-on-failure
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == env.PYTHON_VERSION_PRIMARY

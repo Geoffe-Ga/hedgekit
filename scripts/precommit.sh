@@ -21,9 +21,11 @@ while [[ $# -gt 0 ]]; do
 Usage: $(basename "$0") [OPTIONS]
 
 Run EVERY hook in .pre-commit-config.yaml over --all-files, through the
-pinned toolchain, so Gate 1's hook coverage is a superset of CI's
-"Pre-commit (all files)" job BY CONSTRUCTION rather than by a
-hand-maintained list that drifts (issue #401).
+pinned toolchain, so Gate 1's hook coverage is a superset of CI's BY
+CONSTRUCTION rather than by a hand-maintained list that drifts (issue
+#401). CI reaches this script the same way you do -- through
+./scripts/check-all.sh -- so the two hook sets are the same set, not two
+sets kept in agreement (issue #406).
 
 One hook is excluded, deliberately and by name -- see GATE1_SKIPPED_HOOKS
 below for the hook and the reason.
@@ -91,14 +93,17 @@ fi
 # tree's quality, so running it from a quality gate is a category error -- a
 # developer legitimately running ./scripts/check-all.sh while sitting on main
 # (to verify a merge, say) would get a red Gate 1 that says nothing about the
-# code. CI's "Pre-commit (all files)" step skips it by name for the same reason
-# (issue #127: push-event runs attach HEAD to main, so it fails on every merge).
+# code. CI needs the same exclusion for a reason of its own (issue #127:
+# push-event runs attach HEAD to main via actions/checkout, so the hook fails
+# on every merge -- a category error, since the commit already passed its PR
+# gates).
 #
-# Matching CI's SKIP set exactly is what makes Gate 1 a superset of CI's
-# pre-commit job rather than merely an overlapping set, and
-# tests/toolchain/test_precommit_gate_coverage.py asserts that equality plus a
-# stated reason for every excluded hook. Adding a name here without registering
-# its reason there fails the suite.
+# CI gets it from HERE. ci.yml used to carry its own SKIP list on a standalone
+# "Pre-commit (all files)" step; issue #406 removed that step as duplicated
+# work, so this is now the only skip list in the repository and there is no
+# second one for it to drift from. tests/toolchain/test_precommit_gate_coverage
+# .py pins every exclusion to a stated reason -- adding a name here without
+# registering its reason there fails the suite.
 #
 # The hook is NOT weakened by this: it still runs at commit time via
 # `pre-commit install`, which is where a branch policy belongs.
@@ -137,13 +142,14 @@ echo "=== Pre-commit (all hooks) ==="
 # guarantee. Measured cost of the whole warm run is ~9s against a ~155s Gate 1,
 # so the overlap is worth the loss of a drift class.
 #
-# That argument covers the SCRIPT-level overlap only. It does NOT extend to
-# CI, where ci.yml still has a standalone "Pre-commit (all files)" step running
-# this exact invocation on top of its ./scripts/check-all.sh step -- six full
-# hook-set runs across the 3-way matrix instead of three, for no added
-# coverage, since nothing separately depends on that step now. Tracked in #406
-# rather than fixed here: editing a workflow file makes claude-code-action skip
-# the required claude-review check and leaves the PR admin-merge-only (#402).
+# That argument covers the SCRIPT-level overlap only, where each gate script
+# has to stand alone. It did NOT extend to CI, which ran this exact invocation
+# twice per matrix leg: once through ./scripts/check-all.sh and once through a
+# standalone "Pre-commit (all files)" step -- six hook-set runs across the
+# 3-way matrix instead of three, 74s of runner time per PR, for no added
+# coverage. Issue #406 removed the standalone step; CI now reaches the hook set
+# only through check-all.sh, which is what makes CI's set identical to Gate 1's
+# rather than merely equal to it.
 if SKIP="$GATE1_SKIPPED_HOOKS" "$PRE_COMMIT" "${PRE_COMMIT_ARGS[@]}"; then
     echo "✓ Pre-commit hook set passed"
 else
