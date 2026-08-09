@@ -60,11 +60,29 @@ done
 cd "$PROJECT_ROOT"
 
 # Resolve pre-commit from the PINNED toolchain, never by bare name (issue #366).
-# A missing pre-commit vetoes here, loudly, under `set -e`; there is deliberately
-# no `command -v pre-commit || skip` probe, because a check that reports success
+# A missing pre-commit VETOES -- there is deliberately no
+# `command -v pre-commit || skip` probe, because a check that reports success
 # without running is strictly worse than one that refuses to run.
+#
+# The veto is spelled out rather than left to `set -e` so the failure tells a
+# developer what to do next, matching scripts/security.sh's treatment of the
+# same tool. The resolver already explains which environment it searched; this
+# adds why THIS gate needs the tool and how to get it. Exit 2 ("error running
+# checks", not "checks failed") because an unrunnable gate is not a verdict
+# about the code.
 TOOLCHAIN_ENV="$SCRIPT_DIR/toolchain-env.sh"
-PRE_COMMIT="$(bash "$TOOLCHAIN_ENV" --print-tool pre-commit)"
+if ! PRE_COMMIT="$(bash "$TOOLCHAIN_ENV" --print-tool pre-commit)"; then
+    echo "✗ pre-commit is not installed" >&2
+    echo "  why: this gate runs the WHOLE hook set from" >&2
+    echo "       .pre-commit-config.yaml, which is what makes Gate 1 a" >&2
+    echo "       superset of CI's pre-commit job. Without it, Gate 1 cannot" >&2
+    echo "       match CI -- so it refuses to run rather than report a" >&2
+    echo "       verdict it did not earn (issue #401)." >&2
+    echo "  next: run scripts/provision-venv.sh (the shared pinned venv" >&2
+    echo "        provides pre-commit) or" >&2
+    echo "        pip install -c constraints-quality.txt pre-commit" >&2
+    exit 2
+fi
 
 # THE ONE NAMED EXCLUSION, AND WHY (issue #401 acceptance criterion 1)
 #
@@ -116,8 +134,16 @@ echo "=== Pre-commit (all hooks) ==="
 # Each gate script must stay a complete check for its own dimension when invoked
 # standalone -- CLAUDE.md documents `./scripts/lint.sh` as a thing you run on
 # its own -- and this step exists to make TOTAL coverage a construction
-# guarantee. Measured cost of the whole warm run is ~10s against a ~155s Gate 1,
+# guarantee. Measured cost of the whole warm run is ~9s against a ~155s Gate 1,
 # so the overlap is worth the loss of a drift class.
+#
+# That argument covers the SCRIPT-level overlap only. It does NOT extend to
+# CI, where ci.yml still has a standalone "Pre-commit (all files)" step running
+# this exact invocation on top of its ./scripts/check-all.sh step -- six full
+# hook-set runs across the 3-way matrix instead of three, for no added
+# coverage, since nothing separately depends on that step now. Tracked in #406
+# rather than fixed here: editing a workflow file makes claude-code-action skip
+# the required claude-review check and leaves the PR admin-merge-only (#402).
 if SKIP="$GATE1_SKIPPED_HOOKS" "$PRE_COMMIT" "${PRE_COMMIT_ARGS[@]}"; then
     echo "✓ Pre-commit hook set passed"
 else

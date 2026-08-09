@@ -50,6 +50,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -295,6 +297,70 @@ def test_precommit_gate_has_no_skip_guard() -> None:
     )
 
 
+def test_missing_pre_commit_vetoes_with_actionable_guidance(tmp_path: Path) -> None:
+    """An unresolvable pre-commit stops the gate and says how to fix it.
+
+    Run for real rather than asserted against source text: the script is
+    copied into a throwaway checkout whose pinned `.venv` deliberately lacks
+    `pre-commit`, so the genuine resolution path fails and the genuine veto
+    branch runs. Nothing here touches the real repo's `.venv`.
+
+    Two properties matter and are checked together. The outcome: exit 2
+    ("error running checks"), never 0 -- an unrunnable gate is not a verdict
+    about the code, and issue #366 catalogued four guards that reported
+    success for checks that never ran.
+
+    The message: it must explain what THIS gate lost, not merely that a
+    binary is absent. That distinction is load-bearing, and the first draft
+    of this test missed it -- `toolchain-env.sh` already prints "not
+    installed", a "next:" line and `provision-venv.sh`, and `set -e` already
+    propagates exit 2, so asserting those alone passed identically with and
+    without the gate's own veto branch. A test that cannot fail is the very
+    defect this module exists to prevent, so the assertions below are
+    anchored to wording only `precommit.sh` produces: why a developer should
+    care that the hook set did not run.
+
+    Args:
+        tmp_path: Test-scoped temporary directory.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    for name in ("provision-venv.sh", "toolchain-env.sh", "precommit.sh"):
+        shutil.copy(_REPO_ROOT / "scripts" / name, repo / "scripts" / name)
+    venv_bin = repo / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+    (venv_bin / "python").chmod(0o755)
+
+    result = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", str(repo / "scripts" / "precommit.sh")],
+        cwd=str(repo),
+        env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 2, (
+        "a gate that cannot resolve pre-commit must exit 2 (error running "
+        f"checks), not {result.returncode}; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert "the WHOLE hook set" in result.stderr, (
+        "the veto does not say what this gate lost -- only that some binary "
+        "is missing, which the resolver already reports. State the gate's "
+        f"own stake: {result.stderr!r}"
+    )
+    assert "superset of CI" in result.stderr, (
+        "the veto does not explain why an unrun hook set matters (Gate 1 "
+        f"stops being a superset of CI's pre-commit job): {result.stderr!r}"
+    )
+    assert "provision-venv.sh" in result.stderr, (
+        f"the veto does not name the command that installs it: {result.stderr!r}"
+    )
+
+
 def test_check_all_dispatches_the_precommit_gate() -> None:
     """Gate 1 actually runs the whole-hook-set check.
 
@@ -384,6 +450,15 @@ def test_gate1_skip_list_matches_ci_skip_list() -> None:
     way they can disagree is via their SKIP lists -- pinning them equal makes
     "local green implies CI green" a construction guarantee for the hook set
     rather than something rediscovered on a red build.
+
+    Note for whoever closes #406: that issue removes CI's now-redundant
+    standalone `Pre-commit (all files)` step, at which point
+    `_ci_precommit_skip_list` finds no matching step and this test fails --
+    deliberately, so the change cannot happen silently. Replace it rather
+    than delete it: assert that CI's quality job invokes
+    `./scripts/check-all.sh`, which is what makes CI's hook set Gate 1's.
+    That is stronger than this assertion, because afterwards only one skip
+    list exists and two lists can no longer drift apart.
     """
     assert _gate1_skip_list() == _ci_precommit_skip_list(), (
         f"Gate 1 skips {sorted(_gate1_skip_list())} but CI skips "

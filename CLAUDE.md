@@ -200,8 +200,9 @@ Executes:
 - Complexity analysis (radon, xenon)
 - Test suite with coverage (pytest)
 
-Runtime: roughly 2m45s warm on a developer machine; the whole-hook-set step is
-about 10s of that (~+7% over the pre-#401 gate).
+Runtime: roughly 2m40s warm on a developer machine. The whole-hook-set step is
+about 9s standalone and cost +4.7s (+3%) end-to-end when added, most of its
+work overlapping the dedicated gates that follow it.
 
 Exit code 0 = ready to commit. Non-zero = fix issues first.
 
