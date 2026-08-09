@@ -109,9 +109,9 @@ def _publication_date_invalid(
     """Return whether a citation's publication date fails the S8.8 date check.
 
     A ``None`` date is valid (the "where available" clause): there is nothing
-    to distrust. A present date is invalid when it is naive (timezone-less, so
-    not comparable to the aware ``as_of``) or later than ``as_of`` (a source
-    cannot postdate the verification instant).
+    to distrust. A present date is invalid when it is naive (offsetless, so not
+    comparable to the aware ``as_of``) or later than ``as_of`` (a source cannot
+    postdate the verification instant).
 
     Args:
         publication_date: The citation's publication date, or ``None``.
@@ -122,7 +122,18 @@ def _publication_date_invalid(
     """
     if publication_date is None:
         return False
-    return publication_date.tzinfo is None or publication_date > as_of
+    # Naive means `tzinfo is None` *or* a `tzinfo` whose `utcoffset()` returns
+    # None -- Python's own definition. Testing `tzinfo is None` alone (issue
+    # #346) let the second shape fall through to the comparison below and raise
+    # `TypeError: can't compare offset-naive and offset-aware datetimes`,
+    # aborting the whole S8.8 verification pass on precisely the input this
+    # check exists to reject. `utcoffset()` covers both shapes in one call: it
+    # already returns None when `tzinfo` is None. Rejecting -- rather than
+    # assuming an offset -- matches `windbreak/forecast/pubdate.py`, which
+    # degrades an offsetless date instead of fabricating a timezone for it.
+    if publication_date.utcoffset() is None:
+        return True
+    return publication_date > as_of
 
 
 def _first_failure(content: str, citation: Citation, as_of: datetime) -> str | None:

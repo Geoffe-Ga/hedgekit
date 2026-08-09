@@ -28,7 +28,7 @@ Fixture-construction choice (`_StaticFetchTransport`, `_citation`)
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING
 
 import pytest
@@ -89,6 +89,34 @@ def _citation(**overrides: object) -> Citation:
         A constructed `Citation`.
     """
     return Citation(**{**_VALID_CITATION_KWARGS, **overrides})
+
+
+class _OffsetlessTimezone(tzinfo):
+    """A `tzinfo` whose `utcoffset` is `None`, so its datetimes are still naive.
+
+    Python defines a datetime as naive when `tzinfo is None` *or* when
+    `tzinfo.utcoffset(dt)` returns `None`. Only a hand-written subclass
+    produces that second shape -- neither `datetime.fromisoformat` nor
+    `email.utils.parsedate_to_datetime` ever yields one -- which is exactly why
+    it needs a double here (issue #346). Defined locally rather than shared,
+    per this package's convention (see the module docstring).
+
+    Only `utcoffset` is overridden: it is the single method the naive-ness test
+    and the `>` comparison consult, so supplying `tzname`/`dst` would add
+    behaviour no test exercises.
+    """
+
+    def utcoffset(self, dt: datetime | None) -> None:
+        """Return `None` -- this zone declines to define an offset.
+
+        Args:
+            dt: The datetime being interrogated; unused, since the answer is
+                unconditional.
+
+        Returns:
+            `None`, always.
+        """
+        return None
 
 
 class _StaticFetchTransport:
@@ -388,6 +416,33 @@ def test_naive_publication_date_yields_publication_date_invalid_failure(
     """
     tools = _tools(research_tools_factory, tmp_path)
     citation = _citation(publication_date=datetime(2024, 11, 1))
+
+    verdict = verify_citation(tools, citation, as_of=created_at)
+
+    assert verdict.verified is False
+    assert verdict.failure == FAILURE_PUBLICATION_DATE_INVALID
+
+
+def test_offsetless_tzinfo_publication_date_is_rejected_not_raised(
+    research_tools_factory: ResearchToolsFactory,
+    tmp_path: Path,
+    created_at: datetime,
+) -> None:
+    """A publication date carrying a `tzinfo` whose `utcoffset()` is `None` is
+    naive by Python's own definition, so the date check *rejects* it (issue
+    #346) rather than raising `TypeError` from the `>` against the aware
+    `as_of` -- which would abort the whole verification pass on the exact input
+    the check exists to catch.
+
+    The calendar value deliberately precedes `as_of`, so the naive-ness test is
+    the only thing that can fail this citation: were the guard to consult a
+    fabricated offset instead of rejecting, the date would read as valid and
+    the assertions below would flip rather than merely stop raising.
+    """
+    tools = _tools(research_tools_factory, tmp_path)
+    citation = _citation(
+        publication_date=datetime(2024, 11, 1, tzinfo=_OffsetlessTimezone())
+    )
 
     verdict = verify_citation(tools, citation, as_of=created_at)
 
