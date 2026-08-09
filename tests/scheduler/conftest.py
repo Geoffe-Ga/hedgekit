@@ -21,6 +21,7 @@ test that might be added later.
 from __future__ import annotations
 
 from windbreak.config.schema import CorrelationConfig, CorrelationTagConfig
+from windbreak.numeric import MoneyMicros
 from windbreak.riskkernel.modes import Mode, ModeStateMachine
 from windbreak.riskkernel.process import InMemoryKernelLedgerWriter, RiskKernel
 from windbreak.riskkernel.reservations import ApprovalPipeline, ReservationLedger
@@ -116,6 +117,23 @@ def proven_flat_exposure(ticker: str = "TEST-TICKER") -> ExposureProjection:
     )
     assert projection is not None
     return projection
+
+
+def proven_untraded_day() -> MoneyMicros:
+    """Return the day's booked notional for a ledger holding no fills.
+
+    The `notional_today` companion of `proven_flat_exposure`, and it exists for
+    the same reason: `None` and a proven zero are different facts, and
+    `build_evaluation_context` treats them differently. `None` means the day's
+    spend could not be established, which zeroes `max_notional_per_day` so
+    `velocity_limits` vetoes; this helper means the ledger was read and nothing
+    was booked today, which is what every test below assumed implicitly back
+    when the term was hardcoded to zero (issue #415).
+
+    Returns:
+        `MoneyMicros(0)` -- an untraded day, provably.
+    """
+    return MoneyMicros(0)
 
 
 def build_kernel_approval_components(

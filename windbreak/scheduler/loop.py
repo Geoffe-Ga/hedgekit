@@ -202,6 +202,7 @@ from windbreak.selector.types import (
     SelectorInputs,
     SlippageModelInput,
 )
+from windbreak.timekeeping import require_aware
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -289,6 +290,20 @@ _EQUITY_MICROS_KEY = "equity_micros"
 #: seconds -- the field the UTC-day bucketing reads, never the row's own
 #: ``created_at`` wall clock (which the injected clock does not control).
 _SAMPLE_EPOCH_KEY = "epoch_s"
+
+#: The ledger event type carrying one booked venue fill. The UTC-day fold behind
+#: ``velocity_limits``' daily-notional cap reads these rows
+#: (:func:`notional_today_micros`, issue #415), and it is the single type that
+#: fold's reverse walk is filtered to.
+_FILL_ACCOUNTED_EVENT_TYPE = "FillAccounted"
+
+#: The ``FillAccounted`` payload key carrying the fill's signed available-cash
+#: movement, in micros. Its *magnitude* is the notional that fill routed.
+_CASH_DELTA_MICROS_KEY = "cash_delta_micros"
+
+#: The :class:`~windbreak.ledger.store.LedgerRecord` field naming the recorded
+#: instant, surfaced in the timezone-awareness refusal it is read through.
+_CREATED_AT_FIELD = "created_at"
 
 #: The M6 per-provider track-record artifact the loop's live-eligibility gate
 #: reads, resolved inside the same ``report_dir`` every other evaluation
@@ -729,6 +744,174 @@ def _bounded_start_of_day_equity_micros(
     return MoneyMicros(earliest[1]) if earliest is not None else None
 
 
+def _fill_utc_day(record: LedgerRecord) -> date | None:
+    """Return the UTC calendar day a booked fill was recorded on, or ``None``.
+
+    Read from the row's own ``created_at`` rather than from any payload field,
+    because ``FillAccounted`` carries no instant and the ``Event`` base carries
+    none either -- the fact that made this cap look blocked. The column is not
+    a soft one: :func:`~windbreak.ledger.store.compute_event_hash` folds
+    ``created_at`` into the chain digest alongside the payload, so the stamp a
+    risk cap buckets on carries exactly the tamper-evidence the payload does. A
+    window folded over a rewritable timestamp would be worthless.
+
+    An offsetless stamp yields ``None`` rather than a guessed day.
+    :func:`~windbreak.timekeeping.require_aware` refuses rather than repairs,
+    and the reason is this exact bucketing: read as the host's local time, a
+    naive 20:00 stamp falls on the next calendar day west of UTC and on the
+    current one at UTC, so "which day did this trade on" would answer
+    differently per host and the cap would fail *open* west of UTC (PR #405).
+    An unparseable stamp is refused on the same grounds.
+
+    Args:
+        record: The ``FillAccounted`` row to bucket.
+
+    Returns:
+        The UTC date the row was recorded on, or ``None`` when its stamp is
+        unparseable or carries no UTC offset.
+    """
+    try:
+        instant = datetime.fromisoformat(record.created_at)
+        require_aware(instant, _CREATED_AT_FIELD)
+    except ValueError:
+        return None
+    return instant.astimezone(UTC).date()
+
+
+def _fill_notional_micros(record: LedgerRecord) -> int:
+    """Return the notional one booked fill routed, in micros.
+
+    The *magnitude* of the cash movement, never its sign: a buy consumes cash
+    and a sell releases it, but both routed an order against the day's budget.
+    Summing signed deltas would let a sale refund notional a purchase had
+    spent, which is a cap that loosens the more the loop trades.
+
+    Args:
+        record: The ``FillAccounted`` row to read.
+
+    Returns:
+        The absolute cash movement the fill booked, in micros.
+
+    Raises:
+        KeyError: If the payload is missing the field this reads -- a loud
+            shape drift, never a silently under-counted day.
+    """
+    data = json.loads(record.payload_json)[_PAYLOAD_DATA_KEY]
+    return abs(int(data[_CASH_DELTA_MICROS_KEY]))
+
+
+def _fold_notional_micros(
+    fills: Iterable[LedgerRecord], today: date
+) -> MoneyMicros | None:
+    """Sum the notional booked on ``today`` across ``fills``.
+
+    The shared body of both read paths below, so the indexed walk and the
+    whole-ledger fold can never answer differently.
+
+    A row whose day cannot be established abandons the whole answer rather than
+    being skipped. A day is not partially provable: the unreadable row might be
+    today's, so folding only the readable ones would report a total *smaller*
+    than the evidence supports -- and under-reporting what a cap has already
+    consumed is precisely the permissive direction.
+
+    Args:
+        fills: The ``FillAccounted`` rows to fold, in any order.
+        today: The UTC calendar day being summed.
+
+    Returns:
+        The day's booked notional in micros, or ``None`` when any row's
+        recorded instant could not be established.
+
+    Raises:
+        KeyError: If a payload is missing ``cash_delta_micros``.
+    """
+    total = 0
+    for record in fills:
+        day = _fill_utc_day(record)
+        if day is None:
+            return None
+        if day == today:
+            total += _fill_notional_micros(record)
+    return MoneyMicros(total)
+
+
+def notional_today_micros(
+    records: Iterable[LedgerRecord], *, now_epoch_s: int
+) -> MoneyMicros | None:
+    """Return the notional booked so far on the current UTC day, or ``None``.
+
+    ``velocity_limits`` caps the notional routed within the current UTC day, and
+    the scheduler fed it a hardcoded zero -- permissive in exactly the way zero
+    was permissive for ``concentration_limits``: the cap ran every tick,
+    reported success, and could not bind however much the loop had traded
+    (issue #415). This is the fold that feeds it.
+
+    An empty day is a genuine ``MoneyMicros(0)`` and not ``None``, which is
+    where this differs from :func:`start_of_day_equity_micros`. An unsampled day
+    has no baseline to read, but a day with no booked fill has *provably* routed
+    nothing: ``FillAccounted`` is written once at execution and never rewritten,
+    so its absence is evidence rather than the lack of it. That makes the cap
+    bind from the first tick against a fresh ledger instead of vetoing until
+    something happens to be booked.
+
+    ``None`` is reserved for the one case where the day genuinely cannot be
+    established -- a row whose recorded instant carries no UTC offset (see
+    :func:`_fill_utc_day`) -- and the caller must fail closed on it.
+
+    Args:
+        records: The ledger read (``SqliteLedgerStore.read_all()``). Rows of
+            other types are ignored.
+        now_epoch_s: The instant whose UTC day is the "current" one.
+
+    Returns:
+        The day's booked notional in micros, or ``None`` when it is unprovable.
+
+    Raises:
+        KeyError: If a ``FillAccounted`` payload is missing the field this
+            reads -- a loud shape drift, never a silently under-counted day.
+    """
+    fills = (
+        record for record in records if record.event_type == _FILL_ACCOUNTED_EVENT_TYPE
+    )
+    return _fold_notional_micros(fills, _utc_day(now_epoch_s))
+
+
+def read_notional_today_micros(
+    store: LedgerStore, *, now_epoch_s: int
+) -> MoneyMicros | None:
+    """Read the current UTC day's booked notional from ``store``.
+
+    The tick's entry point, mirroring
+    :func:`read_start_of_day_equity_micros`: a store declaring the optional
+    :class:`~windbreak.ledger.store.ReverseTypeScan` capability is walked over
+    its ``FillAccounted`` rows alone -- O(booked fills) rather than O(ledger),
+    on the composite index that walk already has -- and every other store,
+    including each hand-rolled double, falls back to the whole-ledger fold.
+
+    Unlike the equity baseline's walk, this one deliberately does **not** stop
+    at the day boundary. That early stop is safe when the answer is a single
+    earliest row; it is not safe for a *sum*, because a clock that stepped
+    backwards across midnight would put a previous-day stamp above a same-day
+    one and truncate the total. A truncated total under-reports how much budget
+    the day has spent, which fails open -- so the walk pays the full pass over
+    the fills and keeps the two paths' answers identical.
+
+    Args:
+        store: The ledger to read the day's booked fills out of.
+        now_epoch_s: The instant whose UTC day is the "current" one.
+
+    Returns:
+        The day's booked notional in micros, or ``None`` when it is unprovable
+        -- which keeps the daily cap vetoing (see :func:`_build_limits`).
+    """
+    if isinstance(store, ReverseTypeScan):
+        return _fold_notional_micros(
+            store.iter_records_of_type_reversed(_FILL_ACCOUNTED_EVENT_TYPE),
+            _utc_day(now_epoch_s),
+        )
+    return notional_today_micros(store.read_all(), now_epoch_s=now_epoch_s)
+
+
 def visible_depth_centis(order_book: OrderBookSnapshot) -> ContractCentis:
     """Return the visible depth ``participation_cap_compliance`` may bound against.
 
@@ -873,6 +1056,7 @@ def _build_limits(
     instrument_whitelist: frozenset[str],
     *,
     exposure_provable: bool,
+    notional_provable: bool,
 ) -> RiskLimits:
     """Map a configuration into the risk limits the pre-trade checks read.
 
@@ -891,7 +1075,17 @@ def _build_limits(
     permitted right now") rather than inventing an exposure figure the account
     does not have, and ``concentration_limits`` then vetoes any positive cost.
 
-    It is deliberately *conditional*. A cap that vetoed unconditionally would
+    ``notional_provable=False`` is the same seam for issue #415's daily cap.
+    ``AccountState.notional_today`` is likewise a
+    :class:`~windbreak.numeric.MoneyMicros` with no ``None``, so a day whose
+    booked notional could not be established would have to be carried as a zero
+    that reads as a clean slate. Zeroing ``max_notional_per_day`` instead states
+    the real policy -- "no notional may be routed while the day's spend is
+    unknown" -- and ``velocity_limits`` then vetoes any positive cost. A
+    provably de-risking close stays exempt, correctly: it can only reduce
+    exposure, so an unknown budget must not block the exit.
+
+    Both are deliberately *conditional*. A cap that vetoed unconditionally would
     not be failing closed, it would be broken; these caps veto only while the
     evidence is missing, and pass on a legitimate position once it is not.
 
@@ -900,6 +1094,8 @@ def _build_limits(
         instrument_whitelist: The tradable-ticker set for this tick.
         exposure_provable: Whether this tick established the account's exposure.
             ``False`` zeroes the four concentration caps, as above.
+        notional_provable: Whether this tick established the day's booked
+            notional. ``False`` zeroes ``max_notional_per_day``, as above.
 
     Returns:
         The assembled :class:`~windbreak.riskkernel.context.RiskLimits`.
@@ -918,6 +1114,10 @@ def _build_limits(
     total_pct_ppm = (
         risk.max_pos_total_pct_ppm if exposure_provable else no_share_permitted
     )
+    no_notional_permitted = 0
+    notional_per_day = (
+        risk.max_notional_per_day_micros if notional_provable else no_notional_permitted
+    )
     return RiskLimits(
         floor=MoneyMicros(config.capital.floor_micros),
         instrument_whitelist=instrument_whitelist,
@@ -932,7 +1132,7 @@ def _build_limits(
         daily_loss_limit_pct_ppm=risk.daily_loss_limit_pct_ppm,
         max_drawdown_pct_ppm=risk.max_drawdown_pct_ppm,
         max_orders_per_hour=risk.max_orders_per_hour,
-        max_notional_per_day=MoneyMicros(risk.max_notional_per_day_micros),
+        max_notional_per_day=MoneyMicros(notional_per_day),
         quote_ttl_seconds=risk.quote_ttl_seconds,
         forecast_ttl_seconds=_DEFAULT_FORECAST_TTL_SECONDS,
         clock_skew_max_seconds=risk.clock_skew_max_seconds,
@@ -948,6 +1148,7 @@ def _account_from_verification(
     verification: VerificationSnapshot | None,
     equity_start_of_day: MoneyMicros | None,
     exposure: ExposureProjection | None,
+    notional_today: MoneyMicros | None,
 ) -> AccountState:
     """Return the account snapshot the tick's ledgered evidence supports.
 
@@ -990,14 +1191,22 @@ def _account_from_verification(
     halves are set together by :func:`build_evaluation_context` and neither is
     correct alone.
 
-    ``notional_today`` stays zero, and ``velocity_limits``' daily-notional cap
-    therefore stays unable to bind. That is not an oversight: a UTC-day-bounded
-    fold needs each booked fill's instant, and
-    :class:`~windbreak.ledger.events.FillAccounted` carries no timestamp --
-    nor does the :class:`~windbreak.ledger.events.Event` base. There is no
-    honest time source to fold on yet, unlike ``equity_start_of_day``, whose
-    ``EquitySampled`` rows carry their own ``epoch_s``. The high-water mark is
-    unjustified for the same kind of reason.
+    ``notional_today`` comes from ``notional_today`` (issue #415). It was
+    hardcoded to zero, and zero is *permissive* for ``velocity_limits``' daily
+    cap: an account that looks untraded has its whole budget left however much
+    the loop routed today. :func:`read_notional_today_micros` now folds it out
+    of the ledger's own ``FillAccounted`` rows, bucketed by each row's
+    hash-chained ``created_at``.
+
+    ``notional_today=None`` means the day's spend could not be established, and
+    the term falls back to zero *only* because :func:`_build_limits` has
+    simultaneously zeroed ``max_notional_per_day`` -- the same paired reading
+    ``exposure`` uses, and for the same reason: ``AccountState`` has no ``None``
+    to carry "unprovable" with, so the fact is stated in the limits instead of
+    fabricated into the account. Neither half is correct alone.
+
+    ``equity_high_water_mark`` stays zero for a related but distinct reason:
+    no ledgered high-water history exists to fold.
 
     Args:
         verification: The tick's verification snapshot, or ``None`` when no
@@ -1007,6 +1216,9 @@ def _account_from_verification(
         exposure: The tick's projected exposure, or ``None`` when it could not
             be established -- in which case the caller must also have zeroed
             the concentration caps, as above.
+        notional_today: The current UTC day's booked notional, or ``None`` when
+            it could not be established -- in which case the caller must also
+            have zeroed the daily notional cap, as above.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.AccountState`.
@@ -1033,7 +1245,7 @@ def _account_from_verification(
         bucket_exposure=exposure.bucket_exposure if exposure is not None else zero,
         total_exposure=exposure.total_exposure if exposure is not None else zero,
         orders_last_hour=0,
-        notional_today=zero,
+        notional_today=notional_today if notional_today is not None else zero,
     )
 
 
@@ -1054,6 +1266,7 @@ def build_evaluation_context(
     equity_start_of_day: MoneyMicros | None,
     visible_depth: ContractCentis | None,
     exposure: ExposureProjection | None,
+    notional_today: MoneyMicros | None,
 ) -> EvaluationContext:
     """Compose the evaluation context a PAPER-mode approval reads.
 
@@ -1183,6 +1396,14 @@ def build_evaluation_context(
             here precisely because neither is the fail-closed answer alone -- a
             zeroed exposure under a configured cap is the permissive reading
             this issue removes.
+        notional_today: The current UTC day's booked notional from
+            :func:`read_notional_today_micros`, or ``None`` when it could not be
+            established (issue #415). It sets both halves of the daily cap the
+            same way ``exposure`` does: the ``AccountState`` term and, when
+            ``None``, the zeroed ``max_notional_per_day`` that makes
+            ``velocity_limits`` veto. A day with no booked fill is
+            ``MoneyMicros(0)``, not ``None`` -- an untraded day provably routed
+            nothing.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
@@ -1210,9 +1431,14 @@ def build_evaluation_context(
     return EvaluationContext(
         mode=Mode.PAPER,
         limits=_build_limits(
-            config, instrument_whitelist, exposure_provable=exposure is not None
+            config,
+            instrument_whitelist,
+            exposure_provable=exposure is not None,
+            notional_provable=notional_today is not None,
         ),
-        account=_account_from_verification(verification, equity_start_of_day, exposure),
+        account=_account_from_verification(
+            verification, equity_start_of_day, exposure, notional_today
+        ),
         market=market_view,
         fees=fees,
         now_epoch_s=now_epoch_s,
@@ -2328,8 +2554,12 @@ def _position_input(
     tick that cannot prove its exposure never reaches this function, because
     :func:`_select_stage` declines first.
 
-    ``notional_today`` stays zero -- see :func:`_account_from_verification` for
-    why no honest UTC-day fold of booked notional exists yet.
+    ``notional_today`` stays zero here. Issue #415 fed the *risk kernel's*
+    daily cap from :func:`read_notional_today_micros`, which is where the
+    binding veto lives; the selector's own SPEC S9.6 daily-notional headroom
+    term reads this input instead, and wiring it needs the tick's instant,
+    which this per-candidate function is not given. Left as a stated gap rather
+    than silently fed a clock read at sizing time.
 
     The balances are read per candidate, at the moment that candidate is sized
     (issue #345), so an earlier candidate's fill has already debited them. Both
@@ -2657,6 +2887,7 @@ def _approve_stage(
         ),
         visible_depth=visible_depth_centis(order_book),
         exposure=exposure,
+        notional_today=read_notional_today_micros(deps.store, now_epoch_s=now_epoch_s),
     )
     filled = 0
     for intent in decision.intents:

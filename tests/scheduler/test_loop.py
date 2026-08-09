@@ -55,6 +55,7 @@ from tests.scheduler.conftest import (
     DEFAULT_NOW_EPOCH_S,
     build_kernel_approval_components,
     proven_flat_exposure,
+    proven_untraded_day,
 )
 from windbreak.numeric.types import MoneyMicros
 from windbreak.riskkernel.modes import Mode
@@ -233,6 +234,7 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
     assert context.limits.floor == MoneyMicros(42_000_000)
@@ -265,6 +267,7 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
     assert context.limits.quote_ttl_seconds == 17
@@ -298,6 +301,7 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
     assert context.verification is None
@@ -335,6 +339,7 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
     assert context.market.exchange_status is None
@@ -363,6 +368,7 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
     assert context.now_epoch_s == 1_234_567
@@ -407,6 +413,7 @@ def test_build_evaluation_context_never_stamps_the_quote_with_its_own_clock(
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
     assert context.market.quote_snapshot_epoch_s == expected
@@ -680,6 +687,7 @@ def _context_with(*, status, status_epoch_s: int | None, heartbeat_epoch_s: int 
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
 
@@ -980,6 +988,7 @@ def _exposure_context(*, equity_start_of_day, visible_depth):
         equity_start_of_day=equity_start_of_day,
         visible_depth=visible_depth,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
 
@@ -1373,6 +1382,7 @@ def _position_context(open_position):
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
 
@@ -1529,6 +1539,7 @@ def _skew_context(exchange_clock_epoch_s):
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
 
@@ -1713,6 +1724,7 @@ def _forecast_context(forecast_epoch_s):
         equity_start_of_day=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
+        notional_today=proven_untraded_day(),
     )
 
 
