@@ -376,6 +376,10 @@ v1 policy: hold to resolution. `SELL_TO_CLOSE` intents are generated only by: th
 
 Every market carries structured driver tags (seed taxonomy: `us-election`, `fed-policy`, `inflation`, `weather`, `geopolitics-<region>`, `ai-regulation`, `company-specific`, `legal-case`); LLM-assisted tagging, human-overridable, stored as data. Selector and Kernel independently enforce per-bucket caps (defense in depth, T10).
 
+A tag's `source` names who proposed it, and the vocabulary is exactly the two this section describes: `llm` and `human`. There is deliberately no venue-derived source. A correlation bucket is a claim about which markets move *together*, which is a risk judgment; an exchange's free-form category string cannot support it, and a derived tag labelled with the venue's name would assert a provenance no component holds. Buckets a component cannot honestly propose are operator-supplied data, per "stored as data" above.
+
+An **unbucketable market fails closed**: a market with no effective buckets, or held alongside a position with none, has unprovable bucket exposure and must not be sized. Sizing it against an empty bucket would let the per-bucket cap report success on evidence nobody has — the caps must be unable to bind only when nothing is at risk, never when nothing is known.
+
 ### 9.10 Acceptance criteria
 
 Pure-function golden tests reproduce byte-identical intents from recorded books; property tests: sizing monotone in edge, zero below threshold, never exceeds any cap or participation limit, never negative-EV-after-fees, never opens outside price bands, dispersion scaling monotone; no live intent for ineligible markets or ineligible forecasts.

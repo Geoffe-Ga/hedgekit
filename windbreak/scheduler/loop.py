@@ -169,6 +169,11 @@ from windbreak.scheduler.eligibility import (
     project_jurisdiction,
     project_product_type,
 )
+from windbreak.scheduler.exposure import (
+    ExposureProjection,
+    HeldMarket,
+    project_exposure,
+)
 from windbreak.scheduler.fill_accounting import (
     LedgerFillAccountingFeed,
     LedgerFillBookkeeper,
@@ -193,6 +198,7 @@ from windbreak.selector.types import (
     FeeModelInput,
     PositionReadModelInput,
     RiskConfigInput,
+    SelectorDecision,
     SelectorInputs,
     SlippageModelInput,
 )
@@ -220,7 +226,6 @@ if TYPE_CHECKING:
     from windbreak.riskkernel.verification import VerificationSnapshot
     from windbreak.scheduler.provider_wiring import LiveProviderHttp
     from windbreak.scheduler.screening import MarketCandidate
-    from windbreak.selector.types import SelectorDecision
     from windbreak.tokens.verify import SignedApprovalToken
 
 #: The component label stamped on every scheduler-authored ledger event.
@@ -234,10 +239,6 @@ _HALT_KIND_PER_DAY = "per_day"
 
 #: ``halt_kind`` stamped on a halt caused by one forecast breaching its ceiling.
 _HALT_KIND_PER_FORECAST = "per_forecast"
-
-#: A full parts-per-million share (100%), used for the total-position ceiling the
-#: SPEC S16 ``RiskConfig`` has no dedicated field for.
-_FULL_PPM = 1_000_000
 
 #: Default max admissible forecast age, in seconds, for the risk limits mapped
 #: from config (``RiskConfig`` carries a quote ttl but no forecast ttl).
@@ -868,7 +869,10 @@ def _human_ack_micros(config: WindbreakConfig) -> MoneyMicros | None:
 
 
 def _build_limits(
-    config: WindbreakConfig, instrument_whitelist: frozenset[str]
+    config: WindbreakConfig,
+    instrument_whitelist: frozenset[str],
+    *,
+    exposure_provable: bool,
 ) -> RiskLimits:
     """Map a configuration into the risk limits the pre-trade checks read.
 
@@ -876,14 +880,44 @@ def _build_limits(
     ``RiskLimits`` fields the schema has no dedicated field for take conservative
     named defaults (see the module constants).
 
+    ``exposure_provable=False`` is the fail-closed reading for issue #407. When
+    the tick could not establish what the account holds, the four concentration
+    caps are set to ``0`` ppm rather than their configured shares. That is the
+    only place the "unprovable" fact *can* be said: ``AccountState``'s exposure
+    terms are :class:`~windbreak.numeric.MoneyMicros` with no ``None``, so an
+    unprovable exposure would have to be carried as zero -- and zero is
+    permissive, the exact defect this issue exists to remove. Saying it in the
+    limits instead states a real, meaningful policy ("no exposure share is
+    permitted right now") rather than inventing an exposure figure the account
+    does not have, and ``concentration_limits`` then vetoes any positive cost.
+
+    It is deliberately *conditional*. A cap that vetoed unconditionally would
+    not be failing closed, it would be broken; these caps veto only while the
+    evidence is missing, and pass on a legitimate position once it is not.
+
     Args:
         config: The configuration to map.
         instrument_whitelist: The tradable-ticker set for this tick.
+        exposure_provable: Whether this tick established the account's exposure.
+            ``False`` zeroes the four concentration caps, as above.
 
     Returns:
         The assembled :class:`~windbreak.riskkernel.context.RiskLimits`.
     """
     risk = config.risk
+    no_share_permitted = 0
+    market_pct_ppm = (
+        risk.max_pos_market_pct_ppm if exposure_provable else no_share_permitted
+    )
+    event_pct_ppm = (
+        risk.max_pos_event_pct_ppm if exposure_provable else no_share_permitted
+    )
+    bucket_pct_ppm = (
+        risk.max_pos_bucket_pct_ppm if exposure_provable else no_share_permitted
+    )
+    total_pct_ppm = (
+        risk.max_pos_total_pct_ppm if exposure_provable else no_share_permitted
+    )
     return RiskLimits(
         floor=MoneyMicros(config.capital.floor_micros),
         instrument_whitelist=instrument_whitelist,
@@ -891,10 +925,10 @@ def _build_limits(
         min_open_price=PricePips(risk.min_open_price_pips),
         max_open_price=PricePips(risk.max_open_price_pips),
         max_participation_ppm=risk.max_participation_ppm,
-        max_pos_market_pct_ppm=risk.max_pos_market_pct_ppm,
-        max_pos_event_pct_ppm=risk.max_pos_event_pct_ppm,
-        max_pos_bucket_pct_ppm=risk.max_pos_bucket_pct_ppm,
-        max_pos_total_pct_ppm=_FULL_PPM,
+        max_pos_market_pct_ppm=market_pct_ppm,
+        max_pos_event_pct_ppm=event_pct_ppm,
+        max_pos_bucket_pct_ppm=bucket_pct_ppm,
+        max_pos_total_pct_ppm=total_pct_ppm,
         daily_loss_limit_pct_ppm=risk.daily_loss_limit_pct_ppm,
         max_drawdown_pct_ppm=risk.max_drawdown_pct_ppm,
         max_orders_per_hour=risk.max_orders_per_hour,
@@ -913,6 +947,7 @@ def _build_limits(
 def _account_from_verification(
     verification: VerificationSnapshot | None,
     equity_start_of_day: MoneyMicros | None,
+    exposure: ExposureProjection | None,
 ) -> AccountState:
     """Return the account snapshot the tick's ledgered evidence supports.
 
@@ -938,17 +973,40 @@ def _account_from_verification(
     already reaches, so the check keeps vetoing exactly as it did before any
     baseline existed.
 
-    Every other term stays zero: they are the ones the ledger cannot yet
-    justify (high-water mark, exposures, velocity), and a fabricated figure
-    there would loosen a limit rather than tighten it. With
-    ``verification=None`` and no baseline the whole account is zero, exactly as
-    before, so the fail-closed path is unchanged.
+    The four exposure terms come from ``exposure`` (issue #407). They were
+    hardcoded to zero, and zero is *permissive* for ``concentration_limits``:
+    ``0 + cost > share`` is false for any sane cost, so that check could not
+    veto for one market or for many, however much the account already held.
+    :func:`windbreak.scheduler.exposure.project_exposure` now derives all four
+    from the venue's own reported holdings, priced by
+    :func:`_position_value_micros`.
+
+    ``exposure=None`` means the tick could not establish what the account
+    holds, and the terms fall back to zero *only* because
+    :func:`_build_limits` has simultaneously set the four concentration caps to
+    ``0`` ppm, which makes ``concentration_limits`` veto any positive cost.
+    ``AccountState`` has no ``None`` to carry "unprovable" with, so the fact is
+    stated in the limits instead of fabricated into an exposure figure; the two
+    halves are set together by :func:`build_evaluation_context` and neither is
+    correct alone.
+
+    ``notional_today`` stays zero, and ``velocity_limits``' daily-notional cap
+    therefore stays unable to bind. That is not an oversight: a UTC-day-bounded
+    fold needs each booked fill's instant, and
+    :class:`~windbreak.ledger.events.FillAccounted` carries no timestamp --
+    nor does the :class:`~windbreak.ledger.events.Event` base. There is no
+    honest time source to fold on yet, unlike ``equity_start_of_day``, whose
+    ``EquitySampled`` rows carry their own ``epoch_s``. The high-water mark is
+    unjustified for the same kind of reason.
 
     Args:
         verification: The tick's verification snapshot, or ``None`` when no
             cycle has produced one (the fail-closed reading).
         equity_start_of_day: The current UTC day's first ledgered equity
             sample, or ``None`` when the day has none yet (also fail-closed).
+        exposure: The tick's projected exposure, or ``None`` when it could not
+            be established -- in which case the caller must also have zeroed
+            the concentration caps, as above.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.AccountState`.
@@ -970,10 +1028,10 @@ def _account_from_verification(
         equity_start_of_day=baseline,
         equity_high_water_mark=zero,
         realized_loss_today=zero,
-        market_exposure=zero,
-        event_exposure=zero,
-        bucket_exposure=zero,
-        total_exposure=zero,
+        market_exposure=exposure.market_exposure if exposure is not None else zero,
+        event_exposure=exposure.event_exposure if exposure is not None else zero,
+        bucket_exposure=exposure.bucket_exposure if exposure is not None else zero,
+        total_exposure=exposure.total_exposure if exposure is not None else zero,
         orders_last_hour=0,
         notional_today=zero,
     )
@@ -995,6 +1053,7 @@ def build_evaluation_context(
     open_position: ContractCentis | None,
     equity_start_of_day: MoneyMicros | None,
     visible_depth: ContractCentis | None,
+    exposure: ExposureProjection | None,
 ) -> EvaluationContext:
     """Compose the evaluation context a PAPER-mode approval reads.
 
@@ -1115,6 +1174,15 @@ def build_evaluation_context(
             when no book could be read -- which fails closed (issue #364). A
             genuinely empty book is ``0``, not ``None``: an observed absence of
             liquidity is evidence, and it admits no order at all.
+        exposure: The tick's projected exposure from
+            :func:`windbreak.scheduler.exposure.project_exposure`, or ``None``
+            when it could not be established (issue #407). This one argument
+            sets *both* halves of the concentration caps: the four
+            ``AccountState`` exposure terms and, when ``None``, the four
+            ``RiskLimits`` caps zeroed to make them veto. They are set together
+            here precisely because neither is the fail-closed answer alone -- a
+            zeroed exposure under a configured cap is the permissive reading
+            this issue removes.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
@@ -1141,8 +1209,10 @@ def build_evaluation_context(
     fees = FeeBounds(max_trading_fee=MoneyMicros(0), max_settlement_fee=MoneyMicros(0))
     return EvaluationContext(
         mode=Mode.PAPER,
-        limits=_build_limits(config, instrument_whitelist),
-        account=_account_from_verification(verification, equity_start_of_day),
+        limits=_build_limits(
+            config, instrument_whitelist, exposure_provable=exposure is not None
+        ),
+        account=_account_from_verification(verification, equity_start_of_day, exposure),
         market=market_view,
         fees=fees,
         now_epoch_s=now_epoch_s,
@@ -2152,19 +2222,125 @@ def _ledger_provider_votes(
         )
 
 
-def _position_input(deps: PaperTickDeps, ticker: str) -> PositionReadModelInput:
-    """Build the selector's capital/exposure input from the paper balances.
+def _held_markets(deps: PaperTickDeps) -> tuple[HeldMarket, ...] | None:
+    """Read and price what the account holds, or refuse (issue #407).
+
+    One venue read for the positions, then one per held ticker for its parent
+    event -- ``event_ticker`` is a factual venue field, so asking the venue for
+    it claims nothing the venue did not say. Each holding is priced by
+    :func:`_position_value_micros`, the same fold
+    :func:`_equity_and_positions_stage` uses, so exposure and equity can never
+    disagree about what a position is worth.
+
+    Two refusals, both returning ``None`` rather than an empty tuple:
+
+    * :class:`~windbreak.connector.paper.TwoSidedPositionError` -- the venue
+      declined to describe a ticker filled on both sides, because the only
+      single-row answer is a netted one and a netted YES-plus-NO reports flat
+      while both legs and their collateral are live (issue #361).
+    * :class:`~windbreak.connector.paper.UnknownMarketError` -- a held ticker
+      the venue will not describe, so its event and value cannot be attributed.
+
+    An empty tuple is *not* a refusal: the venue answered and reported no rows,
+    which its contract defines as genuinely flat.
 
     Read per candidate, at the moment that candidate is sized, rather than once
-    per tick (issue #345). That is what makes a tick's markets see each other:
-    the balances an earlier candidate's fill already debited are the balances
-    the next candidate sizes against, so a universe cannot deploy the same
-    dollar twice. A once-per-tick read would have handed every market an
-    identical, pre-tick account.
+    per tick -- the same discipline issue #345 established for the balance read,
+    and for the same reason. It is what makes a tick's markets see each other in
+    *exposure* as well as in capital: an earlier candidate's fill is a position
+    the venue reports by the time the next candidate is sized, so the second
+    market's bucket exposure already includes the first. A once-per-tick read
+    would have handed every market an identical, pre-tick account.
+
+    Args:
+        deps: The tick's dependency bundle.
+
+    Returns:
+        The priced holdings, or ``None`` when the venue could not describe them.
+    """
+    try:
+        positions = deps.exchange.get_positions()
+    except TwoSidedPositionError:
+        return None
+    held: list[HeldMarket] = []
+    for position in positions:
+        try:
+            market = deps.exchange.get_market(position.ticker)
+        except UnknownMarketError:
+            return None
+        held.append(
+            HeldMarket(
+                ticker=position.ticker,
+                event_ticker=market.event_ticker,
+                value_micros=MoneyMicros(_position_value_micros(position)),
+            )
+        )
+    return tuple(held)
+
+
+def read_candidate_exposure(
+    deps: PaperTickDeps, candidate: MarketCandidate
+) -> ExposureProjection | None:
+    """Project one candidate's exposure from the venue's holdings, or refuse.
+
+    The single entry point both the selector's notional caps and the kernel's
+    ``concentration_limits`` read (issue #407), so the two enforce SPEC S9.9's
+    "defense in depth" over the *same* evidence rather than over two
+    independent guesses.
+
+    Per candidate, not per tick. This is what closes issue #345's open
+    acceptance criterion: two markets in one tick sharing a correlation bucket
+    now bind on each other, because the first market's fill is a holding the
+    venue reports before the second is sized. The candidate's event ticker
+    comes straight off its already-screened
+    :class:`~windbreak.connector.models.NormalizedMarket`, so no second venue
+    read can disagree with the one the screen judged.
+
+    Args:
+        deps: The tick's dependency bundle.
+        candidate: The screened market being sized.
+
+    Returns:
+        The projection, or ``None`` when the venue could not describe the
+        account's holdings, or when the operator has declared no correlation
+        bucket for the candidate or for something held.
+    """
+    held = _held_markets(deps)
+    if held is None:
+        return None
+    return project_exposure(
+        held,
+        target_ticker=candidate.ticker,
+        target_event_ticker=candidate.market.event_ticker,
+        correlation=deps.config.correlation,
+    )
+
+
+def _position_input(
+    deps: PaperTickDeps, ticker: str, exposure: ExposureProjection
+) -> PositionReadModelInput:
+    """Build the selector's capital/exposure input from the paper balances.
+
+    The four exposure terms were hardcoded to zero, which left all five of the
+    selector's SPEC S9.6 notional caps computing headroom against an account
+    that looked untouched (issue #407). They now come from ``exposure``, which
+    is required rather than optional precisely so no zeroed path survives: a
+    tick that cannot prove its exposure never reaches this function, because
+    :func:`_select_stage` declines first.
+
+    ``notional_today`` stays zero -- see :func:`_account_from_verification` for
+    why no honest UTC-day fold of booked notional exists yet.
+
+    The balances are read per candidate, at the moment that candidate is sized
+    (issue #345), so an earlier candidate's fill has already debited them. Both
+    cross-market bounds now come from the same instant: capital from these
+    balances, exposure from ``exposure``'s holdings.
 
     Args:
         deps: The tick's dependency bundle.
         ticker: The candidate market being sized, which stamps the snapshot id.
+        exposure: The candidate's projected exposure from
+            :func:`read_candidate_exposure`.
 
     Returns:
         The :class:`~windbreak.selector.types.PositionReadModelInput` the sizing
@@ -2173,17 +2349,51 @@ def _position_input(deps: PaperTickDeps, ticker: str) -> PositionReadModelInput:
     available = deps.exchange.get_balances().available
     floor = MoneyMicros(deps.config.capital.floor_micros)
     above_floor = MoneyMicros(max(available.value - floor.value, 0))
-    zero = MoneyMicros(0)
     return PositionReadModelInput(
         snapshot_id=f"{ticker}-positions",
         equity_micros=available,
         above_floor_capital_micros=above_floor,
         total_deploy_cap_micros=above_floor,
-        market_exposure=zero,
-        event_exposure=zero,
-        bucket_exposure=zero,
-        total_exposure=zero,
-        notional_today=zero,
+        market_exposure=exposure.market_exposure,
+        event_exposure=exposure.event_exposure,
+        bucket_exposure=exposure.bucket_exposure,
+        total_exposure=exposure.total_exposure,
+        notional_today=MoneyMicros(0),
+    )
+
+
+def _unbucketable_decision(
+    candidate: MarketCandidate, forecast: ForecastRecord
+) -> SelectorDecision:
+    """Return the decline for a market whose exposure could not be proven.
+
+    A refusal, not a zero. Before issue #407 this candidate would have sized
+    against ``correlation_tags=()`` and four zeroed exposure terms, so the
+    per-bucket cap aggregated an empty peer set and passed -- a cap reporting
+    success on evidence nobody held. Declining with a stated reason honors
+    :class:`~windbreak.selector.types.SelectorDecision`'s contract that a
+    verdict emitting no intents must still say why.
+
+    Declining one candidate does not stop the walk: a sibling the operator
+    *has* bucketed still sizes. The refusal is as narrow as the missing
+    evidence.
+
+    Args:
+        candidate: The screened market that could not be bucketed.
+        forecast: The forecast that would have been sized.
+
+    Returns:
+        A no-intent :class:`~windbreak.selector.types.SelectorDecision`.
+    """
+    return SelectorDecision(
+        intents=(),
+        reasons=(
+            f"unprovable_exposure: no correlation bucket or holding evidence "
+            f"for {candidate.ticker}",
+        ),
+        forecast_id=forecast.forecast_id,
+        market_ticker=candidate.ticker,
+        calibration_map_version=_CALIBRATION_MAP_VERSION,
     )
 
 
@@ -2192,20 +2402,25 @@ def _select_stage(
     candidate: MarketCandidate,
     forecast: ForecastRecord,
     created_at: datetime,
+    exposure: ExposureProjection | None,
 ) -> SelectorDecision:
     """Run the selector over one candidate's inputs and ledger the decision event.
 
-    ``correlation_tags`` stays empty, and deliberately so: nothing in the
-    codebase derives a
-    :class:`~windbreak.selector.correlation.CorrelationTag` from a
-    :class:`~windbreak.connector.models.NormalizedMarket`, and the tag's
-    ``source`` field admits only ``"llm"`` or ``"human"`` -- neither of which a
-    composition-root derivation honestly is. Inventing a provenance to make the
-    bucket cap appear to bind would be worse than the empty tuple, which at
-    least does not claim the market was ever bucketed. Issue #407 tracks
-    supplying real tags and exposures; until it lands, the one cross-market
-    bound genuinely in force is capital, via :func:`_position_input`'s
-    per-candidate balance read.
+    ``correlation_tags`` and ``bucket_peers`` were ``()`` and defaulted, so
+    ``effective_buckets(()) == ()`` and ``aggregate_bucket_exposure`` returned
+    ``(0, None)`` -- the per-bucket cap could not bind however many markets a
+    tick screened (issue #407). Both now come from ``exposure``, whose tags are
+    the operator's own declaration rather than a derivation.
+
+    That resolves what issue #345 left open here. The previous note in this
+    docstring was right to refuse to invent a ``source``: the tag's field
+    admits only ``"llm"`` or ``"human"``, and a composition-root derivation is
+    honestly neither. The answer was not a third source value but a different
+    producer -- an operator declaring buckets in configuration *is* the human,
+    so no provenance is invented and SPEC S9.9's "human-overridable, stored as
+    data" is satisfied literally. Capital is no longer the only cross-market
+    bound in force: exposure now binds alongside it, on the same per-candidate
+    read.
 
     Args:
         deps: The tick's dependency bundle.
@@ -2213,10 +2428,25 @@ def _select_stage(
             was screened on.
         forecast: The forecast under evaluation.
         created_at: The fee schedule's freshness stamp for this tick.
+        exposure: The candidate's projected exposure from
+            :func:`read_candidate_exposure`, or ``None`` when it could not be
+            established -- which declines this candidate, not the whole tick.
 
     Returns:
         The selector's decision.
     """
+    if exposure is None:
+        decision = _unbucketable_decision(candidate, forecast)
+        deps.store.append(
+            SelectorDecisionRecorded(
+                component=_COMPONENT,
+                forecast_id=decision.forecast_id,
+                market_ticker=decision.market_ticker,
+                intent_count=len(decision.intents),
+                reasons=list(decision.reasons),
+            )
+        )
+        return decision
     inputs = SelectorInputs(
         forecast=forecast,
         calibration_map_version=_CALIBRATION_MAP_VERSION,
@@ -2227,11 +2457,12 @@ def _select_stage(
         slippage_model=SlippageModelInput(
             model_id=_SLIPPAGE_MODEL_ID, per_contract_buffer_ppm=0
         ),
-        positions=_position_input(deps, candidate.ticker),
+        positions=_position_input(deps, candidate.ticker, exposure),
         risk_config=RiskConfigInput(
             config=deps.config.risk, config_hash=config_hash(deps.config)
         ),
-        correlation_tags=(),
+        correlation_tags=exposure.target_tags,
+        bucket_peers=exposure.bucket_peers,
     )
     decision = select(inputs)
     deps.store.append(
@@ -2287,6 +2518,7 @@ def _approve_stage(
     decision: SelectorDecision,
     heartbeat_epoch_s: int,
     forecast: ForecastRecord,
+    exposure: ExposureProjection | None,
 ) -> int:
     """Approve each emitted intent through the seam; route any minted token.
 
@@ -2424,6 +2656,7 @@ def _approve_stage(
             deps.store, now_epoch_s=now_epoch_s
         ),
         visible_depth=visible_depth_centis(order_book),
+        exposure=exposure,
     )
     filled = 0
     for intent in decision.intents:
@@ -2694,8 +2927,11 @@ def _run_candidate(
     forecast = _forecast_stage(deps, candidate, created_at)
     if forecast is None:
         return None
-    decision = _select_stage(deps, candidate, forecast, created_at)
-    filled = _approve_stage(deps, candidate, decision, heartbeat_epoch_s, forecast)
+    exposure = read_candidate_exposure(deps, candidate)
+    decision = _select_stage(deps, candidate, forecast, created_at, exposure)
+    filled = _approve_stage(
+        deps, candidate, decision, heartbeat_epoch_s, forecast, exposure
+    )
     return forecast.forecast_id, len(decision.intents), filled
 
 

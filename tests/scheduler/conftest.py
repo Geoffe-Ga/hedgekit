@@ -20,11 +20,14 @@ test that might be added later.
 
 from __future__ import annotations
 
+from windbreak.config.schema import CorrelationConfig, CorrelationTagConfig
 from windbreak.riskkernel.modes import Mode, ModeStateMachine
 from windbreak.riskkernel.process import InMemoryKernelLedgerWriter, RiskKernel
 from windbreak.riskkernel.reservations import ApprovalPipeline, ReservationLedger
 from windbreak.riskkernel.signing import SigningKeyHandle
 from windbreak.riskkernel.tokens import TokenIssuer
+from windbreak.scheduler.exposure import ExposureProjection, project_exposure
+from windbreak.selector.correlation import BUCKET_WEATHER
 
 #: A fixed 32-byte HMAC key shared by every mint/verify pair in this package's
 #: tests -- mirrors `tests/order_gateway/conftest.py::KEY_MATERIAL`. SPEC S10.6
@@ -42,6 +45,77 @@ DEFAULT_NOW_EPOCH_S = 1_700_000_000
 
 #: A fixed, content-stable config-revision hash stamped on every issued token.
 TEST_CONFIG_HASH = "scheduler-test-config-hash"
+
+
+def weather_bucket_correlation(*tickers: str) -> CorrelationConfig:
+    """Declare every named ticker into the weather correlation bucket.
+
+    The operator-supplied declaration issue #407 made load-bearing: a market
+    absent from this config is unbucketable, so the loop declines to size it
+    rather than sizing it against an empty bucket. Tests that need exposure to
+    actually aggregate must declare every ticker they hold *and* the one they
+    are sizing.
+
+    The bucket choice is arbitrary and the instant is fixed rather than read
+    from a clock -- `CorrelationTag.tagged_at` is provenance, never arithmetic,
+    so a wall-clock read would make the tag unpinnable for no gain.
+
+    Args:
+        tickers: The markets to declare into one shared bucket.
+
+    Returns:
+        The assembled `CorrelationConfig`.
+    """
+    return CorrelationConfig(
+        tags=tuple(
+            CorrelationTagConfig(
+                ticker=ticker,
+                bucket_ids=(BUCKET_WEATHER,),
+                tagged_at="2026-03-01T00:00:00+00:00",
+            )
+            for ticker in tickers
+        )
+    )
+
+
+def proven_flat_exposure(ticker: str = "TEST-TICKER") -> ExposureProjection:
+    """Project a genuinely flat account's exposure, the way production does.
+
+    This exists because `exposure=None` and a *proven* flat projection are two
+    different facts and `build_evaluation_context` treats them differently.
+    `None` means exposure could not be established at all, which zeroes the four
+    concentration caps so they veto; this helper means the venue answered, the
+    account holds nothing, and all four exposure terms are provably zero --
+    exactly what the pre-existing tests below assumed implicitly back when the
+    four terms were hardcoded to zero. The projection is produced by calling
+    `project_exposure` on an empty holdings tuple rather than by hand-building
+    the dataclass, so the zeros the tests rely on come from the real production
+    path and stay honest if that path ever changes.
+
+    Args:
+        ticker: The market being sized, declared into the weather bucket so
+            `project_exposure` can bucket it rather than fail closed.
+
+    Returns:
+        The flat `ExposureProjection` for `ticker`.
+    """
+    correlation = CorrelationConfig(
+        tags=(
+            CorrelationTagConfig(
+                ticker=ticker,
+                bucket_ids=(BUCKET_WEATHER,),
+                tagged_at="2026-03-01T00:00:00+00:00",
+            ),
+        )
+    )
+    projection = project_exposure(
+        (),
+        target_ticker=ticker,
+        target_event_ticker=f"{ticker}-EVENT",
+        correlation=correlation,
+    )
+    assert projection is not None
+    return projection
 
 
 def build_kernel_approval_components(
