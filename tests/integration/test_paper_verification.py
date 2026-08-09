@@ -37,6 +37,12 @@ remainder from being misread as a fill:
    itself ledgered, and the visible depth from the book the tick itself
    snapshotted, with `None` (and therefore a veto) before the UTC day has a
    sample at all.
+6. `test_a_slow_forecast_stage_ages_its_own_forecast_out_of_the_approval`
+   (issue #380, RED -- today `build_evaluation_context` takes no forecast
+   epoch and stamps `MarketView.forecast_epoch_s` with its own `now_epoch_s`)
+   -- the approval must carry the forecast's own `created_at`, so a forecast
+   that took longer than its ttl to produce vetoes on `forecast_freshness`
+   instead of reading as zero seconds old.
 """
 
 from __future__ import annotations
@@ -142,6 +148,12 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
     instant is zero seconds old by construction and `quote_freshness` could
     never veto.
 
+    `forecast_epoch_s` is `DEFAULT_NOW_EPOCH_S` for the same reason and by the
+    same rule (issue #380): the tick under test ran on `_fixed_clock`, so the
+    forecast it produced carries exactly that `created_at`. It deliberately
+    does *not* track `now_epoch_s` -- a stamp that moved with the evaluation
+    instant would be the substitution this pin exists to forbid.
+
     Args:
         deps: The wired `PaperTickDeps` whose ledger, exchange, and kernel the
             context is composed from.
@@ -174,6 +186,7 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
         pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
         exchange_clock_epoch_s=int(deps.exchange.get_exchange_time().timestamp()),
+        forecast_epoch_s=DEFAULT_NOW_EPOCH_S,
         open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
         equity_start_of_day=start_of_day_equity_micros(
             deps.store.read_all(), now_epoch_s=now_epoch_s
@@ -600,3 +613,119 @@ def test_loop_production_context_carries_the_venues_own_open_position(
 
     assert deps.exchange.get_positions() == ()
     assert context.market.open_position == ContractCentis(0)
+
+
+#: The loop's `_DEFAULT_FORECAST_TTL_SECONDS`, pinned as a literal rather than
+#: read back off the composed limits: a test deriving its own boundary from the
+#: value under test would pass against any ttl, including a widened one.
+_FORECAST_TTL_SECONDS = 3_600
+
+
+def _forecast_freshness_check():
+    """Return the real SPEC S10.3 `forecast_freshness` check.
+
+    Returns:
+        The production check callable, taken from `DEFAULT_CHECKS` rather than
+        reconstructed, so the assertion runs the very check the kernel runs.
+    """
+    from windbreak.riskkernel.checks import DEFAULT_CHECKS
+
+    return next(check for check in DEFAULT_CHECKS if check.name == "forecast_freshness")
+
+
+def test_a_slow_forecast_stage_ages_its_own_forecast_out_of_the_approval(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """`_approve_stage` stamps the forecast's `created_at`, not its own clock.
+
+    The forecast stage is wrapped -- the *real* one still runs and still
+    produces the real record -- so that the injected clock advances past
+    `_DEFAULT_FORECAST_TTL_SECONDS` while it works. That is precisely the
+    aging `_approve_stage`'s deliberate second clock read exists to expose:
+    "a slow forecast stage can legitimately age the heartbeat out rather than
+    being masked by a reading taken before it ran."
+
+    While `MarketView.forecast_epoch_s` was fed that second reading, the
+    forecast was zero seconds old however long the stage had taken, so this
+    veto was unreachable for any forecast at any age (issue #380). The
+    composed context is captured at the `build_evaluation_context` seam rather
+    than through the approval seam, so the proof does not depend on the
+    selector happening to emit an intent this tick.
+
+    Args:
+        books_dir: The shared books-fixture directory.
+        cassette_path: The empty recorded-cassette path.
+        report_dir: Where weekly-report stubs would be written.
+        paper_config: The PAPER-ceilinged configuration.
+        research_tools_factory: Builds the offline research tools double.
+        tmp_path: The pytest scratch directory.
+        monkeypatch: Wraps the two `windbreak.scheduler.loop` module globals.
+    """
+    from windbreak.scheduler import loop as loop_module
+    from windbreak.scheduler.loop import _forecast_stage as real_forecast_stage
+    from windbreak.scheduler.loop import (
+        build_evaluation_context as real_build_context,
+    )
+    from windbreak.scheduler.loop import build_paper_deps, run_single_tick
+
+    epoch = [DEFAULT_NOW_EPOCH_S]
+    deps = build_paper_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools=research_tools_factory(),
+        clock=lambda: epoch[0],
+    )
+    forecasts = []
+    contexts = []
+
+    def _slow_forecast_stage(*args, **kwargs):
+        """Run the real forecast stage, then advance the clock past the ttl.
+
+        Args:
+            *args: Forwarded verbatim to the real stage.
+            **kwargs: Forwarded verbatim to the real stage.
+
+        Returns:
+            The real stage's own `ForecastRecord`.
+        """
+        forecast = real_forecast_stage(*args, **kwargs)
+        epoch[0] = DEFAULT_NOW_EPOCH_S + _FORECAST_TTL_SECONDS + 1
+        forecasts.append(forecast)
+        return forecast
+
+    def _recording_build_context(*args, **kwargs):
+        """Compose the real context and keep it for inspection.
+
+        Args:
+            *args: Forwarded verbatim to the real builder.
+            **kwargs: Forwarded verbatim to the real builder.
+
+        Returns:
+            The real builder's own `EvaluationContext`.
+        """
+        context = real_build_context(*args, **kwargs)
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(loop_module, "_forecast_stage", _slow_forecast_stage)
+    monkeypatch.setattr(
+        loop_module, "build_evaluation_context", _recording_build_context
+    )
+    run_single_tick(deps, beat=1)
+
+    assert len(forecasts) == 1
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context.market.forecast_epoch_s == int(forecasts[0].created_at.timestamp())
+    assert context.market.forecast_epoch_s == DEFAULT_NOW_EPOCH_S
+    assert context.now_epoch_s == DEFAULT_NOW_EPOCH_S + _FORECAST_TTL_SECONDS + 1
+    assert _forecast_freshness_check()(make_intent(), context).vetoed is True
