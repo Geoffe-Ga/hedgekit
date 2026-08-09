@@ -375,6 +375,140 @@ class ResearchSettings:
     allowed_content_types: tuple[str, ...] = ("text/html",)
 
 
+#: Transport-selection token naming the recorded offline replay cassette. The
+#: default (issue #344): CI builds ``WindbreakConfig()``, so an omitted section
+#: must never be the one that acquires a live network dependency.
+PROVIDER_TRANSPORT_CASSETTE = "cassette"
+
+#: Transport-selection token naming the live pinned-LLM / research transports.
+#: Opt-in only, and inert on its own -- the composition root additionally
+#: requires the live HTTP seam to be supplied, and refuses to start when this
+#: mode is selected without one (see
+#: :func:`windbreak.scheduler.loop.build_paper_deps`).
+PROVIDER_TRANSPORT_LIVE = "live"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRetryConfig:
+    """The config-schema mirror of the provider retry policy (issue #269).
+
+    Backs :class:`windbreak.forecast.providers.retry.RetryPolicy`, whose four
+    guards bound a hosted provider call: an attempt count, a total wall-clock
+    deadline, an exponential-backoff base, and an affordability ceiling. Every
+    leaf is a whole integer (milliseconds, micros) -- SPEC S6.1 admits no float
+    on this path, and the retry schedule is integer-millisecond by construction
+    so it stays deterministic and test-reproducible.
+
+    The first three defaults deliberately equal the engine's own
+    ``DEFAULT_MAX_ATTEMPTS`` / ``DEFAULT_TOTAL_DEADLINE_MS`` /
+    ``DEFAULT_BACKOFF_BASE_MS``; this module is deliberately dependency-free
+    (it imports nothing from ``windbreak``), so the equality is written out here
+    and pinned by test rather than imported -- the same mirror idiom
+    :func:`_default_vote_ensemble` and :class:`ProviderGateConfig` use.
+
+    Attributes:
+        max_attempts: The maximum provider attempts (one initial call plus
+            retries).
+        total_deadline_ms: The total wall-clock deadline across all attempts,
+            in whole milliseconds.
+        backoff_base_ms: The exponential-backoff base wait, in whole
+            milliseconds; attempt ``n`` waits ``backoff_base_ms << (n - 1)``
+            unless the provider supplies an explicit ``Retry-After`` hint.
+        max_cost_micros: The affordability ceiling across all attempts of a
+            single vote, in micros. Checked *before* every attempt, so an
+            unaffordable retry never reaches the provider.
+    """
+
+    max_attempts: int = 3
+    total_deadline_ms: int = 30_000
+    backoff_base_ms: int = 1_000
+    max_cost_micros: int = 1_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderPrice:
+    """One provider's per-attempt list price, in micros (issue #269).
+
+    A structural pair backing one entry of
+    :attr:`windbreak.forecast.budget.ProviderPriceTable.prices_micros`. Modeled
+    as a tuple of records rather than a mapping because every config leaf must
+    flatten deterministically into the hash-chained ledger.
+
+    Attributes:
+        provider: The provider identifier priced (e.g. ``openai``).
+        price_micros: That provider's per-attempt list price, in micros.
+    """
+
+    provider: str
+    price_micros: int
+
+
+def _default_provider_prices() -> tuple[ProviderPrice, ...]:
+    """Return the default per-attempt price table (issue #269).
+
+    Mirror-equal to the forecast engine's own ``DEFAULT_PROVIDER_PRICE_TABLE``
+    -- pinned by test -- so a config omitting the section and the engine's
+    built-in table price every provider identically. The network-free fixture
+    provider is deliberately absent: its true cost is zero and rides on
+    ``ProviderForecast.cost_micros`` directly, never through this fail-closed
+    (never-zero) list-price table.
+
+    Returns:
+        The default per-provider list prices.
+    """
+    return (
+        ProviderPrice("openai", 200_000),
+        ProviderPrice("anthropic", 300_000),
+        ProviderPrice("futuresearch", 500_000),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderTransportConfig:
+    """Which forecast provider transport the composition root wires (issue #344).
+
+    The PAPER loop's forecast vote stage runs against either the recorded
+    offline replay cassette or the live pinned-LLM / research transports.
+    :attr:`mode` chooses, and it defaults to
+    :data:`PROVIDER_TRANSPORT_CASSETTE` so that CI -- which builds
+    ``WindbreakConfig()`` -- stays offline and byte-deterministic by omission.
+    Going live is an explicit written act, never a default.
+
+    The two ``*_api_key_env`` leaves name *environment variables*, never keys.
+    Every config leaf is flattened verbatim into the hash-chained ledger via
+    ``diff_configs`` -> ``ConfigLoaded``, so a secret placed in configuration is
+    a secret in the audit trail permanently; this follows
+    :attr:`FutureSearchProviderSettings.api_key_env` and
+    :attr:`ResearchSettings.search_api_key_env`. Reading the named variable is
+    the CLI composition root's job -- neither this module nor the forecast
+    engine ever touches the process environment.
+
+    Attributes:
+        mode: :data:`PROVIDER_TRANSPORT_CASSETTE` (the default) or
+            :data:`PROVIDER_TRANSPORT_LIVE`.
+        request_timeout_seconds: The per-request dial timeout, in whole seconds.
+        anthropic_api_key_env: The environment variable the Anthropic key is
+            read from -- the variable's *name*, never the key.
+        openai_api_key_env: The environment variable the OpenAI key is read
+            from -- the variable's *name*, never the key.
+        retry: The bounded-retry policy each provider vote runs under.
+        prices: The per-provider per-attempt list prices, in micros.
+        unknown_provider_price_micros: The fallback price charged for a provider
+            absent from :attr:`prices`. Deliberately high, never zero, so an
+            unpriced provider cannot evade its budget.
+    """
+
+    mode: str = PROVIDER_TRANSPORT_CASSETTE
+    request_timeout_seconds: int = 30
+    anthropic_api_key_env: str = "ANTHROPIC_API_KEY"
+    openai_api_key_env: str = "OPENAI_API_KEY"
+    retry: ProviderRetryConfig = field(default_factory=ProviderRetryConfig)
+    prices: tuple[ProviderPrice, ...] = field(
+        default_factory=_default_provider_prices
+    )
+    unknown_provider_price_micros: int = 1_000_000
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderGateConfig:
     """Per-provider live-eligibility promotion thresholds (issue #194, SPEC S13/S16).
@@ -427,6 +561,9 @@ class ForecastConfig:
     )
     research: ResearchSettings = field(default_factory=ResearchSettings)
     provider_gate: ProviderGateConfig = field(default_factory=ProviderGateConfig)
+    provider_transport: ProviderTransportConfig = field(
+        default_factory=ProviderTransportConfig
+    )
 
 
 @dataclass(frozen=True, slots=True)
