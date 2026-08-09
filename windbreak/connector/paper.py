@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "COMPLEMENT_PIPS",
     "PAPER_FILL_MODEL_VERSION",
     "PaperExchange",
     "PaperOrderIntent",
@@ -115,7 +116,12 @@ __all__ = [
 _DEFAULT_FEE_KEY: Final[str] = "default"
 
 #: Pips in a full ``$1`` payout: a NO price is the complement ``10_000 - yes``.
-_COMPLEMENT_PIPS: Final[int] = 10_000
+#: Public because :func:`_position_row` projects a NO holding into the YES frame
+#: through it, and any consumer that must mark such a row back in its own side's
+#: frame -- the PAPER loop's equity sample does
+#: (``windbreak/scheduler/loop.py::_position_value_micros``) -- has to invert the
+#: exact same complement rather than restate the constant.
+COMPLEMENT_PIPS: Final[int] = 10_000
 
 #: Cash leaving the account always rounds *up*: an overstated debit is the safe
 #: error, mirroring :mod:`windbreak.connector.fills`'s money rounding. Every
@@ -125,8 +131,10 @@ _COMPLEMENT_PIPS: Final[int] = 10_000
 _MONEY_ROUNDING: Final[RoundingDirection] = RoundingDirection.OVERSTATE_COST
 
 #: An average entry price rounds *down*, so a reported holding is never marked
-#: at more than it cost. Matches the PAPER loop's own ``notional // quantity``
-#: position projection (``windbreak/scheduler/loop.py``).
+#: at more than it cost. This is now the *only* position fold in the codebase:
+#: the PAPER loop's own YES-only ``notional // quantity`` projection was deleted
+#: by issue #361 in favour of reading :meth:`PaperExchange.get_positions`, so
+#: there is no second definition of "position" left to keep in step.
 _PRICE_ROUNDING: Final[RoundingDirection] = RoundingDirection.UNDERSTATE_EQUITY
 
 
@@ -287,7 +295,7 @@ def _position_row(
     return Position(
         ticker=ticker,
         quantity=ContractCentis(-totals.quantity_centis),
-        average_price=PricePips(_COMPLEMENT_PIPS - average),
+        average_price=PricePips(COMPLEMENT_PIPS - average),
     )
 
 
@@ -899,13 +907,13 @@ class PaperExchange:
     ) -> tuple[PricePips, tuple[TradePrint, ...], ContractCentis]:
         """Return buy-frame fill inputs for a resting NO bid (complemented)."""
         prints = tuple(
-            replace(trade, price=PricePips(_COMPLEMENT_PIPS - trade.price.value))
+            replace(trade, price=PricePips(COMPLEMENT_PIPS - trade.price.value))
             for trade in step.trades
         )
         depth = sum(
             level.quantity.value
             for level in step.book.yes_asks
-            if _COMPLEMENT_PIPS - level.price.value >= order.price.value
+            if COMPLEMENT_PIPS - level.price.value >= order.price.value
         )
         return order.price, prints, ContractCentis(depth)
 
@@ -970,7 +978,7 @@ class PaperExchange:
             return book.yes_asks
         return tuple(
             OrderBookLevel(
-                PricePips(_COMPLEMENT_PIPS - level.price.value), level.quantity
+                PricePips(COMPLEMENT_PIPS - level.price.value), level.quantity
             )
             for level in book.yes_bids
         )

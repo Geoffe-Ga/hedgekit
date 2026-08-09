@@ -10,7 +10,10 @@ hash-chained :class:`~windbreak.ledger.store.SqliteLedgerStore`, and
     route -> PaperExchange fill -> reconcile
 
 appending one audit event to the ledger at every stage, plus a per-tick
-``ModeHeartbeat``, an ``EquitySampled``, and a ``PositionsSnapshotRecorded``.
+``ModeHeartbeat``, an ``EquitySampled``, and -- whenever the connector can
+describe the account at all -- a ``PositionsSnapshotRecorded``
+(:func:`_equity_and_positions_stage` explains the one case that omits it, and
+why an omitted row is safer there than a written one).
 
 The approval seam is the load-bearing safety boundary: :class:`KernelApproval`
 composes the *real* ``RiskKernel.evaluate_intent`` with the *real*
@@ -72,7 +75,11 @@ from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.config import config_hash
 from windbreak.connector.freshness import is_fresh
 from windbreak.connector.interface import UnknownMarketError
-from windbreak.connector.paper import PaperExchange
+from windbreak.connector.paper import (
+    COMPLEMENT_PIPS,
+    PaperExchange,
+    TwoSidedPositionError,
+)
 from windbreak.connector.readonly import ReadOnlyConnectorView, ReadOnlyVenueView
 from windbreak.forecast.budget import (
     BUDGET_DAY_EXHAUSTED_EVENT,
@@ -150,7 +157,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
-    from windbreak.connector.models import NormalizedMarket, OrderBookSnapshot
+    from windbreak.connector.models import (
+        NormalizedMarket,
+        OrderBookSnapshot,
+        Position,
+    )
     from windbreak.forecast.budget import BudgetEvent
     from windbreak.forecast.cassettes import LlmTransport
     from windbreak.forecast.records import ForecastRecord
@@ -208,11 +219,6 @@ _SIGNING_KEY_BYTES = 32
 #: The bounded maximum number of ``Reconciler.run_once`` cycles a tick runs to
 #: fixpoint after routing a filled order -- never an unbounded loop.
 _RECONCILE_MAX_CYCLES = 5
-
-#: The exclusive, timezone-aware lower bound for reading every paper fill: the
-#: paper exchange models fills (not balances), so positions are folded from the
-#: full fill history each tick.
-_EPOCH_START = datetime(1, 1, 1, tzinfo=UTC)
 
 #: The ledger event type carrying one PAPER-loop equity sample. The tick
 #: appends one every beat, and :func:`start_of_day_equity_micros` reads the
@@ -1585,64 +1591,115 @@ def _approve_stage(
     return filled
 
 
-def _positions_from_fills(exchange: PaperExchange) -> list[dict[str, object]]:
-    """Fold the paper exchange's fill history into open-position rows.
+def _position_rows(positions: tuple[Position, ...]) -> list[dict[str, object]]:
+    """Project the connector's positions into the ledger's row shape.
 
-    The paper exchange models fills but not balances/positions, so each tick
-    derives positions by summing every YES-side fill per ticker (average price is
-    the quantity-weighted mean, floor-divided). Every value is a scaled integer.
+    A pure rename of fields -- the numbers are the connector's own, untouched --
+    so ``PositionsSnapshotRecorded`` and
+    :meth:`~windbreak.connector.paper.PaperExchange.get_positions` can never
+    disagree about what this account holds (issue #361). ``quantity_centis`` is
+    therefore signed and in the YES frame: a long NO reports negative, the way
+    :func:`windbreak.connector.paper._position_row` states it, rather than
+    vanishing the way this module's deleted YES-only fill fold used to make it.
 
     Args:
-        exchange: The paper exchange whose fills are folded.
+        positions: The connector's positions, already in ticker order.
 
     Returns:
-        One ``{ticker, quantity_centis, average_price_pips}`` row per held
-        ticker, sorted by ticker for determinism (empty when flat).
+        One ``{ticker, quantity_centis, average_price_pips}`` row per holding,
+        in the order given (empty when flat).
     """
-    aggregates: dict[str, list[int]] = {}
-    for fill in exchange.get_fills(_EPOCH_START):
-        if fill.side != "yes":
-            continue
-        entry = aggregates.setdefault(fill.ticker, [0, 0])
-        entry[0] += fill.quantity.value
-        entry[1] += fill.price.value * fill.quantity.value
-    rows: list[dict[str, object]] = []
-    for ticker, (quantity, notional) in sorted(aggregates.items()):
-        if quantity <= 0:
-            continue
-        rows.append(
-            {
-                "ticker": ticker,
-                "quantity_centis": quantity,
-                "average_price_pips": notional // quantity,
-            }
-        )
-    return rows
+    return [
+        {
+            "ticker": position.ticker,
+            "quantity_centis": position.quantity.value,
+            "average_price_pips": position.average_price.value,
+        }
+        for position in positions
+    ]
 
 
-def _positions_value_micros(positions: list[dict[str, object]]) -> int:
-    """Return the mark value of open positions, in micros.
+def _position_value_micros(position: Position) -> int:
+    """Return one holding's mark value, in micros, priced in its own side's frame.
 
-    A pip is ``1e-4`` $ and a centi ``1e-2`` contracts, so
-    ``price_pips * quantity_centis`` is an exact micros product.
+    A pip is ``1e-4`` $ and a centi ``1e-2`` contracts, so a
+    ``price_pips * quantity_centis`` product is exactly micros.
+
+    A *positive* (long YES) row marks at ``quantity * average_price`` directly.
+    A *negative* row is the YES-frame projection of a long NO, and its YES-frame
+    product is negative -- which is not a mark at all. A long NO is economically
+    a short YES plus a full ``$1`` of collateral per contract, so the two extra
+    terms cancel to exactly what the holding cost: its size at its own NO price,
+    the complement of the reported YES-frame price. That is also precisely the
+    cash :meth:`~windbreak.connector.paper.PaperExchange.get_balances` debited
+    for it, so the NO leg contributes the same figure it removed from cash and
+    equity moves by the fee alone.
+
+    The complement round-trips exactly: :func:`windbreak.connector.paper._position_row`
+    reports ``COMPLEMENT_PIPS - floor(no_average)``, and subtracting that from
+    ``COMPLEMENT_PIPS`` recovers the floored NO average -- still the
+    understating direction, so this can only mark a holding at less than it
+    cost, never more.
 
     Args:
-        positions: The position rows produced by :func:`_positions_from_fills`.
+        position: One connector-reported holding, in the YES frame.
+
+    Returns:
+        That holding's value, in micros (never negative).
+    """
+    quantity = position.quantity.value
+    if quantity >= 0:
+        return quantity * position.average_price.value
+    return -quantity * (COMPLEMENT_PIPS - position.average_price.value)
+
+
+def _positions_value_micros(positions: tuple[Position, ...]) -> int:
+    """Return the mark value of open positions, in micros.
+
+    Args:
+        positions: The connector's reported holdings.
 
     Returns:
         The summed positions value, in micros.
     """
-    total = 0
-    for position in positions:
-        quantity = position["quantity_centis"]
-        price = position["average_price_pips"]
-        if isinstance(quantity, int) and isinstance(price, int):
-            total += price * quantity
-    return total
+    return sum(_position_value_micros(position) for position in positions)
 
 
 def _equity_and_positions_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
     """Sample equity and snapshot positions, ledgering both events.
+
+    Positions come from :meth:`~windbreak.connector.paper.PaperExchange.get_positions`
+    -- the one definition of "position" in the process (issue #361). The loop
+    used to keep its own fold that summed YES-side fills only, so an account
+    long NO snapshotted as *flat* and the exposure-bounding checks
+    (``concentration_limits``, ``reduce_only_provable``) read a position of zero.
+
+    When the venue refuses to describe itself, this stage fails closed without
+    dying. ``get_positions`` raises
+    :class:`~windbreak.connector.paper.TwoSidedPositionError` for a ticker
+    filled on both sides, because the only single-row answer is a
+    netted one and a netted YES-plus-NO reports flat while both legs and their
+    collateral are live. Letting that escape would abort the tick -- and a
+    stage that kills the loop is not failing closed, it is failing silent (the
+    same reasoning :func:`_forecast_stage` applies to a budget breach and
+    :meth:`~windbreak.riskkernel.verification.ReadOnlyVerifier._unobservable_venue_breach`
+    applies to an unobservable venue). So instead:
+
+    * **No** ``PositionsSnapshotRecorded`` is appended. An empty row list would
+      be the fabricated healthy zero the connector just refused to invent, and
+      writing the YES leg alone would be the understated holding this issue
+      exists to remove. An honest gap is the only truthful option.
+    * The equity sample still lands, valuing the unpriceable holding at zero.
+      That can only *understate* equity, which only lowers the
+      ``daily_loss_limit`` baseline :func:`start_of_day_equity_micros` reads
+      back -- tightening the check, never loosening it.
+
+    The loud half of the response is the verification cycle's, not this stage's:
+    :func:`_verification_stage` observes the same connector at the *top* of every
+    tick, before anything can route, and grades a refusing venue a forced
+    ``BREACH`` that HALTs the kernel and records ``VerificationMismatchHalt``.
+    So a two-sided holding stops trading on the very next tick through the
+    audited path, and this stage's duty is only to neither lie nor die.
 
     Args:
         deps: The tick's dependency bundle.
@@ -1651,10 +1708,14 @@ def _equity_and_positions_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
     Returns:
         The sampled equity, in micros.
     """
-    positions = _positions_from_fills(deps.exchange)
+    try:
+        holdings: tuple[Position, ...] | None = deps.exchange.get_positions()
+    except TwoSidedPositionError:
+        holdings = None
+    positions_value = 0 if holdings is None else _positions_value_micros(holdings)
     equity = compute_equity_micros(
         available_cash=deps.exchange.get_balances().available,
-        positions_value=MoneyMicros(_positions_value_micros(positions)),
+        positions_value=MoneyMicros(positions_value),
     )
     deps.store.append(
         EquitySampled(
@@ -1664,9 +1725,12 @@ def _equity_and_positions_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
             epoch_s=now_epoch_s,
         )
     )
-    deps.store.append(
-        PositionsSnapshotRecorded(component=_COMPONENT, positions=positions)
-    )
+    if holdings is not None:
+        deps.store.append(
+            PositionsSnapshotRecorded(
+                component=_COMPONENT, positions=_position_rows(holdings)
+            )
+        )
     return equity.value
 
 
@@ -1761,6 +1825,13 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     carries genuine evaluation and cost-meter data (issue #188), built lazily so
     the fold is paid for only on the genuine per-week write. Every stage appends
     an audit event to the shared hash-chained ledger.
+
+    Every mention of "positions snapshot" below carries one standing exception,
+    stated once here rather than repeated: a connector that refuses to describe
+    the account (a ticker filled on both sides) yields no
+    ``PositionsSnapshotRecorded`` row at all, because the only rows available to
+    write would be fabricated or understated. See
+    :func:`_equity_and_positions_stage`.
 
     Since issue #353 the tick also runs one read-only verification cycle
     (:func:`_verification_stage`) before deciding anything, and threads its
