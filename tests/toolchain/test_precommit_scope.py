@@ -43,6 +43,11 @@ from tests.toolchain.test_toolchain_pins import _find_repo
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TYPECHECK_SCRIPT_PATH = _REPO_ROOT / "scripts" / "typecheck.sh"
+
+#: `scripts/typecheck.sh`'s mypy invocation over the lockstep-pinned scope.
+#: Accepts the bare command name or the toolchain-resolved absolute path
+#: (`"$MYPY"`, issue #366); the scope after it is what this file guards.
+_MYPY_SCRIPT_INVOCATION = re.compile(r'(?:\bmypy|"\$MYPY") windbreak/ scripts/')
 _PYPROJECT_PATH = _REPO_ROOT / "pyproject.toml"
 
 #: Repo URL substrings for the two pre-commit repos this module inspects,
@@ -88,13 +93,19 @@ def test_mypy_hook_scope_and_typecheck_script_are_kept_in_lockstep() -> None:
     Asserts both halves of the lockstep contract in one test so a partial
     fix (only the hook, or only the script) still fails: the mypy hook's
     `args` must include both `windbreak/` and `scripts/` as directory
-    arguments, and `scripts/typecheck.sh`'s source must contain the exact
-    command `mypy windbreak/ scripts/`.
+    arguments, and `scripts/typecheck.sh` must run mypy over exactly
+    `windbreak/ scripts/`.
 
     Currently the hook is scoped via `files: ^windbreak/` with `args:
     [--strict]` (no directory args at all), and `scripts/typecheck.sh` runs
     only `mypy windbreak/` -- so both assertions fail against the present
     config.
+
+    The script half is matched as a pattern, not a literal: issue #366
+    replaced the bare `mypy` command name with an absolute path resolved
+    from the pinned toolchain (`"$MYPY" windbreak/ scripts/`) so which
+    binary runs no longer depends on the caller's PATH. The scope -- the
+    only thing this lockstep guards -- is unchanged either way.
     """
     hook = _find_hook(_MYPY_REPO_SUBSTRING, "mypy")
     args = hook.get("args", [])
@@ -103,7 +114,7 @@ def test_mypy_hook_scope_and_typecheck_script_are_kept_in_lockstep() -> None:
     assert "scripts/" in args, f"mypy hook args {args!r} missing 'scripts/'"
 
     typecheck_source = _TYPECHECK_SCRIPT_PATH.read_text(encoding="utf-8")
-    assert "mypy windbreak/ scripts/" in typecheck_source, (
+    assert _MYPY_SCRIPT_INVOCATION.search(typecheck_source), (
         "scripts/typecheck.sh does not run 'mypy windbreak/ scripts/'"
     )
 
@@ -140,14 +151,14 @@ def _mypy_config() -> dict[str, Any]:
 def test_mypy_config_strictness_is_in_lockstep_with_the_precommit_hook() -> None:
     """The `[tool.mypy]` config and the pre-commit hook enforce equal strictness.
 
-    Issue #179: `scripts/typecheck.sh` (Gate 2 / check-all.sh) runs the bare,
-    config-driven command `mypy windbreak/ scripts/` -- it takes its strictness
-    solely from pyproject.toml's `[tool.mypy]`. The pre-commit hook, by
-    contrast, passes `--strict` on the command line. If the config enforced only
-    a hand-picked *subset* of `--strict`'s checks (as it once did, omitting
-    `no_implicit_reexport`), the local Gate-2 run would silently miss an entire
-    error class that CI's `--strict` pre-commit step still caught -- the exact
-    false-green recurrence #179 targets.
+    Issue #179: `scripts/typecheck.sh` (Gate 2 / check-all.sh) runs the
+    config-driven command `mypy windbreak/ scripts/` with no explicit flags --
+    it takes its strictness solely from pyproject.toml's `[tool.mypy]`. The
+    pre-commit hook, by contrast, passes `--strict` on the command line. If the
+    config enforced only a hand-picked *subset* of `--strict`'s checks (as it
+    once did, omitting `no_implicit_reexport`), the local Gate-2 run would
+    silently miss an entire error class that CI's `--strict` pre-commit step
+    still caught -- the exact false-green recurrence #179 targets.
 
     This pins the two in lockstep: the hook must pass `--strict`, and the config
     must set `strict = true` (which enables the full `--strict` check set,

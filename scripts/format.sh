@@ -59,6 +59,11 @@ done
 
 cd "$PROJECT_ROOT"
 
+# Resolve ruff from the PINNED toolchain, not the caller's PATH (issue #366):
+# a different ruff build reformats differently, so a PATH-chosen formatter makes
+# `--check` disagree with CI for reasons nobody can see in the diff.
+RUFF="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-tool ruff)"
+
 # Set verbosity
 if $VERBOSE; then
     set -x
@@ -70,13 +75,13 @@ if $FIX; then
     if $VERBOSE; then
         echo "Running ruff format..."
     fi
-    ruff format . || { echo "✗ ruff format failed" >&2; exit 1; }
+    "$RUFF" format . || { echo "✗ ruff format failed" >&2; exit 1; }
     echo "✓ Code formatted successfully"
 else
     if $VERBOSE; then
         echo "Running ruff format --check..."
     fi
-    ruff format --check . || { echo "✗ ruff format check failed" >&2; exit 1; }
+    "$RUFF" format --check . || { echo "✗ ruff format check failed" >&2; exit 1; }
     echo "✓ Code formatting check passed"
 fi
 exit 0

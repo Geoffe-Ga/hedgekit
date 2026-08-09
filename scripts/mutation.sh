@@ -68,12 +68,12 @@ if $VERBOSE; then
     set -x
 fi
 
-# Check if mutmut is installed
-if ! command -v mutmut &> /dev/null; then
-    echo "Error: mutmut is not installed" >&2
-    echo "Install with: pip install mutmut" >&2
-    exit 2
-fi
+# Resolve mutmut from the PINNED toolchain, not the caller's PATH (issue #366).
+# This is a release gate, so which mutmut runs -- and against which installed
+# dependency set -- must be a property of the repo, not of the invoking shell.
+# A failed resolution exits nonzero here and, under `set -e`, aborts the run.
+MUTMUT="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-tool mutmut)"
+STATS_PYTHON="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-python)"
 
 echo "=== Running Mutation Tests ==="
 echo "Minimum required score: ${MIN_SCORE}%"
@@ -81,7 +81,7 @@ echo ""
 
 # Run mutation tests (allow failure, we check the score ourselves).
 echo "Running mutmut (this may take a long time)..."
-if mutmut run 2>&1; then
+if "$MUTMUT" run 2>&1; then
     echo "✓ Mutmut run completed"
 else
     # mutmut exits non-zero when mutants survive, which is not a script error.
@@ -100,7 +100,7 @@ echo "=== Mutation Test Results ==="
 STATS_FILE="mutants/mutmut-cicd-stats.json"
 rm -f "$STATS_FILE"
 
-if ! mutmut export-cicd-stats; then
+if ! "$MUTMUT" export-cicd-stats; then
     echo "Error: 'mutmut export-cicd-stats' failed" >&2
     exit 2
 fi
@@ -127,7 +127,7 @@ echo ""
 # exported -- so scoring against `total` would understate an interrupted run.
 # Instead the denominator is rebuilt from the explicit outcome categories, and
 # any shortfall against `total` is treated as an incomplete run.
-STATS_VARS=$(python3 - "$STATS_FILE" <<'PY'
+STATS_VARS=$("$STATS_PYTHON" - "$STATS_FILE" <<'PY'
 import json
 import sys
 
@@ -269,7 +269,7 @@ else
 
     if [ "$SURVIVED" -gt 0 ]; then
         echo "Surviving mutants:" >&2
-        mutmut results 2>&1 | head -20 || true
+        "$MUTMUT" results 2>&1 | head -20 || true
     fi
 
     exit 1
