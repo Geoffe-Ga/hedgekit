@@ -532,8 +532,13 @@ def test_a_per_forecast_ceiling_breach_halts_the_tick_and_ledgers_per_forecast(
 
     Without this test the `PerForecastBudgetExceededError` arm of the except
     tuple and the per-forecast branch of the ledger writer are unreachable from
-    the other integration tests, since with stock config the charge exactly
-    equals the ceiling and the boundary is inclusive.
+    the other integration tests: the offline fixture providers report
+    `cost_micros == 0`, so a stock-config tick charges only the fixed 3,000,000
+    against a 6,060,000 ceiling and cannot breach it from the cost side. The
+    ceiling knob is what makes the guard observable here; the cost side of the
+    same boundary is pinned in `tests/forecast/test_budget_headroom.py`, which
+    charges a worst-case run against the *stock* ceiling from both sides
+    (issue #394).
     """
     from windbreak.scheduler.loop import run_single_tick
 

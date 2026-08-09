@@ -171,11 +171,15 @@ windbreak run --paper-books-dir ... --cassette-path ... --ledger-path ... \
   deliberately *not* wrapped: billing a list price for a replayed call would
   corrupt the cost accounting the table exists to keep honest.
 - **Budget headroom.** `forecast.budget.per_forecast_micros` defaults to
-  `6000000` -- the fixed research charge plus the default three-member
-  ensemble's worst case, which `retry.max_cost_micros` bounds at `1000000` per
-  member. Raising `max_attempts`, `max_cost_micros`, or the ensemble size
-  without raising this ceiling will make ticks halt fail-closed on budget and
-  produce no forecast at all.
+  `6060000` -- the Stage-0 triage prior (`60000`) plus the fixed research charge
+  (`3000000`) plus the default three-member ensemble's worst case, which
+  `retry.max_cost_micros` bounds at `1000000` per member. That is the exact cost
+  of the most expensive *correct* run, with zero headroom above it by design
+  (SPEC §16.1). Raising `max_cost_micros` or the ensemble size without raising
+  this ceiling will make ticks halt fail-closed on budget and produce no
+  forecast at all. Raising either money ceiling also changes
+  `screener.max_candidates_per_tick`, which is derived as
+  `per_day_micros // per_forecast_micros`.
 
 ### What one PAPER tick actually does
 
@@ -766,7 +770,7 @@ force at the time of each decision are on the row itself.
 
 `windbreak.forecast.budget.ResearchBudget` enforces SPEC S16's three research
 spend ceilings, mirrored in config at `config.forecast.budget.per_forecast_micros`
-(default 3,000,000 micros / $3), `config.forecast.budget.per_day_micros`
+(default 6,060,000 micros / $6.06), `config.forecast.budget.per_day_micros`
 (default 20,000,000 micros / $20), and `config.forecast.budget.max_pages`
 (default 20 pages per forecast). Two events name the two ways a run can be
 halted:

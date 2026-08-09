@@ -24,6 +24,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
 
+from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
 from windbreak.forecast.calibration import ensure_temporal_integrity
 from windbreak.forecast.citations import (
     content_hash_of,
@@ -101,7 +102,10 @@ _SUBQUESTION_PREFIXES: tuple[str, ...] = (
 )
 
 #: Deterministic stub research cost for a full-pipeline run, in micros.
-_RESEARCH_COST_MICROS = 3_000_000
+#: Imported, not restated: ``budget`` derives the per-forecast ceiling from this
+#: figure, and the two were once the same number by accident -- leaving a
+#: forecast zero headroom for its triage prior and its votes (issue #394).
+_RESEARCH_COST_MICROS = FULL_PIPELINE_RESEARCH_COST_MICROS
 
 #: Hours per day and seconds per hour, for the integer horizon computation.
 _HOURS_PER_DAY = 24

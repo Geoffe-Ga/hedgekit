@@ -202,9 +202,14 @@ class _RequestRecordingTransport:
 
 
 def test_triage_threshold_and_budget_constants_have_expected_values() -> None:
-    """Pin the SPEC S8.4 Stage-0 threshold and per-forecast budget constants."""
+    """Pin the SPEC S8.4 Stage-0 threshold and per-forecast budget constants.
+
+    The budget is `6_060_000`, not the `3_000_000` full-run research *cost*:
+    the two were once equal, which left this module's Stage-0 charge no room at
+    all under the ceiling (issue #394).
+    """
     assert TRIAGE_THRESHOLD_PPM == 50_000
-    assert PER_FORECAST_BUDGET_MICROS == 3_000_000
+    assert PER_FORECAST_BUDGET_MICROS == 6_060_000
 
 
 # --- Stage-0 prior: parsing, cost, and the single-call contract ------------------
@@ -221,7 +226,7 @@ def test_stage0_prior_parses_integer_response_into_prior(
     prior = run_stage0_prior(market, baseline, transport=transport)
 
     assert prior == TriagePrior(prior_ppm=520_000, cost_micros=60_000)
-    assert 0 < prior.cost_micros <= PER_FORECAST_BUDGET_MICROS // 50
+    assert 0 < prior.cost_micros <= _FULL_RUN_RESEARCH_COST_MICROS // 50
     assert transport.call_count == 1
 
 

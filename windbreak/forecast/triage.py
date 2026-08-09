@@ -41,6 +41,10 @@ import json
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol
 
+from windbreak.forecast.budget import (
+    DEFAULT_PER_FORECAST_BUDGET_MICROS,
+    STAGE0_PRIOR_COST_MICROS,
+)
 from windbreak.forecast.cassettes import LlmRequest
 from windbreak.forecast.pipeline import (
     _forecast_horizon_hours,
@@ -68,17 +72,18 @@ TRIAGE_THRESHOLD_PPM = 50_000
 
 #: The per-forecast research *budget*, in micros (SPEC S16
 #: ``budget.per_forecast_micros``). This is the spending ceiling for a whole
-#: forecast; it is deliberately distinct from
-#: ``windbreak.forecast.pipeline``'s private ``_RESEARCH_COST_MICROS`` stub
-#: *cost* for a full run, which coincidentally equals the same figure today.
-PER_FORECAST_BUDGET_MICROS = 3_000_000
+#: forecast, and it is emphatically *not* the same figure as the full run's
+#: research *cost*: the two were once both ``3_000_000``, which left a forecast
+#: exactly zero headroom for this module's own Stage-0 charge (issue #394).
+#: Aliased from :mod:`windbreak.forecast.budget` rather than restated so they
+#: can never drift back together.
+PER_FORECAST_BUDGET_MICROS = DEFAULT_PER_FORECAST_BUDGET_MICROS
 
-#: Divisor turning the per-forecast budget into the Stage-0 cost ceiling: the
-#: cheap prior may consume at most 2% (1/50) of the budget.
-_STAGE0_COST_DIVISOR = 50
-
-#: The fixed Stage-0 prior cost, in micros (2% of the per-forecast budget).
-_STAGE0_COST_MICROS = PER_FORECAST_BUDGET_MICROS // _STAGE0_COST_DIVISOR
+#: The fixed Stage-0 prior cost, in micros -- 2% of the full-pipeline research
+#: charge this stage exists to avoid paying (SPEC S8.4). Defined in
+#: :mod:`windbreak.forecast.budget`, which derives the per-forecast ceiling from
+#: it, and imported here so the charge and the ceiling agree by construction.
+_STAGE0_COST_MICROS = STAGE0_PRIOR_COST_MICROS
 
 #: Event type recorded when a run stops at the triage stage (no full pipeline).
 TRIAGE_STOP_EVENT = "TRIAGE_STOP"

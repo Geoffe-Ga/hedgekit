@@ -312,10 +312,15 @@ class ScreenerConfig:
     universe is an unbounded bill whose only stopping condition is a fail-closed
     halt. The default of ``3`` is derived rather than invented: it is
     ``per_day_micros // per_forecast_micros`` at their own defaults
-    (``20_000_000 // 6_000_000``), i.e. the most forecasts a *worst-case* day can
+    (``20_000_000 // 6_060_000``), i.e. the most forecasts a *worst-case* day can
     afford at all. A tick therefore cannot plan to spend more than a whole day's
     research budget, and raising either ceiling is what raises this bound --
     never the other way round.
+
+    The derivation is documented here but *stored* as a literal, because a
+    computed default would silently follow a ceiling change instead of forcing
+    someone to look at it. A test pins the equality, so editing either money
+    ceiling without revisiting this bound fails the suite (issue #394).
 
     Attributes:
         category_blocklist: Topical categories no market may be screened in from.
@@ -346,29 +351,37 @@ class ScreenerConfig:
 class ForecastBudget:
     """Per-forecast and per-day research spend caps (micro-dollar units).
 
-    ``per_forecast_micros`` was raised from ``3_000_000`` to ``6_000_000`` when
-    the live provider path was wired (issue #269, follow-up 4). The old value
-    was exactly the fixed research charge a forecast already incurs, leaving
-    *zero* headroom for the provider votes themselves: the first live tick whose
-    providers were failing accrued retry list price on top of research, breached
-    the per-forecast ceiling, and halted fail-closed -- producing no forecast at
-    all. Fail-closed is the right direction for a breach, but a ceiling that a
-    correct run cannot help but breach is a broken default, not a guard.
+    ``per_forecast_micros`` mirrors
+    :data:`windbreak.forecast.budget.DEFAULT_PER_FORECAST_BUDGET_MICROS` exactly
+    (pinned by test), and that module documents the full rationale. In short: it
+    is the cost of the most expensive *correct* triaged PROCEED-path forecast,
+    and the intended headroom above that worst case is **zero**::
 
-    The new value is derived rather than invented: the fixed research charge
-    (``3_000_000``) plus the default three-member vote ensemble's worst case,
-    which :attr:`ProviderRetryConfig.max_cost_micros` already bounds at
-    ``1_000_000`` per member (``3 x 1_000_000``). It is the true worst case, so
-    anything lower guarantees breaches on a healthy run and anything higher is
-    unspent slack.
+        per_forecast_micros = stage0_prior_cost                    #    60_000
+                            + full_pipeline_research_cost          # 3_000_000
+                            + ensemble_size * max_cost_micros      # 3 x 1_000_000
+                            = 6_060_000
+
+    It was ``3_000_000`` until issue #269's follow-up 4, which is to say exactly
+    the fixed research charge -- leaving *zero* room for the votes themselves,
+    so the first live tick with failing providers breached the ceiling and
+    produced no forecast at all. That follow-up raised it to ``6_000_000``, but
+    derived that figure from ``3_000_000 + 3 x 1_000_000`` and omitted the
+    Stage-0 triage charge, which is levied against the same forecast. The
+    default was therefore ``60_000`` micros short of its own stated worst case;
+    issue #394 closes that gap and pins every term.
+
+    Anything lower guarantees breaches on a healthy run. Anything higher is
+    slack the guard cannot see into -- a ceiling above any reachable cost is an
+    unfalsifiable guard, which is the defect the raise was meant to fix rather
+    than relocate.
 
     ``per_day_micros`` is deliberately left at ``20_000_000``. Doubling a real
     money cap is an operator's decision, not a wiring change's side effect; the
-    effect is simply that a day admits fewer worst-case forecasts. Note that a
-    *successful* live vote currently reports ``cost_micros == 0`` (the vote
-    provider parses no token accounting out of the response envelope), so only
-    failing votes consume this headroom today -- see the PR notes for the
-    per-vote cost-attribution follow-up.
+    effect is simply that a day admits fewer worst-case forecasts. Note that
+    since issue #399 *every* vote attempt is priced, successes included, so the
+    per-forecast ceiling now binds on the healthy path and not only when
+    providers are failing.
 
     Attributes:
         per_forecast_micros: The ceiling one forecast's research plus provider
@@ -378,7 +391,7 @@ class ForecastBudget:
         max_pages: The maximum pages one forecast's bounded web research fetches.
     """
 
-    per_forecast_micros: int = 6000000
+    per_forecast_micros: int = 6060000
     per_day_micros: int = 20000000
     max_pages: int = 20
 
