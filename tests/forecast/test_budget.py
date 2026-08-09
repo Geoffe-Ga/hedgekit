@@ -119,8 +119,14 @@ def _assert_json_safe_leaves(node: object) -> None:
 
 
 def test_budget_default_constants_have_expected_values() -> None:
-    """The three budget defaults are pinned to their SPEC S16 values."""
-    assert DEFAULT_PER_FORECAST_BUDGET_MICROS == 3_000_000
+    """The three budget defaults are pinned to their SPEC S16 values.
+
+    The per-forecast ceiling is *derived* (issue #394): it is the worst case a
+    correct triaged PROCEED run can cost, with zero intended headroom above it.
+    `test_budget_headroom.py` pins that derivation term by term; this assertion
+    is the plain value check the rest of this module reads against.
+    """
+    assert DEFAULT_PER_FORECAST_BUDGET_MICROS == 6_060_000
     assert DEFAULT_PER_DAY_BUDGET_MICROS == 20_000_000
     assert DEFAULT_MAX_PAGES == 20
 

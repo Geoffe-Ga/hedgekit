@@ -15,11 +15,15 @@ never trip on the only figure that matters. :func:`report_research_costs`
 summarizes accumulated spend into per-resolved-forecast and
 per-profitable-trade unit costs.
 
-The three defaults deliberately mirror
-:data:`windbreak.forecast.triage.PER_FORECAST_BUDGET_MICROS` and its siblings
-rather than importing them: importing ``triage`` here would create a
-``budget -> triage -> pipeline -> budget`` import cycle once ``pipeline`` grows a
-budget seam, so the constants are restated locally.
+This module is the single definition site for the per-forecast ceiling *and*
+for every term it is derived from (issue #394): ``pipeline`` and ``triage``
+import their research-cost constants from here rather than restating them. The
+direction matters. This module imports nothing from ``windbreak.forecast``, so
+``pipeline -> budget`` and ``triage -> budget`` are both acyclic; importing
+``triage`` *here* would close a ``budget -> triage -> pipeline -> budget``
+cycle. Keeping the arrows pointing this way is what lets the ceiling and its
+terms be one set of numbers instead of four copies that once silently
+collided.
 
 Every decision is ledgered through the :class:`BudgetLedgerWriter` seam (modeled
 verbatim on :class:`windbreak.forecast.triage.TriageLedgerWriter`) with
@@ -42,10 +46,63 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from datetime import datetime
 
+#: The fixed research charge one full-pipeline run incurs, in micros. The
+#: definition site for :data:`windbreak.forecast.pipeline._RESEARCH_COST_MICROS`,
+#: which imports it from here (SPEC S16).
+FULL_PIPELINE_RESEARCH_COST_MICROS: Final = 3_000_000
+
+#: Divisor turning the full-pipeline research charge into the Stage-0 prior's
+#: cost: SPEC S8.4 caps the cheap prior at ~2% (1/50) of the full pipeline it
+#: exists to avoid paying for. Deliberately a fraction of the *pipeline charge*
+#: and not of the per-forecast ceiling -- the latter would be self-referential,
+#: since the ceiling is itself derived from this cost (issue #394).
+STAGE0_COST_DIVISOR: Final = 50
+
+#: The Stage-0 triage prior's cost, in micros. The definition site for
+#: ``windbreak.forecast.triage``'s Stage-0 charge, which imports it from here.
+STAGE0_PRIOR_COST_MICROS: Final = (
+    FULL_PIPELINE_RESEARCH_COST_MICROS // STAGE0_COST_DIVISOR
+)
+
+#: How many members the default vote ensemble runs. Restated rather than
+#: imported from :data:`windbreak.forecast.providers.DEFAULT_VOTE_ENSEMBLE`,
+#: which would close a ``budget -> providers -> budget`` cycle (``providers``
+#: imports :class:`ProviderPriceTable` from here); pinned mirror-equal by test.
+DEFAULT_VOTE_ENSEMBLE_SIZE: Final = 3
+
+#: The most one ensemble member may accrue across *all* its retry attempts, in
+#: micros. Restated from ``RetryPolicy.max_cost_micros`` (same cycle reason as
+#: above), and pinned mirror-equal by test. This is a hard bound, not an
+#: estimate: ``RetryingProvider`` checks ``accrued + price`` against it before
+#: every attempt and re-checks the total on success, so a member's booked spend
+#: can never exceed it however the price table is configured.
+DEFAULT_PER_MEMBER_VOTE_CEILING_MICROS: Final = 1_000_000
+
 #: The per-forecast research budget, in micros (SPEC S16
-#: ``budget.per_forecast_micros``). Restated (not imported from ``triage``) to
-#: avoid a ``budget -> triage -> pipeline -> budget`` import cycle.
-DEFAULT_PER_FORECAST_BUDGET_MICROS = 3_000_000
+#: ``budget.per_forecast_micros``).
+#:
+#: Derived, never invented: it is exactly what the most expensive *correct*
+#: triaged PROCEED-path forecast can spend -- the Stage-0 prior, plus the full
+#: pipeline's research charge, plus every ensemble member spending its entire
+#: retry allowance. The intended headroom above that worst case is **zero**,
+#: and that is a deliberate choice in both directions (issue #394):
+#:
+#: * Anything *lower* breaches on a healthy run. The old value equalled
+#:   :data:`FULL_PIPELINE_RESEARCH_COST_MICROS` exactly, so research alone
+#:   consumed the whole ceiling and a triaged run failed closed before it could
+#:   produce a forecast at all.
+#: * Anything *higher* is slack the guard cannot see into. A ceiling set
+#:   comfortably above any reachable cost still exists, still gets ledgered,
+#:   and can never fire -- the unfalsifiable-guard defect this codebase has
+#:   fixed repeatedly.
+#:
+#: Raising any term therefore raises this ceiling, and a test pins every term
+#: and the total as literals so an edit to one cannot silently outgrow it.
+DEFAULT_PER_FORECAST_BUDGET_MICROS: Final = (
+    STAGE0_PRIOR_COST_MICROS
+    + FULL_PIPELINE_RESEARCH_COST_MICROS
+    + DEFAULT_VOTE_ENSEMBLE_SIZE * DEFAULT_PER_MEMBER_VOTE_CEILING_MICROS
+)
 
 #: The per-UTC-day research budget, in micros (SPEC S16 ``budget.per_day_micros``).
 DEFAULT_PER_DAY_BUDGET_MICROS = 20_000_000

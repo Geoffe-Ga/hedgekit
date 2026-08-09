@@ -306,7 +306,7 @@ Allowed: `search`, `fetch`, citation verification. Forbidden: ledger queries, co
 
 ### 8.4 Two-stage triage (cost defense, T11)
 
-Stage 0: a single cheap model produces a rough prior from the normalized question plus baseline price, at ≤ ~2% of the full-pipeline budget. The full research pipeline runs only if `|prior − executable_price| ≥ triage_threshold` (default 5 points), the market is operator-flagged, or a refresh trigger fired (§'s screener policy). Triage-only records are stored with `triage_stage="triage_only"` and are never live-eligible. Both stages' costs are ledgered; the evaluation system reports research cost per resolved forecast and per profitable trade.
+Stage 0: a single cheap model produces a rough prior from the normalized question plus baseline price, at ≤ ~2% (1/50) of the **full-pipeline research cost** — the spend this stage exists to avoid — and *not* of the per-forecast ceiling, which is itself derived from that cost (§16.1). Stage 0's charge is levied against the same forecast as the full run, so the per-forecast ceiling governs their total, never either stage alone. The full research pipeline runs only if `|prior − executable_price| ≥ triage_threshold` (default 5 points), the market is operator-flagged, or a refresh trigger fired (§'s screener policy). Triage-only records are stored with `triage_stage="triage_only"` and are never live-eligible. Both stages' costs are ledgered; the evaluation system reports research cost per resolved forecast and per profitable trade.
 
 ### 8.5 Prompt-injection defense (T1)
 
@@ -630,7 +630,7 @@ forecast:
   triage_model: {provider: "cheapest-adequate", model: "pinned-by-operator"}
   triage_threshold_ppm: 50000            # full pipeline only if |prior − price| ≥ 5 pts
   shrink_to_market_lambda_ppm: 250000
-  budget: {per_forecast_micros: 6000000, per_day_micros: 20000000, max_pages: 20}
+  budget: {per_forecast_micros: 6060000, per_day_micros: 20000000, max_pages: 20}
   min_verified_citations: 3
   canary: {enabled: true, cadence_days: 7}
 
@@ -651,6 +651,29 @@ ops:
 alerts:
   sinks: [{type: ntfy, topic: "configured-by-operator"}]
 ```
+
+### 16.1 Research-budget headroom (normative)
+
+`per_forecast_micros` is **derived, not chosen**. It is exactly what the most expensive *correct* forecast can cost — a triaged PROCEED-path run in which every ensemble member exhausts its retry allowance:
+
+```
+per_forecast_micros = stage0_prior_cost                       #    60_000
+                    + full_pipeline_research_cost             # 3_000_000
+                    + ensemble_size × retry.max_cost_micros   # 3 × 1_000_000
+                    = 6_060_000
+```
+
+**The intended headroom above that worst case is zero**, and that is deliberate in both directions:
+
+- **Lower breaches on a healthy run.** The stub research cost and this ceiling were once the same number (3,000,000), so research alone consumed the whole ceiling and a triaged run failed closed before producing anything. Fail-closed is right for a genuine overrun; a ceiling a correct run cannot help but breach is a broken default.
+- **Higher is slack the guard cannot see into.** A ceiling set comfortably above any reachable cost still exists and still ledgers, but can never fire. An unfalsifiable guard is not a weaker guard, it is the absence of one.
+
+Consequences that bind the implementation:
+
+- Each of the four terms is defined once, in `windbreak/forecast/budget.py`; `pipeline` and `triage` import them rather than restating them. Tests pin every term and the total as literals, so raising one without re-deriving the ceiling fails the suite.
+- `stage0_prior_cost` is ~2% (1/50) of the **full-pipeline research cost** (§8.4), not of this ceiling. Deriving it from the ceiling would be self-referential: raising the ceiling would raise the Stage-0 charge, which would raise the required ceiling again.
+- `ensemble_size × retry.max_cost_micros` is a true bound, not an estimate. `RetryingProvider` checks accrued spend against `max_cost_micros` before every attempt and re-checks the total on success, so a member's booked spend cannot exceed it however the price table is configured. At the default price table the realistic worst case is lower (60,000 + 3,000,000 + 2,100,000 = 5,160,000); the ceiling is set by the enforced policy bound, because the price table is operator-editable and the bound is not.
+- `screener.max_candidates_per_tick` is derived from this ceiling as `per_day_micros // per_forecast_micros` (= 3). It is *stored* as a literal so a change forces someone to look at it, and a test pins the equality. **Raising either money ceiling changes what a tick may attempt** — never the reverse.
 
 ---
 
