@@ -66,8 +66,7 @@ def test_retry_defaults_mirror_the_forecast_engines_own_constants() -> None:
 def test_price_defaults_mirror_the_engines_default_price_table() -> None:
     """Every configured default price equals the engine's own list price."""
     configured = {
-        price.provider: price.price_micros
-        for price in ProviderTransportConfig().prices
+        price.provider: price.price_micros for price in ProviderTransportConfig().prices
     }
 
     assert configured == dict(DEFAULT_PROVIDER_PRICE_TABLE.prices_micros)
@@ -124,7 +123,7 @@ def test_the_section_is_frozen() -> None:
     transport = ProviderTransportConfig()
 
     with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
-        setattr(transport, "mode", PROVIDER_TRANSPORT_LIVE)
+        transport.mode = PROVIDER_TRANSPORT_LIVE
 
 
 def test_request_timeout_is_whole_seconds() -> None:

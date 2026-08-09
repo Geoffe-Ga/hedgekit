@@ -161,6 +161,13 @@ from windbreak.scheduler.fill_accounting import (
     LedgerFillAccountingFeed,
     LedgerFillBookkeeper,
 )
+from windbreak.scheduler.provider_wiring import (
+    ProviderFactory,
+    build_live_llm_transport,
+    build_live_research_tools,
+    build_provider_factory,
+    is_live_mode,
+)
 from windbreak.scheduler.weekly_data import weekly_report_body
 from windbreak.selector import select
 from windbreak.selector.types import (
@@ -191,6 +198,7 @@ if TYPE_CHECKING:
     from windbreak.ledger.store import LedgerRecord
     from windbreak.riskkernel.checks import Decision, OrderIntent
     from windbreak.riskkernel.verification import VerificationSnapshot
+    from windbreak.scheduler.provider_wiring import LiveProviderHttp
     from windbreak.selector.types import SelectorDecision
     from windbreak.tokens.verify import SignedApprovalToken
 
@@ -1191,6 +1199,15 @@ class PaperTickDeps:
             grants live eligibility to providers with no measured edge, which
             SPEC S19 forbids outright, so the type makes an ungated loop
             unrepresentable rather than merely discouraged.
+        provider_factory: Builds the vote provider for one ensemble member
+            (issue #269). Non-optional for the same reason as ``budget`` and
+            ``provider_gate``: on the live path it is what wraps each vote in
+            the configured bounded-retry policy and fail-closed price table, so
+            leaving it absent would be a loop calling paid providers with
+            neither. Offline it is the bare fixture provider the pipeline would
+            have built itself, keeping the cassette path byte-identical; see
+            :mod:`windbreak.scheduler.provider_wiring` for why only the live
+            path is wrapped.
     """
 
     config: WindbreakConfig
@@ -1210,6 +1227,7 @@ class PaperTickDeps:
     clock: Callable[[], int]
     budget: ResearchBudget
     provider_gate: ProviderTrackRecordGate
+    provider_factory: ProviderFactory
 
 
 def _default_clock() -> int:
@@ -1224,28 +1242,87 @@ def _default_clock() -> int:
     return int(time.time())
 
 
-def _resolve_research_tools(
-    research_tools: ResearchTools | None, ledger_path: Path
-) -> ResearchTools:
-    """Return the supplied research tools, or an offline no-network default.
+def _resolve_forecast_transport(
+    config: WindbreakConfig,
+    cassette_path: Path,
+    provider_http: LiveProviderHttp | None,
+) -> tuple[LlmTransport, bool]:
+    """Select the recorded cassette or the live provider transport (issue #344).
 
-    The default never actually searches (its transports find nothing), so the
-    forecast pipeline abstains on zero verified citations before any fetch --
-    matching the offline PAPER contract without a live network.
+    Configuration states the intent and the caller supplies the live seam, and
+    the two must agree. A half-configuration in *either* direction refuses to
+    start, mirroring the ``market_data``/``live_ticker`` pair (issue #343):
+
+    * **Live selected, no seam supplied.** Degrading to the cassette would hand
+      an operator who asked for novel forecasts a recorded paper tape while
+      they believed they were reading the market.
+    * **Seam supplied, live not selected.** The transports (and the credentials
+      inside them) were built for nothing. Silently ignoring them hides a
+      mistake in exactly the place a mistake is expensive.
+
+    Args:
+        config: The active configuration naming the transport mode.
+        cassette_path: The recorded cassette the offline replay transport
+            serves from.
+        provider_http: The live HTTP seams, or ``None``.
+
+    Returns:
+        The selected transport paired with whether live mode is in force.
+
+    Raises:
+        ValueError: On an unknown mode, or on either half-configuration.
+    """
+    live = is_live_mode(config)
+    if live and provider_http is None:
+        raise ValueError(
+            "forecast.provider_transport.mode is 'live' but no `provider_http` "
+            "seam was supplied; supply the live transports or select 'cassette'"
+        )
+    if not live and provider_http is not None:
+        raise ValueError(
+            "a `provider_http` seam was supplied while "
+            "forecast.provider_transport.mode is 'cassette'; select 'live' or "
+            "omit the seam"
+        )
+    if provider_http is None:
+        return ReplayCassette.from_path(cassette_path), False
+    return build_live_llm_transport(provider_http), True
+
+
+def _resolve_research_tools(
+    research_tools: ResearchTools | None,
+    ledger_path: Path,
+    config: WindbreakConfig,
+    provider_http: LiveProviderHttp | None,
+) -> ResearchTools:
+    """Return the supplied research tools, or the mode's own default.
+
+    An explicitly supplied bundle always wins, so a test can drive counted or
+    doubled transports through either mode. Otherwise the default follows the
+    selected transport (issue #344): live mode gets the live search/fetch
+    transports behind the sandbox's own host allowlist, and cassette mode gets
+    the offline no-network default, which never actually searches (its
+    transports find nothing) so the pipeline abstains on zero verified
+    citations before any fetch.
 
     Args:
         research_tools: The caller-supplied tools, or ``None``.
         ledger_path: The tick's ledger path, whose parent roots the fetch cache.
+        config: The active configuration supplying live research settings.
+        provider_http: The live HTTP seams, or ``None`` in cassette mode.
 
     Returns:
         A sandboxed :class:`~windbreak.forecast.sandbox.ResearchTools`.
     """
+    cache_dir = ledger_path.parent.joinpath("research-cache")
     if research_tools is not None:
         return research_tools
+    if provider_http is not None:
+        return build_live_research_tools(config, provider_http, cache_dir)
     transport = _OfflineResearchTransport()
     return build_research_tools(
         allowed_hosts=frozenset({_DEFAULT_RESEARCH_HOST}),
-        cache_dir=ledger_path.parent.joinpath("research-cache"),
+        cache_dir=cache_dir,
         search_transport=transport,
         fetch_transport=transport,
     )
@@ -1645,6 +1722,7 @@ def build_paper_deps(
     clock: Callable[[], int] | None = None,
     market_data: MarketDataSource | None = None,
     live_ticker: str | None = None,
+    provider_http: LiveProviderHttp | None = None,
 ) -> PaperTickDeps:
     """Assemble every real component one PAPER tick runs against.
 
@@ -1692,17 +1770,27 @@ def build_paper_deps(
             to read the fixture directory's recorded books.
         live_ticker: The single market a live session trades. Required with
             ``market_data`` and meaningless without it.
+        provider_http: The live forecast-provider HTTP seams, or ``None`` (the
+            default) to replay ``cassette_path``. Required by, and only by,
+            ``forecast.provider_transport.mode == "live"``; see
+            :func:`_resolve_forecast_transport`.
 
     Returns:
         A fully wired :class:`PaperTickDeps`.
 
     Raises:
         ValueError: If exactly one of ``market_data``/``live_ticker`` is given,
-            if a configured ceiling is negative, or if the track-record
-            artifact exists but cannot be read as a strict integer document --
-            each way refusing to start rather than running unguarded.
+            if the configured provider-transport mode is unknown or disagrees
+            with whether ``provider_http`` was supplied, if a configured ceiling
+            or list price is not positive, or if the track-record artifact
+            exists but cannot be read as a strict integer document -- each way
+            refusing to start rather than running unguarded.
     """
     resolved_clock = clock if clock is not None else _default_clock
+    # Selected first, before the ledger database or any exchange session
+    # exists, so a misconfigured transport aborts startup without leaving
+    # half-built durable state behind.
+    transport, live = _resolve_forecast_transport(config, cassette_path, provider_http)
     # The exchange must observe on the same clock the tick reads, or its status
     # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
     # freshness against two unrelated timelines (issue #342).
@@ -1746,12 +1834,15 @@ def build_paper_deps(
         approval=approval,
         kernel=kernel,
         verification_key=key,
-        transport=ReplayCassette.from_path(cassette_path),
-        research_tools=_resolve_research_tools(research_tools, ledger_path),
+        transport=transport,
+        research_tools=_resolve_research_tools(
+            research_tools, ledger_path, config, provider_http
+        ),
         report_dir=report_dir,
         clock=resolved_clock,
         budget=_build_research_budget(store, config),
         provider_gate=_build_provider_gate(report_dir, config),
+        provider_factory=build_provider_factory(config, live=live),
     )
 
 
@@ -1888,6 +1979,12 @@ def _forecast_stage(
             budget=deps.budget,
             ensemble=deps.config.forecast.vote_ensemble,
             provider_gate=deps.provider_gate,
+            # Bound to `deps.transport` at call time, never at composition
+            # time, so a bundle whose transport was swapped via
+            # `dataclasses.replace` really votes through the swapped one.
+            provider_factory=lambda member: deps.provider_factory(
+                deps.transport, member
+            ),
         )
     except (DailyBudgetExhaustedError, PerForecastBudgetExceededError):
         return None

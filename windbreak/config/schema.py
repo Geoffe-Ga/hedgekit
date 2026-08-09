@@ -246,9 +246,41 @@ class ScreenerConfig:
 
 @dataclass(frozen=True, slots=True)
 class ForecastBudget:
-    """Per-forecast and per-day research spend caps (micro-dollar units)."""
+    """Per-forecast and per-day research spend caps (micro-dollar units).
 
-    per_forecast_micros: int = 3000000
+    ``per_forecast_micros`` was raised from ``3_000_000`` to ``6_000_000`` when
+    the live provider path was wired (issue #269, follow-up 4). The old value
+    was exactly the fixed research charge a forecast already incurs, leaving
+    *zero* headroom for the provider votes themselves: the first live tick whose
+    providers were failing accrued retry list price on top of research, breached
+    the per-forecast ceiling, and halted fail-closed -- producing no forecast at
+    all. Fail-closed is the right direction for a breach, but a ceiling that a
+    correct run cannot help but breach is a broken default, not a guard.
+
+    The new value is derived rather than invented: the fixed research charge
+    (``3_000_000``) plus the default three-member vote ensemble's worst case,
+    which :attr:`ProviderRetryConfig.max_cost_micros` already bounds at
+    ``1_000_000`` per member (``3 x 1_000_000``). It is the true worst case, so
+    anything lower guarantees breaches on a healthy run and anything higher is
+    unspent slack.
+
+    ``per_day_micros`` is deliberately left at ``20_000_000``. Doubling a real
+    money cap is an operator's decision, not a wiring change's side effect; the
+    effect is simply that a day admits fewer worst-case forecasts. Note that a
+    *successful* live vote currently reports ``cost_micros == 0`` (the vote
+    provider parses no token accounting out of the response envelope), so only
+    failing votes consume this headroom today -- see the PR notes for the
+    per-vote cost-attribution follow-up.
+
+    Attributes:
+        per_forecast_micros: The ceiling one forecast's research plus provider
+            votes may spend, in micros.
+        per_day_micros: The ceiling all forecasts in one UTC day may spend, in
+            micros.
+        max_pages: The maximum pages one forecast's bounded web research fetches.
+    """
+
+    per_forecast_micros: int = 6000000
     per_day_micros: int = 20000000
     max_pages: int = 20
 
@@ -503,9 +535,7 @@ class ProviderTransportConfig:
     anthropic_api_key_env: str = "ANTHROPIC_API_KEY"
     openai_api_key_env: str = "OPENAI_API_KEY"
     retry: ProviderRetryConfig = field(default_factory=ProviderRetryConfig)
-    prices: tuple[ProviderPrice, ...] = field(
-        default_factory=_default_provider_prices
-    )
+    prices: tuple[ProviderPrice, ...] = field(default_factory=_default_provider_prices)
     unknown_provider_price_micros: int = 1_000_000
 
 
