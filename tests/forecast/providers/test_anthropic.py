@@ -39,7 +39,8 @@ from windbreak.forecast.providers import (
     FixtureVoteProvider,
     HttpResponse,
     ProviderForecast,
-    ProviderResponseRejectedError,
+    ProviderHTTPError,
+    ProviderMalformedResponseError,
 )
 from windbreak.forecast.providers.anthropic import AnthropicMessagesTransport
 from windbreak.forecast.sanitize import (
@@ -212,20 +213,21 @@ def test_two_calls_with_equal_requests_build_byte_identical_bodies() -> None:
 
 
 def test_non_2xx_status_is_rejected_with_http_status_failure_code() -> None:
-    """A non-2xx status raises `ProviderResponseRejectedError` carrying
-    `RESPONSE_FAILURE_HTTP_STATUS` and a fingerprint of the raw body -- never
-    the raw body text itself.
+    """A non-2xx status raises `ProviderHTTPError` carrying the status code,
+    `RESPONSE_FAILURE_HTTP_STATUS`, and a fingerprint of the raw body -- never
+    the raw body text itself. The specific type is what lets the retry layer
+    classify a transient upstream failure (issue #269).
     """
     body = "irrelevant body content that must never leak into the exception"
     transport = _transport(body, status_code=500)
 
-    with pytest.raises(ProviderResponseRejectedError) as excinfo:
+    with pytest.raises(ProviderHTTPError) as excinfo:
         transport.complete(_request())
 
+    assert excinfo.value.status_code == 500
     assert excinfo.value.failure_code == RESPONSE_FAILURE_HTTP_STATUS
     assert body not in str(excinfo.value)
     assert len(excinfo.value.response_fingerprint) == 64
-    assert excinfo.value.response_fingerprint in str(excinfo.value)
     assert (
         excinfo.value.response_fingerprint
         == hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -266,7 +268,7 @@ def test_malformed_envelope_is_rejected_as_malformed_vote_json(body: str) -> Non
     """
     transport = _transport(body)
 
-    with pytest.raises(ProviderResponseRejectedError) as excinfo:
+    with pytest.raises(ProviderMalformedResponseError) as excinfo:
         transport.complete(_request())
 
     assert excinfo.value.failure_code == RESPONSE_FAILURE_MALFORMED_VOTE_JSON
@@ -281,7 +283,7 @@ def test_non_finite_json_constant_anywhere_in_envelope_is_rejected() -> None:
     )
     transport = _transport(body)
 
-    with pytest.raises(ProviderResponseRejectedError) as excinfo:
+    with pytest.raises(ProviderMalformedResponseError) as excinfo:
         transport.complete(_request())
 
     assert excinfo.value.failure_code == RESPONSE_FAILURE_MALFORMED_VOTE_JSON

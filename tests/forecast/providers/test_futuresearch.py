@@ -984,17 +984,21 @@ def test_non_2xx_status_is_rejected_fast(
     """A non-2xx HTTP status is rejected immediately, before any body-schema
     parsing is attempted -- proven by pairing the bad status with a body that
     is not even valid JSON, which a parsing-first implementation would
-    instead surface as `RESPONSE_FAILURE_MALFORMED_VOTE_JSON` (#189).
+    instead surface as `RESPONSE_FAILURE_MALFORMED_VOTE_JSON` (#189). Since
+    issue #269 the rejection is the specific `ProviderHTTPError`, carrying the
+    status code the retry layer classifies on.
     """
+    from windbreak.forecast.providers import ProviderHTTPError
     from windbreak.forecast.sanitize import RESPONSE_FAILURE_HTTP_STATUS
 
     provider = FutureSearchProvider(
         _StubHttpTransport("not even json", status_code=500), _config()
     )
 
-    with pytest.raises(ProviderResponseRejectedError) as excinfo:
+    with pytest.raises(ProviderHTTPError) as excinfo:
         provider.forecast(market, baseline, 0, ())
 
+    assert excinfo.value.status_code == 500
     assert excinfo.value.failure_code == RESPONSE_FAILURE_HTTP_STATUS
 
 

@@ -211,6 +211,11 @@ PROVIDER_FAILURE_RATE_LIMITED: Final = "provider_rate_limited"
 #: per-provider affordability ceiling; the attempt is refused, not billed twice.
 PROVIDER_FAILURE_COST_OVERRUN: Final = "provider_cost_overrun"
 
+#: Failure code stamped when an ensemble member names a provider the running
+#: deployment has no live route for. A *configuration* fault rather than a venue
+#: one, and no request was ever built, so there is no body to fingerprint.
+PROVIDER_FAILURE_NOT_ROUTABLE: Final = "provider_not_routable"
+
 #: Truthful sentinel ``response_fingerprint`` for a failure where no response
 #: body ever existed (timeout, rate-limit, cost overrun). It is deliberately not
 #: a 64-char sha256 hex digest, so it can never be mistaken for -- or forged as
@@ -493,6 +498,44 @@ class ProviderCostOverrunError(ProviderVoteError):
             failure_code=PROVIDER_FAILURE_COST_OVERRUN,
             response_fingerprint=NO_RESPONSE_FINGERPRINT,
             cost_micros=cost_micros,
+        )
+
+
+class ProviderNotRoutableError(ProviderVoteError):
+    """Raised when a vote names a provider the deployment has no live route for.
+
+    A *configuration* fault, not a venue one: an ensemble member named a
+    provider for which no live adapter (and therefore no endpoint, credential,
+    or allowlist entry) was ever built. The composition root refuses such a
+    configuration at startup, so this is the defence-in-depth layer behind that
+    refusal -- and it is a :class:`ProviderVoteError` precisely so that if a
+    route is ever missing at vote time, the vote is *discarded* like any other
+    failure and the run degrades to quorum abstention. A bare :class:`KeyError`
+    here is caught by neither the retry layer nor the pipeline's discard path,
+    so it would escape ``run_pipeline`` and crash the whole tick.
+
+    Deliberately **not** transport-class (see
+    ``windbreak.forecast.pipeline._is_transport_failure``): a missing route is
+    no evidence that a venue was unreachable, and stamping a zero-survivor run
+    ``provider_unavailable`` would tell an operator their provider was down when
+    in truth they never wired it. Never retried either -- a route that does not
+    exist will not exist on a second attempt.
+
+    Attributes:
+        provider: The provider identifier that had no live route.
+    """
+
+    def __init__(self, provider: str) -> None:
+        """Store the unroutable provider identifier.
+
+        Args:
+            provider: The provider identifier that had no live route.
+        """
+        self.provider = provider
+        super().__init__(
+            f"no live route configured for provider {provider!r}",
+            failure_code=PROVIDER_FAILURE_NOT_ROUTABLE,
+            response_fingerprint=NO_RESPONSE_FINGERPRINT,
         )
 
 

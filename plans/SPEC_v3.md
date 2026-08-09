@@ -626,7 +626,7 @@ forecast:
   triage_model: {provider: "cheapest-adequate", model: "pinned-by-operator"}
   triage_threshold_ppm: 50000            # full pipeline only if |prior − price| ≥ 5 pts
   shrink_to_market_lambda_ppm: 250000
-  budget: {per_forecast_micros: 3000000, per_day_micros: 20000000, max_pages: 20}
+  budget: {per_forecast_micros: 6000000, per_day_micros: 20000000, max_pages: 20}
   min_verified_citations: 3
   canary: {enabled: true, cadence_days: 7}
 

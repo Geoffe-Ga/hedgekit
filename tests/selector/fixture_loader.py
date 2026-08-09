@@ -53,28 +53,59 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
-def _parse_dt(value: str) -> datetime:
-    """Parse an ISO-8601 timestamp into a UTC-normalized datetime.
+def _parse_dt(value: str, *, field: str) -> datetime:
+    """Parse an offset-bearing ISO-8601 fixture timestamp into a UTC datetime.
+
+    The offset is required, matching
+    :func:`windbreak.connector.fake._parse_dt` and
+    :func:`windbreak.connector.kalshi.normalize._parse_dt`. ``fromisoformat``
+    returns a *naive* datetime for an offsetless string, and ``.astimezone(UTC)``
+    does not raise on one -- it reads the wall clock as the **host's** local
+    time, so the same checked-in bundle would mean different instants on a
+    developer's laptop and in UTC-running CI (issue #392). Every bundle under
+    ``tests/selector/fixtures/`` carries a ``Z`` today; this guard is what keeps
+    that true, rather than leaving it a property nothing checks.
 
     Args:
-        value: An ISO-8601 string, e.g. ``"2024-12-10T12:00:00.000000Z"``.
+        value: An ISO-8601 string carrying a UTC offset, e.g.
+            ``"2024-12-10T12:00:00.000000Z"``.
+        field: The bundle field name ``value`` came from, named in the error so
+            the offending entry is locatable.
 
     Returns:
         The timezone-aware datetime, normalized to UTC.
+
+    Raises:
+        ValueError: If ``value`` is not parseable as ISO-8601, or parses to a
+            naive (offsetless) datetime.
     """
-    return datetime.fromisoformat(value).astimezone(UTC)
+    parsed = datetime.fromisoformat(value)
+    # Naive means `tzinfo is None` *or* a `tzinfo` whose `utcoffset()` returns
+    # None -- Python's own definition, reported by `utcoffset()` in one call.
+    if parsed.utcoffset() is None:
+        raise ValueError(
+            f"Fixture timestamp field {field!r} carries no UTC offset: {value!r}. "
+            "An offsetless timestamp would be read against the host's local "
+            "timezone, so the bundle is refused rather than loaded against a "
+            "guessed offset."
+        )
+    return parsed.astimezone(UTC)
 
 
-def _parse_optional_dt(value: str | None) -> datetime | None:
-    """Parse an optional ISO-8601 timestamp, preserving ``None``.
+def _parse_optional_dt(value: str | None, *, field: str) -> datetime | None:
+    """Parse an optional offset-bearing ISO-8601 timestamp, preserving ``None``.
 
     Args:
-        value: An ISO-8601 string, or ``None``.
+        value: An ISO-8601 string carrying a UTC offset, or ``None``.
+        field: The bundle field name ``value`` came from, named in the error.
 
     Returns:
         The parsed UTC datetime, or ``None`` when ``value`` is ``None``.
+
+    Raises:
+        ValueError: If ``value`` is present and offsetless or unparseable.
     """
-    return None if value is None else _parse_dt(value)
+    return None if value is None else _parse_dt(value, field=field)
 
 
 def _model_vote_from_dict(data: Mapping[str, object]) -> ModelVote:
@@ -109,7 +140,9 @@ def _citation_from_dict(data: Mapping[str, object]) -> Citation:
         url=data["url"],
         content_hash=data["content_hash"],
         quoted_text=data["quoted_text"],
-        publication_date=_parse_optional_dt(data["publication_date"]),
+        publication_date=_parse_optional_dt(
+            data["publication_date"], field="publication_date"
+        ),
         source_type=data["source_type"],
     )
 
@@ -139,7 +172,7 @@ def _forecast_record_from_dict(data: Mapping[str, object]) -> ForecastRecord:
         source_quality_notes=tuple(data["source_quality_notes"]),
         research_cost_micros=data["research_cost_micros"],
         triage_stage=data["triage_stage"],
-        created_at=_parse_dt(data["created_at"]),
+        created_at=_parse_dt(data["created_at"], field="created_at"),
         forecast_horizon_hours=data["forecast_horizon_hours"],
         market_price_baseline_pips=data["market_price_baseline_pips"],
         baseline_quote_snapshot_id=data["baseline_quote_snapshot_id"],
@@ -183,7 +216,7 @@ def _order_book_from_dict(data: Mapping[str, object]) -> OrderBookSnapshot:
         yes_asks=tuple(
             _order_book_level_from_dict(level) for level in data["yes_asks"]
         ),
-        fetched_at=_parse_dt(data["fetched_at"]),
+        fetched_at=_parse_dt(data["fetched_at"], field="fetched_at"),
     )
 
 
@@ -204,7 +237,7 @@ def _fee_model_input_from_dict(data: Mapping[str, object]) -> FeeModelInput:
         taker_fee_ppm=data["taker_fee_ppm"],
         settlement_fee_ppm=data["settlement_fee_ppm"],
     )
-    return FeeModelInput(model=model, as_of=_parse_dt(data["as_of"]))
+    return FeeModelInput(model=model, as_of=_parse_dt(data["as_of"], field="as_of"))
 
 
 def _slippage_input_from_dict(data: Mapping[str, object]) -> SlippageModelInput:
@@ -279,7 +312,7 @@ def _correlation_tag_from_dict(data: Mapping[str, object]) -> CorrelationTag:
     return CorrelationTag(
         bucket_id=data["bucket_id"],
         source=data["source"],
-        tagged_at=_parse_dt(data["tagged_at"]),
+        tagged_at=_parse_dt(data["tagged_at"], field="tagged_at"),
     )
 
 

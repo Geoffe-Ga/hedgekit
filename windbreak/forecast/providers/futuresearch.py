@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Final, NoReturn
 from windbreak.forecast.providers.base import (
     ProviderCitation,
     ProviderForecast,
+    ProviderHTTPError,
     ProviderResponseRejectedError,
     ProviderVersionDriftError,
     fingerprint_response,
@@ -56,7 +57,6 @@ from windbreak.forecast.providers.base import (
 from windbreak.forecast.providers.http_cassettes import HttpRequest
 from windbreak.forecast.sanitize import (
     MAX_RATIONALE_CHARS,
-    RESPONSE_FAILURE_HTTP_STATUS,
     RESPONSE_FAILURE_INVALID_RATIONALE,
     RESPONSE_FAILURE_MALFORMED_VOTE_JSON,
     RESPONSE_FAILURE_PROBABILITY_OUT_OF_RANGE,
@@ -463,11 +463,13 @@ class FutureSearchProvider:
             The structured forecast parsed from a clean, schema-valid response.
 
         Raises:
-            ProviderResponseRejectedError: If the transport returns a non-2xx
-                status (rejected fast, before any body parsing), or if the raw
-                response fails the injection screen, JSON parse, or a field's
-                domain check; the error carries the failure code and response
-                fingerprint only.
+            ProviderHTTPError: If the transport returns a non-2xx status
+                (rejected fast, before any body parsing), carrying that status
+                code so the retry layer can classify a transient upstream
+                failure (issue #269).
+            ProviderResponseRejectedError: If the raw response fails the
+                injection screen, JSON parse, or a field's domain check; the
+                error carries the failure code and response fingerprint only.
             ProviderVersionDriftError: If the reported forecaster version is off
                 the pinned set and the config rejects drift.
         """
@@ -483,7 +485,7 @@ class FutureSearchProvider:
         if not (
             _HTTP_SUCCESS_MIN <= response.status_code < _HTTP_SUCCESS_MAX_EXCLUSIVE
         ):
-            _reject(RESPONSE_FAILURE_HTTP_STATUS, fingerprint)
+            raise ProviderHTTPError(response.status_code, fingerprint)
         injection = screen_untrusted_text(raw_body)
         if injection is not None:
             _reject(injection, fingerprint)

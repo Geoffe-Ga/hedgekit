@@ -62,7 +62,7 @@ def _extract_completion_text(payload: dict[str, object], fingerprint: str) -> st
         The first choice's message content, verbatim.
 
     Raises:
-        ProviderResponseRejectedError: If ``choices`` is missing/empty/not an
+        ProviderMalformedResponseError: If ``choices`` is missing/empty/not an
             array, its first element or its ``message`` is not an object, or the
             message's ``content`` is missing or not a string.
     """
@@ -105,7 +105,8 @@ class OpenAiChatTransport:
             The extracted ``choices[0]["message"]["content"]`` text, verbatim.
 
         Raises:
-            ProviderResponseRejectedError: On a non-2xx status, a malformed
+            ProviderHTTPError: On a non-2xx status, carrying that status code.
+            ProviderMalformedResponseError: On a malformed
                 body, a non-finite JSON constant, or an unexpected envelope
                 shape; the error carries the failure code and fingerprint only.
         """
