@@ -92,6 +92,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from windbreak.connector.models import NormalizedMarket
+from windbreak.forecast.budget import InMemoryBudgetLedger, ResearchBudget
 from windbreak.forecast.records import BaselineQuoteSnapshot
 
 if TYPE_CHECKING:
@@ -319,6 +320,26 @@ def research_tools(
 ) -> object:
     """Provide a `ResearchTools` sandboxed to the `research.local` allowlist."""
     return research_tools_factory(cache_dir=tmp_path / "research-cache")
+
+
+@pytest.fixture
+def research_budget() -> ResearchBudget:
+    """Provide a deliberately generous `ResearchBudget` (issue #348).
+
+    `run_triaged_pipeline` requires a non-Optional budget, so every triaged run
+    -- including runs about record shape, ledger payloads, or determinism that
+    have nothing to say about money -- has to wire one. This fixture is that
+    wiring: ceilings set high enough that no test asserting on something *else*
+    trips a budget guard incidentally, over a fresh in-memory ledger per test.
+    A run with a real ceiling to prove builds its own budget locally with the
+    exact figures it is pinning, so enforcement is never asserted through this
+    fixture's slack.
+    """
+    return ResearchBudget(
+        per_forecast_micros=100_000_000,
+        per_day_micros=1_000_000_000,
+        ledger=InMemoryBudgetLedger(),
+    )
 
 
 class RaisingFetchTransport:

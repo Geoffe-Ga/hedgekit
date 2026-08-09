@@ -7,9 +7,13 @@ enforces all three fail-closed: :meth:`ResearchBudget.ensure_day_open` halts a
 run *before any research* once the day bucket is exhausted, and
 :meth:`ResearchBudget.charge_forecast` records a forecast's spend into the day
 bucket *first* (so a breached forecast still counts against the day) before
-raising on a per-forecast overrun. :func:`report_research_costs` summarizes
-accumulated spend into per-resolved-forecast and per-profitable-trade unit
-costs.
+raising on a per-forecast overrun. A forecast that spends in stages (SPEC
+S8.4's cheap triage prior, then the full pipeline) charges each stage through
+:meth:`ResearchBudget.charge_stage`, which keeps the per-forecast ceiling
+checked against their *total* -- a ceiling applied per stage instead could
+never trip on the only figure that matters. :func:`report_research_costs`
+summarizes accumulated spend into per-resolved-forecast and
+per-profitable-trade unit costs.
 
 The three defaults deliberately mirror
 :data:`windbreak.forecast.triage.PER_FORECAST_BUDGET_MICROS` and its siblings
@@ -332,6 +336,7 @@ class ResearchBudget:
         self._max_pages = max_pages
         self._ledger = ledger
         self._spend_by_day: dict[str, int] = {}
+        self._already_charged_micros = 0
 
     @property
     def max_pages(self) -> int:
@@ -374,7 +379,11 @@ class ResearchBudget:
 
         The spend lands in the day bucket *first*, so a breached forecast still
         counts against the day. The per-forecast ceiling is inclusive: a cost
-        exactly equal to it passes; only a strictly greater cost breaches.
+        exactly equal to it passes; only a strictly greater cost breaches. On a
+        budget handed back by :meth:`charge_stage`, the ceiling is checked
+        against this cost *plus* what earlier stages of the same forecast
+        already spent, and that aggregate is what the error and its ledgered
+        event report.
 
         Args:
             cost_micros: The forecast's research cost, in micros.
@@ -385,16 +394,17 @@ class ResearchBudget:
 
         Raises:
             ValueError: If ``cost_micros`` is negative.
-            PerForecastBudgetExceededError: If ``cost_micros`` strictly exceeds
-                the per-forecast ceiling. A ``BUDGET_FORECAST_EXCEEDED`` event is
-                ledgered before the raise.
+            PerForecastBudgetExceededError: If the forecast's total cost
+                strictly exceeds the per-forecast ceiling. A
+                ``BUDGET_FORECAST_EXCEEDED`` event is ledgered before the raise.
         """
         _require_non_negative(cost_micros, "cost_micros")
         day = _utc_day_key(at)
         self._spend_by_day[day] = self._spend_by_day.get(day, 0) + cost_micros
-        if cost_micros > self._per_forecast_micros:
+        forecast_cost_micros = self._already_charged_micros + cost_micros
+        if forecast_cost_micros > self._per_forecast_micros:
             payload: dict[str, object] = {
-                "cost_micros": cost_micros,
+                "cost_micros": forecast_cost_micros,
                 "budget_micros": self._per_forecast_micros,
                 "market_ticker": market_ticker,
                 "utc_day": day,
@@ -402,7 +412,57 @@ class ResearchBudget:
             self._ledger.record(
                 BudgetEvent(BUDGET_FORECAST_EXCEEDED_EVENT, payload, _iso_z(at))
             )
-            raise PerForecastBudgetExceededError(cost_micros, self._per_forecast_micros)
+            raise PerForecastBudgetExceededError(
+                forecast_cost_micros, self._per_forecast_micros
+            )
+
+    def charge_stage(
+        self, cost_micros: int, *, market_ticker: str, at: datetime
+    ) -> ResearchBudget:
+        """Charge a finished stage and return the budget for the rest of that forecast.
+
+        A forecast can spend in more than one stage -- SPEC S8.4's cheap Stage-0
+        prior, then the full pipeline -- but it is still *one* forecast, so the
+        per-forecast ceiling governs their total. Putting each stage through
+        :meth:`charge_forecast` independently would clear both checks whenever
+        neither stage alone breaches, leaving a ceiling that cannot trip on the
+        only figure that matters. This charges the stage that has already run
+        (so spent money is on the books immediately, even if a later stage
+        raises) and hands back a view onto the *same* forecast: the same day
+        bucket and ledger, remembering what has been spent so the next stage's
+        charge is checked in aggregate.
+
+        The returned view is deliberately a separate object rather than mutated
+        state on ``self``: a :class:`ResearchBudget` outlives any one forecast,
+        and the already-spent offset must not follow it into the next one.
+
+        Args:
+            cost_micros: The finished stage's research cost, in micros.
+            market_ticker: The forecasted market's ticker, for the audit trail
+                (keyword-only).
+            at: The run's creation instant, bucketing the spend to a UTC day
+                (keyword-only).
+
+        Returns:
+            A budget governing the remainder of the same forecast, sharing this
+            budget's day bucket, ledger, and ceilings.
+
+        Raises:
+            ValueError: If ``cost_micros`` is negative.
+            PerForecastBudgetExceededError: If the forecast's cost through this
+                stage strictly exceeds the per-forecast ceiling -- so no
+                remainder is handed back and no later stage can run on it.
+        """
+        self.charge_forecast(cost_micros, market_ticker=market_ticker, at=at)
+        remainder = ResearchBudget(
+            per_forecast_micros=self._per_forecast_micros,
+            per_day_micros=self._per_day_micros,
+            max_pages=self._max_pages,
+            ledger=self._ledger,
+        )
+        remainder._spend_by_day = self._spend_by_day
+        remainder._already_charged_micros = self._already_charged_micros + cost_micros
+        return remainder
 
 
 @dataclass(frozen=True, slots=True)
