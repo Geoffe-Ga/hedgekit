@@ -541,8 +541,8 @@ def test_retrying_provider_recovers_after_one_timeout(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
     """One timeout then a successful response yields the inner forecast with
-    `cost_micros` bumped by exactly one attempt's accrued price, after
-    exactly two inner calls.
+    `cost_micros` bumped by *both* attempts' accrued price -- the failed one
+    and the successful one (issue #399) -- after exactly two inner calls.
     """
     forecast = _provider_forecast(cost_micros=5_000)
     inner = _FlakyProvider([ProviderTimeoutError(), forecast])
@@ -553,7 +553,7 @@ def test_retrying_provider_recovers_after_one_timeout(
 
     assert inner.calls == 2
     assert result == dataclasses.replace(
-        forecast, cost_micros=forecast.cost_micros + _TEST_PRICE_MICROS
+        forecast, cost_micros=forecast.cost_micros + 2 * _TEST_PRICE_MICROS
     )
 
 
@@ -625,7 +625,7 @@ def test_retrying_provider_retries_http_503(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
     """A 5xx `ProviderHTTPError` is retryable: one 503 then success yields
-    the inner forecast after exactly two inner calls.
+    the inner forecast after exactly two inner calls, priced for both.
     """
     forecast = _provider_forecast()
     inner = _FlakyProvider([ProviderHTTPError(503, "a" * 64), forecast])
@@ -635,7 +635,7 @@ def test_retrying_provider_retries_http_503(
     result = retrying.forecast(market, baseline, 0, ())
 
     assert inner.calls == 2
-    assert result.cost_micros == forecast.cost_micros + _TEST_PRICE_MICROS
+    assert result.cost_micros == forecast.cost_micros + 2 * _TEST_PRICE_MICROS
 
 
 def test_retrying_provider_retries_http_429_using_backoff_not_retry_after(
@@ -802,12 +802,17 @@ def test_retrying_provider_prices_unknown_provider_at_the_ceiling(
     assert error.cost_micros == 250_000
 
 
-def test_retrying_provider_clean_success_is_byte_equal_to_inner_forecast(
+def test_retrying_provider_clean_success_books_exactly_one_list_price(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
-    """A zero-failed-attempts success returns a forecast byte-equal to the
-    inner provider's own result -- the retry wrapper is invisible on the
-    happy path.
+    """A zero-failed-attempts success returns the inner forecast with its
+    ``cost_micros`` raised by exactly one list price, and is otherwise
+    byte-equal to it.
+
+    The wrapper is deliberately *not* invisible on the happy path: issue #399
+    was exactly that invisibility, which booked a successful live vote at zero
+    and left the research budget unable to bound a healthy run. Nothing but
+    the cost changes, and no retry is scheduled.
     """
     forecast = _provider_forecast(cost_micros=42)
     inner = _SucceedingProvider(forecast)
@@ -816,7 +821,9 @@ def test_retrying_provider_clean_success_is_byte_equal_to_inner_forecast(
 
     result = retrying.forecast(market, baseline, 0, ())
 
-    assert result == forecast
+    assert result == dataclasses.replace(
+        forecast, cost_micros=forecast.cost_micros + _TEST_PRICE_MICROS
+    )
     assert inner.calls == 1
     assert clock.waits == []
 

@@ -117,8 +117,67 @@ select = [
     "SIM",    # flake8-simplify
     "TCH",    # flake8-type-checking
     "RUF",    # Ruff-specific rules
+    "D1",     # pydocstyle: the "missing docstring" family -- see below
 ]
 ignore = []
+
+# THE DOCSTRING-COVERAGE GATE (issue #351)
+#
+# CLAUDE.md's Quality Standards table has always listed a docstring threshold
+# next to line coverage, complexity and the rest. Nothing measured it. Neither
+# pydocstyle nor interrogate was installed or dispatched, and `D` was absent
+# from the select list above -- so the row was decoration: a documented gate
+# that could not fail. That is the same defect class as issue #359 (a hook
+# dispatched by no script) and issue #401 (18 of 26 hooks undispatched), found
+# for the third time in the gate machinery itself.
+#
+# WHY RUFF, AND NOT pydocstyle OR interrogate
+#
+# The three names in circulation -- CLAUDE.md said "pydocstyle / ruff D rules",
+# the ralph-documentation-specialist agent said "interrogate >=85%" -- are not
+# three options so much as one implementation and two redundant packagings of
+# it. Ruff REIMPLEMENTS pydocstyle's rule set natively as the `D` family, and
+# ruff is already the pinned linter (constraints-quality.txt), already the
+# single formatter authority (ADR-0002), already dispatched by scripts/lint.sh
+# AND by the ruff-check pre-commit hook that Gate 1 now runs in full (#401).
+# Adding pydocstyle or interrogate would mean a new pin, a new hook, a new
+# gate script and a second tool's opinion to keep in lockstep -- to measure
+# what the tool already in the toolchain measures. So: ruff, no new dependency.
+#
+# WHY D1 (PRESENCE), AND WHAT THAT DOES TO THE NUMBER
+#
+# `D1` is exactly the "missing docstring" family, D100-D107: module, class,
+# method, function, package, magic method, nested class, `__init__`. It is
+# precisely what "docstring coverage" names, and it enforces PRESENCE per
+# symbol -- i.e. 100%, with no percentage to hide behind.
+#
+# That is STRICTER than the >=95% the docs claimed, not looser. A percentage
+# threshold is what you reach for when 100% is out of reach; it buys headroom
+# at the cost of letting a fixed fraction of symbols silently lose their
+# docstrings while the meter still reads green. This repo does not need that
+# headroom: at the time this gate was wired, `windbreak/`, `scripts/` and
+# `plans/` were ALREADY at 100% presence, and every one of the 129 findings
+# was an undocumented test function in eight files -- all written, not
+# ignored, in the same change. So the honest wiring is the strict one, and
+# CLAUDE.md's row was corrected to state the rule actually enforced rather
+# than a percentage no tool computes.
+#
+# WHAT IS DELIBERATELY *NOT* ENABLED, AND WHY IT IS NOT A BLANKET IGNORE
+#
+# The rest of the `D` family (D2xx/D3xx/D4xx) governs docstring FORMATTING and
+# CONTENT -- blank line after summary, terminal punctuation, capitalisation --
+# not coverage. Selecting all of `D` reports ~1,900 further findings here,
+# dominated by 1,667 D205 (multi-line summaries). Those are a real style
+# question, but they are a DIFFERENT question from the documented gate, and
+# reflowing 1,667 docstrings would bury this change. Tracked as a follow-up
+# (see the PR for issue #351) rather than silenced: nothing here suppresses a
+# finding the documented gate asks for.
+[tool.ruff.lint.pydocstyle]
+# CLAUDE.md's "Docstring Style (Google Format)" section is the house standard,
+# so the convention is declared even though no D1xx rule is convention-
+# dependent. It is what makes widening `D1` to `D` a config-only change with
+# the right rules already excluded, instead of an invitation to re-litigate.
+convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["S101"]  # Allow assert in tests

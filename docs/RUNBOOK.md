@@ -461,7 +461,11 @@ pass.
 
 Alerts reach you only through the sinks `config.alerts` declares. Until you
 declare one, every alert falls back to the log-only sink: it appears on stderr
-as a JSON `AlertEmitted` line and **nowhere else**. That is the shipped default
+as a JSON `AlertEmitted` line and **nowhere else** you can be paged from. (The
+one exception is the kill switch's `HALT_KILL` alert, which since issue #287
+*also* appends an `AlertEmitted` row to the hash-chained ledger — an audit
+record, not a delivery channel: it proves after the fact that the page fired,
+and it cannot page you.) The log-only fallback is the shipped default
 (`alerts.sinks` holds one ntfy entry whose `topic_env` is still the
 `configured-by-operator` placeholder), so treat configuring a real sink as a
 prerequisite for any unattended run.
@@ -748,15 +752,52 @@ tick that bundle runs. There is deliberately no `budget` parameter on
 `build_paper_deps`: config is the single source, so there is no injection door
 through which an unlimited or absent budget could arrive.
 
-A halted tick appends exactly one `ResearchBudgetHalted` ledger row (component
+A halted market appends exactly one `ResearchBudgetHalted` ledger row (component
 `scheduler`) carrying `halt_kind` (`per_day` or `per_forecast`), `utc_day`,
-`spent_micros`, and `budget_micros`. It then **skips the forecast, select, and
-approve stages** but still emits its heartbeat, equity sample, positions
-snapshot, and weekly report -- so a budget-halted loop stays observably alive
-and flat rather than dying. Its ledger differs from a normal tick's by exactly
-two absent rows: `ForecastCreated` and `SelectorDecisionRecorded`. No
-`ForecastCreated` row is fabricated for a tick where the forecast engine never
-ran; in a hash-chained audit ledger an honest gap beats an invented record.
+`spent_micros`, and `budget_micros`. The tick then **skips that market's
+forecast, select, and approve stages and stops walking its remaining
+candidates**, but still emits its heartbeat, equity sample, positions snapshot,
+and weekly report -- so a budget-halted loop stays observably alive and flat
+rather than dying. No `ForecastCreated` row is fabricated for a market where the
+forecast engine never ran; in a hash-chained audit ledger an honest gap beats an
+invented record.
+
+**What a halt actually leaves on the ledger.** The halting market and the
+markets behind it leave *different* shapes, so read them separately:
+
+| Market | Rows present | Rows absent |
+| --- | --- | --- |
+| Forecast before the halt | `ScreenDecisionRecorded`, `MarketSnapshotRecorded`, `ForecastCreated`, `SelectorDecisionRecorded`, `ExchangeStatusObserved` | — |
+| **The halting market** | `ScreenDecisionRecorded`, `MarketSnapshotRecorded`, then the tick's `ResearchBudgetHalted` | `ForecastCreated`, `SelectorDecisionRecorded`, `ExchangeStatusObserved` |
+| **Every candidate after it** | `ScreenDecisionRecorded` only | `MarketSnapshotRecorded`, `ForecastCreated`, `SelectorDecisionRecorded`, `ExchangeStatusObserved` |
+
+The halting market keeps its snapshot because the tick ledgers the book before
+the forecast stage can halt. The markets behind it are never run at all, so
+they lose their snapshot too -- do **not** expect a `MarketSnapshotRecorded` for
+them. What they keep is their screen verdict, because the screen covers the
+whole candidate set before the walk begins: the ledger says such a market was
+examined and found eligible, and says nothing further about it.
+
+Both shapes are pinned as exact golden row sequences in
+`tests/integration/test_paper_universe.py`, so this table is checkable rather
+than prose that can drift.
+
+**How many forecasts one tick can buy (issue #345).** A tick no longer forecasts
+one hardcoded ticker: it screens the venue's market universe and forecasts up to
+`config.screener.max_candidates_per_tick` of the markets that pass (default
+`3`). The screen itself is free -- the four §16 filters are integer comparisons
+over market metadata and a book, with no model calls -- so it is the *candidate
+bound*, not the screen, that caps a tick's research bill at
+`max_candidates_per_tick x per_forecast_micros`. The default `3` is
+`per_day_micros // per_forecast_micros` at their own defaults, so a single tick
+cannot plan to spend more than a whole worst-case day. Raising
+`max_candidates_per_tick` without raising `per_day_micros` simply moves the
+day's halt earlier in the day; a value below `1` is refused at startup by
+`build_paper_deps`.
+
+Markets the walk did not reach get **no** `ScreenDecisionRecorded` row. That is
+deliberate: the ledger states which markets were examined and does not claim a
+verdict on markets the tick never looked at.
 
 **Operator arithmetic.** With the SPEC defaults -- a 20,000,000-micro day
 ceiling against the fixed 3,000,000-micro per-forecast research charge -- a UTC

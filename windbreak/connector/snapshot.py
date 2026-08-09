@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, Protocol
 
 from windbreak.connector.models import market_to_payload
+from windbreak.timekeeping import iso_z
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -41,15 +42,28 @@ _LOGGER = logging.getLogger("windbreak.connector")
 def utc_now_iso(moment: datetime | None = None) -> str:
     """Render a moment as ISO-8601 UTC with a trailing ``Z``.
 
+    Every connector ledger ``ts`` flows through here, including the values
+    produced by the injected ``clock`` / ``wall_clock`` callables that
+    :class:`windbreak.screener.screener.Screener` and
+    ``windbreak.connector.validation.SchemaValidator`` take as *required,
+    undefaulted* seams. Those seams never validate what they return, so this is
+    the boundary that refuses a naive instant before it is written to an audit
+    trail (issue #397).
+
     Args:
-        moment: The (timezone-aware) datetime to render, normalized to UTC.
-            Defaults to the current wall-clock UTC time when None.
+        moment: The datetime to render, normalized to UTC; it **must** be
+            timezone-aware. Defaults to the current wall-clock UTC time when
+            ``None``.
 
     Returns:
         A string like ``2026-07-04T12:00:00.000000Z``.
+
+    Raises:
+        ValueError: If ``moment`` is provided and carries no UTC offset.
     """
-    resolved = datetime.now(UTC) if moment is None else moment.astimezone(UTC)
-    return resolved.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    if moment is None:
+        return iso_z(datetime.now(UTC))
+    return iso_z(moment)
 
 
 @dataclass(frozen=True, slots=True)

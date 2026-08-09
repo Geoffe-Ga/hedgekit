@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from datetime import UTC, date
 from typing import TYPE_CHECKING, Final
 
+from windbreak.timekeeping import require_aware
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -202,15 +204,28 @@ def ensure_temporal_integrity(
 
     Args:
         calibration_map: The map whose version encodes its training date.
-        forecast_created_at: The forecast's (timezone-aware) creation instant
-            (keyword-only); normalized to its UTC calendar date for comparison.
+        forecast_created_at: The forecast's creation instant (keyword-only),
+            which **must** be timezone-aware; normalized to its UTC calendar
+            date for comparison.
 
     Raises:
         TemporalIntegrityError: If the map's training date is strictly after the
             forecast's creation date.
-        ValueError: If a non-``"v0"`` version is not a valid ISO-8601 date
-            (propagated unwrapped from :func:`datetime.date.fromisoformat`).
+        ValueError: If ``forecast_created_at`` carries no UTC offset, or if a
+            non-``"v0"`` version is not a valid ISO-8601 date (propagated
+            unwrapped from :func:`datetime.date.fromisoformat`).
     """
+    # Enforced, not merely documented (issue #397). `astimezone()` does not
+    # raise on a naive value; it reads the wall clock as the *host's* local
+    # time, and this is the look-ahead-bias gate, so that misreading admits
+    # future information into a backtest. West of UTC a naive late-evening
+    # instant reads as the *next* day, pushing `created_on` past the true
+    # creation date so a map trained the following day clears the check below
+    # -- the gate fails OPEN. (East of UTC it reads as the previous day and
+    # fails closed: a false alarm, not a breach. Only one direction is
+    # dangerous, which is why the awareness itself must be the invariant
+    # rather than the observed verdict on any one host.)
+    require_aware(forecast_created_at, "forecast_created_at")
     if calibration_map.version == IDENTITY_MAP_VERSION:
         return
     trained_on = date.fromisoformat(calibration_map.version)

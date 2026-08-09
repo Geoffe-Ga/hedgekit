@@ -113,6 +113,7 @@ def test_denylisted_packages_constant(lint_module: types.ModuleType) -> None:
 
 
 def test_detects_float_literal(lint_module: types.ModuleType) -> None:
+    """A float literal (`value = 1.5`) is reported once as FLOAT-001."""
     violations = lint_module.collect_violations("value = 1.5\n", "example.py")
 
     assert len(violations) == 1
@@ -124,6 +125,7 @@ def test_detects_float_literal(lint_module: types.ModuleType) -> None:
 
 
 def test_detects_float_argument_annotation(lint_module: types.ModuleType) -> None:
+    """A `float` parameter annotation is reported as FLOAT-002."""
     source = "def f(x: float) -> None:\n    return None\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -134,6 +136,7 @@ def test_detects_float_argument_annotation(lint_module: types.ModuleType) -> Non
 
 
 def test_detects_float_return_annotation(lint_module: types.ModuleType) -> None:
+    """A `-> float` return annotation is reported as FLOAT-002."""
     source = "def g() -> float:\n    return 0\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -144,6 +147,7 @@ def test_detects_float_return_annotation(lint_module: types.ModuleType) -> None:
 
 
 def test_detects_float_ann_assign(lint_module: types.ModuleType) -> None:
+    """A `y: float = 0` annotated assignment is reported as FLOAT-002."""
     source = "y: float = 0\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -170,6 +174,7 @@ def test_detects_string_literal_float_annotation(lint_module: types.ModuleType) 
 def test_detects_true_division_but_not_floor_division(
     lint_module: types.ModuleType,
 ) -> None:
+    """True division `/` is FLOAT-003 while floor division `//` is allowed."""
     source = "a = 1 // 2\nb = 4 / 2\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -180,6 +185,7 @@ def test_detects_true_division_but_not_floor_division(
 
 
 def test_does_not_flag_divmod(lint_module: types.ModuleType) -> None:
+    """`divmod(7, 2)` is integer-exact and yields no violation."""
     source = "q, r = divmod(7, 2)\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -188,6 +194,7 @@ def test_does_not_flag_divmod(lint_module: types.ModuleType) -> None:
 
 
 def test_detects_augmented_true_division(lint_module: types.ModuleType) -> None:
+    """Augmented true division `a /= 2` is reported as FLOAT-003."""
     source = "a = 4\na /= 2\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -198,6 +205,7 @@ def test_detects_augmented_true_division(lint_module: types.ModuleType) -> None:
 
 
 def test_does_not_flag_augmented_floor_division(lint_module: types.ModuleType) -> None:
+    """Augmented floor division `a //= 2` yields no violation."""
     source = "a = 4\na //= 2\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -647,6 +655,7 @@ def test_does_not_flag_join_via_walrus_bound_path_name(
 
 
 def test_detects_float_cast(lint_module: types.ModuleType) -> None:
+    """A bare `float(...)` cast is reported as FLOAT-004."""
     source = "n = float('1.5')\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -657,6 +666,7 @@ def test_detects_float_cast(lint_module: types.ModuleType) -> None:
 
 
 def test_detects_builtins_qualified_float_cast(lint_module: types.ModuleType) -> None:
+    """A qualified `builtins.float(...)` cast is also reported as FLOAT-004."""
     source = "import builtins\nn = builtins.float(1)\n"
 
     violations = lint_module.collect_violations(source, "example.py")
@@ -670,6 +680,7 @@ def test_detects_builtins_qualified_float_cast(lint_module: types.ModuleType) ->
 
 
 def test_clean_source_yields_no_violations(lint_module: types.ModuleType) -> None:
+    """Int-annotated source using only floor division reports no violations."""
     source = (
         "import math\n"
         "\n"
@@ -708,6 +719,7 @@ def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_cli_exits_1_and_prints_violation_for_bad_file(tmp_path: Path) -> None:
+    """The CLI exits 1 and prints `path:line` with FLOAT-001 for a bad file."""
     bad_file = tmp_path / "bad.py"
     bad_file.write_text("x = 1.5\n")
 
@@ -719,6 +731,7 @@ def test_cli_exits_1_and_prints_violation_for_bad_file(tmp_path: Path) -> None:
 
 
 def test_cli_exits_0_for_clean_file(tmp_path: Path) -> None:
+    """The CLI exits 0 with empty stdout for a float-free file."""
     clean_file = tmp_path / "clean.py"
     clean_file.write_text("def add(a: int, b: int) -> int:\n    return a + b\n")
 

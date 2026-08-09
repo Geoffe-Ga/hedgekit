@@ -31,6 +31,7 @@ from windbreak.forecast.sanitize import (
     RESPONSE_FAILURE_VERSION_DRIFT,
     wrap_data_block,
 )
+from windbreak.timekeeping import require_aware
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -154,6 +155,26 @@ class ProviderCitation:
     url: str
     publication_date: datetime | None
     quoted_text: str
+
+    def __post_init__(self) -> None:
+        """Validate the publication date's timezone-awareness invariant.
+
+        ``None`` is valid -- the provider reporting no date is a fact, not an
+        unprovable instant. A *present* date must carry a UTC offset: this is
+        provider-supplied, untrusted data, and an offsetless value read against
+        the host's timezone would silently shift the claimed provenance.
+
+        The FutureSearch provider already rejects an offsetless date at its own
+        parse boundary with a typed provider failure; this is the structural
+        backstop, so a future provider cannot reintroduce the defect merely by
+        building a citation without repeating that check (issue #397).
+
+        Raises:
+            ValueError: If ``publication_date`` is present and carries no UTC
+                offset.
+        """
+        if self.publication_date is not None:
+            require_aware(self.publication_date, "publication_date")
 
 
 @dataclass(frozen=True, slots=True)

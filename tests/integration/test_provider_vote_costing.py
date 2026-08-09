@@ -106,13 +106,23 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from tests.integration.conftest import FIXED_NOW_EPOCH_S, ledger_path_for
+from tests.integration.conftest import (
+    FIXED_NOW_EPOCH_S,
+    candidate_for,
+    ledger_path_for,
+)
 from windbreak.config.schema import EnsembleMemberConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
+
+#: The sole market the shared `deep_walk` books fixture offers, and therefore
+#: the one candidate this module's direct `_forecast_stage` calls run over.
+#: Since issue #345 the tick screens a universe rather than carrying one
+#: hardcoded ticker, so a test driving a single stage names the market itself.
+_TICKER = "MKT-DEEP"
 
 #: The always-present per-tick stage events regardless of forecast outcome
 #: (mirrors `test_paper_loop.py::_ALWAYS_PRESENT_EVENT_TYPES`, narrowed to
@@ -393,10 +403,10 @@ def test_one_paper_tick_ledgers_one_provider_vote_recorded_per_ensemble_member(
         config=paper_config,
         tmp_path=tmp_path,
     )
-    order_book = deps.exchange.get_order_book(deps.ticker)
+    candidate = candidate_for(deps, _TICKER)
     created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
 
-    forecast = _forecast_stage(deps, order_book, created_at)
+    forecast = _forecast_stage(deps, candidate, created_at)
 
     records = deps.store.read_all()
     forecast_record = next(
@@ -461,10 +471,10 @@ def test_forecast_stage_drives_the_configured_non_default_vote_ensemble(
         config=_config_with_vote_ensemble(paper_config, _CONFIGURED_VOTE_ENSEMBLE),
         tmp_path=tmp_path,
     )
-    order_book = deps.exchange.get_order_book(deps.ticker)
+    candidate = candidate_for(deps, _TICKER)
     created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
 
-    _forecast_stage(deps, order_book, created_at)
+    _forecast_stage(deps, candidate, created_at)
 
     assert _ledgered_member_pairs(deps.store.read_all()) == tuple(
         (member.provider, member.model_version) for member in _CONFIGURED_VOTE_ENSEMBLE
@@ -501,10 +511,10 @@ def test_forecast_stage_empty_configured_vote_ensemble_abstains_fail_closed(
         config=_config_with_vote_ensemble(paper_config, ()),
         tmp_path=tmp_path,
     )
-    order_book = deps.exchange.get_order_book(deps.ticker)
+    candidate = candidate_for(deps, _TICKER)
     created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
 
-    forecast = _forecast_stage(deps, order_book, created_at)
+    forecast = _forecast_stage(deps, candidate, created_at)
 
     assert forecast is not None
     assert forecast.abstention_reason == ABSTENTION_ALL_VOTES_DISCARDED
@@ -608,10 +618,10 @@ def test_forecast_stage_holds_unproven_providers_back_from_live(
         config=paper_config,
         tmp_path=tmp_path,
     )
-    order_book = deps.exchange.get_order_book(deps.ticker)
+    candidate = candidate_for(deps, _TICKER)
     created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
 
-    forecast = _forecast_stage(deps, order_book, created_at)
+    forecast = _forecast_stage(deps, candidate, created_at)
 
     assert forecast is not None
     assert forecast.abstention_reason is None
@@ -673,10 +683,10 @@ def test_forecast_stage_promotes_providers_proven_by_the_track_record_artifact(
         config=paper_config,
         tmp_path=tmp_path,
     )
-    order_book = deps.exchange.get_order_book(deps.ticker)
+    candidate = candidate_for(deps, _TICKER)
     created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
 
-    forecast = _forecast_stage(deps, order_book, created_at)
+    forecast = _forecast_stage(deps, candidate, created_at)
 
     assert forecast is not None
     assert forecast.eligible_for_live is True
@@ -721,10 +731,10 @@ def test_forecast_stage_uses_the_operator_configured_provider_gate_thresholds(
         ),
         tmp_path=tmp_path,
     )
-    order_book = deps.exchange.get_order_book(deps.ticker)
+    candidate = candidate_for(deps, _TICKER)
     created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
 
-    forecast = _forecast_stage(deps, order_book, created_at)
+    forecast = _forecast_stage(deps, candidate, created_at)
 
     assert forecast is not None
     assert forecast.eligible_for_live is False

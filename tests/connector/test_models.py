@@ -52,6 +52,7 @@ def _market(**overrides: object) -> NormalizedMarket:
 
 
 def test_valid_market_constructs_without_error() -> None:
+    """The valid kwarg set constructs a market that keeps its field values."""
     market = _market()
 
     assert market.ticker == "KXFED-24DEC"
@@ -59,11 +60,13 @@ def test_valid_market_constructs_without_error() -> None:
 
 
 def test_bad_market_type_raises_value_error() -> None:
+    """An unrecognized `market_type` raises ValueError naming the field."""
     with pytest.raises(ValueError, match="market_type"):
         _market(market_type="binary")
 
 
 def test_bad_jurisdiction_status_raises_value_error() -> None:
+    """A `jurisdiction_status` outside the enum raises ValueError naming it."""
     with pytest.raises(ValueError, match="jurisdiction_status"):
         _market(jurisdiction_status="maybe")
 
@@ -77,6 +80,7 @@ def test_bool_tick_or_min_order_raises_type_error(field: str) -> None:
 
 @pytest.mark.parametrize("field", ["price_tick_pips", "min_order_contract_centis"])
 def test_non_int_tick_or_min_order_raises_type_error(field: str) -> None:
+    """A string tick or min-order size raises TypeError, never a coercion."""
     with pytest.raises(TypeError):
         _market(**{field: "100"})
 
@@ -86,11 +90,13 @@ def test_non_int_tick_or_min_order_raises_type_error(field: str) -> None:
 def test_non_positive_tick_or_min_order_raises_value_error(
     field: str, bad_value: int
 ) -> None:
+    """Zero or negative tick and min-order sizes raise ValueError naming the field."""
     with pytest.raises(ValueError, match=field):
         _market(**{field: bad_value})
 
 
 def test_empty_payload_hash_raises_value_error() -> None:
+    """An empty `raw_exchange_payload_hash` raises ValueError naming the field."""
     with pytest.raises(ValueError, match="raw_exchange_payload_hash"):
         _market(raw_exchange_payload_hash="")
 
@@ -106,12 +112,14 @@ def test_zero_volume_24h_micros_is_accepted() -> None:
 
 
 def test_positive_volume_24h_micros_is_accepted() -> None:
+    """A positive 24h volume is kept as the plain int micros it was given."""
     market = _market(volume_24h_micros=5_000_000_000)
 
     assert market.volume_24h_micros == 5_000_000_000
 
 
 def test_negative_volume_24h_micros_raises_value_error() -> None:
+    """A negative 24h volume raises ValueError naming `volume_24h_micros`."""
     with pytest.raises(ValueError, match="volume_24h_micros"):
         _market(volume_24h_micros=-1)
 
@@ -123,11 +131,13 @@ def test_bool_volume_24h_micros_raises_type_error() -> None:
 
 
 def test_non_int_volume_24h_micros_raises_type_error() -> None:
+    """A string 24h volume raises TypeError rather than being coerced to int."""
     with pytest.raises(TypeError):
         _market(volume_24h_micros="1000000")
 
 
 def test_market_is_frozen() -> None:
+    """A `NormalizedMarket` is frozen: assignment raises FrozenInstanceError."""
     market = _market()
 
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -138,6 +148,7 @@ def test_market_is_frozen() -> None:
 
 
 def test_market_to_payload_is_json_dumps_clean() -> None:
+    """The payload round-trips unchanged through `json.dumps` and `json.loads`."""
     market = _market(expected_resolution_time=datetime(2024, 12, 18, 20, tzinfo=UTC))
 
     payload = market_to_payload(market)
@@ -146,6 +157,7 @@ def test_market_to_payload_is_json_dumps_clean() -> None:
 
 
 def test_market_to_payload_datetimes_are_iso_z_strings() -> None:
+    """Datetimes render as microsecond-precision ISO-8601 strings ending in `Z`."""
     market = _market(expected_resolution_time=datetime(2024, 12, 18, 20, tzinfo=UTC))
 
     payload = market_to_payload(market)
@@ -155,6 +167,7 @@ def test_market_to_payload_datetimes_are_iso_z_strings() -> None:
 
 
 def test_market_to_payload_handles_none_expected_resolution_time() -> None:
+    """A missing expected resolution time stays `None` in the payload."""
     market = _market(expected_resolution_time=None)
 
     payload = market_to_payload(market)
@@ -163,6 +176,7 @@ def test_market_to_payload_handles_none_expected_resolution_time() -> None:
 
 
 def test_market_to_payload_preserves_plain_int_unit_fields() -> None:
+    """Tick and min-order sizes come through as exact `int` leaves, values intact."""
     market = _market(price_tick_pips=250, min_order_contract_centis=500)
 
     payload = market_to_payload(market)
@@ -185,6 +199,7 @@ def _assert_no_float_leaf(node: object) -> None:
 
 
 def test_market_to_payload_contains_no_float_leaf() -> None:
+    """No float leaf appears anywhere in the serialized payload tree."""
     market = _market()
 
     payload = market_to_payload(market)
@@ -193,6 +208,7 @@ def test_market_to_payload_contains_no_float_leaf() -> None:
 
 
 def test_market_to_payload_preserves_volume_24h_micros_as_int_leaf() -> None:
+    """The 24h volume serializes as an exact `int` leaf, never a float."""
     market = _market(volume_24h_micros=42)
 
     payload = market_to_payload(market)

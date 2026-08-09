@@ -4,16 +4,29 @@ This module is the PAPER loop's one composition root. :func:`build_paper_deps`
 wires the real, unmodified Market Connector (a `PaperExchange`), Forecast Engine,
 Trade Selector, Risk Kernel, Order Gateway, and Reconciler over a single
 hash-chained :class:`~windbreak.ledger.store.SqliteLedgerStore`, and
-:func:`run_single_tick` drives one SPEC S5.3 SINGLE order-path tick through them:
+:func:`run_single_tick` screens the venue's market universe and then drives one
+SPEC S5.3 SINGLE order-path pass through them *per screened market*:
 
-    snapshot -> forecast -> select -> approve(seam) -> (only if a token minted)
-    route -> PaperExchange fill -> reconcile
+    screen -> [ snapshot -> forecast -> select -> approve(seam) ->
+    (only if a token minted) route -> PaperExchange fill -> reconcile ]
 
 appending one audit event to the ledger at every stage, plus a per-tick
 ``ModeHeartbeat``, an ``EquitySampled``, and -- whenever the connector can
 describe the account at all -- a ``PositionsSnapshotRecorded``
 (:func:`_equity_and_positions_stage` explains the one case that omits it, and
 why an omitted row is safer there than a written one).
+
+Issue #345 supplied that leading screen. Before it the loop forecast
+``next(iter(exchange.markets))``: one arbitrary market, chosen once at
+composition time from a mapping's iteration order, and never screened -- so
+nothing in the loop ever established that the market it traded was tradeable.
+:mod:`windbreak.scheduler.screening` now walks the universe each tick, in an
+explicit ticker sort so determinism does not depend on a fixture's key order,
+and bounds the survivors at ``config.screener.max_candidates_per_tick``. The
+bound is a *money* guard first and a wall-clock guard second: since issue #399
+each ensemble vote books real spend, so candidates multiply the bill. Screening
+itself is free of model calls, which is the only reason it can run over the
+whole universe every tick.
 
 The approval seam is the load-bearing safety boundary: :class:`KernelApproval`
 composes the *real* ``RiskKernel.evaluate_intent`` with the *real*
@@ -168,7 +181,13 @@ from windbreak.scheduler.provider_wiring import (
     is_live_mode,
     offline_research_tools,
 )
+from windbreak.scheduler.screening import (
+    ScreenLedgerWriter,
+    require_candidate_bound,
+    screen_universe,
+)
 from windbreak.scheduler.weekly_data import weekly_report_body
+from windbreak.screener import Screener
 from windbreak.selector import select
 from windbreak.selector.types import (
     FeeModelInput,
@@ -190,6 +209,7 @@ if TYPE_CHECKING:
         OrderBookSnapshot,
         Position,
     )
+    from windbreak.connector.snapshot import MarketScreener
     from windbreak.forecast.budget import BudgetEvent
     from windbreak.forecast.cassettes import LlmTransport
     from windbreak.forecast.records import ForecastRecord
@@ -199,6 +219,7 @@ if TYPE_CHECKING:
     from windbreak.riskkernel.checks import Decision, OrderIntent
     from windbreak.riskkernel.verification import VerificationSnapshot
     from windbreak.scheduler.provider_wiring import LiveProviderHttp
+    from windbreak.scheduler.screening import MarketCandidate
     from windbreak.selector.types import SelectorDecision
     from windbreak.tokens.verify import SignedApprovalToken
 
@@ -1147,7 +1168,17 @@ class PaperTickDeps:
 
     Attributes:
         config: The active PAPER-ceilinged configuration.
-        ticker: The single market ticker this loop ticks.
+        screener: The real §16 screener every tick puts the venue's market
+            universe through before spending any research money (issue #345).
+            It replaces the single ``ticker`` this bundle used to carry, which
+            was ``next(iter(exchange.markets))`` -- one arbitrary market, fixed
+            for the life of the process and never screened at all. Deliberately
+            non-optional and with no injection parameter, for the same reason as
+            ``budget`` and ``provider_gate``: a ``None`` here would be a loop
+            that forecasts unscreened markets, so the type makes an unscreened
+            loop unrepresentable rather than merely discouraged. Its decisions
+            land on ``store`` as ``ScreenDecisionRecorded`` rows through
+            :class:`~windbreak.scheduler.screening.ScreenLedgerWriter`.
         store: The hash-chained ledger every stage appends to.
         exchange: The replay-driven paper exchange orders fill against.
         verification_view: The narrow, read-only view of that same exchange the
@@ -1206,7 +1237,7 @@ class PaperTickDeps:
     """
 
     config: WindbreakConfig
-    ticker: str
+    screener: MarketScreener
     store: SqliteLedgerStore
     exchange: PaperExchange
     verification_view: ReadOnlyVenueView
@@ -1630,8 +1661,14 @@ def _build_paper_exchange(
         clock: The injected epoch-second clock, read for the exchange's own
             observation timeline.
         market_data: The read-only venue surface, or ``None`` for fixtures.
-        live_ticker: The single market a live session trades, or ``None`` for
-            fixtures. The market universe is a separate concern (issue #345).
+        live_ticker: The single market a live session binds to, or ``None`` for
+            fixtures. It names the venue's *universe* for a live session, not
+            the market the tick will trade: since issue #345 the loop screens
+            whatever markets the exchange offers, so a named live market that
+            fails the §16 screen is not traded. Binding one market is the
+            venue-surface's own limit today (``LiveBookPaperExchange`` holds a
+            single ticker), not a second selection knob -- which is why
+            ``--paper-live-ticker`` stayed one flag.
 
     Returns:
         The wired exchange -- a
@@ -1709,6 +1746,16 @@ def build_paper_deps(
     status, and the evaluation can never be judged against three unrelated
     timelines.
 
+    It builds the process's one real §16 :class:`~windbreak.screener.Screener`
+    (issue #345), reading its thresholds from ``config.screener`` and writing its
+    verdicts into the same hash-chained store every other stage appends to. That
+    screener is what replaced this function's old
+    ``ticker = next(iter(exchange.markets))``: the market a tick forecasts is now
+    decided each tick, from evidence, rather than once at composition time from
+    a mapping's iteration order. Like the budget and the provider gate it has no
+    injection parameter, so there is no door an unscreened loop can arrive
+    through.
+
     It also builds the process's one per-provider track-record gate from
     ``report_dir``'s M6 artifact and ``config.forecast.provider_gate`` (see
     :func:`_build_provider_gate`). Like the research budget there is deliberately
@@ -1742,9 +1789,11 @@ def build_paper_deps(
         ValueError: If exactly one of ``market_data``/``live_ticker`` is given,
             if the configured provider-transport mode is unknown or disagrees
             with whether ``provider_http`` was supplied, if a configured ceiling
-            or list price is not positive, or if the track-record artifact
-            exists but cannot be read as a strict integer document -- each way
-            refusing to start rather than running unguarded.
+            or list price is not positive, if
+            ``config.screener.max_candidates_per_tick`` is below one, or if the
+            track-record artifact exists but cannot be read as a strict integer
+            document -- each way refusing to start rather than running
+            unguarded.
     """
     resolved_clock = clock if clock is not None else _default_clock
     # Selected first, before the ledger database or any exchange session
@@ -1754,13 +1803,13 @@ def build_paper_deps(
     # The exchange must observe on the same clock the tick reads, or its status
     # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
     # freshness against two unrelated timelines (issue #342).
+    # Validated before the ledger database exists, alongside the transport
+    # check above, so a bound that can never forecast refuses to start rather
+    # than leaving an always-idle loop behind a half-built durable state.
+    require_candidate_bound(config.screener.max_candidates_per_tick)
     exchange = _build_paper_exchange(
         books_dir, resolved_clock, market_data=market_data, live_ticker=live_ticker
     )
-    # In live mode `markets` is the single bound ticker, so this one line
-    # answers both modes: the fixture directory's first market, or the market
-    # the operator named.
-    ticker = next(iter(exchange.markets))
     store = SqliteLedgerStore(ledger_path)
     key = secrets.token_bytes(_SIGNING_KEY_BYTES)
     # The verification path gets a view, never the exchange: `PaperExchange`
@@ -1784,7 +1833,15 @@ def build_paper_deps(
     )
     return PaperTickDeps(
         config=config,
-        ticker=ticker,
+        screener=Screener(
+            config.screener,
+            ScreenLedgerWriter(store, component=_COMPONENT),
+            # The screener measures a market's resolution horizon against
+            # "now", so it reads the very clock the tick judges everything else
+            # on -- never the wall clock, which would let an injected-clock run
+            # screen against a different timeline than it trades on.
+            clock=lambda: datetime.fromtimestamp(resolved_clock(), UTC),
+        ),
         store=store,
         exchange=exchange,
         verification_view=verification_view,
@@ -1813,16 +1870,36 @@ def build_paper_deps(
 class TickOutcome:
     """The summary result of one :func:`run_single_tick` call.
 
+    Since issue #345 a tick runs over a *set* of screened markets rather than
+    one hardcoded ticker, so the per-market figures are reported per market
+    (``forecast_ids``) or summed across them (``intent_count``,
+    ``filled_centis``). ``candidate_tickers`` and ``forecast_ids`` are separate
+    fields rather than one, because a tick can screen a market in and still
+    produce no forecast for it -- the budget can halt mid-universe.
+
     Attributes:
         beat: The 1-based tick sequence number.
-        forecast_id: The forecast this tick produced.
-        intent_count: How many normalized intents the selector emitted.
+        candidate_tickers: The markets that passed the screen, in the ascending
+            ticker order the walk would take them in. This is the *screened-in
+            set*, not a record of what ran: a budget halt stops the walk, so
+            markets after the halting one appear here having never reached
+            :func:`_run_candidate` at all. Empty when the whole universe
+            screened out, which is a tick that correctly forecast nothing.
+        forecast_ids: One forecast id per market this tick actually forecast, in
+            processing order. Shorter than ``candidate_tickers`` exactly when
+            research halted part-way through the universe -- so comparing the
+            two lengths, not reading ``candidate_tickers`` alone, is what tells
+            an operator how far the tick got.
+        intent_count: How many normalized intents the selector emitted, summed
+            over every candidate.
         filled_centis: The quantity filled through the gateway this tick, in
-            contract-centis (``0`` whenever the kernel vetoed every intent).
+            contract-centis, summed over every candidate (``0`` whenever the
+            kernel vetoed every intent).
         equity_micros: The sampled account equity this tick, in micros.
         research_halted: Whether this tick's research was halted fail-closed on
-            a budget ceiling. When ``True`` no forecast exists, so
-            ``forecast_id`` is ``""`` and no selector decision was made.
+            a budget ceiling. When ``True`` the tick stopped walking its
+            candidates at that point, so ``forecast_ids`` covers only the
+            markets reached before the ceiling bit.
         kernel_halted: Whether the Risk Kernel is in ``HALT`` at the end of this
             tick -- today only a verification ``BREACH`` puts it there (issue
             #32). A halted kernel vetoes every later intent, so an always-on
@@ -1833,7 +1910,8 @@ class TickOutcome:
     """
 
     beat: int
-    forecast_id: str
+    candidate_tickers: tuple[str, ...]
+    forecast_ids: tuple[str, ...]
     intent_count: int
     filled_centis: int
     equity_micros: int
@@ -1841,22 +1919,53 @@ class TickOutcome:
     kernel_halted: bool = False
 
 
-def _snapshot_stage(deps: PaperTickDeps) -> OrderBookSnapshot:
-    """Snapshot the market's book and ledger the snapshot event.
+def _screen_stage(deps: PaperTickDeps) -> tuple[MarketCandidate, ...]:
+    """Screen the venue's market universe into this tick's bounded candidates.
+
+    Runs *first*, before any paid stage, which is the whole point: the four §16
+    filters are pure integer comparisons over a market's own metadata and its
+    book, so deciding what to research costs no research money. Since issue #399
+    every ensemble vote books real spend, so a screen that ran after the
+    forecast -- or a loop with no screen at all -- would pay for markets it was
+    about to reject.
+
+    Each examined market's verdict is ledgered by the screener itself, as a
+    ``ScreenDecisionRecorded`` row (issue #159), eligible or not.
 
     Args:
         deps: The tick's dependency bundle.
 
     Returns:
-        The current order-book snapshot.
+        The screened candidates, in ascending ticker order, bounded by
+        ``config.screener.max_candidates_per_tick``.
     """
-    order_book = deps.exchange.get_order_book(deps.ticker)
+    return screen_universe(
+        deps.exchange,
+        deps.screener,
+        max_candidates=deps.config.screener.max_candidates_per_tick,
+    )
+
+
+def _snapshot_stage(deps: PaperTickDeps, candidate: MarketCandidate) -> None:
+    """Ledger the snapshot event for the book this candidate was screened on.
+
+    The book is the candidate's own rather than a fresh read. One market, one
+    observation per tick: re-reading here would ledger a *later* book than the
+    screen's depth floor was measured against, so the audit trail would claim a
+    market was screened in on liquidity that is not the liquidity recorded --
+    and on a live venue the two genuinely differ.
+
+    Args:
+        deps: The tick's dependency bundle.
+        candidate: The screened market whose book is being recorded.
+    """
     deps.store.append(
         market_snapshot_event_to_record(
-            ticker=deps.ticker, order_book=order_book, component=_COMPONENT
+            ticker=candidate.ticker,
+            order_book=candidate.order_book,
+            component=_COMPONENT,
         )
     )
-    return order_book
 
 
 def _baseline_pips(order_book: OrderBookSnapshot) -> int:
@@ -1875,7 +1984,7 @@ def _baseline_pips(order_book: OrderBookSnapshot) -> int:
 
 
 def _forecast_stage(
-    deps: PaperTickDeps, order_book: OrderBookSnapshot, created_at: datetime
+    deps: PaperTickDeps, candidate: MarketCandidate, created_at: datetime
 ) -> ForecastRecord | None:
     """Run the forecast pipeline and ledger the forecast event.
 
@@ -1911,19 +2020,25 @@ def _forecast_stage(
     ledgers nothing itself, because the budget's own ledger writer has already
     appended the durable ``ResearchBudgetHalted`` row before raising.
 
+    Both the market and the baseline book come off the ``candidate`` the screen
+    produced (issue #345), never from a fresh exchange read: the forecast is
+    struck against the very observation the market was screened in on.
+
     Args:
         deps: The tick's dependency bundle.
-        order_book: The current book snapshot the baseline is struck against.
+        candidate: The screened market being forecast, carrying the book the
+            baseline is struck against.
         created_at: The injected creation instant, for determinism.
 
     Returns:
         The produced forecast record, or ``None`` when research halted
         fail-closed on the budget -- in which case neither a ``ForecastCreated``
-        nor any ``ProviderVoteRecorded`` row is appended for this tick.
+        nor any ``ProviderVoteRecorded`` row is appended for this market.
     """
-    market = deps.exchange.get_market(deps.ticker)
+    market = candidate.market
+    order_book = candidate.order_book
     baseline = BaselineQuoteSnapshot(
-        snapshot_id=f"{deps.ticker}-{int(order_book.fetched_at.timestamp())}",
+        snapshot_id=f"{candidate.ticker}-{int(order_book.fetched_at.timestamp())}",
         price_pips=_baseline_pips(order_book),
         fetched_at=order_book.fetched_at,
     )
@@ -2037,11 +2152,19 @@ def _ledger_provider_votes(
         )
 
 
-def _position_input(deps: PaperTickDeps) -> PositionReadModelInput:
+def _position_input(deps: PaperTickDeps, ticker: str) -> PositionReadModelInput:
     """Build the selector's capital/exposure input from the paper balances.
+
+    Read per candidate, at the moment that candidate is sized, rather than once
+    per tick (issue #345). That is what makes a tick's markets see each other:
+    the balances an earlier candidate's fill already debited are the balances
+    the next candidate sizes against, so a universe cannot deploy the same
+    dollar twice. A once-per-tick read would have handed every market an
+    identical, pre-tick account.
 
     Args:
         deps: The tick's dependency bundle.
+        ticker: The candidate market being sized, which stamps the snapshot id.
 
     Returns:
         The :class:`~windbreak.selector.types.PositionReadModelInput` the sizing
@@ -2052,7 +2175,7 @@ def _position_input(deps: PaperTickDeps) -> PositionReadModelInput:
     above_floor = MoneyMicros(max(available.value - floor.value, 0))
     zero = MoneyMicros(0)
     return PositionReadModelInput(
-        snapshot_id=f"{deps.ticker}-positions",
+        snapshot_id=f"{ticker}-positions",
         equity_micros=available,
         above_floor_capital_micros=above_floor,
         total_deploy_cap_micros=above_floor,
@@ -2066,15 +2189,28 @@ def _position_input(deps: PaperTickDeps) -> PositionReadModelInput:
 
 def _select_stage(
     deps: PaperTickDeps,
-    order_book: OrderBookSnapshot,
+    candidate: MarketCandidate,
     forecast: ForecastRecord,
     created_at: datetime,
 ) -> SelectorDecision:
-    """Run the selector over the tick's inputs and ledger the decision event.
+    """Run the selector over one candidate's inputs and ledger the decision event.
+
+    ``correlation_tags`` stays empty, and deliberately so: nothing in the
+    codebase derives a
+    :class:`~windbreak.selector.correlation.CorrelationTag` from a
+    :class:`~windbreak.connector.models.NormalizedMarket`, and the tag's
+    ``source`` field admits only ``"llm"`` or ``"human"`` -- neither of which a
+    composition-root derivation honestly is. Inventing a provenance to make the
+    bucket cap appear to bind would be worse than the empty tuple, which at
+    least does not claim the market was ever bucketed. Issue #407 tracks
+    supplying real tags and exposures; until it lands, the one cross-market
+    bound genuinely in force is capital, via :func:`_position_input`'s
+    per-candidate balance read.
 
     Args:
         deps: The tick's dependency bundle.
-        order_book: The current book snapshot.
+        candidate: The screened market being selected over, carrying the book it
+            was screened on.
         forecast: The forecast under evaluation.
         created_at: The fee schedule's freshness stamp for this tick.
 
@@ -2084,14 +2220,14 @@ def _select_stage(
     inputs = SelectorInputs(
         forecast=forecast,
         calibration_map_version=_CALIBRATION_MAP_VERSION,
-        order_book=order_book,
+        order_book=candidate.order_book,
         fee_model=FeeModelInput(
-            model=deps.exchange.get_fee_model(deps.ticker), as_of=created_at
+            model=deps.exchange.get_fee_model(candidate.ticker), as_of=created_at
         ),
         slippage_model=SlippageModelInput(
             model_id=_SLIPPAGE_MODEL_ID, per_contract_buffer_ppm=0
         ),
-        positions=_position_input(deps),
+        positions=_position_input(deps, candidate.ticker),
         risk_config=RiskConfigInput(
             config=deps.config.risk, config_hash=config_hash(deps.config)
         ),
@@ -2147,9 +2283,9 @@ def _route_intent(
 
 def _approve_stage(
     deps: PaperTickDeps,
+    candidate: MarketCandidate,
     decision: SelectorDecision,
     heartbeat_epoch_s: int,
-    order_book: OrderBookSnapshot,
     forecast: ForecastRecord,
 ) -> int:
     """Approve each emitted intent through the seam; route any minted token.
@@ -2221,13 +2357,27 @@ def _approve_stage(
     A market the exchange cannot resolve becomes ``None`` rather than an
     exception, so an unknown ticker vetoes the tick instead of aborting it.
 
+    The instrument whitelist is this candidate's ticker alone, not the tick's
+    whole candidate set (issue #345). Each approval is proven against exactly
+    the one market it would trade, so widening the universe cannot widen what
+    any single token authorizes.
+
+    This stage runs once per candidate, so a multi-market tick observes the
+    exchange status -- and ledgers an ``ExchangeStatusObserved`` row -- once per
+    candidate rather than once per tick. That repetition is deliberate: the
+    venue can pause part-way through a universe walk, and every approval must be
+    proven against a status observed at *its own* evaluation time. Observing
+    once at the top of the tick and reusing it would let the last candidate in a
+    long walk trade on a reading taken before the pause, with
+    ``exchange_status_ok`` unable to notice.
+
     Args:
         deps: The tick's dependency bundle.
+        candidate: The screened market being approved for, carrying the book
+            whose shallower visible side bounds the participation cap.
         decision: The selector's decision carrying any emitted intents.
         heartbeat_epoch_s: The instant an earlier stage observed the pipeline
             alive.
-        order_book: The book snapshot this tick took, whose shallower visible
-            side bounds the participation cap.
         forecast: The very forecast ``decision`` was selected against, whose
             ``created_at`` stamps the context. Non-optional on purpose: a tick
             with no forecast never reaches this stage at all
@@ -2238,8 +2388,9 @@ def _approve_stage(
     Returns:
         The total quantity filled this tick, in contract-centis.
     """
+    order_book = candidate.order_book
     try:
-        market: NormalizedMarket | None = deps.exchange.get_market(deps.ticker)
+        market: NormalizedMarket | None = deps.exchange.get_market(candidate.ticker)
     except UnknownMarketError:
         market = None
     observed = deps.exchange.get_exchange_status()
@@ -2260,7 +2411,7 @@ def _approve_stage(
         deps.config,
         now_epoch_s=now_epoch_s,
         verification=deps.kernel.latest_verification,
-        instrument_whitelist=frozenset({deps.ticker}),
+        instrument_whitelist=frozenset({candidate.ticker}),
         market=market,
         exchange_status=project_exchange_status(observed.status),
         exchange_status_epoch_s=status_epoch_s,
@@ -2268,7 +2419,7 @@ def _approve_stage(
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
         exchange_clock_epoch_s=read_exchange_clock_epoch_s(deps.exchange),
         forecast_epoch_s=int(forecast.created_at.timestamp()),
-        open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
+        open_position=read_open_position_centis(deps.exchange, ticker=candidate.ticker),
         equity_start_of_day=read_start_of_day_equity_micros(
             deps.store, now_epoch_s=now_epoch_s
         ),
@@ -2428,9 +2579,18 @@ def _equity_and_positions_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
 def _heartbeat_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
     """Ledger a pipeline heartbeat and return the instant it attests to.
 
-    Called after the snapshot stage, so the heartbeat is stamped only once the
-    tick has proven the pipeline genuinely running -- an attestation rather than
-    a constant. It is deliberately NOT stamped inside the approval context: a
+    Called after the screen stage -- which reads the venue's markets and their
+    books -- so the heartbeat is stamped only once the tick has proven the
+    pipeline genuinely running, an attestation rather than a constant. Before
+    issue #345 the same duty was served by the snapshot stage, which used to run
+    first; the screen now does, and it exercises the same connector reads.
+
+    Stamped once per tick rather than once per candidate: it attests that the
+    *pipeline* is alive, which is not a per-market fact, and one heartbeat per
+    market would let a slow universe walk keep refreshing its own freshness.
+    Every candidate's approval is therefore judged against the one instant the
+    tick actually observed. It is deliberately NOT stamped inside the approval
+    context either: a
     heartbeat equal to the approval's own ``now`` could never be stale, which
     would make ``pipeline_heartbeat_ok`` unfalsifiable and therefore worse than
     the ``None`` it replaces.
@@ -2489,50 +2649,138 @@ def _verification_stage(deps: PaperTickDeps) -> None:
     deps.kernel.run_verification_cycle()
 
 
-def _decide_and_approve(
+@dataclass(frozen=True, slots=True)
+class _UniverseOutcome:
+    """What one tick's walk over its screened candidates produced.
+
+    Attributes:
+        forecast_ids: One id per market actually forecast, in processing order.
+        intent_count: Intents emitted, summed over every market processed.
+        filled_centis: Quantity filled, in contract-centis, summed likewise.
+        research_halted: Whether a budget ceiling stopped the walk early.
+    """
+
+    forecast_ids: tuple[str, ...]
+    intent_count: int
+    filled_centis: int
+    research_halted: bool
+
+
+def _run_candidate(
     deps: PaperTickDeps,
-    order_book: OrderBookSnapshot,
-    forecast: ForecastRecord | None,
+    candidate: MarketCandidate,
     created_at: datetime,
     heartbeat_epoch_s: int,
-) -> tuple[str, int, int]:
-    """Select and approve against a forecast, or short-circuit a halted tick.
+) -> tuple[str, int, int] | None:
+    """Run one screened market through snapshot, forecast, select, and approve.
 
     Narrows the optional forecast in one place so the select and approve stages
-    keep their non-optional contracts. That narrowing is why a halted tick
-    needs no fail-closed forecast stamp of its own (issue #380): it never
+    keep their non-optional contracts. That narrowing is why a budget-halted
+    market needs no fail-closed forecast stamp of its own (issue #380): it never
     reaches an approval at all, which is strictly stronger than vetoing one.
 
     Args:
         deps: The tick's dependency bundle.
-        order_book: The current book snapshot the selector reads.
-        forecast: The tick's forecast, or ``None`` when research halted.
+        candidate: The screened market to run.
         created_at: The injected creation instant, for determinism.
         heartbeat_epoch_s: The instant an earlier stage observed the pipeline
             alive, threaded through to the approval context.
 
     Returns:
-        A ``(forecast_id, intent_count, filled_centis)`` triple -- ``("", 0, 0)``
-        when research halted, since no forecast exists to select against.
+        A ``(forecast_id, intent_count, filled_centis)`` triple, or ``None``
+        when research halted fail-closed on a budget ceiling.
     """
+    _snapshot_stage(deps, candidate)
+    forecast = _forecast_stage(deps, candidate, created_at)
     if forecast is None:
-        return "", 0, 0
-    decision = _select_stage(deps, order_book, forecast, created_at)
-    filled = _approve_stage(deps, decision, heartbeat_epoch_s, order_book, forecast)
+        return None
+    decision = _select_stage(deps, candidate, forecast, created_at)
+    filled = _approve_stage(deps, candidate, decision, heartbeat_epoch_s, forecast)
     return forecast.forecast_id, len(decision.intents), filled
+
+
+def _run_universe(
+    deps: PaperTickDeps,
+    candidates: tuple[MarketCandidate, ...],
+    created_at: datetime,
+    heartbeat_epoch_s: int,
+) -> _UniverseOutcome:
+    """Walk the tick's screened candidates, stopping on a budget halt.
+
+    The walk stops at the first market whose research halts on a ceiling rather
+    than trying the rest (issue #345). The per-UTC-day ceiling is checked before
+    any tool or transport is touched, so every remaining candidate would halt on
+    the same exhausted bucket and append a ``ResearchBudgetHalted`` row saying
+    nothing the first one did not: an exhausted day is a property of the day,
+    not of the market that happened to discover it.
+
+    Args:
+        deps: The tick's dependency bundle.
+        candidates: The screened markets, in processing order.
+        created_at: The injected creation instant, for determinism.
+        heartbeat_epoch_s: The instant an earlier stage observed the pipeline
+            alive, threaded through to each approval context.
+
+    Returns:
+        The summed :class:`_UniverseOutcome` for the markets actually reached.
+    """
+    forecast_ids: list[str] = []
+    intent_count = 0
+    filled_centis = 0
+    halted = False
+    for candidate in candidates:
+        result = _run_candidate(deps, candidate, created_at, heartbeat_epoch_s)
+        if result is None:
+            halted = True
+            break
+        forecast_id, intents, filled = result
+        forecast_ids.append(forecast_id)
+        intent_count += intents
+        filled_centis += filled
+    return _UniverseOutcome(
+        forecast_ids=tuple(forecast_ids),
+        intent_count=intent_count,
+        filled_centis=filled_centis,
+        research_halted=halted,
+    )
 
 
 def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     """Drive one PAPER tick end to end, ledgering every stage (SPEC S5.3).
 
-    The tick follows the SINGLE order path -- snapshot -> forecast -> select ->
-    approve(seam) -> (only if a token minted) route -> fill -> reconcile -- then
-    emits the per-tick heartbeat, equity sample, and positions snapshot, and
+    The tick opens by screening the venue's market universe
+    (:func:`_screen_stage`) into a bounded candidate set, then runs the SINGLE
+    order path -- snapshot -> forecast -> select -> approve(seam) -> (only if a
+    token minted) route -> fill -> reconcile -- once **per screened candidate**,
+    then emits the per-tick heartbeat, equity sample, and positions snapshot, and
     writes this ISO-week's report -- folding the real ledger through
     :func:`windbreak.scheduler.weekly_data.weekly_report_body` so the report
     carries genuine evaluation and cost-meter data (issue #188), built lazily so
     the fold is paid for only on the genuine per-week write. Every stage appends
     an audit event to the shared hash-chained ledger.
+
+    Issue #345 is what made that per-candidate. The loop used to forecast
+    ``next(iter(exchange.markets))`` -- one arbitrary market, fixed for the life
+    of the process and never screened at all. The single-market path was not
+    merely narrow: nothing checked that the market it traded was tradeable.
+
+    Iterating a universe multiplies research spend by the markets screened, so
+    two things bound it and both are load-bearing. Screening is *free* -- the
+    four §16 filters are pure integer comparisons over metadata and a book, no
+    model calls -- so the loop never spends money deciding what to spend money
+    on. And ``config.screener.max_candidates_per_tick`` caps the forecasts one
+    tick may run, enforced on the universe walk itself, which caps the tick's
+    worst-case bill at that many per-forecast ceilings. The per-UTC-day ceiling
+    then bounds the *day* independently, and a tick that trips it stops walking
+    (see :func:`_run_universe`).
+
+    The tick-level stages -- heartbeat, verification cycle, mode heartbeat,
+    equity sample, positions snapshot, weekly report -- still run exactly once
+    per tick, not once per market. They describe the *loop*, not a market, and
+    duplicating them per candidate would inflate the audit trail with rows that
+    say the same thing N times. The verification cycle in particular runs before
+    any candidate is touched, so a breach halts the kernel ahead of the whole
+    universe rather than part-way through it.
 
     Every mention of "positions snapshot" below carries one standing exception,
     stated once here rather than repeated: a connector that refuses to describe
@@ -2561,13 +2809,34 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     positions snapshot, but every later approval vetoes on the halted mode, and
     :attr:`TickOutcome.kernel_halted` says so.
 
-    A tick whose per-forecast or per-UTC-day research budget is exhausted halts
-    fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row, skips
-    the forecast, select, and approve stages, and still emits its heartbeat,
-    equity sample, positions snapshot, and weekly report -- so the loop stays
-    observably alive and flat rather than dying on an uncaught budget error.
-    Its ledger therefore differs from a normal tick's by exactly two absent
-    rows: ``ForecastCreated`` and ``SelectorDecisionRecorded``.
+    A market whose per-forecast or per-UTC-day research budget is exhausted
+    halts fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row,
+    skips that market's forecast, select, and approve stages, and stops the
+    universe walk there. The tick still emits its heartbeat, equity sample,
+    positions snapshot, and weekly report -- so the loop stays observably alive
+    and flat rather than dying on an uncaught budget error.
+
+    The halting market and the markets behind it leave *different* ledger
+    shapes, and the difference is worth stating precisely, because someone
+    auditing a halt reads this paragraph to know which rows to expect:
+
+    * **The halting market** keeps its ``MarketSnapshotRecorded``.
+      :func:`_run_candidate` ledgers the snapshot before :func:`_forecast_stage`
+      can return ``None``, so the book it was about to research is on record.
+      What it loses is ``ForecastCreated``, ``SelectorDecisionRecorded``, and
+      the ``ExchangeStatusObserved`` the approval stage would have appended.
+    * **Every candidate after it** is never run at all -- :func:`_run_universe`
+      breaks before reaching them -- so they lose their
+      ``MarketSnapshotRecorded`` too, not merely the forecast and selector rows.
+      What they keep is their ``ScreenDecisionRecorded``, because the screen ran
+      over the whole candidate set before the walk began. The ledger therefore
+      says such a market was examined and found eligible, and says nothing
+      further about it: the honest record of a market the tick screened in and
+      then ran out of money before reaching.
+
+    Both shapes are pinned as exact golden row sequences in
+    ``tests/integration/test_paper_universe.py``, so this description is
+    checkable rather than prose that can drift away from the code.
 
     Args:
         deps: The fully wired dependency bundle.
@@ -2578,13 +2847,10 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     """
     now_epoch_s = deps.clock()
     created_at = datetime.fromtimestamp(now_epoch_s, UTC)
-    order_book = _snapshot_stage(deps)
+    candidates = _screen_stage(deps)
     heartbeat_epoch_s = _heartbeat_stage(deps, now_epoch_s)
     _verification_stage(deps)
-    forecast = _forecast_stage(deps, order_book, created_at)
-    forecast_id, intent_count, filled = _decide_and_approve(
-        deps, order_book, forecast, created_at, heartbeat_epoch_s
-    )
+    universe = _run_universe(deps, candidates, created_at, heartbeat_epoch_s)
     # The kernel's *real* mode, never a hardcoded PAPER: a verification breach
     # drives it to HALT mid-tick, and a heartbeat still claiming PAPER would be
     # the loop's own audit trail lying about whether it is trading.
@@ -2599,10 +2865,11 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     )
     return TickOutcome(
         beat=beat,
-        forecast_id=forecast_id,
-        intent_count=intent_count,
-        filled_centis=filled,
+        candidate_tickers=tuple(candidate.ticker for candidate in candidates),
+        forecast_ids=universe.forecast_ids,
+        intent_count=universe.intent_count,
+        filled_centis=universe.filled_centis,
         equity_micros=equity,
-        research_halted=forecast is None,
+        research_halted=universe.research_halted,
         kernel_halted=mode is Mode.HALT,
     )

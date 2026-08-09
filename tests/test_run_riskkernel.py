@@ -748,6 +748,13 @@ def test_run_process_riskkernel_replays_killed_state_across_restart(
     finally:
         store.close()
     assert "KillEngaged" in run_one_event_types
+    # Issue #287: the real `windbreak run` composition -- not just the unit
+    # seam -- persists the `HALT_KILL` alert's audit row, and it lands after
+    # the kill it announces.
+    assert "AlertEmitted" in run_one_event_types
+    assert run_one_event_types.index("AlertEmitted") > run_one_event_types.index(
+        "KillEngaged"
+    )
 
     (tmp_path / KILL_FILENAME).unlink()
 

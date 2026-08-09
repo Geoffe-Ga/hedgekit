@@ -11,9 +11,12 @@ Every trigger funnels into :meth:`KillSwitch.kill`, which composes the LOCKED
 it drives the machine to ``KILLED`` *first* (the fail-safe direction), then
 records the closed kill-effect surface -- one :class:`KillEngaged`, one
 :class:`CancelAllDirective`, and one ``ReservationReleased`` per active
-reservation -- dispatches one ``HALT_KILL`` alert, and drops a ``KILL`` file.
-The switch **holds positions by design**: it only cancels resting orders and
-releases capital reservations, and no string it ever ledgers names a
+reservation -- dispatches one ``HALT_KILL`` alert, drops a ``KILL`` file, and
+finally ledgers one :class:`AlertEmitted` recording that the alert fired
+(issue #287), so the single most consequential operator page the system ever
+sends is tamper-evident and survives log rotation rather than existing only as
+a log line. The switch **holds positions by design**: it only cancels resting
+orders and releases capital reservations, and no string it ever ledgers names a
 sell/close/submit/dump action.
 
 The trigger adapters (:class:`KillFileWatcher`,
@@ -79,8 +82,13 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, cast
 
-from windbreak.alerts.registry import AlertType
-from windbreak.ledger.events import CancelAllDirective, KillEngaged, KillReArmed
+from windbreak.alerts.registry import AlertType, get_registration
+from windbreak.ledger.events import (
+    AlertEmitted,
+    CancelAllDirective,
+    KillEngaged,
+    KillReArmed,
+)
 from windbreak.riskkernel import modes
 from windbreak.riskkernel.modes import KillReArmError, Mode
 from windbreak.riskkernel.verification import VerificationOutcome
@@ -114,6 +122,12 @@ _RELEASE_REASON = "kill_switch_engaged"
 
 #: The ``HALT_KILL`` alert body. Also hold-only wording (no action token).
 _HALT_KILL_MESSAGE = "kill switch engaged; trading halted, positions held"
+
+#: The severity the ledgered :class:`AlertEmitted` carries, read once from the
+#: alert registry so the audit row can never disagree with the severity the
+#: operator was actually paged at. Resolved at import (the registry is a frozen
+#: mapping) rather than per kill, so the kill path stays allocation-free.
+_HALT_KILL_SEVERITY = get_registration(AlertType.HALT_KILL).severity.value
 
 #: Byte budget handed to :func:`secrets.token_urlsafe` for a dashboard nonce.
 _CHALLENGE_TOKEN_BYTES = 32
@@ -385,9 +399,24 @@ class KillSwitch:
         release, no alert, no raise -- so a persistent ``KILL`` file or a
         repeated trigger kills exactly once.
 
+        The one :class:`AlertEmitted` audit row is written **last**, after every
+        fail-safe effect including the ``KILL`` file (issue #287). Ordering is
+        load-bearing: a ledger append that fails must never be able to skip the
+        halt, the cancel-all, the page, or the on-disk kill signal. Once they
+        are all done the append is deliberately *unguarded* -- exactly like the
+        :class:`KillEngaged` record above it -- because a kill switch whose
+        audit record silently fails to write is worse than one that never
+        claimed to write: the ledger would then read as a clean history with no
+        kill alert in it, and absent evidence must never pass for healthy.
+
         Args:
             trigger: The source engaging the kill; its ``name`` is recorded on
                 the :class:`KillEngaged` event.
+
+        Raises:
+            Exception: Whatever the wired ``ledger_writer`` raises. Propagated
+                rather than swallowed, and only ever after the full fail-safe
+                surface has already taken effect.
         """
         if self._mode_machine.mode is Mode.KILLED:
             return
@@ -405,6 +434,13 @@ class KillSwitch:
         self._release_reservations()
         self._alert_dispatcher.dispatch(AlertType.HALT_KILL, _HALT_KILL_MESSAGE)
         self._write_kill_file()
+        self._ledger_writer.record(
+            AlertEmitted(
+                component=_COMPONENT,
+                severity=_HALT_KILL_SEVERITY,
+                message=_HALT_KILL_MESSAGE,
+            )
+        )
 
     def expected_rearm_phrase(self, kill_sequence: int) -> str:
         """Return the exact confirmation phrase required to re-arm a given kill.
