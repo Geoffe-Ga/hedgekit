@@ -20,6 +20,7 @@ import pytest
 from windbreak.config.schema import (
     PROVIDER_TRANSPORT_CASSETTE,
     PROVIDER_TRANSPORT_LIVE,
+    EnsembleMemberConfig,
     ForecastConfig,
     ProviderPrice,
     ProviderRetryConfig,
@@ -257,28 +258,140 @@ def test_the_factory_takes_the_transport_per_call() -> None:
 # --- Live LLM routing ---------------------------------------------------------------
 
 
+def _ensemble_config(*providers: str) -> WindbreakConfig:
+    """Build a live-mode config whose vote ensemble names ``providers``.
+
+    Args:
+        *providers: The provider identifiers the ensemble draws on.
+
+    Returns:
+        The configuration under test.
+    """
+    base = WindbreakConfig()
+    forecast = dataclasses.replace(
+        base.forecast,
+        provider_transport=ProviderTransportConfig(mode=PROVIDER_TRANSPORT_LIVE),
+        vote_ensemble=tuple(
+            EnsembleMemberConfig(provider, f"{provider}-pinned", "2025-01-01")
+            for provider in providers
+        ),
+    )
+    return dataclasses.replace(base, forecast=forecast)
+
+
 def test_every_known_provider_gets_an_adapter() -> None:
     """Both providers with a live adapter are routable."""
-    transport = build_live_llm_transport(_live_http())
+    transport = build_live_llm_transport(
+        _ensemble_config("anthropic", "openai"), _live_http()
+    )
 
     assert transport.complete is not None
 
 
-def test_a_provider_with_no_adapter_is_dropped_rather_than_guessed_at() -> None:
-    """An unknown provider has no live route, so it fails closed at vote time."""
+def test_a_provider_with_no_adapter_is_discarded_as_a_vote_failure() -> None:
+    """An unroutable provider fails as a *vote*, never as a bare `KeyError`.
+
+    A `KeyError` is caught by neither `RetryingProvider.forecast` nor
+    `pipeline._collect_provider_forecasts` (both catch `ProviderVoteError`
+    only), so it would escape `run_pipeline` and crash the whole tick. Raising a
+    taxonomy leaf instead means the vote is discarded like any other failure and
+    the run degrades to quorum abstention.
+    """
     from windbreak.forecast.cassettes import LlmRequest
+    from windbreak.forecast.providers import ProviderNotRoutableError
 
     transport = build_live_llm_transport(
-        _live_http({"a-provider-with-no-adapter": _StubHttpTransport()})
+        _ensemble_config("a-provider-with-no-adapter"),
+        _live_http({"a-provider-with-no-adapter": _StubHttpTransport()}),
+        validate=False,
     )
 
-    with pytest.raises(KeyError):
+    with pytest.raises(ProviderNotRoutableError) as excinfo:
         transport.complete(
             LlmRequest(
                 provider="a-provider-with-no-adapter",
                 model_version="v",
                 prompt="p",
             )
+        )
+
+    assert "a-provider-with-no-adapter" in str(excinfo.value)
+
+
+def test_an_unroutable_provider_failure_is_a_vote_error() -> None:
+    """It must sit under the type both discard paths actually catch."""
+    from windbreak.forecast.cassettes import LlmRequest
+    from windbreak.forecast.providers import ProviderVoteError
+
+    transport = build_live_llm_transport(
+        _ensemble_config("nope"),
+        _live_http({"nope": _StubHttpTransport()}),
+        validate=False,
+    )
+
+    with pytest.raises(ProviderVoteError):
+        transport.complete(LlmRequest(provider="nope", model_version="v", prompt="p"))
+
+
+def test_an_unroutable_provider_failure_is_not_retried() -> None:
+    """A missing route will not appear on a second attempt."""
+    from windbreak.forecast.providers import ProviderNotRoutableError
+    from windbreak.forecast.providers.retry import _is_retryable
+
+    assert not _is_retryable(ProviderNotRoutableError("nope"))
+
+
+# --- Startup validation: an unroutable ensemble refuses to start ------------------
+
+
+def test_a_live_ensemble_naming_an_unroutable_provider_refuses_to_start() -> None:
+    """The misconfiguration is refused cleanly, before any tick runs."""
+    with pytest.raises(ValueError, match="futuresearch"):
+        build_live_llm_transport(
+            _ensemble_config("futuresearch"),
+            _live_http({"futuresearch": _StubHttpTransport()}),
+        )
+
+
+def test_the_refusal_names_the_routable_providers() -> None:
+    """An operator who typo'd a provider needs to be told what is routable."""
+    with pytest.raises(ValueError) as excinfo:
+        build_live_llm_transport(
+            _ensemble_config("anthropi"), _live_http({"anthropi": _StubHttpTransport()})
+        )
+
+    assert "anthropic" in str(excinfo.value)
+
+
+def test_an_ensemble_provider_absent_from_the_supplied_seams_refuses() -> None:
+    """A routable provider still needs a transport actually built for it."""
+    with pytest.raises(ValueError, match="openai"):
+        build_live_llm_transport(
+            _ensemble_config("openai"), _live_http({"anthropic": _StubHttpTransport()})
+        )
+
+
+def test_a_fully_routable_live_ensemble_builds() -> None:
+    """The supported configuration is unaffected by the new guard."""
+    transport = build_live_llm_transport(
+        _ensemble_config("anthropic", "openai"), _live_http()
+    )
+
+    assert transport is not None
+
+
+def test_a_provider_with_no_adapter_is_dropped_rather_than_guessed_at() -> None:
+    """An unknown provider has no live route, so it fails closed at vote time."""
+    from windbreak.forecast.cassettes import LlmRequest
+    from windbreak.forecast.providers import ProviderNotRoutableError
+
+    transport = build_live_llm_transport(
+        _ensemble_config("anthropic"), _live_http(), validate=False
+    )
+
+    with pytest.raises(ProviderNotRoutableError):
+        transport.complete(
+            LlmRequest(provider="futuresearch", model_version="v", prompt="p")
         )
 
 

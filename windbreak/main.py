@@ -1074,6 +1074,7 @@ def _live_http_for(
     endpoint_url: str,
     headers: dict[str, str],
     config: WindbreakConfig,
+    *,
     timeout_seconds: int,
 ) -> LiveHttpTransport:
     """Build one credentialed, single-host live transport for ``endpoint_url``.
@@ -1143,39 +1144,57 @@ def _resolve_provider_http(config: WindbreakConfig) -> LiveProviderHttp | None:
     single-host allowlist -- never one shared transport, which would send the
     first provider's key to the second provider's endpoint.
 
+    Transports are built for exactly the providers ``forecast.vote_ensemble``
+    names, not for every provider this module knows how to route. That keeps the
+    demand for credentials honest -- an Anthropic-only ensemble does not require
+    an OpenAI key to exist -- and it is what makes an unroutable ensemble member
+    structurally impossible to build a bundle for: the provider that has no
+    routing entry is refused here, by name, rather than discovered mid-tick.
+
     Args:
-        config: The loaded configuration naming the transport mode, the key
-            environment variables, and the dial timeout.
+        config: The loaded configuration naming the transport mode, the vote
+            ensemble, the key environment variables, and the dial timeout.
 
     Returns:
         The live seams when ``forecast.provider_transport.mode`` is ``live``,
         else ``None``.
 
     Raises:
-        ValueError: If the mode is unrecognized, a named key variable is unset,
-            or a provider host is not on this deployment's outbound allowlist --
-            each way refusing to start rather than dialing unauthorized or
-            unauthenticated.
+        ValueError: If the mode is unrecognized, the ensemble names a provider
+            with no live transport, a named key variable is unset, or a provider
+            host is not on this deployment's outbound allowlist -- each way
+            refusing to start rather than dialing unauthorized, unauthenticated,
+            or unroutable.
     """
-    from windbreak.scheduler.provider_wiring import LiveProviderHttp, is_live_mode
+    from windbreak.scheduler.provider_wiring import (
+        LiveProviderHttp,
+        is_live_mode,
+        live_vote_providers,
+        routable_live_providers,
+    )
 
     if not is_live_mode(config):
         return None
     settings = config.forecast.provider_transport
     timeout_seconds = settings.request_timeout_seconds
-    llm = {
-        provider: _live_http_for(
+    llm = {}
+    for provider in live_vote_providers(config):
+        routing = _LIVE_LLM_PROVIDERS.get(provider)
+        if routing is None:
+            routable = sorted(routable_live_providers())
+            msg = (
+                f"forecast.vote_ensemble names provider {provider!r}, which has "
+                f"no live transport; live-routable providers are {routable}. "
+                f"Remove it from the ensemble or select the 'cassette' transport"
+            )
+            raise ValueError(msg)
+        endpoint_url, key_env_field, build_headers = routing
+        llm[provider] = _live_http_for(
             endpoint_url,
             build_headers(_read_provider_key(getattr(settings, key_env_field))),
             config,
-            timeout_seconds,
+            timeout_seconds=timeout_seconds,
         )
-        for provider, (
-            endpoint_url,
-            key_env_field,
-            build_headers,
-        ) in _LIVE_LLM_PROVIDERS.items()
-    }
     search, fetch = _live_research_http(config, timeout_seconds)
     return LiveProviderHttp(llm=llm, search=search, fetch=fetch)
 
@@ -1229,7 +1248,7 @@ def _live_research_http(
             "content-type": "application/json",
         },
         config,
-        timeout_seconds,
+        timeout_seconds=timeout_seconds,
     )
     fetch = LiveHttpTransport(
         session=requests.Session(),

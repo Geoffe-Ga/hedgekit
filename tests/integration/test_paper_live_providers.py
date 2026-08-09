@@ -32,6 +32,7 @@ network. (Byte-level cassette replay itself is covered by
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -705,6 +706,88 @@ def test_a_live_tick_ledgers_a_forecast_built_from_provider_responses(
     assert votes != []
     assert all(vote["outcome"] == "voted" for vote in votes)
     assert [f["probability_ppm"] for f in forecasts] == [_LIVE_VOTE_PPM]
+
+
+def test_an_unroutable_provider_abstains_rather_than_crashing_the_tick(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """A vote with no live route must not take the whole tick down.
+
+    The regression this exists for: ``RoutingLlmTransport.complete`` raised a
+    bare ``KeyError``, which neither ``RetryingProvider.forecast`` nor
+    ``pipeline._collect_provider_forecasts`` catches -- both catch
+    ``ProviderVoteError`` -- so it escaped ``run_pipeline`` and crashed the
+    tick. Transport-level tests pinned that the ``KeyError`` was *raised*; only
+    driving a whole tick shows that nothing *handles* it.
+
+    Startup validation now refuses this configuration outright, so the bundle is
+    built routable and its transport swapped for an empty router afterwards --
+    exercising the defence-in-depth layer on a path that should be unreachable.
+    """
+    from windbreak.net.live_http import RoutingLlmTransport
+    from windbreak.scheduler.loop import run_single_tick
+
+    deps = _build_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        report_dir=report_dir,
+        tmp_path=tmp_path,
+        config=_config(mode=PROVIDER_TRANSPORT_LIVE),
+        research_tools=_citation_producing_research_tools(tmp_path),
+        provider_http=_live_http(),
+    )
+    unrouted = dataclasses.replace(deps, transport=RoutingLlmTransport({}))
+
+    run_single_tick(unrouted, beat=1)
+
+    forecasts = [
+        payload
+        for event_type, payload in read_event_type_payload_pairs(
+            unrouted.store.read_all()
+        )
+        if event_type == _FORECAST_EVENT
+    ]
+    assert forecasts != []
+    assert all(not forecast["eligible_for_live"] for forecast in forecasts)
+    assert all(forecast["abstention_reason"] for forecast in forecasts)
+
+
+def test_a_live_ensemble_naming_an_unroutable_provider_refuses_to_start(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    tmp_path: Path,
+    research_tools_factory,
+) -> None:
+    """The misconfiguration is refused at composition, not discovered mid-tick.
+
+    Reachable by an operator adding ``futuresearch`` to a live ensemble, or
+    simply typo'ing a provider name.
+    """
+    from windbreak.config.schema import EnsembleMemberConfig
+
+    base = _config(mode=PROVIDER_TRANSPORT_LIVE)
+    forecast = dataclasses.replace(
+        base.forecast,
+        vote_ensemble=(
+            EnsembleMemberConfig("anthropic", "claude-pinned", "2025-07-31"),
+            EnsembleMemberConfig("futuresearch", "fs-pinned", "2025-07-31"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="futuresearch"):
+        _build_deps(
+            books_dir=books_dir,
+            cassette_path=cassette_path,
+            report_dir=report_dir,
+            tmp_path=tmp_path,
+            config=dataclasses.replace(base, forecast=forecast),
+            research_tools=research_tools_factory(),
+            provider_http=_live_http(),
+        )
 
 
 def test_a_total_provider_outage_abstains_rather_than_inventing_a_value(

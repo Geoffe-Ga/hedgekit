@@ -1281,7 +1281,7 @@ def _resolve_forecast_transport(
         )
     if provider_http is None:
         return ReplayCassette.from_path(cassette_path), False
-    return build_live_llm_transport(provider_http), True
+    return build_live_llm_transport(config, provider_http), True
 
 
 def _resolve_research_tools(

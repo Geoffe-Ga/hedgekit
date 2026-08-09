@@ -129,7 +129,6 @@ forecast:
     prices:
       - {provider: openai, price_micros: 200000}
       - {provider: anthropic, price_micros: 300000}
-      - {provider: futuresearch, price_micros: 500000}
     unknown_provider_price_micros: 1000000
 ```
 

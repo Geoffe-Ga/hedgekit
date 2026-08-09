@@ -224,16 +224,100 @@ def is_live_mode(config: WindbreakConfig) -> bool:
     raise ValueError(msg)
 
 
-def build_live_llm_transport(provider_http: LiveProviderHttp) -> LlmTransport:
+def routable_live_providers() -> frozenset[str]:
+    """Return every provider this composition root can route a live vote to.
+
+    The authoritative answer to "what does ``mode: live`` actually support",
+    shared by the startup guard, its error message, and the configuration
+    defaults, so those three can never drift into advertising a provider the
+    root would refuse.
+
+    Returns:
+        The live-routable provider identifiers.
+    """
+    return frozenset(_LLM_ADAPTER_BUILDERS)
+
+
+def live_vote_providers(config: WindbreakConfig) -> tuple[str, ...]:
+    """Return the distinct providers the configured vote ensemble draws on.
+
+    Order-preserving and de-duplicated, because the default ensemble names one
+    provider twice (two OpenAI models) and only one transport per provider is
+    ever built.
+
+    Args:
+        config: The active configuration.
+
+    Returns:
+        Each distinct provider identifier, in first-appearance order.
+    """
+    return tuple(
+        dict.fromkeys(member.provider for member in config.forecast.vote_ensemble)
+    )
+
+
+def _require_routable(config: WindbreakConfig, provider_http: LiveProviderHttp) -> None:
+    """Refuse a live ensemble naming a provider this deployment cannot route.
+
+    ``EnsembleMemberConfig.provider`` is a free string, so nothing else stops an
+    operator adding a provider with no live adapter -- ``futuresearch``, whose
+    provider is a :class:`ForecastProvider` rather than a completion transport
+    and so does not ride this seam at all, or simply a typo. Left unchecked that
+    surfaces as a per-vote
+    :class:`~windbreak.forecast.providers.base.ProviderNotRoutableError`
+    mid-tick; refusing here turns it into a clean startup failure naming the
+    provider, which is what an operator can actually act on.
+
+    Args:
+        config: The active configuration supplying the vote ensemble.
+        provider_http: The live HTTP seams supplied for it.
+
+    Raises:
+        ValueError: If any ensemble provider has no live adapter, or has one but
+            no HTTP seam was built for it.
+    """
+    routable = sorted(routable_live_providers())
+    for provider in live_vote_providers(config):
+        if provider not in _LLM_ADAPTER_BUILDERS:
+            msg = (
+                f"forecast.vote_ensemble names provider {provider!r}, which has "
+                f"no live transport; live-routable providers are {routable}. "
+                f"Remove it from the ensemble or select the 'cassette' transport"
+            )
+            raise ValueError(msg)
+        if provider not in provider_http.llm:
+            msg = (
+                f"forecast.vote_ensemble names provider {provider!r} but no live "
+                f"HTTP seam was built for it; supply one or remove the member"
+            )
+            raise ValueError(msg)
+
+
+def build_live_llm_transport(
+    config: WindbreakConfig,
+    provider_http: LiveProviderHttp,
+    *,
+    validate: bool = True,
+) -> LlmTransport:
     """Build the provider-routing live completion transport.
 
     Args:
+        config: The active configuration supplying the vote ensemble.
         provider_http: The live HTTP seams, one per provider.
+        validate: Whether to refuse an ensemble naming an unroutable provider
+            (keyword-only, default ``True``). Only a test proving the
+            defence-in-depth layer behind that refusal passes ``False``.
 
     Returns:
         A :class:`~windbreak.net.live_http.RoutingLlmTransport` dispatching each
         vote to the adapter for its own provider.
+
+    Raises:
+        ValueError: If ``validate`` and the ensemble names a provider with no
+            live route; see :func:`_require_routable`.
     """
+    if validate:
+        _require_routable(config, provider_http)
     adapters = {
         provider: _LLM_ADAPTER_BUILDERS[provider](http)
         for provider, http in provider_http.llm.items()

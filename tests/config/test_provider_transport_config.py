@@ -63,13 +63,29 @@ def test_retry_defaults_mirror_the_forecast_engines_own_constants() -> None:
     assert retry.backoff_base_ms == DEFAULT_BACKOFF_BASE_MS
 
 
-def test_price_defaults_mirror_the_engines_default_price_table() -> None:
-    """Every configured default price equals the engine's own list price."""
+def test_price_defaults_agree_with_the_engines_default_price_table() -> None:
+    """Where the two tables overlap they must not disagree on a price."""
     configured = {
         price.provider: price.price_micros for price in ProviderTransportConfig().prices
     }
+    engine = dict(DEFAULT_PROVIDER_PRICE_TABLE.prices_micros)
 
-    assert configured == dict(DEFAULT_PROVIDER_PRICE_TABLE.prices_micros)
+    assert all(engine[provider] == price for provider, price in configured.items())
+
+
+def test_price_defaults_cover_exactly_the_live_routable_providers() -> None:
+    """The default table must not advertise a provider the root would refuse.
+
+    ``futuresearch`` is priced by the *engine's* table but has no routed
+    completion transport (its provider does its own research and is not an
+    ``LlmTransport``), so listing it here would imply live support that startup
+    validation then rejects.
+    """
+    from windbreak.scheduler.provider_wiring import routable_live_providers
+
+    configured = {price.provider for price in ProviderTransportConfig().prices}
+
+    assert configured == routable_live_providers()
 
 
 def test_unknown_provider_fallback_price_mirrors_the_engines_own() -> None:

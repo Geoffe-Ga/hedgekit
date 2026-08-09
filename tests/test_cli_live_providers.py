@@ -140,18 +140,103 @@ def test_a_missing_key_error_names_the_variable_not_any_value(
     assert _OPENAI_CANARY not in str(excinfo.value)
 
 
-@pytest.mark.usefixtures("_keys")
-def test_an_undeclared_provider_host_refuses_to_start() -> None:
-    """A deployment whose allowlist omits a provider host must not dial it.
+def _ensemble_config(*providers: str) -> WindbreakConfig:
+    """Build a live config whose vote ensemble names exactly ``providers``.
 
-    The vote ensemble is what puts a provider host on the outbound allowlist
-    (``allowlist_from_config``), so an ensemble naming no known provider
-    declares no provider host -- and a live transport for one would be egress
-    nobody authorized.
+    Args:
+        *providers: The provider identifiers the ensemble draws on.
+
+    Returns:
+        The configuration under test.
     """
+    from windbreak.config.schema import EnsembleMemberConfig
+
+    base = _config()
+    forecast = dataclasses.replace(
+        base.forecast,
+        vote_ensemble=tuple(
+            EnsembleMemberConfig(provider, f"{provider}-pinned", "2025-01-01")
+            for provider in providers
+        ),
+    )
+    return dataclasses.replace(base, forecast=forecast)
+
+
+def test_only_the_configured_ensembles_providers_need_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Anthropic-only ensemble must not demand an OpenAI key.
+
+    Building a transport for a provider nobody configured is what made an
+    unroutable ensemble member possible in the first place.
+    """
+    monkeypatch.setenv(_ANTHROPIC_ENV, _ANTHROPIC_CANARY)
+    monkeypatch.delenv(_OPENAI_ENV, raising=False)
+
+    resolved = _resolve_provider_http(_ensemble_config("anthropic"))
+
+    assert resolved is not None
+    assert set(resolved.llm) == {"anthropic"}
+
+
+@pytest.mark.usefixtures("_keys")
+def test_an_ensemble_naming_an_unroutable_provider_refuses_to_start() -> None:
+    """`futuresearch` has no completion-transport route, so it is refused."""
+    with pytest.raises(ValueError, match="futuresearch"):
+        _resolve_provider_http(_ensemble_config("anthropic", "futuresearch"))
+
+
+@pytest.mark.usefixtures("_keys")
+def test_the_unroutable_refusal_names_what_is_routable() -> None:
+    """An operator who typo'd needs to be told the routable set."""
+    with pytest.raises(ValueError) as excinfo:
+        _resolve_provider_http(_ensemble_config("anthropi"))
+
+    assert "anthropic" in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("_keys")
+def test_a_repeated_provider_builds_one_transport() -> None:
+    """The default ensemble names OpenAI twice; one transport is enough."""
+    resolved = _resolve_provider_http(_ensemble_config("openai", "openai"))
+
+    assert resolved is not None
+    assert set(resolved.llm) == {"openai"}
+
+
+def test_an_undeclared_provider_host_refuses_to_start() -> None:
+    """A host this deployment's allowlist omits must not be dialed.
+
+    Asserted against ``_live_http_for`` directly rather than through
+    ``_resolve_provider_http``. Since transports are now built only for
+    ``vote_ensemble`` providers, and ``allowlist_from_config`` derives its
+    provider hosts from that very field, the two can no longer disagree by
+    configuration -- this screen is defence in depth behind that agreement, and
+    the honest way to exercise defence in depth is to aim at it directly.
+    """
+    from windbreak.main import _live_http_for
+
     base = _config()
     forecast = dataclasses.replace(base.forecast, vote_ensemble=(), ensemble=())
     config = dataclasses.replace(base, forecast=forecast)
 
     with pytest.raises(ValueError, match="allowlist"):
-        _resolve_provider_http(config)
+        _live_http_for(
+            "https://api.anthropic.com/v1/messages", {}, config, timeout_seconds=30
+        )
+
+
+def test_the_undeclared_host_refusal_names_the_host() -> None:
+    """An operator needs to know which host was not declared."""
+    from windbreak.main import _live_http_for
+
+    base = _config()
+    forecast = dataclasses.replace(base.forecast, vote_ensemble=(), ensemble=())
+    config = dataclasses.replace(base, forecast=forecast)
+
+    with pytest.raises(ValueError) as excinfo:
+        _live_http_for(
+            "https://api.anthropic.com/v1/messages", {}, config, timeout_seconds=30
+        )
+
+    assert "api.anthropic.com" in str(excinfo.value)

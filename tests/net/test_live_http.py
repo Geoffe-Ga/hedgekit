@@ -34,7 +34,12 @@ import pytest
 import requests
 
 from windbreak.forecast.cassettes import LlmRequest
-from windbreak.forecast.providers import HttpRequest, ProviderTimeoutError
+from windbreak.forecast.providers import (
+    HttpRequest,
+    ProviderNotRoutableError,
+    ProviderTimeoutError,
+    ProviderVoteError,
+)
 from windbreak.net.allowlist import EgressDeniedError, OutboundAllowlist
 from windbreak.net.live_http import (
     LiveHttpTransport,
@@ -368,8 +373,32 @@ def test_an_unrouted_provider_fails_closed() -> None:
     """A provider with no live adapter must not silently reach another's."""
     router = RoutingLlmTransport({"anthropic": _StubLlmTransport("A")})
 
-    with pytest.raises(KeyError):
+    with pytest.raises(ProviderNotRoutableError):
         router.complete(_llm_request("openai"))
+
+
+def test_an_unrouted_provider_fails_as_a_discardable_vote_error() -> None:
+    """It must be the type the discard paths catch, not a bare `KeyError`.
+
+    Regression for the crash this shape caused: `RetryingProvider.forecast` and
+    `pipeline._collect_provider_forecasts` both catch `ProviderVoteError` only,
+    so a `KeyError` escaped `run_pipeline` and took the whole tick down instead
+    of discarding one vote.
+    """
+    router = RoutingLlmTransport({"anthropic": _StubLlmTransport("A")})
+
+    with pytest.raises(ProviderVoteError):
+        router.complete(_llm_request("openai"))
+
+
+def test_an_unrouted_provider_error_names_the_provider() -> None:
+    """The operator needs to know which member had no route."""
+    router = RoutingLlmTransport({"anthropic": _StubLlmTransport("A")})
+
+    with pytest.raises(ProviderNotRoutableError) as excinfo:
+        router.complete(_llm_request("openai"))
+
+    assert excinfo.value.provider == "openai"
 
 
 # --- The real-world time seam ------------------------------------------------------

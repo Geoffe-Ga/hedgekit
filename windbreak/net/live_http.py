@@ -41,11 +41,14 @@ dressed up as a benign provider timeout.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING
 
 import requests
 
-from windbreak.forecast.providers.base import ProviderTimeoutError
+from windbreak.forecast.providers.base import (
+    ProviderNotRoutableError,
+    ProviderTimeoutError,
+)
 from windbreak.forecast.providers.http_cassettes import HttpResponse
 
 if TYPE_CHECKING:
@@ -66,88 +69,6 @@ _MS_PER_SECOND = 1000
 _NS_PER_MS = 1_000_000
 
 
-class ResponseLike(Protocol):
-    """The narrow slice of ``requests.Response`` this module reads.
-
-    Attributes:
-        status_code: The HTTP status code.
-        text: The decoded response body.
-        headers: The response headers.
-    """
-
-    @property
-    def status_code(self) -> int:
-        """Return the HTTP status code.
-
-        Returns:
-            The status code.
-        """
-        ...
-
-    @property
-    def text(self) -> str:
-        """Return the decoded response body.
-
-        Returns:
-            The body text.
-        """
-        ...
-
-    @property
-    def headers(self) -> Mapping[str, str]:
-        """Return the response headers.
-
-        Returns:
-            The headers.
-        """
-        ...
-
-
-class SessionLike(Protocol):
-    """The narrow slice of ``requests.Session`` this transport dials through.
-
-    Declared structurally so a test can drive the transport with a double, and
-    so the redirect-free session wrapper the connector already uses satisfies it
-    without inheritance.
-    """
-
-    def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        data: bytes,
-        headers: Mapping[str, str],
-        timeout: int,
-        allow_redirects: bool,
-    ) -> Any:
-        """Send one HTTP request.
-
-        The keyword set is spelled out exactly as :meth:`LiveHttpTransport.send`
-        passes it, rather than as ``**kwargs``: a protocol declaring ``**kwargs``
-        would demand a session accepting *arbitrary* keywords, which the real
-        ``requests.Session.request`` -- with its fixed, named option list -- does
-        not satisfy. The return stays ``Any`` because it is narrowed immediately
-        by :func:`_to_http_response`, and pinning it to
-        :class:`ResponseLike` here would reject the genuine ``Response`` for no
-        gain.
-
-        Args:
-            method: The HTTP method.
-            url: The target URL.
-            data: The encoded request body (keyword-only).
-            headers: The send-time headers, including any credential
-                (keyword-only).
-            timeout: The dial timeout in whole seconds (keyword-only).
-            allow_redirects: Whether redirects may be followed; always ``False``
-                here (keyword-only).
-
-        Returns:
-            The response object.
-        """
-        ...
-
-
 class LiveHttpTransport:
     """A live ``requests``-backed transport: allowlisted, redirect-free, keyed.
 
@@ -160,7 +81,7 @@ class LiveHttpTransport:
     def __init__(
         self,
         *,
-        session: SessionLike,
+        session: requests.Session,
         allowlist: OutboundAllowlist,
         headers: Mapping[str, str],
         timeout_seconds: int,
@@ -231,7 +152,7 @@ def _content_type_of(headers: Mapping[str, str]) -> str:
     return ""
 
 
-def _to_http_response(response: ResponseLike) -> HttpResponse:
+def _to_http_response(response: requests.Response) -> HttpResponse:
     """Adapt a ``requests``-shaped response into the provider seam's own type.
 
     Args:
@@ -277,11 +198,20 @@ class RoutingLlmTransport:
             The routed adapter's completion text.
 
         Raises:
-            KeyError: If no adapter is registered for the request's provider --
-                failing closed rather than silently borrowing another
-                provider's transport (and credential).
+            ProviderNotRoutableError: If no adapter is registered for the
+                request's provider. Fails closed rather than silently borrowing
+                another provider's transport -- and credential -- and does so as
+                a :class:`~windbreak.forecast.providers.base.ProviderVoteError`
+                so the pipeline *discards this one vote* instead of crashing the
+                tick. A bare ``KeyError`` here is caught by neither
+                :meth:`~windbreak.forecast.providers.retry.RetryingProvider.forecast`
+                nor the pipeline's own discard path, both of which catch
+                ``ProviderVoteError`` only.
         """
-        return self._adapters[request.provider].complete(request)
+        adapter = self._adapters.get(request.provider)
+        if adapter is None:
+            raise ProviderNotRoutableError(request.provider)
+        return adapter.complete(request)
 
 
 def monotonic_ms() -> int:

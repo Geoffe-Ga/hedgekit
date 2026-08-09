@@ -478,10 +478,19 @@ class ProviderPrice:
 def _default_provider_prices() -> tuple[ProviderPrice, ...]:
     """Return the default per-attempt price table (issue #269).
 
-    Mirror-equal to the forecast engine's own ``DEFAULT_PROVIDER_PRICE_TABLE``
-    -- pinned by test -- so a config omitting the section and the engine's
-    built-in table price every provider identically. The network-free fixture
-    provider is deliberately absent: its true cost is zero and rides on
+    Covers exactly the providers the live composition root can *route* -- the
+    two pinned-LLM completion transports. Where it overlaps the forecast
+    engine's own ``DEFAULT_PROVIDER_PRICE_TABLE`` the prices are mirror-equal,
+    pinned by test.
+
+    ``futuresearch`` is deliberately absent even though the engine's table
+    prices it. Its provider is a ``ForecastProvider`` that does its own
+    research, not an ``LlmTransport``, so it does not ride the routed
+    completion seam this configuration selects; listing it here would advertise
+    a live provider the composition root would then refuse at startup. An
+    operator who wires it through the ``run_pipeline`` seam directly still gets
+    the engine's own list price. The network-free fixture provider is absent for
+    a different reason: its true cost is zero and rides on
     ``ProviderForecast.cost_micros`` directly, never through this fail-closed
     (never-zero) list-price table.
 
@@ -491,7 +500,6 @@ def _default_provider_prices() -> tuple[ProviderPrice, ...]:
     return (
         ProviderPrice("openai", 200_000),
         ProviderPrice("anthropic", 300_000),
-        ProviderPrice("futuresearch", 500_000),
     )
 
 
