@@ -390,6 +390,27 @@ def test_build_parser_new_paper_loop_flags_default_to_none() -> None:
     assert args.report_dir is None
 
 
+# --- issue #343: `--paper-live-ticker` selects live venue books ---------------
+#
+# `build_parser()` does not yet register `--paper-live-ticker`, so the first
+# test below fails with `SystemExit(2)` (argparse "unrecognized arguments") and
+# the second with `AttributeError` -- the expected Gate 1 RED state for #343.
+
+
+def test_build_parser_parses_the_paper_live_ticker_flag() -> None:
+    """`run` accepts `--paper-live-ticker`, naming the live market to trade."""
+    args = build_parser().parse_args(["run", "--paper-live-ticker", "KXFED-24DEC"])
+
+    assert args.paper_live_ticker == "KXFED-24DEC"
+
+
+def test_paper_live_ticker_defaults_to_none() -> None:
+    """Omitting it leaves the PAPER loop on its fixture books, byte-identically."""
+    args = build_parser().parse_args(["run"])
+
+    assert args.paper_live_ticker is None
+
+
 # --- issue #57: `windbreak ack --approval-id <32-hex>` -------------------------
 #
 # `build_parser()` does not yet register an `ack` subcommand, so every

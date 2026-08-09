@@ -1586,17 +1586,84 @@ def test_the_loop_reads_the_venue_clock_rather_than_restamping_its_own() -> None
     from datetime import datetime as _datetime
 
     from windbreak.connector import paper
+    from windbreak.scheduler.loop import read_exchange_clock_epoch_s
 
     anchor = _datetime.fromtimestamp(DEFAULT_NOW_EPOCH_S - 3_600, _UTC)
     exchange = paper.PaperExchange.from_fixture_dir(
-        _books_fixture_dir() / "deep_walk", replay_anchor=anchor
+        _books_fixture_dir() / "deep_walk",
+        clock=lambda: anchor,
+        replay_anchor=anchor,
     )
 
-    context = _skew_context(int(exchange.get_exchange_time().timestamp()))
+    context = _skew_context(read_exchange_clock_epoch_s(exchange))
 
     assert context.market.exchange_clock_epoch_s == DEFAULT_NOW_EPOCH_S - 3_600
     assert context.market.exchange_clock_epoch_s != context.now_epoch_s
     assert _check_named("clock_skew_limit")(make_intent(), context).vetoed is True
+
+
+# --- Issue #382: an exhausted replay reports no venue clock, not a stale one -
+
+
+def test_an_exhausted_replay_vetoes_for_a_stated_reason_not_as_drift() -> None:
+    """A run that outlives its recording reads as unknown, never as skew.
+
+    The anchored venue clock does not advance with wall time (#377), so before
+    this issue a re-enactment that outran its recorded span kept reporting a
+    literal the recording no longer substantiates and `clock_skew_limit` vetoed
+    on accumulated drift -- an incidental veto that says nothing about the
+    venue. Now the replay refuses, the reading is absent, and the check vetoes
+    with the reason an operator can act on: the recording ran out.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+    from datetime import timedelta as _timedelta
+
+    from windbreak.connector import paper
+    from windbreak.scheduler.loop import read_exchange_clock_epoch_s
+
+    anchor = _datetime.fromtimestamp(DEFAULT_NOW_EPOCH_S, _UTC)
+    exchange = paper.PaperExchange.from_fixture_dir(
+        _books_fixture_dir() / "deep_walk",
+        clock=lambda: anchor + _timedelta(hours=1),
+        replay_anchor=anchor,
+    )
+
+    reading = read_exchange_clock_epoch_s(exchange)
+    result = _check_named("clock_skew_limit")(make_intent(), _skew_context(reading))
+
+    assert reading is None
+    assert result.vetoed is True
+    assert result.reason == "exchange clock unknown"
+
+
+def test_a_replay_inside_its_recorded_span_still_reports_the_venue_clock() -> None:
+    """The refusal is bounded: inside the span the reading is still served.
+
+    Without this the change would have "fixed" the drift veto by making the
+    venue clock permanently unreadable, which fails closed but also makes
+    `clock_skew_limit` unable to approve for any replay -- the mirror image of
+    the unfalsifiable check #377 removed.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+    from datetime import timedelta as _timedelta
+
+    from windbreak.connector import paper
+    from windbreak.scheduler.loop import read_exchange_clock_epoch_s
+
+    anchor = _datetime.fromtimestamp(DEFAULT_NOW_EPOCH_S, _UTC)
+    exchange = paper.PaperExchange.from_fixture_dir(
+        _books_fixture_dir() / "deep_walk",
+        clock=lambda: anchor + _timedelta(minutes=1),
+        replay_anchor=anchor,
+    )
+
+    reading = read_exchange_clock_epoch_s(exchange)
+    result = _check_named("clock_skew_limit")(make_intent(), _skew_context(reading))
+
+    assert reading == DEFAULT_NOW_EPOCH_S
+    assert result.vetoed is False
 
 
 # --- Issue #380: the forecast's own `created_at`, not the tick's clock -------

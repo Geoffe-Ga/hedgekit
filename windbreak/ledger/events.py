@@ -406,6 +406,63 @@ class OrderTransitionLedgered(Event):
 
 
 @dataclass(frozen=True)
+class FillAccounted(Event):
+    """Books one venue fill's cash and position movement (issue #365).
+
+    The durable, hash-chained accounting entry for a single execution: what that
+    fill moved out of (or into) available cash, and how it moved the account's
+    position. It is written *once, at execution*, from the venue's execution
+    report, and never rewritten -- which is what lets
+    :class:`~windbreak.riskkernel.verification.LedgerExpectationSource` advance
+    its reconciliation baseline from ledgered evidence instead of freezing at
+    process start and breaching on the first fill.
+
+    Booking an entry is deliberately *not* the same as observing the venue. The
+    entry is frozen at execution; the reconciliation cycle compares it against
+    the venue's live *aggregate* balance and position. The two are independent
+    and can still disagree -- a fill the venue reports but nobody booked, a fee
+    charged differently than reported, a settlement, a phantom position -- which
+    is precisely the divergence verification exists to catch. Re-deriving the
+    expectation from the connector each cycle instead would compare the venue
+    against itself and could never fail (issue #352).
+
+    Every field is a ``str`` or a plain scaled ``int`` (SPEC S6.1); no raw
+    config value, credential, or venue token is ever carried here.
+
+    Attributes:
+        fill_id: The venue's own identifier for the booked fill. It is the
+            idempotency key: one entry per fill id, so a replayed or re-polled
+            execution report can never be booked twice.
+        ticker: The market that traded.
+        cash_delta_micros: The signed available-cash movement this fill caused,
+            in micros -- negative when the fill consumed cash (including the
+            fee charged on it), positive when it released cash.
+        position_delta_centis: The signed position movement this fill caused, in
+            contract-centis, in the same YES frame
+            :attr:`~windbreak.connector.models.Position.quantity` reports:
+            positive is longer YES, negative is longer NO.
+    """
+
+    fill_id: str
+    ticker: str
+    cash_delta_micros: int
+    position_delta_centis: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "fill_id": self.fill_id,
+            "ticker": self.ticker,
+            "cash_delta_micros": self.cash_delta_micros,
+            "position_delta_centis": self.position_delta_centis,
+        }
+        _derive_typed_event(self, payload)
+
+
+@dataclass(frozen=True)
 class SubmissionRefused(Event):
     """Records a submission refused before any transition or submit (issue #38).
 
@@ -1460,6 +1517,7 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "CancelAllDirective": CancelAllDirective,
     "KillReArmed": KillReArmed,
     "OrderTransitionLedgered": OrderTransitionLedgered,
+    "FillAccounted": FillAccounted,
     "SubmissionRefused": SubmissionRefused,
     "ReduceOnlyRefused": ReduceOnlyRefused,
     "ReduceOnlyViolation": ReduceOnlyViolation,
