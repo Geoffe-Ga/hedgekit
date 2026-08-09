@@ -4,6 +4,21 @@ name: Code Review
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Per-PR concurrency (issue #400, AC 5). CONFIRMED from the run logs, not
+# assumed: PR #396 had two review runs in flight on DIFFERENT head SHAs — run
+# 31313993066 (sha 7ed0553, started 12:43:18Z) and run 31314080368 (sha e13b4d8,
+# started 12:45:23Z). Neither was cancelled, both ran to completion, and both
+# posted, leaving two near-identical LGTMs 109 seconds apart. The superseded
+# run's verdict describes an OBSOLETE commit while still looking "fresh" by
+# createdAt, so a timestamp-only staleness check cannot see it — the same
+# false-green shape the subject binding below closes.
+#
+# The group is keyed on the PR number so a run can only ever cancel an earlier
+# run of THIS pull request; two different PRs reviewed at once never interact.
+concurrency:
+  group: code-review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   # write is required by the deterministic "Post review" step below (#152),
@@ -38,8 +53,30 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
-            Review this pull request against the repository's CLAUDE.md. Read the
-            change with `gh pr diff` and `gh pr view` (and any files you need).
+            Review pull request #${{ github.event.pull_request.number }} of
+            ${{ github.repository }}, at head commit
+            ${{ github.event.pull_request.head.sha }}, against the repository's
+            CLAUDE.md.
+
+            SUBJECT BINDING — load-bearing, issue #400. Always name that PR
+            number explicitly:
+
+                gh pr diff ${{ github.event.pull_request.number }}
+                gh pr view ${{ github.event.pull_request.number }}
+
+            NEVER run a bare `gh pr diff` or `gh pr view`. This job checks out
+            the PR's MERGE REF in detached HEAD (see the checkout step), so a
+            bare invocation has no current branch to resolve and fails with
+            "could not determine current branch: failed to run git: not on any
+            branch". That failure is what caused #400: the agent fell back to
+            `gh pr list`, whose default ordering is newest-first, and reviewed a
+            DIFFERENT, newer pull request — whose review was then posted, still
+            correctly addressed, onto the PR that triggered the run. `gh pr list`
+            has since been removed from your tools. Do not try to discover which
+            PR to review; it is stated above and it is the only correct answer.
+
+            You may read any file you need from the checkout — it is already the
+            merge ref for this PR.
 
             Do NOT post a comment yourself. Return ONLY the structured result with
             three fields:
@@ -102,11 +139,29 @@ jobs:
           # in this workflow is the deterministic step below, which posts exactly
           # the schema-validated fields and nothing else.
           #
+          # `Bash(gh pr list:*)` was REMOVED (issue #400). It was the vector for
+          # the cross-posted review: with bare `gh pr diff`/`gh pr view` failing
+          # in the detached-HEAD merge-ref checkout, `gh pr list` was the only
+          # remaining way to name a PR, and its newest-first ordering handed the
+          # agent PR #398 while reviewing #396. The agent is now told its PR
+          # number outright, so listing PRs buys nothing and can only reintroduce
+          # the guess. Re-adding it requires a very good reason.
+          #
+          # Read/Grep/Glob were ADDED, and are read-only. Supplying
+          # --allowed-tools REPLACES the default toolset, so the previous list
+          # left the agent unable to open a single file — despite the prompt
+          # inviting it to. Run 31314440670 recorded permission_denials_count: 29
+          # over 40 turns and 10 minutes ($3.42) as it hunted for a way in; that
+          # flailing is precisely what drove it to `gh pr list`. Restoring
+          # file reads removes the pressure and makes the reviews better. It
+          # widens nothing security-relevant: the checkout is already this PR's
+          # merge ref, and no write- or network-capable tool is granted.
+          #
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # for allowed-tools syntax and security model.
           claude_args: >-
             --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","verdict_rationale","review_markdown"],"properties":{"verdict":{"type":"string","enum":["CHANGES_REQUESTED","COMMENTS","LGTM"]},"verdict_rationale":{"type":"string"},"review_markdown":{"type":"string"}}}'
-            --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"
+            --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
 
       # Deterministic posting (#152): the review agent no longer posts its own
       # comment — this step does, from the action's schema-validated
@@ -124,6 +179,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
           STRUCTURED: ${{ steps.claude-review.outputs.structured_output }}
         run: |
@@ -143,6 +199,22 @@ jobs:
           if [ -n "$rationale" ]; then
             printf '\n%s\n' "$rationale" >> review.md
           fi
+          # SUBJECT BINDING (#400). The verdict line proves a verdict exists; it
+          # says nothing about WHAT was reviewed. This trailing line states the
+          # subject in a fixed machine-readable form, so any consumer can prove
+          # the review is about this PR AND about this head commit before acting
+          # on it. Its shape is owned by REVIEW_SUBJECT_RE in
+          # scripts/ralph/verdict-regex.sh and pinned by the #400 static guard in
+          # scripts/ralph/test_assert_review_posted.sh; the assert step below
+          # enforces this exact pr/sha pair. Both values come from the triggering
+          # event only — never from the branch, the checkout, or a prior step —
+          # which is the whole point: the number that addresses the comment and
+          # the number written inside it have one shared origin.
+          #
+          # It goes AFTER the verdict and rationale so the "## Verdict: <X>" line
+          # itself is never made ambiguous, and it deliberately does not begin
+          # with the word "verdict", so VERDICT_RE cannot select on it.
+          printf '\nReview subject: PR #%s @ %s\n' "$PR_NUMBER" "$HEAD_SHA" >> review.md
           gh pr comment "$PR_NUMBER" -R "$REPO" --body-file review.md
           echo "Posted review with verdict: ${verdict}"
 
@@ -176,6 +248,13 @@ jobs:
       # rerun message. Such a PR requires operator review + admin merge. This
       # self-approval-prevention posture is CORRECT, not a bug.
       #
+      # SUBJECT BINDING (#400): --head-sha makes this step assert not merely that
+      # a fresh verdict landed, but that the landed verdict names THIS PR and
+      # THIS head commit. Passing it is what keeps the guard non-vacuous, so the
+      # #400 static guard in test_assert_review_posted.sh pins that it is still
+      # passed here — dropping the flag would silently restore the old
+      # "well-formed verdict about who-knows-what" acceptance.
+      #
       # Every value flows into the run: body through env: — no inline ${{ }} in
       # the script — for injection-safety and actionlint/shellcheck cleanliness.
       # REVIEW_STARTED_AT was exported into $GITHUB_ENV by the "Record review
@@ -191,9 +270,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
           REVIEW_STARTED_AT: ${{ env.REVIEW_STARTED_AT }}
           EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
         run: |
           bash scripts/ralph/assert-review-posted.sh "$PR_NUMBER" "$REVIEW_STARTED_AT" \
-            --repo "$REPO" --execution-file "$EXECUTION_FILE"
+            --repo "$REPO" --execution-file "$EXECUTION_FILE" --head-sha "$HEAD_SHA"

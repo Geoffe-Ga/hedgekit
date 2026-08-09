@@ -23,10 +23,24 @@
 #     missing/unreadable/malformed file or absent jq — it just falls through.
 #   STEP B (authoritative): assert a verdict-bearing comment (same VERDICT_RE
 #     pr-ready.sh selects on) exists with createdAt >= STARTED_AT, so a stale
-#     verdict from a PREVIOUS run cannot paper over a broken current one.
+#     verdict from a PREVIOUS run cannot paper over a broken current one. When
+#     --head-sha is supplied, that comment must ALSO carry the #400 subject
+#     binding for this exact PR and head commit (see below).
+#
+#   #400 (cross-posted review): a well-formed, correctly-parsed, perfectly fresh
+#     verdict can still be a review of a DIFFERENT pull request. It happened: the
+#     review agent produced PR #398's review and the poster landed it, correctly
+#     addressed, on PR #396, where it became the latest verdict. Freshness cannot
+#     see this — the wrong review is posted at the right time. Nor can the
+#     timestamp check catch a superseded concurrent run, whose verdict describes
+#     an obsolete commit yet is genuinely newer than STARTED_AT.
+#     So code-review.yml now writes the subject INTO the comment:
+#         Review subject: PR #396 @ 635ac9d1ab7378f705303fcf802801d8c3ae5824
+#     and --head-sha makes this script require that exact line. Identity, not
+#     timing, is what proves a review belongs to its PR.
 #
 # Usage:  assert-review-posted.sh <PR_NUMBER> <STARTED_AT> \
-#           [--repo <owner/repo>] [--execution-file <path>]
+#           [--repo <owner/repo>] [--execution-file <path>] [--head-sha <sha>]
 set -euo pipefail
 
 # Shared verdict regex — the single source of truth also sourced by pr-ready.sh
@@ -42,12 +56,14 @@ die() { echo "assert-review-posted: $1" >&2; exit 2; }
 pr=""
 started_at=""
 execution_file=""
+head_sha=""
 repo_args=()
 positional_seen=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)           [[ $# -ge 2 ]] || die "--repo needs a value"; repo_args+=(--repo "$2"); shift 2 ;;
     --execution-file) [[ $# -ge 2 ]] || die "--execution-file needs a value"; execution_file="$2"; shift 2 ;;
+    --head-sha)       [[ $# -ge 2 ]] || die "--head-sha needs a value"; head_sha="$2"; shift 2 ;;
     -*)               die "unknown option: $1" ;;
     *)
       if [[ "$positional_seen" -eq 0 ]]; then
@@ -62,6 +78,13 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$pr" =~ ^[0-9]+$ ]] || die "usage: assert-review-posted.sh <PR_NUMBER> <STARTED_AT> [--repo <owner/repo>] [--execution-file <path>]"
 [[ -n "$started_at" ]]  || die "usage: assert-review-posted.sh <PR_NUMBER> <STARTED_AT> [--repo <owner/repo>] [--execution-file <path>]"
+# A supplied head SHA must be abbreviated-or-full hex. This is a correctness
+# check first (a malformed SHA could never match a rendered subject line, so it
+# would fail every run for the wrong reason) and an injection check second: `pr`
+# is already digits-only and this keeps `head_sha` free of any quote or
+# backslash before it is spliced into the jq string literal below.
+[[ -z "$head_sha" || "$head_sha" =~ ^[0-9a-fA-F]{7,40}$ ]] \
+  || die "--head-sha must be a 7-40 character hex commit SHA, got: $head_sha"
 
 # `${arr[@]+"${arr[@]}"}` expands to nothing when the array is empty instead of
 # tripping `set -u` on bash 3.2 (stock /bin/bash on macOS).
@@ -99,12 +122,47 @@ fi
 # interpolation is the only channel. Safe here — STARTED_AT is a fixed-width
 # RFC3339 UTC timestamp (`date -u +%Y-%m-%dT%H:%M:%SZ`) with no quote characters
 # to break out of the literal.
+fresh_sel="[.comments[] | select(.body != null and (.body | test(\"$VERDICT_RE\")) and (.createdAt != null) and (.createdAt >= \"$started_at\"))]"
+
+# --- #400 subject binding -----------------------------------------------------
+# With a head SHA supplied, "fresh" is no longer sufficient: the comment must
+# also SAY which PR and which commit it reviewed, and both must be ours. The
+# expected line is assembled as a LITERAL and matched with jq `contains`
+# (substring) rather than a regex — `pr` is validated as digits and `head_sha` as
+# hex, so neither can carry a quote or backslash out of the jq string literal,
+# and a literal cannot be silently widened the way a regex can. Interpolation is
+# again the only channel: `gh --jq` evaluates server-side and offers no --arg.
+#
+# Absent --head-sha this is a no-op and the pre-#400 behaviour is preserved
+# exactly, which is why code-review.yml is statically pinned to keep passing it.
+subject_line=""
+subject_pred=""
+if [[ -n "$head_sha" ]]; then
+  subject_line="Review subject: PR #${pr} @ ${head_sha}"
+  subject_pred=" | map(select(.body | contains(\"$subject_line\")))"
+fi
+
 count="$(gh pr view "${gh_args[@]}" \
   --json comments \
-  --jq "[.comments[] | select(.body != null and (.body | test(\"$VERDICT_RE\")) and (.createdAt != null) and (.createdAt >= \"$started_at\"))] | length")"
+  --jq "${fresh_sel}${subject_pred} | length")"
 
 if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -ge 1 ]]; then
   exit 0
+fi
+
+# --- STEP B failure path: #400 subject-binding mismatch -----------------------
+# Separate "no verdict at all" from "a verdict landed, but about something else".
+# The second IS the #400 incident, and the generic rerun message below would be
+# actively misleading for it: the run did post — it posted a review of a
+# different PR, or a superseded concurrent run's review of an older commit. Name
+# the binding we required so the operator can see the mismatch immediately.
+if [[ -n "$head_sha" ]]; then
+  unbound="$(gh pr view "${gh_args[@]}" --json comments --jq "${fresh_sel} | length" 2>/dev/null || true)"
+  if [[ "$unbound" =~ ^[0-9]+$ ]] && [[ "$unbound" -ge 1 ]]; then
+    echo "assert-review-posted: a fresh verdict comment exists, but none carries the required subject binding: \"${subject_line}\"" >&2
+    echo "assert-review-posted: that verdict reviewed a DIFFERENT pull request or an OLDER head commit (issue #400) — it does not count as a review of this PR; rerun the Code Review workflow" >&2
+    exit 1
+  fi
 fi
 
 # --- STEP B failure path: workflow-validation-guard detection -----------------

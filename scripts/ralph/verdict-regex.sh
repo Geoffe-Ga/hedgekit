@@ -61,3 +61,32 @@ readonly VERDICT_RE="${VERDICT_PREFIX_RE}"'[:*\\s]'
 readonly VERDICT_LGTM_RE="${VERDICT_PREFIX_RE}"'[^a-zA-Z0-9]+lgtm'
 # shellcheck disable=SC2034
 readonly VERDICT_COMMENTS_RE="${VERDICT_PREFIX_RE}"'[^a-zA-Z0-9]+comments'
+#
+# --- SUBJECT BINDING (issue #400) --------------------------------------------
+# A correctly-parsed verdict line proves a verdict was posted. It does NOT prove
+# the review is ABOUT this PR, or about its CURRENT head commit. Issue #400 is
+# exactly that hole: the review agent produced PR #398's review and the poster
+# landed it, correctly and explicitly, on PR #396 — where it became the LATEST
+# verdict. Every consumer that greps `^## Verdict` got a well-formed answer
+# belonging to a different pull request.
+#
+# So the posted comment now states its own subject in a fixed, machine-readable
+# form, rendered by code-review.yml's "Post review" step:
+#
+#     Review subject: PR #396 @ 635ac9d1ab7378f705303fcf802801d8c3ae5824
+#
+# REVIEW_SUBJECT_RE matches the SHAPE of that line (any PR, any SHA) and exists
+# so the format has one owner: code-review.yml renders it, the #400 static guard
+# in test_assert_review_posted.sh proves the rendering still conforms, and
+# assert-review-posted.sh enforces the concrete pr/sha pair. Checking a SPECIFIC
+# subject is deliberately NOT done with this regex — assert-review-posted.sh
+# builds the exact literal line and uses jq `contains`, which needs no escaping
+# and cannot be widened by accident.
+#
+# Same escaping rules as above: `\\s` and `\\d` are doubled because this text is
+# spliced into a jq string literal and must reach Oniguruma as `\s` / `\d`, and
+# the fragment is SINGLE-quoted so bash does not collapse the doubling first.
+# The SHA class is `[0-9a-f]{7,40}` (git's abbreviated through full form); the
+# `(?im)` flags are honoured only by jq's test(), never by BSD grep -E.
+# shellcheck disable=SC2034
+readonly REVIEW_SUBJECT_RE='(?im)^\\s*review\\s+subject:\\s*pr\\s*#[0-9]+\\s*@\\s*[0-9a-f]{7,40}\\s*$'
