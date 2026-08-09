@@ -185,6 +185,7 @@ def test_total_cost_never_understates_book_cost_plus_fee(
     haircut_ppm: int,
     max_participation_ppm: int,
 ) -> None:
+    """Total cost never falls below book cost plus fee, and the haircut is >= 0."""
     result = walk_taker_fill(
         levels,
         PricePips(limit_price),
@@ -217,6 +218,7 @@ def test_filled_never_exceeds_the_participation_cap_or_eligible_depth(
     haircut_ppm: int,
     max_participation_ppm: int,
 ) -> None:
+    """Filled quantity stays within the participation cap, itself within depth."""
     result = walk_taker_fill(
         levels,
         PricePips(limit_price),

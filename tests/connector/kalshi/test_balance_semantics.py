@@ -142,6 +142,7 @@ def test_balance_semantics_field_order_matches_the_spec() -> None:
 
 
 def test_balance_semantics_is_frozen() -> None:
+    """A `BalanceSemantics` is frozen: assignment raises FrozenInstanceError."""
     semantics = _semantics()
     # Assign through a dynamic attribute name so the test exercises the frozen
     # dataclass's runtime rejection without a static type-checker suppression.
@@ -152,6 +153,7 @@ def test_balance_semantics_is_frozen() -> None:
 
 
 def test_is_fully_known_true_when_every_field_is_a_known_member() -> None:
+    """A record with no UNKNOWN field reports `is_fully_known()` as True."""
     assert _semantics().is_fully_known() is True
 
 
@@ -166,6 +168,7 @@ def test_is_fully_known_false_when_exactly_one_field_is_unknown(
 
 
 def test_is_fully_known_false_when_every_field_is_unknown() -> None:
+    """An all-UNKNOWN record reports `is_fully_known()` as False."""
     semantics = _semantics(**_UNKNOWN_BY_FIELD)
 
     assert semantics.is_fully_known() is False

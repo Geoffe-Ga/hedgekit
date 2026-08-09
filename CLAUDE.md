@@ -52,7 +52,7 @@
 |--------|-----------|------|
 | **Code Coverage** | ≥90% | pytest-cov |
 | **Branch Coverage** | ≥85% | pytest-cov |
-| **Docstring Coverage** | ≥95% | pydocstyle / ruff D rules |
+| **Docstring Coverage** | 100% of public symbols (ruff `D1`) | ruff |
 | **Mutation Score** | ≥80% (manual pre-v1.0.0 gate, not automated) | mutmut |
 | **Cyclomatic Complexity** | ≤10 per function | radon |
 | **Pylint Score** | ≥9.0 | pylint |
@@ -229,9 +229,15 @@ Run all linting and type checking.
 
 Executes:
 - ruff check (comprehensive Python linting)
-- pylint (≥9.0 score required)
-- mypy (strict type checking)
-- pydocstyle (docstring coverage)
+- ruff `D1` — docstring coverage. Every public module, class, method and
+  function must carry a docstring; there is no percentage to fall below
+  (issue #351). Ruff reimplements pydocstyle's rule family natively, so this
+  is that check, run by the linter already in the pinned toolchain rather
+  than by a second tool. Docstring *style* is the Google convention
+  (`[tool.ruff.lint.pydocstyle]`), currently declared but not yet enforced —
+  see `pyproject.toml` for what is deliberately not selected and why.
+- float-lint (no floats on the money path, SPEC S6.1/S17.3)
+- shellcheck, via the pinned pre-commit hook (issue #359)
 
 ### format.sh
 Auto-format all Python code.
