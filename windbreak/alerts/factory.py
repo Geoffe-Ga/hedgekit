@@ -25,12 +25,18 @@ operator:
    would hide a broken alerting path behind a healthy-looking process.
 3. **Destinations are secrets.** An ntfy topic is a bearer capability and a
    webhook URL can embed a token, so no message this module raises or logs ever
-   contains more of a destination than its hostname.
+   contains more of a destination than its hostname -- and when a hostname
+   cannot be *proven* (a URL whose netloc will not parse, a bare-host field
+   holding something that is not a bare host), it contains none of the
+   destination at all. The redaction is driven by what can be proven safe, not
+   by enumerating the separators a leak might use, so an unanticipated
+   malformed destination fails closed onto saying nothing.
 """
 
 from __future__ import annotations
 
 import logging
+from string import ascii_letters, digits
 from typing import TYPE_CHECKING, Final
 from urllib.parse import urlsplit
 
@@ -73,6 +79,12 @@ _DESKTOP: Final = "desktop"
 #: operator is told what the valid choices are.
 _KNOWN_TYPES: Final = (_NTFY, _WEBHOOK, _SMTP, _DESKTOP)
 
+#: The characters a hostname may contain. Used as an allowlist (not a blocklist
+#: of URL punctuation) so a value is named in an error only when every one of
+#: its characters is proven harmless, rather than when none of the separators we
+#: happened to think of is present.
+_HOST_CHARS: Final = frozenset(ascii_letters + digits + ".-_")
+
 
 class AlertSinkConfigError(Exception):
     """Raised when an alert sink is configured in a way that cannot work.
@@ -114,8 +126,25 @@ def _skip_unconfigured(sink_type: str, missing: str) -> None:
     )
 
 
-def _denied(sink_type: str, destination: str) -> AlertSinkConfigError:
-    """Translate an egress denial into an error that leaks no destination.
+def _is_bare_host(value: str) -> bool:
+    """Return whether ``value`` provably carries nothing but a hostname.
+
+    Args:
+        value: The configured destination value.
+
+    Returns:
+        ``True`` when every character is hostname-legal, so naming the value
+        cannot disclose a path, query, port, or userinfo. Fails closed: any
+        other character -- including the colons of an IPv6 literal, or the
+        ``/``/``?`` of a URL an operator mistyped into a bare-host field --
+        reads as "cannot prove this is only a host", and the value is redacted
+        rather than echoed on the chance that it is well-formed.
+    """
+    return bool(value) and all(char in _HOST_CHARS for char in value)
+
+
+def _denied(sink_type: str, field: str, host: str | None) -> AlertSinkConfigError:
+    """Build the denial error, naming ``host`` only when one was proven.
 
     :class:`~windbreak.net.allowlist.EgressDeniedError`'s own message quotes the
     whole URL, which for a webhook may carry a token in its path or query. Every
@@ -124,16 +153,64 @@ def _denied(sink_type: str, destination: str) -> AlertSinkConfigError:
 
     Args:
         sink_type: The sink's configured ``type``.
-        destination: The denied URL or bare host.
+        field: The configuration field holding the destination, so an operator
+            is told exactly what to correct without being shown its value.
+        host: The destination's hostname, or ``None`` when none could be proven.
 
     Returns:
-        The :class:`AlertSinkConfigError` to raise in the denial's place.
+        The :class:`AlertSinkConfigError` to raise in the denial's place. With
+        no hostname the remediation differs as well as the redaction: the fault
+        is a malformed destination, so telling the operator to add it to
+        ``alerts.allowed_hosts`` would be misdirection -- there is nothing
+        addable to declare.
     """
-    host = urlsplit(destination).hostname or destination
+    if host is None:
+        return AlertSinkConfigError(
+            f"alert sink {sink_type!r} has a malformed {field}: no hostname "
+            "could be parsed from it, so it can never clear the outbound "
+            f"egress allowlist. Correct {field} in the sink's configuration; "
+            "its value is withheld from this message because an alert "
+            "destination can embed a token."
+        )
     return AlertSinkConfigError(
         f"alert sink {sink_type!r} destination host {host!r} is not on the "
         "outbound egress allowlist; declare it in alerts.allowed_hosts"
     )
+
+
+def _denied_url(sink_type: str, field: str, url: str) -> AlertSinkConfigError:
+    """Translate an egress denial for a URL-shaped destination.
+
+    Args:
+        sink_type: The sink's configured ``type``.
+        field: The configuration field holding ``url``.
+        url: The denied URL. Treated as secret-bearing throughout: only the
+            hostname :func:`~urllib.parse.urlsplit` parses out of it -- which
+            excludes userinfo, port, path, query, and fragment -- is ever named.
+
+    Returns:
+        The :class:`AlertSinkConfigError` to raise in the denial's place.
+    """
+    return _denied(sink_type, field, urlsplit(url).hostname or None)
+
+
+def _denied_host(sink_type: str, field: str, host: str) -> AlertSinkConfigError:
+    """Translate an egress denial for a bare-hostname destination.
+
+    An SMTP relay is configured as a host, not a URL, so there is no URL to
+    parse and the value is normally safe to name in full. It is still screened
+    by :func:`_is_bare_host` first, so an operator who mistypes a token-bearing
+    URL into the field gets the same redaction the URL branch gives.
+
+    Args:
+        sink_type: The sink's configured ``type``.
+        field: The configuration field holding ``host``.
+        host: The denied hostname.
+
+    Returns:
+        The :class:`AlertSinkConfigError` to raise in the denial's place.
+    """
+    return _denied(sink_type, field, host if _is_bare_host(host) else None)
 
 
 def _build_ntfy(
@@ -163,7 +240,7 @@ def _build_ntfy(
     try:
         return NtfySink(config, transport=transport, allowlist=allowlist)
     except EgressDeniedError:
-        raise _denied(spec.type, spec.base_url) from None
+        raise _denied_url(spec.type, "base_url", spec.base_url) from None
 
 
 def _build_webhook(
@@ -190,7 +267,7 @@ def _build_webhook(
             WebhookSinkConfig(url=spec.url), transport=transport, allowlist=allowlist
         )
     except EgressDeniedError:
-        raise _denied(spec.type, spec.url) from None
+        raise _denied_url(spec.type, "url", spec.url) from None
 
 
 def _build_smtp(
@@ -229,7 +306,7 @@ def _build_smtp(
     try:
         return SmtpSink(config, transport=transport, allowlist=allowlist)
     except EgressDeniedError:
-        raise _denied(spec.type, smtp.host) from None
+        raise _denied_host(spec.type, "smtp.host", smtp.host) from None
 
 
 def _build_desktop(

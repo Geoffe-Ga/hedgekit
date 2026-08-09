@@ -52,6 +52,15 @@ _WEBHOOK_SECRET_PATH = "/services/s3cr3t-token"
 #: The SMTP relay host every configured-smtp test hands to its transport.
 _SMTP_HOST = "smtp.example.com"
 
+#: The operator secret embedded in :data:`_HOSTLESS_WEBHOOK_URL`'s query string.
+_HOSTLESS_URL_TOKEN = "abc123"
+
+#: A plausible operator typo: one slash too many leaves the netloc empty, so
+#: `urlsplit(...).hostname` is `None` even though the URL still carries a path
+#: and a token. Used to prove a denial with no parseable host redacts the whole
+#: destination rather than falling back to echoing it.
+_HOSTLESS_WEBHOOK_URL = f"https:///{_WEBHOOK_HOST}/incoming?token={_HOSTLESS_URL_TOKEN}"
+
 
 class _RecordingHttpTransport:
     """An :data:`~windbreak.alerts.sinks.HttpTransport` double.
@@ -284,6 +293,125 @@ def test_webhook_rejection_message_never_echoes_the_url_past_its_host() -> None:
 
     assert "s3cr3t-token" not in str(exc_info.value)
     assert "internal.example.org" in str(exc_info.value)
+
+
+def test_webhook_rejection_message_never_echoes_an_unparseable_url() -> None:
+    """A denied webhook URL with no parseable host still leaks nothing.
+
+    The triple-slash typo (`https:///host/...`) leaves `urlsplit` with an empty
+    netloc, so there is no hostname to name. The message must fall back to
+    saying *which sink and field* to fix rather than echoing the destination:
+    the raw URL carries the token, and `main.py` logs this message verbatim via
+    `_LOGGER.critical("FATAL: %s", exc)` onto stderr.
+    """
+    config = _config_with(
+        AlertsConfig(
+            sinks=(AlertSink(type="webhook", url=_HOSTLESS_WEBHOOK_URL),),
+            allowed_hosts=(_WEBHOOK_HOST,),
+        )
+    )
+
+    with pytest.raises(AlertSinkConfigError) as exc_info:
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+
+    message = str(exc_info.value)
+    assert _HOSTLESS_URL_TOKEN not in message
+    assert _HOSTLESS_WEBHOOK_URL not in message
+    assert "/incoming" not in message
+    assert "webhook" in message
+    assert "url" in message
+
+
+def test_ntfy_rejection_message_never_echoes_an_unparseable_base_url() -> None:
+    """The same hostless-destination redaction applies to an ntfy `base_url`.
+
+    `base_url` and `topic` are both bearer capabilities, so the ntfy branch must
+    name its field without echoing the value, exactly as the webhook branch does.
+    """
+    config = _config_with(
+        AlertsConfig(
+            sinks=(
+                AlertSink(
+                    type="ntfy",
+                    base_url=_HOSTLESS_WEBHOOK_URL,
+                    topic="secret-topic",
+                ),
+            ),
+            allowed_hosts=(_NTFY_HOST,),
+        )
+    )
+
+    with pytest.raises(AlertSinkConfigError) as exc_info:
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+
+    message = str(exc_info.value)
+    assert _HOSTLESS_URL_TOKEN not in message
+    assert _HOSTLESS_WEBHOOK_URL not in message
+    assert "ntfy" in message
+    assert "base_url" in message
+
+
+def test_smtp_rejection_message_redacts_a_host_that_is_not_a_bare_host() -> None:
+    """A URL mistyped into `smtp.host` is redacted, not echoed.
+
+    `smtp.host` is a bare hostname by contract, and a bare host is safe to name
+    in full -- but only *because* it is bare. An operator who pastes a full URL
+    into the field would otherwise have its query string echoed into a FATAL
+    log line, since a bare-host denial has no URL parsing to strip it.
+    """
+    config = _config_with(
+        AlertsConfig(
+            sinks=(
+                AlertSink(
+                    type="smtp",
+                    smtp=SmtpSinkSettings(
+                        host=_HOSTLESS_WEBHOOK_URL,
+                        sender="alerts@example.com",
+                        recipients=("ops@example.com",),
+                    ),
+                ),
+            ),
+            allowed_hosts=(_SMTP_HOST,),
+        )
+    )
+
+    with pytest.raises(AlertSinkConfigError) as exc_info:
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+
+    message = str(exc_info.value)
+    assert _HOSTLESS_URL_TOKEN not in message
+    assert _HOSTLESS_WEBHOOK_URL not in message
+    assert "smtp.host" in message
+
+
+def test_smtp_rejection_message_still_names_a_genuine_bare_host() -> None:
+    """Redacting the malformed case must not blind the ordinary one.
+
+    An off-allowlist bare relay host carries no secret, and naming it is the
+    whole remediation: the operator needs to know which host to declare.
+    """
+    config = _config_with(
+        AlertsConfig(
+            sinks=(
+                AlertSink(
+                    type="smtp",
+                    smtp=SmtpSinkSettings(
+                        host="relay.internal.example",
+                        sender="alerts@example.com",
+                        recipients=("ops@example.com",),
+                    ),
+                ),
+            ),
+            allowed_hosts=(_SMTP_HOST,),
+        )
+    )
+
+    with pytest.raises(AlertSinkConfigError) as exc_info:
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+
+    message = str(exc_info.value)
+    assert "relay.internal.example" in message
+    assert "alerts.allowed_hosts" in message
 
 
 # --- 3. SMTP and desktop -----------------------------------------------------

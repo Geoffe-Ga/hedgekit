@@ -116,7 +116,14 @@ surfaces through the dispatcher's log-only fallback.
 Alert destinations are treated as secrets: an ntfy topic is a bearer capability
 and a webhook URL can embed a token, so no log line or error message emitted by
 `windbreak.alerts.factory` ever contains more of a destination than its
-hostname.
+hostname. Where a hostname cannot be *proven* — a URL whose netloc will not
+parse (`https:///host/path?token=…`, a plausible one-slash-too-many typo), or a
+bare-host field such as `smtp.host` holding something that is not a bare host —
+the message names the sink type and the configuration field to correct and
+withholds the destination entirely, rather than falling back to echoing it. The
+decision is driven by proving every character of a value is hostname-legal, not
+by stripping the URL separators a leak might use, so an unanticipated malformed
+destination fails closed onto disclosing nothing.
 
 ## Supply chain
 
