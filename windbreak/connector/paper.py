@@ -25,6 +25,19 @@ frozen fixture, the ledger-derived *expectation* and the exchange-reported
 could not fail for any reason -- checks that structurally cannot fail are worse
 than no checks at all.
 
+Replay anchoring (issue #369): a recording's timestamps are frozen literals, so
+a book replayed verbatim is stale against every freshness ttl forever and
+``quote_freshness`` (SPEC S7.3) can only ever veto. An optional ``replay_anchor``
+declares when the recording is being re-enacted and shifts every book and trade
+print by that one offset, preserving all recorded deltas. The book is
+deliberately *not* restamped per read the way :meth:`PaperExchange.get_exchange_status`
+is: a status value does not decay and its timestamp has no other consumer,
+whereas a book's ``fetched_at`` dates the prices themselves and also stamps the
+taker fill, the ledgered market snapshot, the forecast baseline, and the
+selector's entry-condition reference. A book that renewed its own timestamp on
+every read could never be stale, which is the unfalsifiable check the anchor
+exists to avoid.
+
 Consistency guard (issues #18, #362): the constructor rejects any fixture whose
 :class:`~windbreak.connector.semantics.BalanceSemantics` claims a behavior this
 simulator does not implement (see :data:`_SEMANTICS_REQUIREMENTS`). A taker walk
@@ -92,6 +105,7 @@ from windbreak.numeric import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from datetime import timedelta
     from enum import Enum
     from typing import Any, Literal
 
@@ -379,6 +393,75 @@ def _load_sessions(directory: Path) -> dict[str, tuple[_SessionStep, ...]]:
     }
 
 
+def _recording_origin(
+    sessions: Mapping[str, tuple[_SessionStep, ...]],
+) -> datetime | None:
+    """Return the earliest book instant across every ticker, or ``None`` if empty.
+
+    The origin is deliberately global rather than per ticker: two markets
+    recorded minutes apart must stay minutes apart after re-basing. A per-ticker
+    origin would slide each session independently onto the anchor and invent a
+    cross-market simultaneity the recording never had.
+
+    Args:
+        sessions: The loaded ticker-keyed replay steps.
+
+    Returns:
+        The earliest recorded book ``fetched_at``, or ``None`` when no session
+        holds a single step (nothing to re-base).
+    """
+    instants = [step.book.fetched_at for steps in sessions.values() for step in steps]
+    return min(instants) if instants else None
+
+
+def _shift_step(step: _SessionStep, offset: timedelta) -> _SessionStep:
+    """Return ``step`` with its book and every trade print moved by ``offset``.
+
+    Books and prints shift together by the one shared offset, so a resting
+    order's trade-through fill stays dated after the book it rested against
+    rather than a year before it.
+
+    Args:
+        step: The recorded replay step to re-date.
+        offset: The shift applied to the whole recording.
+
+    Returns:
+        The re-dated step; its prices, sizes, and ordering are untouched.
+    """
+    return _SessionStep(
+        book=replace(step.book, fetched_at=step.book.fetched_at + offset),
+        trades=tuple(replace(trade, ts=trade.ts + offset) for trade in step.trades),
+    )
+
+
+def _anchor_sessions(
+    sessions: Mapping[str, tuple[_SessionStep, ...]], anchor: datetime
+) -> dict[str, tuple[_SessionStep, ...]]:
+    """Re-date a recorded session so its earliest book lands on ``anchor``.
+
+    Every recorded instant moves by the same offset, so all inter-step and
+    cross-ticker deltas survive exactly. This is what keeps ``quote_freshness``
+    (SPEC S7.3) answerable over a committed fixture: the books age against the
+    wall clock as the replay runs, instead of sitting permanently stale at their
+    recorded literals *or* being renewed on every read.
+
+    Args:
+        sessions: The loaded ticker-keyed replay steps.
+        anchor: The instant the re-enactment is declared to start at.
+
+    Returns:
+        The re-dated sessions, unchanged when the recording holds no steps.
+    """
+    origin = _recording_origin(sessions)
+    if origin is None:
+        return dict(sessions)
+    offset = anchor - origin
+    return {
+        ticker: tuple(_shift_step(step, offset) for step in steps)
+        for ticker, steps in sessions.items()
+    }
+
+
 class PaperExchange:
     """A replay-driven, pessimistic paper-trading :class:`MarketConnector`.
 
@@ -392,7 +475,8 @@ class PaperExchange:
 
     Attributes:
         markets: Ticker-keyed normalized markets.
-        sessions: Ticker-keyed replay steps.
+        sessions: Ticker-keyed replay steps, re-dated onto ``replay_anchor``
+            when one was given (issue #369).
         exchange_status: The exchange's trading status.
         exchange_time: The exchange's server time.
         balances: The account's *opening* balances, before any fill is debited;
@@ -416,6 +500,7 @@ class PaperExchange:
         fee_models: Mapping[str, FeeModel],
         haircut_ppm: int = DEFAULT_FEE_HAIRCUT_PPM,
         max_participation_ppm: int = DEFAULT_MAX_PARTICIPATION_PPM,
+        replay_anchor: datetime | None = None,
     ) -> None:
         """Initialize the paper exchange and validate fill-record consistency.
 
@@ -432,6 +517,13 @@ class PaperExchange:
             fee_models: Fee schedules keyed by ticker (plus a ``default``).
             haircut_ppm: The slippage haircut on modeled fees, in ppm.
             max_participation_ppm: The participation cap on recorded depth, in ppm.
+            replay_anchor: The instant this recording is declared to be
+                re-enacted from, or ``None`` to replay its recorded timestamps
+                verbatim (issue #369). When given, every book and trade print
+                shifts by the single offset that puts the earliest recorded book
+                on the anchor, so the recording's internal timing is preserved
+                while its absolute dates become measurable against the run's own
+                clock.
 
         Raises:
             ValueError: If ``balance_semantics`` answers any question in
@@ -443,7 +535,11 @@ class PaperExchange:
         """
         _require_implemented_semantics(balance_semantics)
         self.markets = markets
-        self.sessions = sessions
+        self.sessions = (
+            sessions
+            if replay_anchor is None
+            else _anchor_sessions(sessions, replay_anchor)
+        )
         self.exchange_status = exchange_status
         self.exchange_time = exchange_time
         self._clock = clock
@@ -464,6 +560,7 @@ class PaperExchange:
         path: str | Path,
         *,
         clock: Callable[[], datetime] = _utc_now,
+        replay_anchor: datetime | None = None,
         **overrides: int,
     ) -> PaperExchange:
         """Build a :class:`PaperExchange` from a fixture directory.
@@ -477,6 +574,9 @@ class PaperExchange:
         Args:
             path: The directory holding the JSON fixtures and ``sessions.json``.
             clock: Observation clock forwarded to the constructor (issue #342).
+            replay_anchor: Re-enactment start instant forwarded to the
+                constructor, or ``None`` to keep the fixture's recorded
+                timestamps (issue #369).
             **overrides: Optional ``haircut_ppm`` / ``max_participation_ppm``
                 keyword overrides forwarded to the constructor.
 
@@ -494,6 +594,7 @@ class PaperExchange:
             balances=_load_balances(directory),
             balance_semantics=_load_balance_semantics(directory),
             fee_models=_load_fee_models(directory),
+            replay_anchor=replay_anchor,
             **overrides,
         )
 
