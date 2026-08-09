@@ -17,6 +17,24 @@ four bounded guards:
   ``policy.max_cost_micros``; an unaffordable attempt raises
   :class:`~windbreak.forecast.providers.base.ProviderCostOverrunError` *without*
   ever calling the inner provider.
+* **Per-attempt pricing** -- every attempt the wrapper actually makes is
+  charged its provider's list price, the *successful* one included.
+
+That last guard is why this wrapper, and not the inner provider, is where a
+live vote's cost is booked (issue #399). The inner provider on the live path is
+a :class:`~windbreak.forecast.providers.fixture.FixtureVoteProvider`, whose
+``cost_micros`` is a truthful ``0`` for a network-free cassette replay, and
+``LlmTransport.complete`` hands back bare completion text carrying no token
+accounting -- so nothing beneath this layer can price a call. Charging only the
+*failed* attempts, as this module originally did, meant a first-attempt success
+booked ``cost_micros == 0``: real money spent, none of it booked, and a
+:class:`~windbreak.forecast.budget.ResearchBudget` ceiling that could not fire
+on the healthy path however expensive that path became. Pricing from the table
+cannot book zero --
+:class:`~windbreak.forecast.budget.ProviderPriceTable` validates every mapped
+price strictly positive and charges a positive fallback for an unmapped
+provider -- so an unpriced live provider fails closed at a conservative
+ceiling rather than reading as free.
 
 Only a
 :class:`~windbreak.forecast.providers.base.ProviderVoteError` is caught: a
@@ -155,9 +173,11 @@ class RetryingProvider:
     Wraps an inner provider, retrying transient transport faults with
     exponential backoff (or an honored ``Retry-After`` hint) up to a bounded
     attempt count and total deadline, while charging each attempt's list price
-    against an affordability ceiling. On the happy path (zero failed attempts)
-    the returned forecast is byte-equal to the inner provider's own result --
-    the wrapper is invisible.
+    against an affordability ceiling. Every attempt made is priced, so even a
+    clean first-attempt success returns a forecast whose ``cost_micros`` is the
+    inner provider's own cost plus exactly one list price -- the wrapper is
+    deliberately *not* invisible on the happy path, because that invisibility
+    was issue #399's fail-open.
     """
 
     def __init__(
@@ -215,7 +235,8 @@ class RetryingProvider:
 
         Returns:
             The inner forecast, its ``cost_micros`` bumped by the accrued price
-            of any failed attempts.
+            of *every* attempt made -- the successful one included, so a live
+            vote is never booked as free (issue #399).
 
         Raises:
             ProviderCostOverrunError: If an attempt (or the successful total)
@@ -230,10 +251,10 @@ class RetryingProvider:
         while True:
             attempt += 1
             self._ensure_affordable(accrued, price)
+            accrued += price
             try:
                 forecast = self._inner.forecast(market, baseline, vote_index, quotes)
             except ProviderVoteError as error:
-                accrued += price
                 if not self._retry_after_failure(error, attempt, deadline):
                     error.cost_micros = accrued
                     raise
@@ -309,15 +330,16 @@ class RetryingProvider:
     def _finalize_success(
         self, forecast: ProviderForecast, accrued: int
     ) -> ProviderForecast:
-        """Fold accrued retry cost into a successful forecast, checking budget.
+        """Fold the accrued attempt cost into a successful forecast.
 
         Args:
             forecast: The inner provider's successful forecast.
-            accrued: The spend accrued across failed attempts, in micros.
+            accrued: The spend accrued across every attempt made, in micros --
+                always at least one list price, since the successful attempt is
+                itself priced.
 
         Returns:
-            ``forecast`` with ``cost_micros`` increased by ``accrued`` (byte-equal
-            to ``forecast`` when ``accrued`` is zero).
+            ``forecast`` with ``cost_micros`` increased by ``accrued``.
 
         Raises:
             ProviderCostOverrunError: If the combined total breaches the ceiling.
