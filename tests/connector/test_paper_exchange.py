@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 
 from windbreak.connector import fills, paper
 from windbreak.connector.fees import FeeModel
+from windbreak.connector.freshness import is_fresh
 from windbreak.connector.interface import MarketConnector, UnknownMarketError
 from windbreak.connector.models import OrderBookLevel
 from windbreak.connector.semantics import (
@@ -1856,4 +1857,179 @@ class TestPaperExchangeWithholdsRestingOrderCollateral:
 
         assert exchange.get_balances().available == MoneyMicros(
             _OPENING_BALANCE_MICROS - _NO_SIDE_COLLATERAL_MICROS
+        )
+
+
+# --- Issue #369: the replay carries an anchored timeline, not a read-time stamp ---
+#
+# `quote_freshness` (SPEC S7.3) exists to stop the kernel pricing an order off a
+# stale book. It can only do that if `OrderBookSnapshot.fetched_at` is the
+# instant the *prices* were observed. The committed sessions carry frozen
+# literals (2025-01-01), so measuring them against a wall clock vetoes forever
+# and the paper loop can never trade.
+#
+# The fix is NOT to restamp the book at read time the way `get_exchange_status`
+# does (issue #342). A status value does not decay and its `fetched_at` has no
+# other consumer; a book's `fetched_at` dates the prices themselves and is
+# already load-bearing in four places -- the taker fill's `ts`, the ledgered
+# `MarketSnapshotRecorded.fetched_at_epoch_s`, the forecast's
+# `BaselineQuoteSnapshot`, and the selector's `T = max(...)` reference. Stamping
+# it "now" on every read would corrupt all four to satisfy one check, and would
+# recreate the very unfalsifiability #369 objects to one layer lower.
+#
+# Instead the recorded session is re-based onto a declared re-enactment start:
+# every book and every trade print shifts by one shared offset, so all recorded
+# inter-step and cross-ticker deltas survive exactly. The book still ages
+# against the wall clock between the snapshot stage and the approval stage, so a
+# slow tick -- or a replay that has run out of steps -- still vetoes.
+
+_REPLAY_ANCHOR = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
+
+#: `deep_walk`'s two steps are recorded five minutes apart.
+_DEEP_WALK_STEP_DELTA = timedelta(minutes=5)
+
+
+class TestReplayAnchor:
+    """`replay_anchor` re-dates a recorded session onto the run's own clock."""
+
+    def test_anchor_rebases_the_first_book_onto_the_declared_start(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The earliest recorded book becomes the anchor exactly.
+
+        This is what makes a committed session usable at all: unanchored, the
+        first book is dated 2025-01-01 and is stale against every ttl forever.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk", replay_anchor=_REPLAY_ANCHOR
+        )
+
+        assert exchange.get_order_book("MKT-DEEP").fetched_at == _REPLAY_ANCHOR
+
+    def test_anchor_preserves_recorded_inter_step_deltas(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Step 1 lands at the anchor plus its own recorded gap, not at the anchor.
+
+        The offset is a single shift of the whole recording, so the session's
+        internal timing survives. Collapsing every step onto the anchor -- or
+        onto the read instant -- would erase exactly the aging the freshness
+        check measures.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk", replay_anchor=_REPLAY_ANCHOR
+        )
+
+        exchange.advance()
+
+        assert (
+            exchange.get_order_book("MKT-DEEP").fetched_at
+            == _REPLAY_ANCHOR + _DEEP_WALK_STEP_DELTA
+        )
+
+    def test_anchor_keeps_every_ticker_on_one_shared_timeline(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Two tickers recorded simultaneously stay simultaneous after anchoring.
+
+        The offset is derived from the earliest book across the *whole* session
+        file, never per ticker: a per-ticker origin would silently align two
+        markets that were recorded minutes apart, inventing a cross-market
+        simultaneity the recording never had.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "two_ticker_isolation", replay_anchor=_REPLAY_ANCHOR
+        )
+
+        assert exchange.get_order_book("MKT-ISO-A").fetched_at == _REPLAY_ANCHOR
+        assert exchange.get_order_book("MKT-ISO-B").fetched_at == _REPLAY_ANCHOR
+
+    def test_anchor_shifts_trade_prints_onto_the_same_timeline(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """A resting fill's `ts` moves with the books it is interleaved with.
+
+        `trade_through`'s print is recorded one minute after step 0's book. If
+        prints kept their literal timestamps while books moved, the fill log
+        would be dated a year before the book that produced it and
+        `get_fills(since=...)` would surface fills for a cursor that predates
+        the run.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "trade_through", replay_anchor=_REPLAY_ANCHOR
+        )
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-THROUGH", "yes", PricePips(4200), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+
+        exchange.advance()
+
+        recorded = exchange.get_fills(_SINCE)
+        assert recorded[-1].ts == _REPLAY_ANCHOR + timedelta(minutes=1)
+
+    def test_an_anchored_book_still_goes_stale_once_the_ttl_elapses(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Anchoring makes the check answerable, not unfalsifiable.
+
+        At the ttl boundary the anchored book is still fresh; one second past it
+        it is stale. A read-time stamp would make the second assertion
+        impossible to reach, which is the defect #369 names.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk", replay_anchor=_REPLAY_ANCHOR
+        )
+        fetched_at = exchange.get_order_book("MKT-DEEP").fetched_at
+
+        assert is_fresh(
+            fetched_at, ttl_seconds=10, now=_REPLAY_ANCHOR + timedelta(seconds=10)
+        )
+        assert not is_fresh(
+            fetched_at, ttl_seconds=10, now=_REPLAY_ANCHOR + timedelta(seconds=11)
+        )
+
+    def test_the_same_step_reports_the_same_instant_on_every_read(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Re-reading a book does not refresh it, even as the clock advances.
+
+        This is the line between anchoring and the read-time restamp
+        `get_exchange_status` uses: a book that renews its own timestamp on
+        every read can never be stale, so the kernel would happily price an
+        order off a replay that ran out of data hours ago.
+        """
+        ticks = iter(
+            [
+                _REPLAY_ANCHOR,
+                _REPLAY_ANCHOR + timedelta(hours=1),
+                _REPLAY_ANCHOR + timedelta(hours=2),
+            ]
+        )
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk",
+            clock=lambda: next(ticks),
+            replay_anchor=_REPLAY_ANCHOR,
+        )
+
+        first = exchange.get_order_book("MKT-DEEP").fetched_at
+        second = exchange.get_order_book("MKT-DEEP").fetched_at
+
+        assert first == second == _REPLAY_ANCHOR
+
+    def test_an_unanchored_session_keeps_its_recorded_timestamps(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Omitting the anchor replays the recording verbatim.
+
+        Anchoring is a declared re-enactment, so it is opt-in: a caller that
+        wants the recording's own timeline (offline analysis, golden fixtures)
+        must keep getting it untouched.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
+
+        assert exchange.get_order_book("MKT-DEEP").fetched_at == datetime(
+            2025, 1, 1, tzinfo=UTC
         )
