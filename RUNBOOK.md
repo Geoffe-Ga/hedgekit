@@ -77,10 +77,9 @@ The weekly report stub (below) is also (re-)written each tick.
 stage composes the real `RiskKernel.evaluate_intent` with the real
 `ApprovalPipeline.approve` (`KernelApproval` in `windbreak/scheduler/loop.py`).
 Right now that seam can never mint an approval token, for two independent
-reasons:
+reasons (issue #340 removed a third -- `jurisdiction_product_eligibility` is a
+real check now, and it passes over a market with eligible metadata):
 
-- One SPEC S10.3 pre-trade check (`jurisdiction_product_eligibility`) is still
-  an unconditional-veto stub.
 - `exchange_status_ok` and `pipeline_heartbeat_ok` are now real checks (issue
   #110), but the loop honestly supplies no exchange-status feed and no
   pipeline heartbeat (`exchange_status=None`, `pipeline_heartbeat_epoch_s=None`),
@@ -94,9 +93,9 @@ selector decision, and an `IntentVetoed`) but routes nothing and fills
 nothing; `filled_centis` on every tick's outcome is `0`. Don't be surprised
 to see nothing but vetoes in `/decisions` or `selector_decisions.json` --
 that is the expected, honestly-ledgered state of the loop today. The first
-real, kernel-approved paper fill activates once the remaining stub is retired
-and live exchange-status, heartbeat, and verification feeds are wired into the
-loop in place of today's fail-closed `None`s.
+real, kernel-approved paper fill activates once live exchange-status,
+heartbeat, and verification feeds are wired into the loop in place of today's
+fail-closed `None`s.
 
 **Known limitation -- the kill switch does not stop the PAPER loop yet.**
 `windbreak kill --state-dir <dir>` and `windbreak rearm --state-dir <dir>` write
@@ -283,12 +282,18 @@ pass.
 
 ### Known limitations (summary)
 
-- The real Risk Kernel currently vetoes every intent (the
-  `jurisdiction_product_eligibility` check is still an unconditional-veto stub;
-  the now-real `exchange_status_ok`/`pipeline_heartbeat_ok` checks and the
-  reconciliation checks all fail closed on the `None` status/heartbeat/
-  verification the loop honestly supplies), so no PAPER tick fills yet --
-  expect vetoes, not fills, in the ledger and dashboard.
+- The real Risk Kernel currently vetoes every intent, but no longer because of
+  a stub: issue #340 made `jurisdiction_product_eligibility` a real check. The
+  three remaining causes are all honest `None` feeds -- the
+  `exchange_status_ok`/`pipeline_heartbeat_ok` checks and the three
+  reconciliation checks fail closed on the `None` status, heartbeat, and
+  verification the loop supplies. So no PAPER tick fills yet: expect vetoes, not
+  fills, in the ledger and dashboard.
+- On a **live Kalshi** path the jurisdiction check vetoes for an additional
+  reason: Kalshi publishes no eligibility signal, so `normalize_market` stamps
+  every market `jurisdiction_status="unknown"`, which fails closed by design
+  (SPEC §20 Q3, unresolved). Only a market carrying real eligibility metadata --
+  as the paper fixture books do -- can clear that check.
 - `windbreak kill`/`windbreak rearm` do not stop or gate the PAPER loop today
   (`kill_integration=None`); use process signals to stop the loop.
 - `windbreak run --process dashboard` boots the HTTP dashboard server directly
