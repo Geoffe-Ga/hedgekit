@@ -113,6 +113,45 @@ that SPEC §9.6 sizes against is deliberately provider-family-agnostic (see
 without excluding its *vote* from the ensemble keeps that honest
 disagreement signal intact even while the provider itself remains unproven.
 
+**How the loop enforces this (issue #305).** `build_paper_deps` constructs
+**one** `ProviderTrackRecordGate` per process and carries it on
+`PaperTickDeps`, and every tick's `run_pipeline` call runs under it — the gate
+is the PAPER loop's own behaviour, not merely an available seam. Its two bars
+come from `config.forecast.provider_gate`; its records come from a single
+strict-JSON artifact, `provider-track-records.json`, read from the same
+`report_dir` the loop's other evaluation artifacts live in:
+
+```json
+{
+  "anthropic": {"resolved_count": 210, "brier_skill_ppm": 14000},
+  "openai":    {"resolved_count": 180, "brier_skill_ppm": 11500}
+}
+```
+
+Like the research budget there is deliberately no `provider_gate` parameter on
+`build_paper_deps`: config plus artifact are the only sources, so an ungated
+loop has no injection door to arrive through. Two boundary cases are decided
+and both fail *closed*:
+
+- **Bootstrap — no artifact yet.** Until an evaluation pass writes the file,
+  every provider is unproven and every full forecast is held back from live
+  eligibility. That is the honest reading of "no measured edge yet", and it is
+  the direction the mistake must point.
+- **Malformed artifact.** A file that `parse_track_records` refuses (a float
+  leaf, a bool where a count belongs, an unknown key, a missing measurement)
+  aborts startup. Degrading to an empty source would also withhold
+  eligibility, but it would silently discard an operator's evaluation output —
+  a broken pass and a genuinely empty one must not look alike from outside.
+
+Each hold lands in the tick's durable ledger as one `ProviderGateHeld` row
+(component `scheduler`), carrying the tick's `forecast_id` and `market_ticker`
+alongside the comma-joined `unproven_providers`, their `unproven_count`, and
+the `min_resolved` / `min_brier_skill_ppm` bars actually in force — so a
+withheld forecast is always distinguishable, from the audit trail alone, from
+one that merely had thin citations. The row sits *after* the tick's
+`ProviderVoteRecorded` rows, in causal order: the votes happened, then their
+providers were screened.
+
 ## Versioned calibration map (SPEC §8.2)
 
 `windbreak.forecast.calibration` loads a versioned probability-calibration

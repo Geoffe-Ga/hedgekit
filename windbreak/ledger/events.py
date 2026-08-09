@@ -1280,6 +1280,66 @@ class ProviderVoteRecorded(Event):
 
 
 @dataclass(frozen=True)
+class ProviderGateHeld(Event):
+    """Records a per-provider track-record live-eligibility hold (issue #305).
+
+    Appended by the scheduler's ``_forecast_stage`` composition root when the
+    tick's :class:`~windbreak.forecast.providers.track_record.ProviderTrackRecordGate`
+    finds any voting provider unproven and therefore forces the forecast
+    live-ineligible (SPEC S13/S16 promotion bars, S19's no-unmeasured-edge
+    mandate). The hold is the durable answer to "why did this otherwise healthy
+    forecast not qualify to back a live order", and naming the providers plus
+    the two bars they missed makes the decision reconstructable from the audit
+    trail alone -- without it, a held forecast is indistinguishable from one
+    that simply had thin citations. Like every concrete event its
+    ``event_type`` is the literal class name ``"ProviderGateHeld"``, derived via
+    :func:`_derive_typed_event`, and every payload leaf is int/str -- never a
+    float, never ``None``.
+
+    The votes themselves are *not* held: an unproven provider keeps forecasting
+    (that is the only way its paper track record ever accrues), so this row sits
+    alongside, never instead of, the tick's :class:`ProviderVoteRecorded` rows.
+
+    Attributes:
+        forecast_id: The forecast whose live eligibility was withheld.
+        market_ticker: That forecast's market ticker.
+        unproven_providers: The unproven voting providers, comma-joined in the
+            sorted, deduplicated order the gate screens them in (e.g.
+            ``"anthropic,openai"``). A scalar string rather than a list so the
+            payload stays flat, matching this module's leaf convention.
+        unproven_count: How many distinct providers ``unproven_providers``
+            names -- carried explicitly so a fold never has to re-split the
+            joined string to count them.
+        min_resolved: The resolved-forecast bar in force for this decision,
+            from ``config.forecast.provider_gate.min_resolved``.
+        min_brier_skill_ppm: The Brier-skill bar in force for this decision, in
+            ppm, from ``config.forecast.provider_gate.min_brier_skill_ppm``.
+    """
+
+    forecast_id: str
+    market_ticker: str
+    unproven_providers: str
+    unproven_count: int
+    min_resolved: int
+    min_brier_skill_ppm: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "forecast_id": self.forecast_id,
+            "market_ticker": self.market_ticker,
+            "unproven_providers": self.unproven_providers,
+            "unproven_count": self.unproven_count,
+            "min_resolved": self.min_resolved,
+            "min_brier_skill_ppm": self.min_brier_skill_ppm,
+        }
+        _derive_typed_event(self, payload)
+
+
+@dataclass(frozen=True)
 class ResearchBudgetHalted(Event):
     """Records a fail-closed research halt on a budget ceiling (issue #339).
 
@@ -1421,6 +1481,7 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "CanaryVerdictRecorded": CanaryVerdictRecorded,
     "PromotionBlocked": PromotionBlocked,
     "ProviderVoteRecorded": ProviderVoteRecorded,
+    "ProviderGateHeld": ProviderGateHeld,
     "ResearchBudgetHalted": ResearchBudgetHalted,
     "ExchangeStatusObserved": ExchangeStatusObserved,
     "PipelineHeartbeatRecorded": PipelineHeartbeatRecorded,

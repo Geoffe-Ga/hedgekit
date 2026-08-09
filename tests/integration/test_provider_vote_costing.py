@@ -50,6 +50,40 @@ Four scenarios:
    the built-in default triple. An ensemble configured away must not read as a
    healthy one.
 
+Issue #305 adds a fifth wiring seam to the same composition root and the same
+observable ledger: the per-provider track-record gate. `PaperTickDeps` must
+carry a `ProviderTrackRecordGate` built by `build_paper_deps`, `_forecast_stage`
+must pass it into `run_pipeline`, and the hold it produces must land in the
+tick's durable ledger as a `ProviderGateHeld` row. Five scenarios cover it:
+
+5. `test_forecast_stage_holds_unproven_providers_back_from_live` -- the RED
+   one. With no track-record artifact yet (the bootstrap case) both default
+   ensemble provider families are unproven, so the tick's record must be
+   live-INeligible and exactly one `ProviderGateHeld` row must name them.
+   Today `_forecast_stage` passes no gate at all, so the very same tick
+   produces `eligible_for_live=True` off providers with zero measured track
+   record and ledgers nothing.
+6. `test_forecast_stage_promotes_providers_proven_by_the_track_record_artifact`
+   -- an artifact meeting both bars *exactly* (the inclusive `>=` boundary)
+   proves both families: the record is live-eligible again and zero
+   `ProviderGateHeld` rows are appended. This is the "the gate changes nothing
+   once the record clears" pin.
+7. `test_forecast_stage_uses_the_operator_configured_provider_gate_thresholds`
+   -- an operator who raises `forecast.provider_gate` above what the artifact
+   proves gets the raised bar: held, with the *configured* (non-default)
+   thresholds ledgered. The gate an operator configures is the gate they get.
+8. `test_build_paper_deps_refuses_a_malformed_track_record_artifact` -- a
+   corrupt artifact aborts startup rather than degrading to an empty (or, far
+   worse, permissive) source. An unreadable record is not a proven one and is
+   not a bootstrap either.
+9. `test_offline_default_tick_ledgers_no_provider_gate_held` -- the always-on
+   offline default path abstains before the vote stage, so it screens zero
+   providers and appends zero `ProviderGateHeld` rows: wiring the gate leaves
+   the default tick's ledger byte-identical. Like scenario 1 this asserts an
+   ABSENCE and so passes vacuously until `ProviderGateHeld` exists; it earns
+   its keep afterwards, by failing the moment the gate starts ledgering holds
+   on a tick that never screened a provider.
+
 Local-doubles choice
     This module defines its own `_FixtureSearchTransport` /
     `_FixtureFetchTransport` / `_FakeVoteTransport` doubles rather than
@@ -70,6 +104,8 @@ import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import pytest
+
 from tests.integration.conftest import FIXED_NOW_EPOCH_S, ledger_path_for
 from windbreak.config.schema import EnsembleMemberConfig
 
@@ -83,6 +119,16 @@ if TYPE_CHECKING:
 #: what this module's tests actually need).
 _FORECAST_CREATED = "ForecastCreated"
 _PROVIDER_VOTE_RECORDED = "ProviderVoteRecorded"
+
+#: The durable row the per-provider track-record hold lands on (issue #305).
+#: Spelled as a literal, never imported, so the issue-#305 scenarios below fail
+#: on a genuine `AssertionError` about behaviour rather than collapsing the whole
+#: module into an `ImportError` before the issue-#281/#294 scenarios can run.
+_PROVIDER_GATE_HELD = "ProviderGateHeld"
+
+#: Both provider families the default vote ensemble draws from, comma-joined in
+#: the sorted order `ProviderTrackRecordGate.unproven_providers` emits.
+_DEFAULT_ENSEMBLE_PROVIDERS = "anthropic,openai"
 
 #: A deliberately non-default two-member vote ensemble (issue #294): it shares
 #: no `model_version` with `DEFAULT_VOTE_ENSEMBLE` and is a *different size*, so
@@ -464,3 +510,308 @@ def test_forecast_stage_empty_configured_vote_ensemble_abstains_fail_closed(
     assert forecast.abstention_reason == ABSTENTION_ALL_VOTES_DISCARDED
     assert forecast.eligible_for_live is False
     assert _ledgered_member_pairs(deps.store.read_all()) == ()
+
+
+# --- issue #305: the per-provider track-record gate reaches run_pipeline ---------
+
+
+def _write_track_record_artifact(report_dir: Path, records: dict[str, dict]) -> None:
+    """Write the M6 provider track-record artifact the composition root reads.
+
+    The path is the loop's own published convention constant rather than a
+    hand-copied filename, so a rename of the artifact breaks this helper at the
+    import rather than silently reverting every scenario below to the
+    no-artifact bootstrap case (which would let a broken gate look proven).
+
+    Args:
+        report_dir: The evaluation-artifact directory the tick is wired to.
+        records: The provider -> ``{resolved_count, brier_skill_ppm}`` mapping
+            to serialize.
+    """
+    from windbreak.scheduler.loop import PROVIDER_TRACK_RECORD_FILENAME
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_dir.joinpath(PROVIDER_TRACK_RECORD_FILENAME).write_text(
+        json.dumps(records), encoding="utf-8"
+    )
+
+
+def _provider_gate_held_payloads(records) -> list[dict]:
+    """Extract every ledgered `ProviderGateHeld` payload, in row order.
+
+    Args:
+        records: The ledger rows read back from the tick's store.
+
+    Returns:
+        One payload `data` dict per `ProviderGateHeld` row.
+    """
+    return [
+        json.loads(record.payload_json)["data"]
+        for record in records
+        if record.event_type == _PROVIDER_GATE_HELD
+    ]
+
+
+def _config_with_provider_gate(
+    config: WindbreakConfig, *, min_resolved: int, min_brier_skill_ppm: int
+) -> WindbreakConfig:
+    """Return `config` with only its `forecast.provider_gate` bars replaced.
+
+    Args:
+        config: The base PAPER-ceilinged configuration.
+        min_resolved: The resolved-forecast bar to configure.
+        min_brier_skill_ppm: The Brier-skill bar to configure, in ppm.
+
+    Returns:
+        A new `WindbreakConfig` carrying the two configured thresholds.
+    """
+    from windbreak.config.schema import ProviderGateConfig
+
+    forecast = dataclasses.replace(
+        config.forecast,
+        provider_gate=ProviderGateConfig(
+            min_resolved=min_resolved, min_brier_skill_ppm=min_brier_skill_ppm
+        ),
+    )
+    return dataclasses.replace(config, forecast=forecast)
+
+
+def test_forecast_stage_holds_unproven_providers_back_from_live(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    tmp_path: Path,
+) -> None:
+    """With no track-record artifact written yet -- the bootstrap case -- both
+    default-ensemble provider families are unproven, so a tick that reaches
+    full aggregation must be held back from live eligibility and must ledger
+    exactly one `ProviderGateHeld` row naming both (issue #305).
+
+    Today `_forecast_stage` passes no `provider_gate` into `run_pipeline` at
+    all, so this very tick returns `eligible_for_live=True` off two providers
+    with zero measured track record, and ledgers nothing about it.
+
+    The two thresholds are pinned as literals rather than read back off
+    `paper_config`, matching the rigor
+    `tests/forecast/test_epic_m2_5_smoke.py` applies to the same payload: an
+    accidental edit to `ProviderGateConfig`'s defaults must fail this equality
+    rather than move both sides of it together and escape the pin.
+    """
+    from windbreak.scheduler.loop import _forecast_stage
+
+    deps = _build_deps_with_real_citations(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        tmp_path=tmp_path,
+    )
+    order_book = deps.exchange.get_order_book(deps.ticker)
+    created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
+
+    forecast = _forecast_stage(deps, order_book, created_at)
+
+    assert forecast is not None
+    assert forecast.abstention_reason is None
+    assert forecast.eligible_for_live is False
+
+    records = deps.store.read_all()
+    assert _provider_gate_held_payloads(records) == [
+        {
+            "forecast_id": forecast.forecast_id,
+            "market_ticker": forecast.market_ticker,
+            "unproven_providers": _DEFAULT_ENSEMBLE_PROVIDERS,
+            "unproven_count": 2,
+            "min_resolved": 150,
+            "min_brier_skill_ppm": 10_000,
+        }
+    ]
+    held_record = next(
+        record for record in records if record.event_type == _PROVIDER_GATE_HELD
+    )
+    assert held_record.component == "scheduler"
+
+    # The hold is about live *eligibility*, never about the votes: every
+    # ensemble member still voted and still costed (SPEC S19 -- a paper track
+    # record can only accrue if the unproven provider keeps forecasting).
+    assert len(forecast.model_votes) == 3
+    assert len(_ledgered_member_pairs(records)) == 3
+
+
+def test_forecast_stage_promotes_providers_proven_by_the_track_record_artifact(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    tmp_path: Path,
+) -> None:
+    """A track-record artifact meeting both default bars *exactly* -- the
+    inclusive `>=` boundary -- proves both provider families: the tick's record
+    is live-eligible again and no `ProviderGateHeld` row is appended.
+
+    This is issue #305's "changes nothing once the record clears" pin: with a
+    clearing artifact the wired gate must leave the tick's ledger exactly as it
+    was before the gate existed, so the gate provably withholds eligibility
+    only from providers that have not earned it.
+    """
+    from windbreak.scheduler.loop import _forecast_stage
+
+    _write_track_record_artifact(
+        report_dir,
+        {
+            "anthropic": {"resolved_count": 150, "brier_skill_ppm": 10_000},
+            "openai": {"resolved_count": 150, "brier_skill_ppm": 10_000},
+        },
+    )
+    deps = _build_deps_with_real_citations(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        tmp_path=tmp_path,
+    )
+    order_book = deps.exchange.get_order_book(deps.ticker)
+    created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
+
+    forecast = _forecast_stage(deps, order_book, created_at)
+
+    assert forecast is not None
+    assert forecast.eligible_for_live is True
+    records = deps.store.read_all()
+    assert _provider_gate_held_payloads(records) == []
+    assert len(_ledgered_member_pairs(records)) == 3
+
+
+def test_forecast_stage_uses_the_operator_configured_provider_gate_thresholds(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    tmp_path: Path,
+) -> None:
+    """An operator who raises `forecast.provider_gate` above what the artifact
+    proves gets the raised bar, not the default one (issue #305).
+
+    The artifact below clears the *default* thresholds outright, so a
+    composition root that quietly built the gate on
+    `ProviderTrackRecordGate`'s own defaults -- or on no config at all -- would
+    promote both providers and ledger nothing. Requiring the hold, with the
+    configured thresholds on it, is what makes the configured gate the gate
+    that actually runs.
+    """
+    from windbreak.scheduler.loop import _forecast_stage
+
+    _write_track_record_artifact(
+        report_dir,
+        {
+            "anthropic": {"resolved_count": 150, "brier_skill_ppm": 10_000},
+            "openai": {"resolved_count": 150, "brier_skill_ppm": 10_000},
+        },
+    )
+    deps = _build_deps_with_real_citations(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=_config_with_provider_gate(
+            paper_config, min_resolved=900, min_brier_skill_ppm=250_000
+        ),
+        tmp_path=tmp_path,
+    )
+    order_book = deps.exchange.get_order_book(deps.ticker)
+    created_at = datetime.fromtimestamp(FIXED_NOW_EPOCH_S, tz=UTC)
+
+    forecast = _forecast_stage(deps, order_book, created_at)
+
+    assert forecast is not None
+    assert forecast.eligible_for_live is False
+    assert _provider_gate_held_payloads(deps.store.read_all()) == [
+        {
+            "forecast_id": forecast.forecast_id,
+            "market_ticker": forecast.market_ticker,
+            "unproven_providers": _DEFAULT_ENSEMBLE_PROVIDERS,
+            "unproven_count": 2,
+            "min_resolved": 900,
+            "min_brier_skill_ppm": 250_000,
+        }
+    ]
+
+
+def test_build_paper_deps_refuses_a_malformed_track_record_artifact(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """A corrupt track-record artifact aborts startup rather than degrading to
+    an empty source (issue #305).
+
+    A fractional `brier_skill_ppm` is exactly the leaf
+    `parse_track_records` refuses, and the composition root must let that
+    refusal out: an artifact the loop cannot read is neither a proven record
+    nor a bootstrap, and silently treating it as either would hide a broken
+    evaluation pass behind a gate decision the operator would have no way to
+    question.
+    """
+    from windbreak.scheduler.loop import (
+        PROVIDER_TRACK_RECORD_FILENAME,
+        build_paper_deps,
+    )
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_dir.joinpath(PROVIDER_TRACK_RECORD_FILENAME).write_text(
+        '{"anthropic": {"resolved_count": 150, "brier_skill_ppm": 10000.5}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be integers, got float"):
+        build_paper_deps(
+            books_dir=books_dir,
+            cassette_path=cassette_path,
+            ledger_path=ledger_path_for(tmp_path),
+            report_dir=report_dir,
+            config=paper_config,
+            research_tools=research_tools_factory(),
+            clock=_fixed_clock,
+        )
+
+
+def test_offline_default_tick_ledgers_no_provider_gate_held(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """The always-on offline default tick abstains on zero verified citations
+    *before* the vote stage, so it screens no providers and appends zero
+    `ProviderGateHeld` rows: wiring the gate leaves the default tick's ledger
+    byte-identical (issue #305).
+
+    Like `test_zero_verified_citations_path_ledgers_zero_provider_vote_
+    recorded` this asserts an ABSENCE, so it passes vacuously until
+    `ProviderGateHeld` exists. It earns its keep afterwards: it fails the
+    moment the gate starts ledgering a hold on a tick whose pipeline never
+    reached a single provider to screen.
+    """
+    from windbreak.scheduler.loop import build_paper_deps, run_single_tick
+
+    deps = build_paper_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools=research_tools_factory(),
+        clock=_fixed_clock,
+    )
+
+    run_single_tick(deps, beat=1)
+
+    assert _provider_gate_held_payloads(deps.store.read_all()) == []

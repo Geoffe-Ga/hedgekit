@@ -137,6 +137,7 @@ from windbreak.ledger.events import (
     PositionsSnapshotRecorded,
     PromotionBlocked,
     PromotionEvaluated,
+    ProviderGateHeld,
     ProviderVoteRecorded,
     ReconciliationHalted,
     ReconciliationHealed,
@@ -378,6 +379,7 @@ def test_event_types_registry_maps_type_name_to_class() -> None:
         "CanaryVerdictRecorded": CanaryVerdictRecorded,
         "PromotionBlocked": PromotionBlocked,
         "ProviderVoteRecorded": ProviderVoteRecorded,
+        "ProviderGateHeld": ProviderGateHeld,
         "ResearchBudgetHalted": ResearchBudgetHalted,
         "ExchangeStatusObserved": ExchangeStatusObserved,
         "PipelineHeartbeatRecorded": PipelineHeartbeatRecorded,
@@ -1201,6 +1203,80 @@ def test_research_budget_halted_is_reexported_from_windbreak_ledger() -> None:
         "ResearchBudgetHalted not re-exported from windbreak.ledger"
     )
     assert ledger_package.ResearchBudgetHalted is ResearchBudgetHalted
+
+
+# --- Issue #305: ProviderGateHeld, the per-provider live-eligibility hold ----
+
+
+def test_provider_gate_held_populates_event_type_and_payload() -> None:
+    """`ProviderGateHeld` derives the full `Event` contract from typed fields.
+
+    Every payload leaf must be int/str -- never a float and never `None` -- so
+    "which providers were unproven, against which bars" stays queryable typed
+    data rather than prose. The comma-joined provider list is deliberately a
+    scalar string, keeping the payload flat like every other event here.
+    """
+    event = ProviderGateHeld(
+        component="scheduler",
+        forecast_id="f" * 64,
+        market_ticker="MKT-DEEP",
+        unproven_providers="anthropic,openai",
+        unproven_count=2,
+        min_resolved=150,
+        min_brier_skill_ppm=10_000,
+    )
+
+    assert event.event_type == "ProviderGateHeld"
+    assert event.component == "scheduler"
+    assert event.payload == {
+        "forecast_id": "f" * 64,
+        "market_ticker": "MKT-DEEP",
+        "unproven_providers": "anthropic,openai",
+        "unproven_count": 2,
+        "min_resolved": 150,
+        "min_brier_skill_ppm": 10_000,
+    }
+    assert all(isinstance(leaf, int | str) for leaf in event.payload.values())
+    assert not any(isinstance(leaf, float) for leaf in event.payload.values())
+
+
+def test_provider_gate_held_round_trips_through_the_event_types_registry() -> None:
+    """A persisted hold envelope reconstructs to an equal event.
+
+    Without the `EVENT_TYPES` registration this fails only at replay time, in
+    production, rather than here.
+    """
+    event = ProviderGateHeld(
+        component="scheduler",
+        forecast_id="a" * 64,
+        market_ticker="MKT-DEEP",
+        unproven_providers="futuresearch",
+        unproven_count=1,
+        min_resolved=900,
+        min_brier_skill_ppm=250_000,
+    )
+
+    assert EVENT_TYPES["ProviderGateHeld"] is ProviderGateHeld
+    rebuilt = EVENT_TYPES[event.event_type](
+        component=event.component,
+        **event.payload,
+    )
+    assert rebuilt == event
+    assert rebuilt.envelope_json == event.envelope_json
+
+
+def test_provider_gate_held_is_reexported_from_windbreak_ledger() -> None:
+    """`ProviderGateHeld` is importable from `windbreak.ledger` directly.
+
+    The package's import block and `__all__` are separately hand-maintained
+    lists; this pins that they agree for the new event.
+    """
+    import windbreak.ledger as ledger_package
+
+    assert hasattr(ledger_package, "ProviderGateHeld"), (
+        "ProviderGateHeld not re-exported from windbreak.ledger"
+    )
+    assert ledger_package.ProviderGateHeld is ProviderGateHeld
 
 
 # --- Issue #342: the two liveness-evidence events ---------------------------
