@@ -28,11 +28,13 @@ Issue #364 closed the last two unconditional vetoes the same way -- by
 supplying evidence the loop already holds, never a convenient number:
 
 * ``daily_loss_limit`` now measures against the current UTC day's *first*
-  ledgered ``EquitySampled`` row (:func:`start_of_day_equity_micros`), which is
-  a genuine start-of-day baseline. Until the day has a sample -- including the
-  day's first approval, since a tick samples equity only after approving -- the
-  baseline is absent, lands on the account as zero, and the check keeps
-  vetoing.
+  ledgered ``EquitySampled`` row (:func:`read_start_of_day_equity_micros`),
+  which is a genuine start-of-day baseline. Until the day has a sample --
+  including the day's first approval, since a tick samples equity only after
+  approving -- the baseline is absent, lands on the account as zero, and the
+  check keeps vetoing. That read is bounded to the samples taken since the day
+  boundary (issue #370), because an always-on loop asks it every tick against a
+  ledger that never stops growing.
 * ``participation_cap_compliance`` now measures against the shallower visible
   side of the book the tick snapshotted (:func:`visible_depth_centis`). A book
   that cannot be read at all stays ``None`` and the check keeps vetoing.
@@ -108,7 +110,12 @@ from windbreak.ledger.events import (
     ResearchBudgetHalted,
     SelectorDecisionRecorded,
 )
-from windbreak.ledger.store import SqliteLedgerStore, events_from_records
+from windbreak.ledger.store import (
+    LedgerStore,
+    ReverseTypeScan,
+    SqliteLedgerStore,
+    events_from_records,
+)
 from windbreak.numeric import ContractCentis, MoneyMicros, PricePips
 from windbreak.order_gateway.gateway import OrderGateway, PaperSubmitter
 from windbreak.order_gateway.ledger_writer import SqliteGatewayLedgerWriter
@@ -221,8 +228,9 @@ _SIGNING_KEY_BYTES = 32
 _RECONCILE_MAX_CYCLES = 5
 
 #: The ledger event type carrying one PAPER-loop equity sample. The tick
-#: appends one every beat, and :func:`start_of_day_equity_micros` reads the
-#: day's first one back as the ``daily_loss_limit`` baseline (issue #364).
+#: appends one every beat, and :func:`read_start_of_day_equity_micros` reads the
+#: day's first one back as the ``daily_loss_limit`` baseline (issue #364). It is
+#: also the single type the bounded reverse walk is filtered to (issue #370).
 _EQUITY_SAMPLED_EVENT_TYPE = "EquitySampled"
 
 #: Envelope key under which a ledgered event's typed payload is nested (mirrors
@@ -535,8 +543,13 @@ def start_of_day_equity_micros(
 
     The whole record sequence is scanned rather than stopped at the first
     same-day hit, for the clock reason above: append order is not proof of
-    chronological order. That is the same whole-ledger fold the tick's weekly
-    report already performs, so it adds no new order of cost.
+    chronological order.
+
+    That makes this fold O(ledger), which is why the tick no longer reaches it
+    directly: :func:`read_start_of_day_equity_micros` is the entry point, and it
+    prefers a bounded reverse walk on any store offering one (issue #370). This
+    fold remains the fallback for stores without that capability -- and the
+    reference definition of the answer both paths must produce.
 
     Args:
         records: The ledger read (``SqliteLedgerStore.read_all()``), in append
@@ -556,12 +569,116 @@ def start_of_day_equity_micros(
     for record in records:
         if record.event_type != _EQUITY_SAMPLED_EVENT_TYPE:
             continue
-        data = json.loads(record.payload_json)[_PAYLOAD_DATA_KEY]
-        epoch_s = int(data[_SAMPLE_EPOCH_KEY])
+        epoch_s, equity_micros = _equity_sample(record)
         if _utc_day(epoch_s) != today:
             continue
         if earliest is None or epoch_s < earliest[0]:
-            earliest = (epoch_s, int(data[_EQUITY_MICROS_KEY]))
+            earliest = (epoch_s, equity_micros)
+    return MoneyMicros(earliest[1]) if earliest is not None else None
+
+
+def _equity_sample(record: LedgerRecord) -> tuple[int, int]:
+    """Return one ``EquitySampled`` row's ``(epoch_s, equity_micros)`` pair.
+
+    Args:
+        record: The ``EquitySampled`` record to read.
+
+    Returns:
+        The sample's stamped instant in epoch seconds and its equity in micros.
+
+    Raises:
+        KeyError: If the payload is missing either field -- a loud shape drift,
+            never a silently zeroed baseline.
+    """
+    data = json.loads(record.payload_json)[_PAYLOAD_DATA_KEY]
+    return int(data[_SAMPLE_EPOCH_KEY]), int(data[_EQUITY_MICROS_KEY])
+
+
+def read_start_of_day_equity_micros(
+    store: LedgerStore, *, now_epoch_s: int
+) -> MoneyMicros | None:
+    """Read the current UTC day's first ledgered equity sample from ``store``.
+
+    The tick's baseline read, and the reason it is not simply
+    ``start_of_day_equity_micros(store.read_all(), ...)``: ``_approve_stage``
+    asks this on *every* tick of a loop built to run for weeks, while the ledger
+    only grows and every tick appends to it, so a full fold would cost more each
+    beat without bound (issue #370).
+
+    A store declaring the optional
+    :class:`~windbreak.ledger.store.ReverseTypeScan` capability answers it with a
+    bounded walk instead -- see
+    :func:`_bounded_start_of_day_equity_micros` -- and any other store,
+    including every hand-rolled :class:`~windbreak.ledger.store.LedgerStore`
+    double, falls back to the original whole-ledger fold. The two paths return
+    the same baseline, so the dispatch is a pure optimization and never a
+    behavioral fork.
+
+    Args:
+        store: The ledger to read the day's samples out of.
+        now_epoch_s: The instant whose UTC day is the "current" one.
+
+    Returns:
+        The day's earliest sampled equity, in micros, or ``None`` when the day
+        carries no sample at all -- which keeps ``daily_loss_limit`` vetoing.
+    """
+    if isinstance(store, ReverseTypeScan):
+        return _bounded_start_of_day_equity_micros(store, now_epoch_s=now_epoch_s)
+    return start_of_day_equity_micros(store.read_all(), now_epoch_s=now_epoch_s)
+
+
+def _bounded_start_of_day_equity_micros(
+    store: ReverseTypeScan, *, now_epoch_s: int
+) -> MoneyMicros | None:
+    """Derive the baseline from a newest-first walk that stops at the day boundary.
+
+    Walks ``EquitySampled`` rows alone, newest first, and stops at the first one
+    stamped on an *earlier* UTC day: everything older is older still, so nothing
+    beyond it can be today's earliest. The cost is therefore O(samples taken
+    today) -- bounded by ticks-per-day -- rather than O(ledger), with no new
+    index and no change to what the answer means.
+
+    Two subtleties keep it faithful to the full fold it replaces:
+
+    * The earliest of today's samples is chosen by comparing stamped
+      ``epoch_s`` values, not by taking the first row the walk happens to
+      surface, so a clock that steps backwards mid-day cannot promote a later
+      sample to the baseline (the walk arrives newest-first, so seizing its
+      first hit would be exactly the latest-of-day reading this must not do).
+    * A sample stamped on a *later* day -- a forward clock blip -- is skipped
+      rather than treated as the boundary. Only predating today ends the walk;
+      stopping on a future stamp would discard today's genuine baseline for as
+      long as the blip sat at the head of the ledger.
+
+    The one case where this can diverge from the full fold is a clock that
+    rewinds *across* midnight and then jumps forward again, burying a still
+    earlier same-day sample beneath a previous-day one. That ordering makes the
+    samples mutually contradictory anyway, and the walk keeps the invariant that
+    matters here: it never reports a baseline that no sample carried.
+
+    Args:
+        store: The ledger, declaring the reverse-walk capability.
+        now_epoch_s: The instant whose UTC day is the "current" one.
+
+    Returns:
+        The day's earliest sampled equity, in micros, or ``None`` when the walk
+        reaches the day boundary (or the end of the ledger) without a sample.
+
+    Raises:
+        KeyError: If an ``EquitySampled`` payload is missing either field this
+            reads -- a loud shape drift, never a silently zeroed baseline.
+    """
+    today = _utc_day(now_epoch_s)
+    earliest: tuple[int, int] | None = None
+    for record in store.iter_records_of_type_reversed(_EQUITY_SAMPLED_EVENT_TYPE):
+        epoch_s, equity_micros = _equity_sample(record)
+        sample_day = _utc_day(epoch_s)
+        if sample_day < today:
+            break
+        if sample_day > today:
+            continue
+        if earliest is None or epoch_s < earliest[0]:
+            earliest = (epoch_s, equity_micros)
     return MoneyMicros(earliest[1]) if earliest is not None else None
 
 
@@ -1528,9 +1645,11 @@ def _approve_stage(
     fails closed.
 
     Threads the two exposure figures issue #364 supplies, both out of evidence
-    this tick itself produced: the start-of-day equity is folded from the
-    ``EquitySampled`` rows already on the ledger, and the visible depth from
-    the book the snapshot stage just read. Both are read at the same clock
+    this tick itself produced: the start-of-day equity is read back from the
+    ``EquitySampled`` rows already on the ledger -- bounded to those taken since
+    the UTC day boundary rather than the whole log, since this runs every tick
+    of an always-on loop (issue #370) -- and the visible depth from the book the
+    snapshot stage just read. Both are read at the same clock
     reading the context is stamped with, so the UTC day the baseline is bucketed
     into is the day the evaluation happens on. On the day's first tick the
     ledger carries no sample yet -- the tick appends its own only after this
@@ -1578,8 +1697,8 @@ def _approve_stage(
         exchange_status=project_exchange_status(observed.status),
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
-        equity_start_of_day=start_of_day_equity_micros(
-            deps.store.read_all(), now_epoch_s=now_epoch_s
+        equity_start_of_day=read_start_of_day_equity_micros(
+            deps.store, now_epoch_s=now_epoch_s
         ),
         visible_depth=visible_depth_centis(order_book),
     )

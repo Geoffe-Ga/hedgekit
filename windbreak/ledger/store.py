@@ -13,13 +13,20 @@ by design, which is what makes the log trustworthy as an audit trail. The
 package's SQL is statically checked to remain insert-and-select only.
 
 Beyond the four :class:`LedgerStore` operations every store supports, a store
-may additionally declare the *optional*, narrow :class:`LatestRecordLookup`
-capability: an indexed reverse read answering "the newest record of these event
-types" without replaying the whole log (issue #246). It is deliberately a
-separate protocol rather than three more lines on :class:`LedgerStore`, because
-:class:`LedgerStore` is satisfied structurally by hand-rolled doubles that must
-keep working untouched; a consumer duck-type dispatches onto the capability when
-present and falls back to a full scan when it is not.
+may additionally declare *optional*, narrow capability protocols that answer a
+targeted question without replaying the whole log:
+
+* :class:`LatestRecordLookup` -- "the newest record of these event types",
+  as one indexed reverse read (issue #246).
+* :class:`ReverseTypeScan` -- a lazy newest-first walk over one event type, for
+  the questions that need more than the newest row but far less than the whole
+  log, and whose consumer can stop early (issue #370).
+
+Each is deliberately a separate protocol rather than a few more lines on
+:class:`LedgerStore`, because :class:`LedgerStore` is satisfied structurally by
+hand-rolled doubles that must keep working untouched; a consumer duck-type
+dispatches onto the capability when present and falls back to a full scan when
+it is not.
 """
 
 from __future__ import annotations
@@ -34,7 +41,7 @@ from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 from windbreak.ledger.events import GENESIS_PREV_HASH, Event
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable
+    from collections.abc import Callable, Collection, Iterable, Iterator
     from pathlib import Path
 
 #: DDL creating the eight-column §12 ledger row if it does not yet exist.
@@ -90,6 +97,19 @@ _SELECT_LATEST_OF_TYPE_SQL = (
     "SELECT sequence_number, event_type, created_at, component, "
     "payload_json, payload_schema_version, prev_hash, event_hash "
     "FROM ledger WHERE event_type = ? ORDER BY sequence_number DESC LIMIT 1"
+)
+
+#: Every row of ONE event type, newest first. Same statement as
+#: ``_SELECT_LATEST_OF_TYPE_SQL`` without the ``LIMIT``, and backed by the same
+#: composite index, so SQLite seeks straight to that type's last entry and walks
+#: it backwards. Deliberately unbounded in SQL and bounded by the *consumer*
+#: instead: how far back is far enough is a question only the caller's predicate
+#: can answer (see :class:`ReverseTypeScan`), and the rows are streamed one at a
+#: time so stopping early genuinely stops the read.
+_SELECT_OF_TYPE_REVERSED_SQL = (
+    "SELECT sequence_number, event_type, created_at, component, "
+    "payload_json, payload_schema_version, prev_hash, event_hash "
+    "FROM ledger WHERE event_type = ? ORDER BY sequence_number DESC"
 )
 
 
@@ -294,6 +314,36 @@ class LatestRecordLookup(Protocol):
         """Return the highest-sequence record whose type is in ``event_types``."""
 
 
+@runtime_checkable
+class ReverseTypeScan(Protocol):
+    """Optional capability: a lazy newest-first walk over one type (issue #370).
+
+    The sibling of :class:`LatestRecordLookup`, for the questions that need more
+    than the single newest row but far less than the whole log. Its first
+    consumer,
+    :func:`windbreak.scheduler.loop.read_start_of_day_equity_micros`, wants the
+    *earliest* ``EquitySampled`` row of the current UTC day -- which the
+    latest-only lookup cannot answer, and which the PAPER loop asks on every
+    tick of a deployment meant to run for weeks.
+
+    Walking newest-first is what makes that bounded: the consumer holds a
+    recency predicate, so it can stop the moment it crosses the day boundary and
+    pay O(rows since that boundary) instead of O(ledger). The walk must
+    therefore be **lazy** -- yielding one record at a time rather than
+    materializing the type's rows -- or the consumer's early stop would save
+    only the decoding, not the read.
+
+    Kept narrow and separate from :class:`LedgerStore` for the same reason
+    :class:`LatestRecordLookup` is: consumers ``isinstance``-dispatch onto it
+    when a store provides it and fall back to a full
+    :meth:`LedgerStore.read_all` fold when it does not, so every hand-rolled
+    double keeps working unchanged.
+    """
+
+    def iter_records_of_type_reversed(self, event_type: str) -> Iterator[LedgerRecord]:
+        """Yield records of ``event_type`` newest first, one at a time."""
+
+
 class SqliteLedgerStore:
     """A :class:`LedgerStore` persisted to a WAL-journaled SQLite database.
 
@@ -414,6 +464,33 @@ class SqliteLedgerStore:
             if latest is None or record.sequence_number > latest.sequence_number:
                 latest = record
         return latest
+
+    def iter_records_of_type_reversed(self, event_type: str) -> Iterator[LedgerRecord]:
+        """Walk every record of ``event_type`` newest first, streaming one row.
+
+        Satisfies the optional :class:`ReverseTypeScan` capability. The read runs
+        against the same ``(event_type, sequence_number)`` index
+        :meth:`latest_record_of_types` uses, so rows of other types are never
+        visited at all, and rows are pulled from the cursor one at a time rather
+        than fetched in bulk -- a consumer that stops after the first few (the
+        PAPER loop's daily-loss baseline stops at the UTC day boundary, issue
+        #370) really does leave the rest unread.
+
+        Abandoning the walk part-way is the expected case, not an error: the
+        cursor is released with the generator, and WAL journaling lets a
+        subsequent append proceed regardless.
+
+        Args:
+            event_type: The single event type to walk. One type, not a
+                collection, so the statement stays fully literal and the
+                package's SQL statically auditable.
+
+        Yields:
+            The matching :class:`LedgerRecord` instances in descending
+            ``sequence_number`` order.
+        """
+        for row in self._conn.execute(_SELECT_OF_TYPE_REVERSED_SQL, (event_type,)):
+            yield LedgerRecord(*row)
 
     def verify_chain(self) -> None:
         """Verify sequence contiguity and hash linkage across the chain.
