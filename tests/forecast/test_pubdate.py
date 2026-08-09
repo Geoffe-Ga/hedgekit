@@ -24,11 +24,20 @@ extraction contract:
 `windbreak/forecast/pubdate.py` does not exist yet, so importing it fails
 collection with `ModuleNotFoundError` -- the expected Gate 1 RED state for
 issue #192.
+
+Issue #313 added the meta/JSON-LD extraction branches at the bottom of this
+module: a `<meta>` with no usable `content`, a `<meta>` matching neither date
+shape, and a JSON-LD block whose top-level value is a list rather than a bare
+object. One caveat is recorded there rather than hidden: the `content is None`
+early return in `_capture_meta` is an **equivalent mutant** through the public
+API -- deleting it writes `None` over an already-`None` first-wins sentinel, so
+no page can distinguish the two. It is covered but not killable; see the note
+above `test_content_less_article_meta_does_not_suppress_a_later_date_meta`.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 from windbreak.forecast.pubdate import extract_publication_date
 
@@ -285,3 +294,384 @@ def test_extraction_over_realistic_full_page_with_visible_body_text() -> None:
     result = extract_publication_date(html)
 
     assert result == datetime(2024, 11, 11, 9, 15, 0, tzinfo=UTC)
+
+
+# --- Issue #313: meta/JSON-LD extraction branches ------------------------------
+#
+# Every decoy below carries a *parseable* date that differs from the date the
+# page really publishes. A decoy holding free text (or the same date) could not
+# tell "the wrong tag was preferred" apart from "no tag was read at all" -- both
+# would yield the correct answer for the wrong reason.
+
+
+def _named_meta(name: str, content: str) -> str:
+    """Build a `<meta name="..." content="...">` tag with an arbitrary name.
+
+    Args:
+        name: The raw `name` attribute value.
+        content: The raw `content` attribute value.
+
+    Returns:
+        The `<meta name="..." content="...">` tag.
+    """
+    return f'<meta name="{name}" content="{content}">'
+
+
+def _propertied_meta(prop: str, content: str) -> str:
+    """Build a `<meta property="..." content="...">` tag with any property.
+
+    Args:
+        prop: The raw `property` attribute value.
+        content: The raw `content` attribute value.
+
+    Returns:
+        The `<meta property="..." content="...">` tag.
+    """
+    return f'<meta property="{prop}" content="{content}">'
+
+
+def _list_json_ld(*entries: str) -> str:
+    """Build a JSON-LD `<script>` block whose top-level value is a JSON list.
+
+    Args:
+        *entries: Raw JSON texts to place, in order, inside the list.
+
+    Returns:
+        The `<script type="application/ld+json">[...]</script>` HTML fragment.
+    """
+    return f'<script type="application/ld+json">[{", ".join(entries)}]</script>'
+
+
+# --- A meta tag carrying no usable `content` ----------------------------------
+#
+# Honest caveat: `_capture_meta`'s `if content is None: return` cannot be killed
+# through the public API. Deleting it assigns `None` to a collector that is
+# already `None`, and "first one wins" is decided by `is None`, so the two
+# versions agree on every page (verified by differential comparison over 1110
+# generated meta combinations). These tests pin the *observable* contract --
+# a content-less tag does not consume the first-wins slot and does not suppress
+# a later real date -- which is what a future refactor could actually break.
+
+
+def test_content_less_article_meta_does_not_suppress_a_later_date_meta() -> None:
+    """A date-shaped meta with no `content` attribute at all is skipped.
+
+    An `article:published_time` meta whose `content` attribute is entirely
+    absent carries no date, so extraction must continue to the `name="date"`
+    meta rather than latching onto the empty tag. The two dates differ, so a
+    wrong answer here is a *different* datetime, not the same one.
+    """
+    html = (
+        "<html><head>"
+        '<meta property="article:published_time">'
+        f"{_date_meta('2024-10-10T06:00:00Z')}"
+        "</head></html>"
+    )
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 10, 10, 6, 0, 0, tzinfo=UTC)
+
+
+def test_valueless_content_attribute_is_treated_as_absent() -> None:
+    """A bare `content` attribute (no `=value`) parses as `None`, not `""`.
+
+    `HTMLParser` reports `<meta ... content>` as the pair `("content", None)`,
+    a different shape from the missing-attribute case above. It must reach the
+    same conclusion: no date here, keep looking.
+    """
+    html = (
+        "<html><head>"
+        '<meta property="article:published_time" content>'
+        f"{_article_meta('2025-01-02T03:04:05Z')}"
+        "</head></html>"
+    )
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2025, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+
+def test_page_whose_only_date_meta_lacks_content_yields_none() -> None:
+    """With no other source, a content-less date meta degrades to `None`.
+
+    Fail closed: an unreadable publication date is reported as absent, never
+    filled in from the clock, the epoch, or the fetch time.
+    """
+    html = '<html><head><meta property="article:published_time"></head></html>'
+
+    assert extract_publication_date(html) is None
+
+
+# --- A meta tag matching neither date shape -----------------------------------
+
+
+def test_meta_matching_neither_date_shape_is_ignored() -> None:
+    """A meta that is neither date shape leaves both collectors untouched.
+
+    `name="viewport"` carries a `content` value, so it gets past the
+    content-presence check and must then fall out of *both* the
+    `article:published_time` and the `name="date"` arms.
+    """
+    html = f"<html><head>{_named_meta('viewport', 'width=device-width')}</head></html>"
+
+    assert extract_publication_date(html) is None
+
+
+def test_a_date_valued_meta_under_the_wrong_name_is_not_harvested() -> None:
+    """Only `name="date"` is read -- not any meta that happens to hold a date.
+
+    `author` and `description` here both carry perfectly parseable timestamps.
+    If the `name` comparison were dropped or widened, first-wins would capture
+    2024-04-04 and the page would be dated six months early.
+    """
+    html = (
+        "<html><head>"
+        f"{_named_meta('author', '2024-04-04T00:00:00Z')}"
+        f"{_named_meta('description', '2024-05-05T00:00:00Z')}"
+        f"{_date_meta('2024-10-10T00:00:00Z')}"
+        "</head></html>"
+    )
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 10, 10, tzinfo=UTC)
+
+
+def test_a_non_published_property_meta_is_not_read_as_published_time() -> None:
+    """`og:updated_time` and `article:modified_time` are not publication dates.
+
+    A *modified* time is systematically later than the publication time it
+    would be mistaken for, which is precisely the direction that lets a source
+    look newer than it is.
+    """
+    html = (
+        "<html><head>"
+        f"{_propertied_meta('og:updated_time', '2023-03-03T00:00:00Z')}"
+        f"{_propertied_meta('article:modified_time', '2023-04-04T00:00:00Z')}"
+        f"{_article_meta('2024-12-12T00:00:00Z')}"
+        "</head></html>"
+    )
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 12, 12, tzinfo=UTC)
+
+
+def test_a_bare_content_meta_with_no_name_or_property_is_ignored() -> None:
+    """A meta carrying only `content` names no source and is not harvested."""
+    html = (
+        "<html><head>"
+        '<meta content="2024-04-04T00:00:00Z">'
+        f"{_date_meta('2024-10-10T00:00:00Z')}"
+        "</head></html>"
+    )
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 10, 10, tzinfo=UTC)
+
+
+# --- A JSON-LD block whose top-level value is a list --------------------------
+
+
+def test_extracts_date_published_from_a_list_form_json_ld_block() -> None:
+    """A top-level JSON *list* of objects is read like a bare object.
+
+    The page also carries a meta date, deliberately different, so this asserts
+    the list arm actually ran: had the list gone unread, extraction would have
+    fallen through and returned the meta's 2024-06-06 instead.
+    """
+    json_ld = _list_json_ld(
+        '{"@type": "WebPage", "name": "Landing"}',
+        '{"@type": "NewsArticle", "datePublished": "2024-02-14T07:00:00Z"}',
+    )
+    html = f"<html><head>{json_ld}{_date_meta('2024-06-06T00:00:00Z')}</head></html>"
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 2, 14, 7, 0, 0, tzinfo=UTC)
+
+
+def test_list_form_json_ld_skips_non_object_entries() -> None:
+    """Strings and numbers inside a JSON-LD list are skipped, not dereferenced.
+
+    Scraped JSON-LD is hostile input: a list of mixed types must not crash the
+    stage-5 citation loop on its way to the one object that has a date.
+    """
+    json_ld = _list_json_ld(
+        '"https://example.test/schema"',
+        "42",
+        "null",
+        '{"datePublished": "2024-08-21T12:30:00Z"}',
+    )
+    html = f"<html><head>{json_ld}{_date_meta('2024-06-06T00:00:00Z')}</head></html>"
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 8, 21, 12, 30, 0, tzinfo=UTC)
+
+
+def test_first_list_entry_with_a_date_published_wins() -> None:
+    """Within one list, the earliest-positioned `datePublished` is taken.
+
+    Both entries carry a valid but different date, so taking the wrong one is
+    observable rather than coincidentally equal.
+    """
+    json_ld = _list_json_ld(
+        '{"datePublished": "2024-03-03T00:00:00Z"}',
+        '{"datePublished": "2024-09-09T00:00:00Z"}',
+    )
+    html = f"<html><head>{json_ld}</head></html>"
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 3, 3, tzinfo=UTC)
+
+
+def test_a_list_entry_with_an_unparseable_date_falls_through_to_the_next() -> None:
+    """A list entry whose `datePublished` is junk yields to the next candidate.
+
+    A present-but-unparseable higher-priority source must not abort the whole
+    extraction -- the same fall-through contract the bare-object form has.
+    """
+    json_ld = _list_json_ld(
+        '{"datePublished": "yesterday-ish"}',
+        '{"datePublished": "2024-07-19T18:45:00Z"}',
+    )
+    html = f"<html><head>{json_ld}</head></html>"
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 7, 19, 18, 45, 0, tzinfo=UTC)
+
+
+def test_an_empty_list_json_ld_block_falls_through_to_the_meta_tags() -> None:
+    """An empty JSON-LD list yields no candidates and never raises."""
+    html = (
+        "<html><head>"
+        f"{_list_json_ld()}{_date_meta('2024-06-06T00:00:00Z')}"
+        "</head></html>"
+    )
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 6, 6, tzinfo=UTC)
+
+
+def test_a_list_json_ld_with_no_date_published_anywhere_falls_through() -> None:
+    """A list of dateless objects falls through rather than returning `None`."""
+    json_ld = _list_json_ld('{"@type": "WebPage"}', '{"@type": "Organization"}')
+    html = f"<html><head>{json_ld}{_date_meta('2024-06-06T00:00:00Z')}</head></html>"
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 6, 6, tzinfo=UTC)
+
+
+def test_a_scalar_top_level_json_ld_block_yields_no_candidates() -> None:
+    """A JSON-LD block that is neither an object nor a list is ignored.
+
+    `"just a string"` and `42` are valid JSON, so the block parses cleanly and
+    then matches neither the object nor the list shape. It must yield nothing
+    and let the meta tags answer, rather than raising on a `.get` that a bare
+    scalar does not have.
+    """
+    scalar_blocks = (
+        '<script type="application/ld+json">"https://example.test/"</script>'
+        '<script type="application/ld+json">42</script>'
+    )
+    html = (
+        f"<html><head>{scalar_blocks}{_date_meta('2024-06-06T00:00:00Z')}</head></html>"
+    )
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 6, 6, tzinfo=UTC)
+
+
+def test_a_non_string_date_published_in_a_list_entry_is_refused() -> None:
+    """A numeric `datePublished` is not coerced into a date.
+
+    An epoch-looking integer must not be guessed at (seconds? milliseconds?
+    whose epoch?). It is skipped, and the next real source is used.
+    """
+    json_ld = _list_json_ld('{"datePublished": 1710500400}')
+    html = f"<html><head>{json_ld}{_date_meta('2024-06-06T00:00:00Z')}</head></html>"
+
+    result = extract_publication_date(html)
+
+    assert result == datetime(2024, 6, 6, tzinfo=UTC)
+
+
+# --- Timezone: a naive pubdate is refused, never read as host-local time -------
+#
+# `datetime.fromisoformat` returns a **naive** datetime for an offsetless
+# string, and `.astimezone()` on a naive value silently reads the wall clock as
+# the *host's* local time. CI runs UTC, where the correct and misreading paths
+# agree exactly, so an unpinned assertion here would be a permanent false green
+# (issue #392, PR #396). Each test below pins the process timezone.
+
+
+def test_naive_json_ld_date_is_refused_west_of_utc(
+    local_timezone_utc_minus_5: None,
+) -> None:
+    """An offsetless JSON-LD date is refused, not localized, west of UTC.
+
+    This is the dangerous direction: read as host-local, 2024-12-18T19:00 on a
+    UTC-05:00 host becomes 2024-12-19T00:00Z -- a *different calendar day*, and
+    a later one. A source stamped a day late can pass as prior evidence for a
+    forecast it actually postdates. The page's only other source is deliberately
+    absent so the refusal itself is what is asserted.
+
+    Args:
+        local_timezone_utc_minus_5: Pins the process timezone west of UTC.
+    """
+    json_ld = _json_ld("2024-12-18T19:00:00")
+    html = f"<html><head>{json_ld}</head></html>"
+
+    assert extract_publication_date(html) is None
+
+
+def test_naive_meta_date_is_refused_east_of_utc(
+    local_timezone_utc_plus_5: None,
+) -> None:
+    """An offsetless meta date is refused east of UTC too.
+
+    The mirror skew: 2024-12-19T02:00 read as host-local on a UTC+05:00 host
+    becomes 2024-12-18T21:00Z, the *previous* day. Pinning only the westward
+    host would let a merely-conservative misreading pass for correctness.
+
+    Args:
+        local_timezone_utc_plus_5: Pins the process timezone east of UTC.
+    """
+    html = f"<html><head>{_article_meta('2024-12-19T02:00:00')}</head></html>"
+
+    assert extract_publication_date(html) is None
+
+
+def test_an_offset_bearing_date_is_preserved_not_converted_to_host_local(
+    local_timezone_utc_minus_5: None,
+) -> None:
+    """An explicit offset survives extraction unshifted, on a non-UTC host.
+
+    Equality alone cannot catch a stray `.astimezone()`: a converted datetime
+    still compares equal because it names the same instant. The wall-clock
+    fields and the offset are asserted individually, so a normalization to the
+    host's zone (which would read 05:30 at UTC-05:00) fails.
+
+    Args:
+        local_timezone_utc_minus_5: Pins the process timezone west of UTC.
+    """
+    json_ld = _json_ld("2024-12-18T19:00:00+05:30")
+    html = f"<html><head>{json_ld}</head></html>"
+
+    result = extract_publication_date(html)
+
+    assert result is not None
+    assert result.utcoffset() == timedelta(hours=5, minutes=30)
+    assert (result.year, result.month, result.day) == (2024, 12, 18)
+    assert (result.hour, result.minute) == (19, 0)
+    assert result == datetime(
+        2024, 12, 18, 19, 0, tzinfo=timezone(timedelta(hours=5, minutes=30))
+    )
