@@ -69,9 +69,22 @@ TOOLCHAIN_RESOLVED=false
 # Resolve the pinned toolchain for this process (idempotent within one shell).
 #
 # Sets TOOLCHAIN_VENV (empty when there is no shared venv), TOOLCHAIN_BIN and
-# TOOLCHAIN_PYTHON, and puts the pinned bin directory first on PATH so tools
-# that spawn their own subprocesses (pre-commit hooks, pytest plugins) also see
-# the pinned toolchain.
+# TOOLCHAIN_PYTHON, and prepends the pinned bin directory to PATH *in the
+# process that sources this file*.
+#
+# Scope, stated precisely because the obvious reading overclaims: a gate script
+# resolves individual tools through `--print-tool`, which runs in a disposable
+# subprocess, so THAT prepend dies with it. The PATH a spawned tool actually
+# inherits is the calling gate script's own, which only check-all.sh currently
+# exports explicitly. So a tool that spawns its own subprocesses (pre-commit
+# hooks, pytest plugins) sees the pinned toolchain under check-all.sh, but NOT
+# under a directly-invoked ./scripts/security.sh.
+#
+# That gap predates this file and no gate tool presently depends on it -- every
+# tool a gate invokes is resolved by absolute path, which is the guarantee this
+# module actually delivers. Closing it would mean each gate script exporting
+# PATH for itself; do that deliberately if a tool ever needs it, rather than
+# assuming this function already did.
 #
 # Returns 0 on success, 2 when no interpreter can be found at all.
 toolchain_init() {
