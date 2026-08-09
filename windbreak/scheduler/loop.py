@@ -1676,9 +1676,12 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
     A :class:`~windbreak.scheduler.fill_accounting.LedgerFillAccountingFeed`
     now advances it from *ledgered evidence*. The paired
     :class:`~windbreak.scheduler.fill_accounting.LedgerFillBookkeeper` books
-    each execution once, durably, into this same hash chain, and the feed hands
-    those entries to the expectation. Two composition-time decisions live here,
-    both deliberate:
+    each execution once, durably, into this same hash chain, and -- since issue
+    #390 -- each order that comes to rest, so the open-order dimension advances
+    too. Before that, an order left resting was one the ledger had never heard
+    of, and the loop breached on the next cycle the moment it routed anything
+    other than an outright marketable order. Two composition-time decisions live
+    here, both deliberate:
 
     * **Which component is trusted.** The feed accepts only bookings stamped
       ``_COMPONENT`` -- this loop's own. In the PAPER deployment the scheduler
@@ -3092,17 +3095,19 @@ def _verification_stage(deps: PaperTickDeps) -> None:
     holding -- is graded a forced breach there rather than escaping as an
     exception, so an unobservable venue halts instead of killing the tick.
 
-    Every execution the venue has reported is booked into the ledger first
-    (issue #365), so the expectation the cycle diffs against has already
-    absorbed the fills the ledger can explain. Booking here rather than beside
-    the routing call catches fills from *every* source -- a taker walk on a
-    placed order and a resting order filled by ``PaperExchange.advance`` alike
-    -- and does it at the one moment the answer is needed. Booking is
-    idempotent on the venue's fill id, so re-entering this stage never advances
-    the expectation past cash the venue moved once.
+    Every execution the venue has reported, and every order it has come to rest,
+    is booked into the ledger first (issues #365 and #390), so the expectation
+    the cycle diffs against has already absorbed what the ledger can explain.
+    Booking here rather than beside the routing call catches activity from
+    *every* source -- a taker walk on a placed order, a remainder resting behind
+    it, and a resting order filled by ``PaperExchange.advance`` alike -- and does
+    it at the one moment the answer is needed. Booking is idempotent on the
+    venue's fill id and order id, so re-entering this stage never advances the
+    expectation past cash the venue moved once or an order it rested once.
 
-    The booking reads the venue's *execution reports*; the cycle reads the
-    venue's *aggregate* balances and positions. Those are different questions,
+    The booking reads the venue's *discrete reports* -- executions, and orders
+    arriving on the resting book; the cycle reads the venue's *aggregate*
+    balances, positions, and live resting book. Those are different questions,
     which is why the comparison can still fail -- see
     :class:`~windbreak.riskkernel.verification.LedgerExpectationSource`.
 

@@ -301,6 +301,12 @@ class Fill:
         price: The execution price, in pips.
         quantity: The executed size, in contract-centis.
         ts: When the fill occurred (used for ``get_fills`` since-filtering).
+        order_id: The venue's identifier for the resting order this fill
+            executed against, or ``None`` when the execution never rested -- an
+            immediate taker walk consumes the book, not an order of ours (issue
+            #390). It is what lets a booked fill name the resting order it
+            retired, so a partially filled order's surviving remainder is
+            explained venue movement rather than a reconciliation breach.
     """
 
     id: str
@@ -309,6 +315,7 @@ class Fill:
     price: PricePips
     quantity: ContractCentis
     ts: datetime
+    order_id: str | None = None
 
 
 def _jsonable_field(value: object) -> object:

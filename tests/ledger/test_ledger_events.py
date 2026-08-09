@@ -146,6 +146,7 @@ from windbreak.ledger.events import (
     ReduceOnlyRefused,
     ReduceOnlyViolation,
     ResearchBudgetHalted,
+    RestingOrderAccounted,
     ReturnToScreener,
     ScreenDecisionRecorded,
     SelectorDecisionRecorded,
@@ -346,6 +347,78 @@ def test_config_loaded_is_frozen() -> None:
         event.config_hash = "changed"  # type: ignore[misc]
 
 
+def test_fill_accounted_carries_the_order_it_retired_at_schema_v2() -> None:
+    """Issue #390 added `venue_order_id`, which is a payload shape change.
+
+    A v1 row carries no such key and can retire nothing; a v2 row always carries
+    one. Stamping them apart keeps "this fill retired nothing" distinguishable
+    from "this fill predates ids being recorded at all".
+    """
+    event = FillAccounted(
+        component="scheduler",
+        fill_id="paper-fill-1",
+        ticker="MKT-DEEP",
+        cash_delta_micros=-240_000,
+        position_delta_centis=50,
+        venue_order_id="paper-order-1",
+    )
+
+    assert event.payload_schema_version == 2
+    assert event.payload["venue_order_id"] == "paper-order-1"
+
+
+def test_fill_accounted_defaults_to_retiring_no_order() -> None:
+    """An outright taker walk consumed the book, not a resting order of ours."""
+    event = FillAccounted(
+        component="scheduler",
+        fill_id="paper-fill-1",
+        ticker="MKT-DEEP",
+        cash_delta_micros=-240_000,
+        position_delta_centis=50,
+    )
+
+    assert event.payload["venue_order_id"] == ""
+
+
+def test_resting_order_accounted_books_an_arrival() -> None:
+    """The open-order counterpart to `FillAccounted` (issue #390).
+
+    Only a placement receipt can say an order came to rest at all, which is what
+    the expectation needs before any fill can draw that order down.
+    """
+    event = RestingOrderAccounted(
+        component="scheduler",
+        venue_order_id="paper-order-1",
+        ticker="MKT-DEEP",
+        resting_quantity_centis=250,
+    )
+
+    assert event.event_type == "RestingOrderAccounted"
+    assert event.payload_schema_version == 1
+    assert event.payload == {
+        "venue_order_id": "paper-order-1",
+        "ticker": "MKT-DEEP",
+        "resting_quantity_centis": 250,
+    }
+
+
+def test_resting_order_accounted_round_trips_through_its_envelope() -> None:
+    """A persisted arrival rebuilds into the identical event via EVENT_TYPES."""
+    event = RestingOrderAccounted(
+        component="scheduler",
+        venue_order_id="paper-order-1",
+        ticker="MKT-DEEP",
+        resting_quantity_centis=250,
+    )
+    envelope = json.loads(event.envelope_json)
+
+    rebuilt = EVENT_TYPES[event.event_type](
+        component=envelope["component"], **envelope["data"]
+    )
+
+    assert rebuilt == event
+
+
 def test_event_types_registry_maps_type_name_to_class() -> None:
     """EVENT_TYPES lets a persisted event_type string recover its class."""
     assert {
@@ -360,6 +433,7 @@ def test_event_types_registry_maps_type_name_to_class() -> None:
         "KillReArmed": KillReArmed,
         "OrderTransitionLedgered": OrderTransitionLedgered,
         "FillAccounted": FillAccounted,
+        "RestingOrderAccounted": RestingOrderAccounted,
         "SubmissionRefused": SubmissionRefused,
         "ReduceOnlyRefused": ReduceOnlyRefused,
         "ReduceOnlyViolation": ReduceOnlyViolation,

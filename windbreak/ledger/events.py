@@ -46,6 +46,14 @@ GENESIS_PREV_HASH = "0" * 64
 #: shape changes so old and new records remain distinguishable.
 _SCHEMA_VERSION = 1
 
+#: ``FillAccounted``'s payload version. Issue #390 added ``venue_order_id`` so a
+#: booked fill can name the resting order it retired, which changes the payload's
+#: shape: a v1 row carries no such key and cannot retire anything, while a v2 row
+#: always carries one (``""`` when the execution never rested). Stamping them
+#: apart keeps "this fill retired nothing" distinguishable from "this fill was
+#: booked before ids were recorded at all".
+_FILL_ACCOUNTED_SCHEMA_VERSION = 2
+
 
 def canonical_json(obj: dict[str, object]) -> str:
     """Serialize a mapping to deterministic, whitespace-free JSON.
@@ -440,13 +448,24 @@ class FillAccounted(Event):
         position_delta_centis: The signed position movement this fill caused, in
             contract-centis, in the same YES frame
             :attr:`~windbreak.connector.models.Position.quantity` reports:
-            positive is longer YES, negative is longer NO.
+            positive is longer YES, negative is longer NO. Its *magnitude* is
+            the fill's own size, which is what lets the expectation shrink the
+            named resting order by exactly what this execution consumed.
+        venue_order_id: The venue's identifier for the resting order this fill
+            executed against, or ``""`` when the execution never rested -- an
+            outright taker walk retires no resting order (issue #390). It is an
+            opaque venue-assigned handle, never a credential: it names a row on
+            the account's own order book and confers nothing on its holder.
+            Without it no booked fill could name the order it retired, so a
+            partially filled order's surviving remainder read as unexplained
+            venue movement and HALTed.
     """
 
     fill_id: str
     ticker: str
     cash_delta_micros: int
     position_delta_centis: int
+    venue_order_id: str = ""
     event_type: str = field(init=False)
     payload_schema_version: int = field(init=False)
     payload: dict[str, object] = field(init=False)
@@ -458,6 +477,63 @@ class FillAccounted(Event):
             "ticker": self.ticker,
             "cash_delta_micros": self.cash_delta_micros,
             "position_delta_centis": self.position_delta_centis,
+            "venue_order_id": self.venue_order_id,
+        }
+        _derive_typed_event(
+            self, payload, schema_version=_FILL_ACCOUNTED_SCHEMA_VERSION
+        )
+
+
+@dataclass(frozen=True)
+class RestingOrderAccounted(Event):
+    """Books one venue order's arrival on the resting book (issue #390).
+
+    The open-order counterpart to :class:`FillAccounted`, and the other half of
+    what the reconciliation expectation needs to follow an order's whole life.
+    A fill can say what an order *consumed*; only a placement receipt can say
+    that an order came to rest at all. Without this entry a loop that routed
+    anything other than an outright marketable order breached on the very next
+    cycle: the remainder resting at the venue was an open order the ledger had
+    never heard of.
+
+    It is written from the venue's *placement receipt* -- the discrete report
+    that an order was accepted and rested -- never from the venue's aggregate
+    ``get_open_orders`` view. That distinction is the whole safety property.
+    Mirroring the aggregate view into the ledger and then comparing the venue
+    against it would make the open-order dimension structurally incapable of
+    failing, which is the issue #352 tautology this event exists *not* to
+    reintroduce. Because the evidence is an arrival report, an order the venue
+    rests that nobody placed still breaches, and an order that vanishes with no
+    booked fill behind it still breaches.
+
+    Every field is a ``str`` or a plain scaled ``int`` (SPEC S6.1); no raw
+    config value, credential, or venue token is ever carried here.
+
+    Attributes:
+        venue_order_id: The venue's identifier for the order now resting. An
+            opaque handle to a row on this account's own order book -- not a
+            credential, and it authorizes nothing on its own.
+        ticker: The market the order rests in.
+        resting_quantity_centis: The quantity that came to rest under that id,
+            in contract-centis; always strictly positive, because an order that
+            rested nothing never rested. Retirement is expressed by a
+            :class:`FillAccounted` naming the order, never by booking a
+            zero-sized arrival.
+    """
+
+    venue_order_id: str
+    ticker: str
+    resting_quantity_centis: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "venue_order_id": self.venue_order_id,
+            "ticker": self.ticker,
+            "resting_quantity_centis": self.resting_quantity_centis,
         }
         _derive_typed_event(self, payload)
 
@@ -1518,6 +1594,7 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "KillReArmed": KillReArmed,
     "OrderTransitionLedgered": OrderTransitionLedgered,
     "FillAccounted": FillAccounted,
+    "RestingOrderAccounted": RestingOrderAccounted,
     "SubmissionRefused": SubmissionRefused,
     "ReduceOnlyRefused": ReduceOnlyRefused,
     "ReduceOnlyViolation": ReduceOnlyViolation,

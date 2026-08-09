@@ -664,6 +664,11 @@ class PaperExchange:
         self.max_participation_ppm = max_participation_ppm
         self._cursor: dict[str, int] = dict.fromkeys(sessions, 0)
         self._resting: list[OpenOrder] = []
+        # The append-only arrival log behind `get_rested_orders`. Distinct from
+        # `_resting` on purpose: an order leaves the live resting book when it
+        # fills or is cancelled, but never leaves this log. See
+        # `get_rested_orders` for why that difference is load-bearing.
+        self._rested: list[OpenOrder] = []
         self._fills: list[Fill] = []
         self._order_seq = 0
         self._fill_seq = 0
@@ -1183,7 +1188,9 @@ class PaperExchange:
         # is stamped at the triggering print's time -- not the (earlier) book
         # snapshot -- keeping Fill.ts honest for get_fills() since-filtering.
         fill_ts = trade_through_fill_ts(limit, prints)
-        self._emit_fill(order.ticker, order.side, order.price, filled, fill_ts)
+        self._emit_fill(
+            order.ticker, order.side, order.price, filled, fill_ts, order.id
+        )
         remaining = order.quantity.value - filled.value
         if remaining <= 0:
             return None
@@ -1322,6 +1329,7 @@ class PaperExchange:
                     level.price,
                     level.quantity,
                     book.fetched_at,
+                    None,
                 )
             )
         return tuple(fills)
@@ -1341,7 +1349,32 @@ class PaperExchange:
             quantity=ContractCentis(remainder),
         )
         self._resting.append(order)
+        self._rested.append(order)
         return order
+
+    def get_rested_orders(self) -> tuple[OpenOrder, ...]:
+        """Return every order that has come to rest, oldest first (issue #390).
+
+        The *arrival report* for orders, and the deliberate counterpart to
+        :meth:`get_fills`: an append-only log of the discrete moments an order
+        was accepted onto the resting book, each carrying the size it rested
+        with. It is emphatically **not** :meth:`get_open_orders`, which is the
+        account's live aggregate resting book -- an order that later fills or is
+        cancelled leaves that view but never leaves this log.
+
+        That distinction is the whole safety property of issue #390. The
+        reconciliation cycle compares the venue's aggregate open-order view
+        against a ledgered expectation; if the expectation were advanced from
+        that same aggregate view the two would agree by construction and the
+        check could never fail (the issue #352 tautology). Advancing it from
+        arrival reports instead keeps the two independent: an order this venue
+        rests that no arrival explains still breaches, and an order that
+        disappears with no fill behind it still breaches.
+
+        Returns:
+            The orders that came to rest, in arrival order.
+        """
+        return tuple(self._rested)
 
     def _emit_fill(
         self,
@@ -1350,6 +1383,7 @@ class PaperExchange:
         price: PricePips,
         quantity: ContractCentis,
         ts: datetime,
+        order_id: str | None,
     ) -> Fill:
         """Record and return one simulated fill stamped at ``ts``.
 
@@ -1361,6 +1395,9 @@ class PaperExchange:
             ts: When the fill occurred -- the current book time for a taker fill
                 (it executes now, against now's book), or the triggering trade
                 print's time for a resting trade-through fill.
+            order_id: The resting order this fill consumed, or ``None`` for a
+                taker fill, which consumes the book rather than an order of
+                ours and so retires nothing.
 
         Returns:
             The recorded :class:`Fill`.
@@ -1373,6 +1410,7 @@ class PaperExchange:
             price=price,
             quantity=quantity,
             ts=ts,
+            order_id=order_id,
         )
         self._fills.append(fill)
         return fill
