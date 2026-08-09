@@ -1135,9 +1135,12 @@ class TestPaperExchangeReadOnlySurface:
         with pytest.raises(UnknownMarketError):
             paper_exchange.get_market("NOT-A-REAL-TICKER")
 
-    def test_get_balances_matches_the_fixture(
+    def test_get_balances_reports_the_opening_fixture_balance_while_flat(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """An exchange that has filled nothing has debited nothing, so the
+        fixture's opening balance survives verbatim. The debits a fill applies
+        are pinned by `TestPaperExchangeDebitsFilledNotionalAndFees`."""
         balances = paper_exchange.get_balances()
 
         assert balances.total == MoneyMicros(100_000_000)
@@ -1153,8 +1156,12 @@ class TestPaperExchangeReadOnlySurface:
 
         assert fee_model.taker_fee_ppm == 70_000
 
-    def test_get_positions_returns_a_tuple(self, paper_exchange: PaperExchange) -> None:
-        assert isinstance(paper_exchange.get_positions(), tuple)
+    def test_get_positions_is_empty_while_the_exchange_has_not_filled(
+        self, paper_exchange: PaperExchange
+    ) -> None:
+        """No fills means no holdings -- a genuinely flat account, not a stub.
+        `TestPaperExchangePositionsFoldTheFillLog` pins what a fill produces."""
+        assert paper_exchange.get_positions() == ()
 
     def test_get_open_orders_starts_empty(self, paper_exchange: PaperExchange) -> None:
         assert paper_exchange.get_open_orders() == ()
@@ -1407,3 +1414,203 @@ def test_get_exchange_status_keeps_the_fixture_status_value(
     exchange = paper.PaperExchange.from_fixture_dir(paused_dir)
 
     assert exchange.get_exchange_status().status == "paused"
+
+
+# --- Issue #352: positions and cash debits are modeled from the fill log -----
+#
+# Before #352 the paper exchange returned a hardcoded `()` from `get_positions`
+# and a static fixture snapshot from `get_balances`. Wiring PAPER verification
+# onto that would reconcile the exchange against itself: the ledger-derived
+# expectation and the exchange-reported observation would both be the same
+# frozen fixture, so `balance_ok` / `position_ok` could never fail. Folding the
+# exchange's *own* fills into positions and debiting filled notional plus fees
+# makes the observation an independently derived fact.
+#
+# Every golden number below is hand-derived from the same `deep_walk` walk
+# already pinned by `TestWalkTakerFill.test_multi_level_walk_spans_two_levels_
+# with_a_partial_second`: consumed (4600, 200) and (4700, 100), book cost
+# 1_390_000 micros, fee 60_000 micros.
+
+#: The `deep_walk` fixture's opening balance, in micros (`balances.json`).
+_OPENING_BALANCE_MICROS = 100_000_000
+
+
+class TestPaperExchangePositionsFoldTheFillLog:
+    """`get_positions` derives per-ticker holdings from the exchange's fills."""
+
+    def test_a_yes_fill_becomes_a_long_position_at_the_weighted_mean_price(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Two consumed levels fold into one row: 300 centis, mean price
+        `1_390_000 // 300 == 4633` pips (floored -- the average entry price
+        never overstates what is held)."""
+        exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
+
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-DEEP", "yes", PricePips(4700), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+
+        positions = exchange.get_positions()
+        assert len(positions) == 1
+        assert positions[0].ticker == "MKT-DEEP"
+        assert positions[0].quantity == ContractCentis(300)
+        assert positions[0].average_price == PricePips(4633)
+
+    def test_a_no_fill_becomes_a_negative_yes_frame_position(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """A long NO is a short YES: 125 NO contracts bought at 4000 pips report
+        as `-125` centis with the complement price `10_000 - 4000 == 6000`, so a
+        NO holding can never be mistaken for a YES holding by a consumer that
+        only reads `quantity`."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "no_side_taker"
+        )
+
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-NOTAKER", "no", PricePips(4050), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+
+        positions = exchange.get_positions()
+        assert len(positions) == 1
+        assert positions[0].ticker == "MKT-NOTAKER"
+        assert positions[0].quantity == ContractCentis(-125)
+        assert positions[0].average_price == PricePips(6000)
+
+    def test_a_resting_trade_through_fill_also_enters_the_position(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Resting fills are fills: the position folds them exactly as it folds
+        taker fills, so a position never lags the fill log."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "trade_through"
+        )
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-THROUGH", "yes", PricePips(4200), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+        before = exchange.get_positions()
+
+        exchange.advance()
+
+        after = exchange.get_positions()
+        assert sum(p.quantity.value for p in after) > sum(
+            p.quantity.value for p in before
+        )
+        assert sum(p.quantity.value for p in after) == sum(
+            fill.quantity.value for fill in exchange.get_fills(_SINCE)
+        )
+
+    def test_holding_both_sides_of_one_ticker_raises_instead_of_netting(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """A ticker held on both sides has no honest single-row representation.
+
+        `Position` carries one signed quantity per ticker, and
+        `LedgerExpectationSource` keys its expectation by ticker, so a YES leg
+        and a NO leg on the same market can only be reported by netting them --
+        and a netted 1 YES + 1 NO reports as flat, which is the exact
+        "healthy zero" a verification comparison must never be handed. Fail
+        closed instead.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-DEEP", "yes", PricePips(4700), ContractCentis(100)
+            ),
+            approval_token=object(),
+        )
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-DEEP", "no", PricePips(5500), ContractCentis(100)
+            ),
+            approval_token=object(),
+        )
+
+        with pytest.raises(paper.TwoSidedPositionError, match="MKT-DEEP"):
+            exchange.get_positions()
+
+
+class TestPaperExchangeDebitsFilledNotionalAndFees:
+    """`get_balances` spends real cash on every fill instead of standing still."""
+
+    def test_a_fill_debits_book_cost_plus_fee_from_available_and_total(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """book cost 1_390_000 + fee 60_000 == 1_450_000 micros leaves the
+        account; the slippage haircut is a modeling allowance, not a cash
+        movement, so it is not debited."""
+        exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
+
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-DEEP", "yes", PricePips(4700), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+
+        balances = exchange.get_balances()
+        assert balances.available == MoneyMicros(_OPENING_BALANCE_MICROS - 1_450_000)
+        assert balances.total == MoneyMicros(_OPENING_BALANCE_MICROS - 1_450_000)
+
+    def test_the_debited_fee_is_the_venue_fee_schedule_not_a_constant(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The fee component is re-derived from the same `FeeModel` the taker
+        walk charged, per consumed level -- so a fee-schedule change moves the
+        balance, and a hardcoded fee cannot pass this."""
+        exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
+        fee_model = exchange.get_fee_model("MKT-DEEP")
+
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-DEEP", "yes", PricePips(4700), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+
+        expected_fee = fee_model.max_trading_fee_micros(
+            4600, 200
+        ) + fee_model.max_trading_fee_micros(4700, 100)
+        debited = _OPENING_BALANCE_MICROS - exchange.get_balances().available.value
+        assert debited - 1_390_000 == expected_fee
+
+    def test_a_resting_trade_through_fill_also_debits_cash(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """A resting fill spends cash exactly like a taker fill does."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "trade_through"
+        )
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-THROUGH", "yes", PricePips(4200), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+        before = exchange.get_balances().available
+
+        exchange.advance()
+
+        assert exchange.get_balances().available.value < before.value
+
+    def test_balances_are_stamped_at_the_observation_instant(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The returned figures are computed at call time, so carrying the
+        fixture's frozen `fetched_at` would advertise a stale observation as
+        fresh evidence. Mirrors `get_exchange_status` (issue #342)."""
+        observed_at = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk", clock=lambda: observed_at
+        )
+
+        assert exchange.get_balances().fetched_at == observed_at

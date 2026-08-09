@@ -44,6 +44,7 @@ from windbreak.connector.models import (
     OrderBookSnapshot,
     Position,
 )
+from windbreak.connector.paper import PaperExchange, PaperOrderIntent
 from windbreak.connector.semantics import (
     CancelCollateralRelease,
     FeeDebitTiming,
@@ -1698,3 +1699,96 @@ def test_ledger_expectation_source_positions_reject_a_bool_quantity() -> None:
     assert dict(source.get_expectations().expected_positions) == {
         "KXFED-24DEC": ContractCentis(250)
     }
+
+
+# --- Issue #352: PAPER verification is falsifiable, not tautological -------------
+#
+# `LedgerExpectationSource` seeds every dimension from `component ==
+# "riskkernel"` events, and the PAPER loop stamps `"scheduler"` on everything it
+# writes, so a `LedgerExpectationSource(history, paper_exchange)` falls through
+# to the connector on all three dimensions. That is only sound if the connector's
+# *observation* is derived independently of the frozen *expectation*. Before
+# issue #352 it was not: `PaperExchange.get_positions()` was hardcoded to `()`
+# and `get_balances()` returned a static fixture, so expectation and observation
+# were the same constant and `balance_ok` / `position_ok` could not fail for any
+# reason -- three SPEC S10.3 checks passing on a comparison with no failure mode.
+#
+# The pair of assertions below is the whole point of the issue: the identical
+# comparison must be able to land CLEAN *and* land BREACH, driven only by whether
+# the exchange actually traded.
+
+#: `tests/fixtures/books/<scenario>` -- the `PaperExchange` book-replay fixtures
+#: shared with `tests/connector/test_paper_exchange.py`.
+_BOOKS_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "books"
+
+
+def _paper_verifier(
+    exchange: PaperExchange,
+) -> tuple[ReadOnlyVerifier, InMemoryKernelLedgerWriter]:
+    """Build a zero-tolerance verifier reconciling ``exchange`` against itself.
+
+    The expectation source is constructed *now*, freezing the exchange's
+    current state as the ledger baseline, exactly as a kernel startup would.
+
+    Args:
+        exchange: The paper exchange serving both the frozen expectation (at
+            construction) and every later observation.
+
+    Returns:
+        The `(verifier, kernel_ledger_writer)` pair.
+    """
+    ledger_writer = InMemoryKernelLedgerWriter()
+    verifier = ReadOnlyVerifier(
+        connector=exchange,
+        expectation_source=LedgerExpectationSource([], exchange),
+        tolerances=VerificationTolerances(
+            balance_tolerance=_ZERO_TOLERANCE_MICROS,
+            position_tolerance=_ZERO_TOLERANCE_CENTIS,
+        ),
+        dispatcher=AlertDispatcher(
+            [_RecordingSink()], ledger_writer=LoggingLedgerWriter()
+        ),
+        ledger_writer=ledger_writer,
+    )
+    return verifier, ledger_writer
+
+
+def test_paper_verification_passes_while_the_exchange_has_not_traded() -> None:
+    """An untraded paper exchange still matches the baseline frozen off it."""
+    exchange = PaperExchange.from_fixture_dir(_BOOKS_DIR / "deep_walk")
+    verifier, _ = _paper_verifier(exchange)
+
+    snapshot = verifier.run_cycle(now_epoch_s=DEFAULT_NOW_EPOCH_S)
+
+    assert snapshot.balance_ok is True
+    assert snapshot.position_ok is True
+    assert snapshot.open_order_ok is True
+    assert snapshot.outcome is VerificationOutcome.CLEAN
+
+
+def test_paper_verification_breaches_once_the_exchange_actually_trades() -> None:
+    """The same comparison BREACHES after a real fill -- so it is falsifiable.
+
+    The order is sized to be fully absorbed (`deep_walk` step 1 offers a single
+    4750 ask of 500 centis; a 100-centi buy is under both the requested size and
+    the 25% participation cap), so *no* order rests and `open_order_ok` stays
+    `True`. The breach is therefore attributable purely to the two dimensions
+    that used to be tautologies: cash moved by 475_000 book cost + 20_000 fee,
+    and a 100-centi MKT-DEEP position appeared where the frozen baseline
+    expected none.
+    """
+    exchange = PaperExchange.from_fixture_dir(_BOOKS_DIR / "deep_walk")
+    exchange.advance()
+    verifier, _ = _paper_verifier(exchange)
+
+    exchange.place_order(
+        PaperOrderIntent("MKT-DEEP", "yes", PricePips(4750), ContractCentis(100)),
+        approval_token=object(),
+    )
+    snapshot = verifier.run_cycle(now_epoch_s=DEFAULT_NOW_EPOCH_S)
+
+    assert snapshot.open_order_ok is True
+    assert snapshot.balance_ok is False
+    assert snapshot.position_ok is False
+    assert snapshot.outcome is VerificationOutcome.BREACH
+    assert snapshot.cash_drift == MoneyMicros(495_000)
