@@ -79,7 +79,9 @@ from windbreak.connector.freshness import is_fresh
 from windbreak.connector.interface import UnknownMarketError
 from windbreak.connector.paper import (
     COMPLEMENT_PIPS,
+    LiveBookPaperExchange,
     PaperExchange,
+    ReplayExhaustedError,
     TwoSidedPositionError,
 )
 from windbreak.connector.readonly import ReadOnlyConnectorView, ReadOnlyVenueView
@@ -155,6 +157,10 @@ from windbreak.scheduler.eligibility import (
     project_jurisdiction,
     project_product_type,
 )
+from windbreak.scheduler.fill_accounting import (
+    LedgerFillAccountingFeed,
+    LedgerFillBookkeeper,
+)
 from windbreak.scheduler.weekly_data import weekly_report_body
 from windbreak.selector import select
 from windbreak.selector.types import (
@@ -171,6 +177,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
+    from windbreak.connector.live import MarketDataSource
     from windbreak.connector.models import (
         NormalizedMarket,
         OrderBookSnapshot,
@@ -778,6 +785,50 @@ def read_open_position_centis(
     return ContractCentis(0)
 
 
+def read_exchange_clock_epoch_s(exchange: PaperExchange) -> int | None:
+    """Return what the venue says the time is, or ``None`` when it cannot say.
+
+    The one reading ``clock_skew_limit`` measures our clock against (issue
+    #377), taken from the venue rather than from this tick's own clock -- a
+    check fed its own ``now_epoch_s`` reports a skew of exactly zero for any
+    venue at any drift.
+
+    Two answers, and the second is what issue #382 adds:
+
+    * **The venue's own instant**, in whole epoch seconds, while the replay's
+      recording still covers this run. Whether that agrees with our clock is
+      exactly the question the check exists to ask, so the reading is passed
+      through untouched however far it sits from ours.
+    * **``None``** when the replay refuses
+      (:class:`~windbreak.connector.paper.ReplayExhaustedError`): its cursor has
+      consumed the recording, or an anchored run has outlived the recorded
+      span. The recording holds no observation covering this instant, so there
+      is no venue clock to report and ``clock_skew_limit`` vetoes with
+      "exchange clock unknown". Substituting the anchored reading would state a
+      venue time the recording never witnessed, and substituting our own would
+      be the identically-zero skew #377 removed -- an exhausted replay is
+      precisely the case where both substitutions look most reassuring and are
+      least supported.
+
+    Note that the cast is to whole seconds, so a sub-second venue instant floors
+    onto the same integer timeline ``now_epoch_s`` uses; the tolerance is
+    measured in whole seconds too (SPEC S6.1 keeps every epoch off the float
+    path).
+
+    Args:
+        exchange: The paper exchange whose replay answers for the venue.
+
+    Returns:
+        The venue's clock in whole epoch seconds, or ``None`` when the replay
+        can no longer substantiate one.
+    """
+    try:
+        venue_now = exchange.get_exchange_time()
+    except ReplayExhaustedError:
+        return None
+    return int(venue_now.timestamp())
+
+
 def _human_ack_micros(config: WindbreakConfig) -> MoneyMicros | None:
     """Return the configured human-ack notional threshold, or ``None``.
 
@@ -1102,6 +1153,11 @@ class PaperTickDeps:
             the verification path structurally cannot trade (SPEC S1.1
             invariant 3), even though it watches the very exchange this loop
             fills against.
+        fill_bookkeeper: Books each of the exchange's executions into the ledger
+            exactly once, so the verification cycle's expectation can advance
+            from ledgered evidence instead of freezing at process start and
+            halting on the first fill (issue #365). Paired by component label
+            with the feed :func:`_build_verifier` wires.
         gateway: The recovered Order Gateway submissions route through.
         reconciler: The bounded reconciler run to fixpoint after a fill.
         approval: The approval seam intents are decided through.
@@ -1142,6 +1198,7 @@ class PaperTickDeps:
     store: SqliteLedgerStore
     exchange: PaperExchange
     verification_view: ReadOnlyVenueView
+    fill_bookkeeper: LedgerFillBookkeeper
     gateway: OrderGateway
     reconciler: Reconciler
     approval: ApprovalSeam
@@ -1244,14 +1301,41 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
     later cycle compares a live, moving observation against that fixed
     baseline -- a comparison that can, and on any real fill does, fail.
 
-    The consequence is deliberate and load-bearing: once a PAPER order fills,
-    the venue has moved away from the only baseline the ledger can justify
-    (fills are not ledgered with amounts, so no ledgered fact can update it),
-    the next cycle grades a ``BREACH``, and the kernel HALTs per issue #32.
-    That is the fail-closed answer to "our books cannot explain the venue", not
-    an accident of wiring -- and it is strictly better than the alternative of
-    re-reading the expectation off the same connector every cycle, which would
-    make all three dimensions structurally incapable of failing.
+    That baseline no longer stays frozen for the life of the process. Until
+    issue #365 it did, and the consequence was that the first PAPER fill moved
+    the venue away from the only baseline the ledger could justify -- fills were
+    not ledgered with amounts, so no ledgered fact could update it -- the next
+    cycle graded ``BREACH``, the kernel HALTed per issue #32, and only a restart
+    cleared it. An always-on PAPER deployment could not survive its own first
+    fill.
+
+    A :class:`~windbreak.scheduler.fill_accounting.LedgerFillAccountingFeed`
+    now advances it from *ledgered evidence*. The paired
+    :class:`~windbreak.scheduler.fill_accounting.LedgerFillBookkeeper` books
+    each execution once, durably, into this same hash chain, and the feed hands
+    those entries to the expectation. Two composition-time decisions live here,
+    both deliberate:
+
+    * **Which component is trusted.** The feed accepts only bookings stamped
+      ``_COMPONENT`` -- this loop's own. In the PAPER deployment the scheduler
+      *is* the account's bookkeeper, so declaring it here is the honest form of
+      that trust; the alternative, letting the kernel fold whatever
+      ``FillAccounted`` rows a shared ``ledger`` volume happens to carry, is
+      exactly the cross-process contamination
+      ``_own_component_events`` was written to stop.
+    * **Where the cursor starts.** At the chain head *as of this call*, which is
+      the ledger position the baseline above was captured over. Entries booked
+      by an earlier process are already reflected in that baseline -- a fresh
+      ``PaperExchange`` opens flat -- so folding them again would advance the
+      expectation past cash the venue never moved.
+
+    This is not the issue #352 tautology returning. A booked entry is frozen at
+    execution and describes one discrete movement; the observation is the
+    venue's live *aggregate*. A venue that moves by anything the books cannot
+    explain -- an unbooked fill, a settlement, a retired resting order -- still
+    diverges and still halts. Only the explained part is absorbed. Re-reading
+    the expectation off the same connector each cycle, by contrast, would make
+    all three dimensions structurally incapable of failing.
 
     The tolerances come from ``config.risk`` (both default to ``0``: exact
     match). The dispatcher fans mismatch and unknown-jurisdiction alerts out
@@ -1270,9 +1354,15 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
         The composed :class:`~windbreak.riskkernel.verification.ReadOnlyVerifier`.
     """
     history = events_from_records(store.read_all())
+    head = store.head()
+    feed = LedgerFillAccountingFeed(
+        store,
+        component=_COMPONENT,
+        after_sequence=0 if head is None else head.sequence_number,
+    )
     return ReadOnlyVerifier(
         connector=view,
-        expectation_source=LedgerExpectationSource(history, view),
+        expectation_source=LedgerExpectationSource(history, view, fill_accounting=feed),
         tolerances=VerificationTolerances(
             balance_tolerance=MoneyMicros(
                 config.risk.verification_balance_tolerance_micros
@@ -1465,6 +1555,85 @@ def _build_provider_gate(
     )
 
 
+def _build_paper_exchange(
+    books_dir: Path,
+    clock: Callable[[], int],
+    *,
+    market_data: MarketDataSource | None,
+    live_ticker: str | None,
+) -> PaperExchange:
+    """Build the tick's exchange: replayed fixture books, or the venue's live ones.
+
+    Both modes produce a :class:`~windbreak.connector.paper.PaperExchange`, so
+    every consumer :func:`build_paper_deps` wires downstream -- gateway,
+    reconciler, verification view -- takes the one object this returns and
+    needs no knowledge of which mode it is in. That is what makes the live wire
+    *total*: there is no second exchange for a consumer to be left holding.
+
+    The two modes differ in exactly one further respect, and it is a
+    fail-closed one. The fixture path anchors the recording to this run's clock
+    (issue #369): a committed book's frozen literals sit permanently outside
+    every ttl -- or, for a recording dated after the run's clock, permanently
+    in the future -- so without an anchor ``quote_freshness`` could only ever
+    veto. The anchor shifts every book and print by one offset, so the
+    recording's internal timing survives intact and a book genuinely ages as
+    the replay runs.
+
+    A live book has no such problem: it already carries the instant the venue
+    was actually observed, and shifting that would fabricate freshness the
+    venue never claimed. Live mode therefore passes **no** ``replay_anchor``,
+    and the venue's ``fetched_at`` reaches the freshness check untouched --
+    which is what leaves that check able to genuinely veto a stale book.
+
+    Args:
+        books_dir: The fixture directory. In fixture mode it supplies books,
+            markets, and fees; in live mode only its *account* fixtures
+            (opening balances and balance semantics) are read, because the
+            whole point of live mode is that the market data is the venue's.
+        clock: The injected epoch-second clock, read for the exchange's own
+            observation timeline.
+        market_data: The read-only venue surface, or ``None`` for fixtures.
+        live_ticker: The single market a live session trades, or ``None`` for
+            fixtures. The market universe is a separate concern (issue #345).
+
+    Returns:
+        The wired exchange -- a
+        :class:`~windbreak.connector.paper.LiveBookPaperExchange` in live mode.
+
+    Raises:
+        ValueError: If exactly one of ``market_data`` / ``live_ticker`` is
+            supplied. Half a live configuration must not degrade to fixtures:
+            an operator who named a live market and silently got recorded books
+            would be reading a paper tape while believing it was the venue.
+    """
+
+    def observed_at() -> datetime:
+        """Return this run's clock reading as a timezone-aware UTC instant.
+
+        Returns:
+            The injected clock's current reading, in UTC.
+        """
+        return datetime.fromtimestamp(clock(), UTC)
+
+    if market_data is None:
+        if live_ticker is not None:
+            raise ValueError(
+                f"live_ticker={live_ticker!r} was named without a `market_data` "
+                "source to read it from; supply both or neither"
+            )
+        return PaperExchange.from_fixture_dir(
+            books_dir, clock=observed_at, replay_anchor=observed_at()
+        )
+    if live_ticker is None:
+        raise ValueError(
+            "`market_data` was supplied without a `live_ticker` naming the market "
+            "to trade; supply both or neither"
+        )
+    return LiveBookPaperExchange.from_account_dir(
+        books_dir, market_data=market_data, ticker=live_ticker, clock=observed_at
+    )
+
+
 def build_paper_deps(
     *,
     books_dir: Path,
@@ -1474,6 +1643,8 @@ def build_paper_deps(
     config: WindbreakConfig,
     research_tools: ResearchTools | None = None,
     clock: Callable[[], int] | None = None,
+    market_data: MarketDataSource | None = None,
+    live_ticker: str | None = None,
 ) -> PaperTickDeps:
     """Assemble every real component one PAPER tick runs against.
 
@@ -1482,13 +1653,23 @@ def build_paper_deps(
     signing key shared by the kernel and gateway (SPEC S10.6), and wires the real
     approval seam, gateway (boot-recovered), and reconciler over them.
 
-    The exchange is given ``clock`` twice, for two distinct jobs: as its
-    observation clock, so its status attestation is stamped on the same
-    timeline the tick judges freshness on (issue #342), and as its
-    ``replay_anchor``, so the recording is re-enacted from this run's start
-    rather than replayed at its recorded literals (issue #369). Both readings
-    come from the one injected clock, so the books, the status, and the
-    evaluation can never be judged against three unrelated timelines.
+    Supplying ``market_data`` with ``live_ticker`` swaps the fixture books for a
+    venue's live ones -- real prices in, paper money out (issue #343). The swap
+    is *total* by construction: :func:`_build_paper_exchange` returns the single
+    exchange object that the gateway's submitter, its status and reconciliation
+    sources, the :class:`~windbreak.order_gateway.reconciler.Reconciler`, the
+    read-only verification view, and :attr:`PaperTickDeps.exchange` are all
+    built from, so no consumer can be left reading a different venue from the
+    one the loop trades against. Omitting both leaves every existing caller
+    byte-identical.
+
+    The exchange is given ``clock`` as its observation clock, so its status
+    attestation is stamped on the same timeline the tick judges freshness on
+    (issue #342) -- and, in fixture mode only, as its ``replay_anchor`` (issue
+    #369; see :func:`_build_paper_exchange` for why a live book must never be
+    re-dated). Both readings come from the one injected clock, so the books, the
+    status, and the evaluation can never be judged against three unrelated
+    timelines.
 
     It also builds the process's one per-provider track-record gate from
     ``report_dir``'s M6 artifact and ``config.forecast.provider_gate`` (see
@@ -1507,31 +1688,30 @@ def build_paper_deps(
         research_tools: The sandboxed research tools, or ``None`` for an offline
             no-network default.
         clock: The injected epoch-second clock, or ``None`` for the wall clock.
+        market_data: The read-only live venue surface, or ``None`` (the default)
+            to read the fixture directory's recorded books.
+        live_ticker: The single market a live session trades. Required with
+            ``market_data`` and meaningless without it.
 
     Returns:
         A fully wired :class:`PaperTickDeps`.
 
     Raises:
-        ValueError: If a configured ceiling is negative, or the track-record
+        ValueError: If exactly one of ``market_data``/``live_ticker`` is given,
+            if a configured ceiling is negative, or if the track-record
             artifact exists but cannot be read as a strict integer document --
-            either way refusing to start rather than running unguarded.
+            each way refusing to start rather than running unguarded.
     """
     resolved_clock = clock if clock is not None else _default_clock
     # The exchange must observe on the same clock the tick reads, or its status
     # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
     # freshness against two unrelated timelines (issue #342).
-    # The replay is anchored to that same clock's reading at wiring time
-    # (issue #369), so the recording's frozen literals become dates measurable
-    # against this run. Without it the committed books sit permanently outside
-    # every ttl -- or, for a recording dated after the run's clock, permanently
-    # in the future -- and `quote_freshness` could only ever veto. The anchor
-    # shifts every book and print by one offset, so the recording's internal
-    # timing survives intact and a book genuinely ages as the replay runs.
-    exchange = PaperExchange.from_fixture_dir(
-        books_dir,
-        clock=lambda: datetime.fromtimestamp(resolved_clock(), UTC),
-        replay_anchor=datetime.fromtimestamp(resolved_clock(), UTC),
+    exchange = _build_paper_exchange(
+        books_dir, resolved_clock, market_data=market_data, live_ticker=live_ticker
     )
+    # In live mode `markets` is the single bound ticker, so this one line
+    # answers both modes: the fixture directory's first market, or the market
+    # the operator named.
     ticker = next(iter(exchange.markets))
     store = SqliteLedgerStore(ledger_path)
     key = secrets.token_bytes(_SIGNING_KEY_BYTES)
@@ -1539,6 +1719,11 @@ def build_paper_deps(
     # exposes `place_order`/`cancel_order` alongside its reads, and the
     # read-only cycle must not be able to reach them (SPEC S1.1 invariant 3).
     verification_view = ReadOnlyConnectorView(exchange)
+    # Books each execution into the ledger exactly once, under this loop's own
+    # component -- the label `_build_verifier`'s feed is told to trust. The
+    # bookkeeper is built before the verifier so no execution can slip between
+    # the baseline capture and the first booking (issue #365).
+    fill_bookkeeper = LedgerFillBookkeeper(store, exchange, component=_COMPONENT)
     approval, kernel = _build_approval(
         store, config, key, verification_view, resolved_clock
     )
@@ -1555,6 +1740,7 @@ def build_paper_deps(
         store=store,
         exchange=exchange,
         verification_view=verification_view,
+        fill_bookkeeper=fill_bookkeeper,
         gateway=gateway,
         reconciler=reconciler,
         approval=approval,
@@ -1953,7 +2139,10 @@ def _approve_stage(
     ``now_epoch_s``, so ``clock_skew_limit`` measures our clock against the
     venue's instead of against itself. ``PaperExchange.get_exchange_time``
     answers from the anchored replay timeline and deliberately does not renew
-    itself per read -- a clock that did could never disagree.
+    itself per read -- a clock that did could never disagree. A replay that has
+    run out of recording reports no clock at all rather than a stale one (issue
+    #382; see :func:`read_exchange_clock_epoch_s`), so a run that outlives its
+    recording vetoes for a stated reason instead of on accumulated drift.
 
     Threads the venue's own open position (issue #373), read here rather than
     taken from :func:`_equity_and_positions_stage`, which runs *after* this
@@ -2020,7 +2209,7 @@ def _approve_stage(
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
-        exchange_clock_epoch_s=int(deps.exchange.get_exchange_time().timestamp()),
+        exchange_clock_epoch_s=read_exchange_clock_epoch_s(deps.exchange),
         forecast_epoch_s=int(forecast.created_at.timestamp()),
         open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
         equity_start_of_day=read_start_of_day_equity_micros(
@@ -2222,9 +2411,24 @@ def _verification_stage(deps: PaperTickDeps) -> None:
     holding -- is graded a forced breach there rather than escaping as an
     exception, so an unobservable venue halts instead of killing the tick.
 
+    Every execution the venue has reported is booked into the ledger first
+    (issue #365), so the expectation the cycle diffs against has already
+    absorbed the fills the ledger can explain. Booking here rather than beside
+    the routing call catches fills from *every* source -- a taker walk on a
+    placed order and a resting order filled by ``PaperExchange.advance`` alike
+    -- and does it at the one moment the answer is needed. Booking is
+    idempotent on the venue's fill id, so re-entering this stage never advances
+    the expectation past cash the venue moved once.
+
+    The booking reads the venue's *execution reports*; the cycle reads the
+    venue's *aggregate* balances and positions. Those are different questions,
+    which is why the comparison can still fail -- see
+    :class:`~windbreak.riskkernel.verification.LedgerExpectationSource`.
+
     Args:
         deps: The tick's dependency bundle.
     """
+    deps.fill_bookkeeper.book_new()
     deps.kernel.run_verification_cycle()
 
 
