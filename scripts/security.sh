@@ -106,8 +106,10 @@ echo "Auditing dependencies of: $AUDIT_PYTHON"
 
 echo "=== Security Checks (detect-secrets baseline) ==="
 
-# Enforce the same baseline-diffing detect-secrets hook that CI's
-# "Pre-commit (all files)" step runs, so local Gate 1 == CI (issue #262).
+# Enforce the same baseline-diffing detect-secrets hook that CI runs -- CI
+# reaches it through ./scripts/check-all.sh -> scripts/precommit.sh since issue
+# #406 removed its standalone pre-commit step -- so local Gate 1 == CI
+# (issue #262).
 # Fail loud if pre-commit is unavailable rather than silently skipping the
 # check -- a silent skip is the exact enforcement gap this section closes.
 if ! PRE_COMMIT="$(bash "$TOOLCHAIN_ENV" --print-tool pre-commit)"; then
@@ -125,7 +127,7 @@ if $VERBOSE; then
 fi
 "$PRE_COMMIT" run detect-secrets --all-files || {
     echo "✗ detect-secrets found a potential secret not in .secrets.baseline (or the hook failed)" >&2
-    echo "  why: this is the same check CI's 'Pre-commit (all files)' step runs, so CI would fail too." >&2
+    echo "  why: this is the same hook CI runs (via ./scripts/check-all.sh), so CI would fail too." >&2
     echo "  next: audit the flagged finding above. If it is a real secret, remove it." >&2
     echo "        If it is a genuine false positive, fix it structurally (e.g. rename the" >&2
     echo "        fixture) as PRs #260/#282 did. Do NOT regenerate or weaken .secrets.baseline" >&2
