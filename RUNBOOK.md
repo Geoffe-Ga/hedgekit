@@ -457,6 +457,53 @@ pass.
 - Weekly reports are structural stubs (`No data yet.` bodies); the real
   report content is a later pass.
 
+### Declaring correlation buckets (required to size anything)
+
+Since issue #407 the loop **refuses to size a market you have not placed in a
+correlation bucket**, and refuses again if it is holding any position it cannot
+place either. With the built-in defaults nothing is declared, so a tick logs a
+`SelectorDecisionRecorded` carrying `unprovable_exposure: ...` and emits no
+intent. That is deliberate, not a regression: before #407 the per-bucket cap
+aggregated an empty peer set and the kernel's `concentration_limits` compared
+four hardcoded zeros, so both caps ran on every tick, reported success, and
+could not veto however concentrated the account became.
+
+Declare buckets in configuration:
+
+```yaml
+correlation:
+  tags:
+    - ticker: KXRAINNYC-26MAR01
+      bucket_ids: [weather]
+      tagged_at: "2026-03-01T00:00:00+00:00"
+    - ticker: KXSNOWCHI-26MAR01
+      bucket_ids: [weather]
+      tagged_at: "2026-03-01T00:00:00+00:00"
+```
+
+- `bucket_ids` must name the SPEC S9.9 seed taxonomy -- `us-election`,
+  `fed-policy`, `inflation`, `weather`, `ai-regulation`, `company-specific`,
+  `legal-case` -- or `geopolitics-<region>` with a non-empty region. A typo is
+  refused at load rather than silently creating a bucket of one.
+- `tagged_at` must carry a UTC offset. An offsetless value is refused rather
+  than read as host-local, so a tag's provenance cannot depend on which machine
+  loaded the config.
+- These tags are recorded with `source: human`, because you wrote them. There
+  is deliberately no venue-derived source: a correlation bucket is a claim
+  about which markets move *together*, and the exchange's free-form `category`
+  string ("Politics" spanning US elections, foreign elections and legislation
+  alike) cannot support it. Deriving one and labelling it with the venue's name
+  would put a provenance in the audit trail that nothing actually holds.
+- **Every ticker you hold must be declared, not just the one you are trading.**
+  An unclassified holding could be in the target's bucket, so while it is held
+  the target's bucket exposure is unprovable and the loop declines. If a tick
+  stops sizing after a fill, look for a held ticker missing from this list.
+
+`risk.max_pos_total_pct_ppm` is also declarable now (it was a hardcoded 100%).
+It defaults to `1000000` -- 100% of worst-case equity -- which preserves the
+previous ceiling rather than choosing a tighter appetite on your behalf. It is a
+live cap either way now that total exposure is fed real figures.
+
 ## Operator alerts
 
 Alerts reach you only through the sinks `config.alerts` declares. Until you
