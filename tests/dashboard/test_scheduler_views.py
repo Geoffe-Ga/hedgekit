@@ -12,6 +12,12 @@ the ledger. Every renderer must `html.escape` any ledger-derived string before
 interpolating it -- selector/veto reasons are forecast/LLM-adjacent and
 therefore an XSS surface (mirrors `windbreak/dashboard/app.py`'s own existing
 `html.escape` treatment of `mode`/`last_heartbeat`).
+
+The two table views (`render_positions`, `render_equity_vs_floor`) are asserted
+through `tests.dashboard.html_structure.assert_data_table` rather than by
+substring (issue #275): a substring assertion over cell text cannot see whether
+a `<table>` wraps the rows at all, which is precisely how the orphan-`<tr>`
+markup reached production.
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
+
+from tests.dashboard.html_structure import assert_data_table
 
 
 def test_dashboard_read_models_is_frozen() -> None:
@@ -53,9 +61,14 @@ def test_render_positions_shows_no_data_yet_placeholder_when_empty() -> None:
     assert "no data yet" in html.lower()
 
 
-def test_render_positions_renders_the_ticker_and_quantity() -> None:
-    """A populated positions read model renders each position's ticker and
-    quantity.
+def test_render_positions_renders_a_labelled_table_of_each_position() -> None:
+    """A populated positions read model renders a real, labelled table.
+
+    Asserted structurally (issue #275): the previous version of this test only
+    checked that ``"MKT-DEEP"`` and ``"200"`` appeared *somewhere* in the string,
+    which passed against the orphan ``<tr>``/``<td>`` markup this view used to
+    emit -- markup a browser foster-parents out of its section and renders as
+    run-together text. Deleting the ``<table>`` wrapper now fails this test.
     """
     from windbreak.dashboard.views import render_positions
 
@@ -78,8 +91,11 @@ def test_render_positions_renders_the_ticker_and_quantity() -> None:
 
     html = render_positions(rows)
 
-    assert "MKT-DEEP" in html
-    assert "200" in html
+    assert_data_table(
+        html,
+        headers=["ticker", "quantity_centis", "average_price_pips"],
+        rows=[["MKT-DEEP", "200", "4600"]],
+    )
 
 
 def test_render_equity_vs_floor_shows_no_data_yet_placeholder_when_empty() -> None:
@@ -91,8 +107,13 @@ def test_render_equity_vs_floor_shows_no_data_yet_placeholder_when_empty() -> No
     assert "no data yet" in html.lower()
 
 
-def test_render_equity_vs_floor_renders_equity_and_floor_values() -> None:
-    """A populated equity-curve read model renders each row's equity and floor."""
+def test_render_equity_vs_floor_renders_a_labelled_table_of_each_sample() -> None:
+    """A populated equity-curve read model renders a real, labelled table.
+
+    Asserted structurally (issue #275) for the same reason as the positions
+    view: ``"1000000000" in html`` passed against orphan ``<td>`` markup with no
+    ``<table>`` ancestor, so it could never have caught the missing structure.
+    """
     from windbreak.dashboard.views import render_equity_vs_floor
 
     rows = [
@@ -110,7 +131,11 @@ def test_render_equity_vs_floor_renders_equity_and_floor_values() -> None:
 
     html = render_equity_vs_floor(rows)
 
-    assert "1000000000" in html or "1,000,000,000" in html
+    assert_data_table(
+        html,
+        headers=["epoch_s", "equity_micros", "floor_micros"],
+        rows=[["1700000000", "1000000000", "0"]],
+    )
 
 
 def test_render_decisions_shows_no_data_yet_placeholder_when_empty() -> None:

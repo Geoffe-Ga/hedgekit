@@ -1,16 +1,18 @@
 """Renderer for the live execution-quality view (issue #58).
 
-Renders every ``ExecutionQualityRecorded`` read-model row into an HTML table of a
-fill's identity and its live-vs-paper cost slippage. Every ledger-derived value
-is HTML-escaped (:func:`windbreak.dashboard.views._html.escape`) before output --
-a fill id is forecast/venue-adjacent and therefore an XSS surface.
+Renders every ``ExecutionQualityRecorded`` read-model row into one row of a
+column-labelled HTML table (``<table>``/``<thead>``/``<tbody>``, issue #275)
+giving a fill's identity and its live-vs-paper cost slippage. Every
+ledger-derived value is HTML-escaped
+(:func:`windbreak.dashboard.views._html.escape`) before output -- a fill id is
+forecast/venue-adjacent and therefore an XSS surface.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-from windbreak.dashboard.views._html import escape, section
+from windbreak.dashboard.views._html import table
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -18,25 +20,25 @@ if TYPE_CHECKING:
 #: The section heading the execution-quality view renders under.
 _TITLE = "Execution quality (live vs paper)"
 
+#: The payload keys rendered, in column order. One tuple serves as both the
+#: header labels and the cell lookup keys so a header can never drift out of
+#: step with the value beneath it.
+_COLUMNS = ("fill_id", "market_ticker", "slippage_micros")
 
-def _execution_row(row: dict[str, object]) -> str:
-    """Render one execution-quality record into an escaped table row.
+
+def _execution_values(row: dict[str, object]) -> tuple[object, ...]:
+    """Extract one execution-quality record's cell values in column order.
 
     Args:
         row: One ``execution_quality`` read-model row
             (``{seq, created_at, event_type, data}``).
 
     Returns:
-        An HTML ``<tr>`` with the fill id, market ticker, and slippage escaped.
+        The record's :data:`_COLUMNS` values, unescaped (the table helper
+        escapes every cell).
     """
     data = cast("Mapping[str, object]", row["data"])
-    return (
-        "<tr>"
-        f"<td>{escape(data.get('fill_id'))}</td>"
-        f"<td>{escape(data.get('market_ticker'))}</td>"
-        f"<td>{escape(data.get('slippage_micros'))}</td>"
-        "</tr>"
-    )
+    return tuple(data.get(column) for column in _COLUMNS)
 
 
 def render_execution_quality(rows: list[dict[str, object]]) -> str:
@@ -47,8 +49,7 @@ def render_execution_quality(rows: list[dict[str, object]]) -> str:
             empty list renders the shared "no data yet" placeholder.
 
     Returns:
-        An HTML section fragment listing each fill's slippage, all values
-        HTML-escaped.
+        An HTML section containing a table of each fill's slippage under
+        :data:`_COLUMNS` headers, all values HTML-escaped.
     """
-    body = [_execution_row(row) for row in rows]
-    return section(_TITLE, body)
+    return table(_TITLE, _COLUMNS, [_execution_values(row) for row in rows])

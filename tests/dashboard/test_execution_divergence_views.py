@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.dashboard.html_structure import assert_data_table
 from tests.dashboard.test_app import TEST_TOKEN, _bearer, _get
 
 if TYPE_CHECKING:
@@ -202,6 +203,67 @@ def test_execution_route_escapes_a_hostile_fill_id(
     assert status == 200
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
     assert "<script>" not in body
+
+
+def test_execution_route_serves_a_well_formed_labelled_table(
+    dashboard_server_with_execution_divergence_rows: tuple[
+        http.server.ThreadingHTTPServer, tuple[str, int]
+    ],
+) -> None:
+    """The served `/execution` page is a real table, not orphan rows (#275).
+
+    Asserted over the *whole served page*, so it covers `_VIEW_TEMPLATE`'s
+    wrapping as well as the renderer: every `<tr>`/`<td>` must sit inside a
+    single `<table>` with a header row naming the columns. The hostile fill id
+    is expected back as cell *text*; had it been interpolated raw it would parse
+    as a `<script>` element instead and the cell text would not match.
+    """
+    _server, address = dashboard_server_with_execution_divergence_rows
+
+    status, _headers, body = _get(address, "/execution", headers=_bearer(TEST_TOKEN))
+
+    assert status == 200
+    assert_data_table(
+        body,
+        headers=["fill_id", "market_ticker", "slippage_micros"],
+        rows=[["F-<script>alert(1)</script>", "MKT-EXEC", "100000"]],
+    )
+
+
+def test_render_live_divergence_renders_a_labelled_table_of_each_row() -> None:
+    """The divergence renderer emits a labelled table, placeholders included.
+
+    A sampled row carries neither threshold nor `trigger`, so those cells render
+    the `n/a` placeholder -- structurally identical cells, never omitted, so the
+    columns stay aligned with their headers (issue #275).
+    """
+    from windbreak.dashboard.views import render_live_divergence
+
+    rows = [
+        {
+            "seq": 9,
+            "created_at": "2026-01-01T00:00:00.000000+00:00",
+            "event_type": "LiveDivergenceSampled",
+            "data": {
+                "live_slippage_ratio_ppm": 1_100_000,
+                "live_brier_degradation_ppm": "UNDEFINED",
+            },
+        }
+    ]
+
+    html = render_live_divergence(rows)
+
+    assert_data_table(
+        html,
+        headers=[
+            "live_slippage_ratio_ppm",
+            "live_slippage_ratio_limit_ppm",
+            "live_brier_degradation_ppm",
+            "live_brier_degradation_band_ppm",
+            "trigger",
+        ],
+        rows=[["1100000", "n/a", "UNDEFINED", "n/a", "n/a"]],
+    )
 
 
 def test_divergence_route_renders_the_seeded_ratio(
