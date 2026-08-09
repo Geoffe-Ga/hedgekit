@@ -86,11 +86,15 @@ See [Workflow](workflow.md) for complete documentation.
 Quality thresholds are immutable. Meet them, don't lower them.
 
 **Standards**:
-- Test Coverage: ≥90%
-- Docstring Coverage: ≥95%
+- Test Coverage: ≥90%, over line and branch outcomes combined
+- Docstring Coverage: 100% of public symbols (ruff `D1`)
 - Mutation Score: ≥80% (manual pre-v1.0.0 release gate, not an automated check)
-- Cyclomatic Complexity: ≤10 per function
-- Pylint Score: ≥9.0
+- Cyclomatic Complexity: ≤10 per function (xenon `--max-absolute B`)
+
+Each of these is computed by a tool in the pinned toolchain. Correcting a
+documented number to match the one actually enforced is not lowering a gate —
+but adding a number nothing computes is worse than either, because it gets
+believed (issue #411).
 
 **When code doesn't meet standards**:
 - ❌ Change `fail_under = 70` in pyproject.toml

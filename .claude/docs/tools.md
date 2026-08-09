@@ -18,8 +18,8 @@
 |------|------------------|-------------------|
 | **Format code** | `ruff format .` | `./scripts/format.sh` |
 | **Check formatting** | `ruff format --check .` | `./scripts/check-all.sh` |
-| **Lint code** | `ruff check .`<br>`pylint src/` | `./scripts/lint.sh` |
-| **Type check** | `mypy src/` | `./scripts/lint.sh` |
+| **Lint code** | `ruff check .` | `./scripts/lint.sh` |
+| **Type check** | `mypy windbreak/ scripts/` | `./scripts/typecheck.sh` |
 | **Run tests** | `pytest` | `./scripts/test.sh` |
 | **Run unit tests** | `pytest tests/unit/` | `./scripts/test.sh --unit` |
 | **Check coverage** | `pytest --cov` | `./scripts/test.sh` |
@@ -71,13 +71,16 @@ pytest tests/
 
 **`./scripts/check-all.sh`** - Run all quality checks (use before every commit)
 
-Runs in order:
-1. Formatting checks (ruff format — single formatter authority, ADR-0002)
-2. Linting (ruff, pylint, mypy)
-3. Security scanning (bandit, pip-audit)
-4. Complexity analysis (radon, xenon)
-5. Unit tests with coverage
-6. Coverage report validation (90% minimum)
+Runs in order (mirrors the `run_check` calls in `scripts/check-all.sh`):
+1. The whole pre-commit hook set (`scripts/precommit.sh`, issue #401)
+2. Linting (ruff, ruff `D1`, float-lint, shellcheck)
+3. Architecture boundaries (import-linter)
+4. Formatting checks (ruff format — single formatter authority, ADR-0002)
+5. Type checking (mypy)
+6. Security scanning (bandit, pip-audit, detect-secrets)
+7. Complexity analysis (radon reports; xenon enforces)
+8. Unit tests
+9. Coverage report validation (90% minimum, line + branch combined)
 
 **Note**: Mutation testing is NOT included in check-all.sh (long runtime) and is
 NOT run by any automated trigger. It is the manual pre-v1.0.0 release gate (owner

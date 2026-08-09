@@ -99,9 +99,21 @@ follows from "one formatter, one linter, no duplicated enforcement":
   `test_precommit_rev_matches_constraints_pin` is the guard that catches
   this the next time the test suite runs — it is not prevented outright, but
   it cannot pass silently.
-- **Deferred, not resolved:** `pylint` and `interrogate` remain documented
-  in project docs but are not wired into an enforced gate — this predates
-  #104 and is unchanged by it. Likewise, adopting ruff's `TRY`/`FURB` rule
+- **Deferred, not resolved** *(since resolved — see below)*: `pylint` and
+  `interrogate` remain documented in project docs but are not wired into an
+  enforced gate — this predates #104 and is unchanged by it.
+  - **Resolved for `interrogate`** by #351 / PR #409: docstring coverage is
+    enforced by ruff `D1`, which reimplements the same rule family, rather
+    than by adding a second tool.
+  - **Resolved for `pylint`** by #411: the documented `≥9.0` row was removed
+    rather than wired. Ruff already ships pylint's rules as its `PL` family,
+    and a score threshold is a tolerance for defects rather than the
+    per-rule floor this repo gates on — the reasoning, with measured
+    `--select PL` counts, is in `pyproject.toml` beside the `select` list.
+    `tests/toolchain/test_quality_standards_table.py` now fails the suite if
+    any quality-standards row names an unpinned tool, so this instinct is
+    enforced rather than merely recorded.
+  Likewise, adopting ruff's `TRY`/`FURB` rule
   categories as an enforced gate (rather than just removing the standalone
   `tryceratops`/`refurb` tools) is deferred behind a separate cleanup of the
   106 pre-existing violations; it should be filed and tracked as its own

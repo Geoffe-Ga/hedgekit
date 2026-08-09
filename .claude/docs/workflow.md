@@ -148,12 +148,14 @@ Before a v1.0.0 release only:
    ./scripts/check-all.sh
    ```
    This runs (in order):
-   - Formatting checks (ruff format, black)
-   - Linting (ruff, pylint, mypy)
-   - Security checks (bandit, pip-audit)
+   - The whole pre-commit hook set (`scripts/precommit.sh`, issue #401)
+   - Linting (ruff, float-lint, shellcheck) and docstring coverage (ruff `D1`)
+   - Architecture boundaries (import-linter)
+   - Formatting checks (ruff format — the single formatter authority, ADR-0002)
+   - Type checking (mypy)
+   - Security checks (bandit, pip-audit, detect-secrets)
+   - Complexity (xenon enforces; radon reports)
    - Tests with coverage
-   - Docstring coverage (pydocstyle / ruff D rules)
-   - Code quality metrics
 
 4. **Commit with Conventional Commits**
    ```bash
