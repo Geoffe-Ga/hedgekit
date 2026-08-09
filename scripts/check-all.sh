@@ -23,7 +23,7 @@ Usage: $(basename "$0") [OPTIONS]
 Run all quality checks in sequence.
 
 Runs:
-  1. Linting (Ruff)
+  1. Linting (Ruff + float-lint + shellcheck)
   2. Architecture boundary checks (import-linter)
   3. Formatting (ruff format)
   4. Type checking (MyPy)
