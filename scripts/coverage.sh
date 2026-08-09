@@ -59,6 +59,11 @@ done
 
 cd "$PROJECT_ROOT"
 
+# Resolve pytest from the PINNED toolchain, not the caller's PATH (issue #366):
+# the coverage threshold must be measured against the pinned dependency set, not
+# whichever pytest/pytest-cov pair happens to be first on PATH.
+PYTEST="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-tool pytest)"
+
 # Set verbosity
 if $VERBOSE; then
     set -x
@@ -88,7 +93,7 @@ if $XML_REPORT; then
 fi
 
 # Run tests with coverage
-pytest "${PYTEST_ARGS[@]}" tests/ || {
+"$PYTEST" "${PYTEST_ARGS[@]}" tests/ || {
     echo "✗ Coverage below threshold" >&2
     exit 1
 }
