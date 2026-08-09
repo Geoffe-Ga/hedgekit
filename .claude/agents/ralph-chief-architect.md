@@ -76,10 +76,11 @@ plans to the same standard, and every rule in
    - **documentation** → new public API, changed behavior, README/docstring gaps
    - **migration** → any schema/model change needs a matching migration
      (schema drift without a migration is a broken deploy — always call it out)
-5. **Emit the plan** (the deliverable) — see Output Contract. Name the repo
-   **skills** each specialist should load (e.g. `security`, `testing`,
-   `mutation-testing`, `frontend-aesthetics`, `documentation`) so the hands invoke
-   the project's craft instead of improvising.
+5. **Emit the plan** (the deliverable) — see Output Contract. Name a repo
+   **skill** for a specialist to load only when the task needs a repo-specific
+   procedure (e.g. `mutation-testing`). Do not name a skill for ordinary craft:
+   testing, documentation, error handling, and security hygiene are expected by
+   default, not delegated to a file.
 
 ## Output Contract (return this; do not write files)
 

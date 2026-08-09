@@ -45,8 +45,7 @@ Route only the dimensions the diff actually touches — no redundant reviews.
 
 0. **Load the rules and the craft.** `Read`
    [`shared/house-rules.md`](shared/house-rules.md) (gates,
-   thresholds, anti-bypass — not auto-injected) and invoke the
-   `comprehensive-pr-review` skill via the Skill tool before reviewing.
+   thresholds, anti-bypass — not auto-injected) before reviewing.
 1. Read the diff (`git diff` against the merge base) and the architect's risk
    flags.
 2. **Primary path — review the applicable dimensions yourself** against each
@@ -100,4 +99,4 @@ after the constant is named.
 ---
 
 **References**: [shared/house-rules.md](shared/house-rules.md),
-[taxonomy map](README.md), repo `comprehensive-pr-review` skill
+[taxonomy map](README.md)
