@@ -98,16 +98,36 @@ _SURVIVING_VETO_REASONS = (
     "participation cap exceeded",
 )
 
+#: What `_SURVIVING_VETO_REASONS` becomes once the replayed book has aged past
+#: `quote_ttl_seconds`, in SPEC S10.3 check order: `quote_freshness` sits at
+#: position 14, between `concentration_limits` (10) and
+#: `participation_cap_compliance` (17), so the new reason lands *between* the
+#: two survivors rather than after them. Exact equality again, for the same
+#: reason: a membership check would not prove the veto arrived in the right
+#: place, nor that nothing else changed when the clock moved.
+_STALE_QUOTE_VETO_REASONS = (
+    "concentration limit exceeded",
+    "quote is stale or missing",
+    "participation cap exceeded",
+)
 
-def _production_context(deps):
+
+def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
     """Rebuild the exact `EvaluationContext` `_approve_stage` composes.
 
     Every argument mirrors that stage's own call, so what this test pins is the
-    loop's production wiring rather than a permissive test fixture.
+    loop's production wiring rather than a permissive test fixture. In
+    particular `quote_snapshot_epoch_s` comes from the book's own `fetched_at`
+    (issue #369), never from `now_epoch_s`: a quote stamped with the evaluation
+    instant is zero seconds old by construction and `quote_freshness` could
+    never veto.
 
     Args:
         deps: The wired `PaperTickDeps` whose ledger, exchange, and kernel the
             context is composed from.
+        now_epoch_s: The evaluation instant, defaulting to the fixed clock every
+            builder here agrees on. A caller passes a later instant to age the
+            replayed book against the run's own clock.
 
     Returns:
         The composed `EvaluationContext`.
@@ -119,9 +139,10 @@ def _production_context(deps):
         visible_depth_centis,
     )
 
+    order_book = deps.exchange.get_order_book(deps.ticker)
     return build_evaluation_context(
         deps.config,
-        now_epoch_s=DEFAULT_NOW_EPOCH_S,
+        now_epoch_s=now_epoch_s,
         verification=deps.kernel.latest_verification,
         instrument_whitelist=frozenset({deps.ticker}),
         market=deps.exchange.get_market(deps.ticker),
@@ -130,10 +151,11 @@ def _production_context(deps):
         ),
         exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
         pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+        quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
         equity_start_of_day=start_of_day_equity_micros(
-            deps.store.read_all(), now_epoch_s=DEFAULT_NOW_EPOCH_S
+            deps.store.read_all(), now_epoch_s=now_epoch_s
         ),
-        visible_depth=visible_depth_centis(deps.exchange.get_order_book(deps.ticker)),
+        visible_depth=visible_depth_centis(order_book),
     )
 
 
@@ -447,3 +469,67 @@ def test_paper_verification_holds_no_trade_scope_write_surface(
     assert not hasattr(view, "place_order")
     assert not hasattr(view, "cancel_order")
     assert view.get_balances().available == deps.exchange.get_balances().available
+
+
+def test_loop_context_vetoes_a_book_aged_past_its_quote_ttl(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """A replayed book that ages past its ttl vetoes; a fresh one does not (#369).
+
+    The whole point of the issue: `build_evaluation_context` stamped
+    `quote_snapshot_epoch_s` with the tick's own `now_epoch_s`, so
+    `_is_stale(now, now, ttl)` was `False` for every ttl and `quote_freshness`
+    could not veto against any book, however old.
+
+    Both halves are asserted, so the fix cannot be a mere inversion:
+
+    * at the anchor instant the replayed book is zero seconds old and the
+      surviving reasons are exactly `_SURVIVING_VETO_REASONS` -- no quote
+      reason;
+    * one second past `quote_ttl_seconds` the very same book vetoes, and the
+      reason lands at its SPEC S10.3 position (`_STALE_QUOTE_VETO_REASONS`).
+
+    Only the clock moves between the two evaluations. The exchange, the ledger,
+    the verification snapshot, and the book itself are identical, so the
+    difference is attributable to the book's age and nothing else.
+
+    Args:
+        books_dir: The shared books-fixture directory.
+        cassette_path: The empty recorded-cassette path.
+        report_dir: Where weekly-report stubs would be written.
+        paper_config: The PAPER-ceilinged configuration.
+        research_tools_factory: Builds the offline research tools double.
+        tmp_path: The pytest scratch directory.
+    """
+    from windbreak.scheduler.loop import build_paper_deps, run_single_tick
+
+    epoch = [DEFAULT_NOW_EPOCH_S]
+    deps = build_paper_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools=research_tools_factory(),
+        clock=lambda: epoch[0],
+    )
+    run_single_tick(deps, beat=1)
+
+    fresh = deps.approval.decide(
+        make_intent(market_ticker=deps.ticker),
+        _production_context(deps, now_epoch_s=epoch[0]),
+    )
+
+    epoch[0] = DEFAULT_NOW_EPOCH_S + paper_config.risk.quote_ttl_seconds + 1
+    stale = deps.approval.decide(
+        make_intent(market_ticker=deps.ticker),
+        _production_context(deps, now_epoch_s=epoch[0]),
+    )
+
+    assert fresh.decision.reasons == _SURVIVING_VETO_REASONS
+    assert stale.decision.reasons == _STALE_QUOTE_VETO_REASONS

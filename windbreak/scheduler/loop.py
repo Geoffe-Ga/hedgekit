@@ -861,6 +861,7 @@ def build_evaluation_context(
     exchange_status: ExchangeTradingStatus | None,
     exchange_status_epoch_s: int | None,
     pipeline_heartbeat_epoch_s: int | None,
+    quote_snapshot_epoch_s: int | None,
     equity_start_of_day: MoneyMicros | None,
     visible_depth: ContractCentis | None,
 ) -> EvaluationContext:
@@ -885,6 +886,15 @@ def build_evaluation_context(
     function's own ``now_epoch_s`` -- a heartbeat equal to ``now`` can never go
     stale, which would make its check unfalsifiable and strictly worse than the
     ``None`` it replaced.
+
+    The quote snapshot epoch is caller-supplied for the same reason and with
+    the same prohibition (issue #369). It must be the *book's own*
+    ``fetched_at``, never this function's ``now_epoch_s``: ``_is_stale(now,
+    now, ttl)`` is ``False`` for every ttl, so a quote stamped with the
+    evaluation instant makes ``quote_freshness`` unfalsifiable -- and that is
+    the SPEC S7.3 snapshot-TTL guarantee, the one check standing between the
+    kernel and an order priced off a stale book. A caller holding no book
+    passes ``None`` and the check keeps vetoing.
 
     The start-of-day equity and the visible depth are caller-supplied for the
     same reason (issue #364), and both loosen a real exposure limit when they
@@ -914,6 +924,12 @@ def build_evaluation_context(
             alive, or ``None``. Stamped by an earlier stage, never by this
             function -- a heartbeat equal to ``now`` could never go stale and
             would make its check unfalsifiable.
+        quote_snapshot_epoch_s: Epoch second the order book this evaluation
+            prices against was fetched, or ``None`` when no book could be read
+            -- which fails closed (issue #369). Taken from the book's own
+            ``fetched_at``, never from the tick's clock: a quote stamped
+            ``now`` is zero seconds old by construction and ``quote_freshness``
+            could never veto.
         equity_start_of_day: The current UTC day's first ledgered equity
             sample, or ``None`` when the day has none yet -- which fails closed
             (issue #364).
@@ -926,7 +942,7 @@ def build_evaluation_context(
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
     """
     market_view = MarketView(
-        quote_snapshot_epoch_s=now_epoch_s,
+        quote_snapshot_epoch_s=quote_snapshot_epoch_s,
         forecast_epoch_s=now_epoch_s,
         visible_depth=visible_depth,
         exchange_clock_epoch_s=now_epoch_s,
@@ -1359,6 +1375,14 @@ def build_paper_deps(
     signing key shared by the kernel and gateway (SPEC S10.6), and wires the real
     approval seam, gateway (boot-recovered), and reconciler over them.
 
+    The exchange is given ``clock`` twice, for two distinct jobs: as its
+    observation clock, so its status attestation is stamped on the same
+    timeline the tick judges freshness on (issue #342), and as its
+    ``replay_anchor``, so the recording is re-enacted from this run's start
+    rather than replayed at its recorded literals (issue #369). Both readings
+    come from the one injected clock, so the books, the status, and the
+    evaluation can never be judged against three unrelated timelines.
+
     It also builds the process's one per-provider track-record gate from
     ``report_dir``'s M6 artifact and ``config.forecast.provider_gate`` (see
     :func:`_build_provider_gate`). Like the research budget there is deliberately
@@ -1389,9 +1413,17 @@ def build_paper_deps(
     # The exchange must observe on the same clock the tick reads, or its status
     # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
     # freshness against two unrelated timelines (issue #342).
+    # The replay is anchored to that same clock's reading at wiring time
+    # (issue #369), so the recording's frozen literals become dates measurable
+    # against this run. Without it the committed books sit permanently outside
+    # every ttl -- or, for a recording dated after the run's clock, permanently
+    # in the future -- and `quote_freshness` could only ever veto. The anchor
+    # shifts every book and print by one offset, so the recording's internal
+    # timing survives intact and a book genuinely ages as the replay runs.
     exchange = PaperExchange.from_fixture_dir(
         books_dir,
         clock=lambda: datetime.fromtimestamp(resolved_clock(), UTC),
+        replay_anchor=datetime.fromtimestamp(resolved_clock(), UTC),
     )
     ticker = next(iter(exchange.markets))
     store = SqliteLedgerStore(ledger_path)
@@ -1799,6 +1831,16 @@ def _approve_stage(
     stage -- so the baseline is genuinely ``None`` and ``daily_loss_limit``
     keeps vetoing rather than trading against an invented one.
 
+    Threads the book's *own* ``fetched_at`` as the quote snapshot epoch (issue
+    #369), taken from the very snapshot the participation cap is measured
+    against, so ``quote_freshness`` compares the price's age with the instant
+    it is being priced at. It used to receive this stage's ``now_epoch_s``,
+    which made ``_is_stale(now, now, ttl)`` ``False`` for every ttl and the
+    check incapable of ever vetoing -- worse than the absent datum it replaced,
+    because it advertised the SPEC S7.3 guarantee without providing it. That
+    reading only became honest once :func:`build_paper_deps` anchored the
+    replay, so the recording's frozen literals age against this run's clock.
+
     A market the exchange cannot resolve becomes ``None`` rather than an
     exception, so an unknown ticker vetoes the tick instead of aborting it.
 
@@ -1840,6 +1882,7 @@ def _approve_stage(
         exchange_status=project_exchange_status(observed.status),
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
+        quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
         equity_start_of_day=read_start_of_day_equity_micros(
             deps.store, now_epoch_s=now_epoch_s
         ),

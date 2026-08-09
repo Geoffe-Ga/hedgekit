@@ -225,6 +225,7 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        quote_snapshot_epoch_s=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -252,6 +253,7 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        quote_snapshot_epoch_s=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -280,6 +282,7 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        quote_snapshot_epoch_s=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -312,6 +315,7 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        quote_snapshot_epoch_s=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -335,11 +339,52 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        quote_snapshot_epoch_s=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
 
     assert context.now_epoch_s == 1_234_567
+
+
+@pytest.mark.parametrize(
+    ("quote_epoch_s", "expected"),
+    [(None, None), (1_234_000, 1_234_000)],
+    ids=["absent-book", "real-book"],
+)
+def test_build_evaluation_context_never_stamps_the_quote_with_its_own_clock(
+    quote_epoch_s: int | None, expected: int | None
+) -> None:
+    """The quote epoch is the caller's, never `now_epoch_s` (issue #369).
+
+    Both arms are asserted against a `now_epoch_s` deliberately *unequal* to
+    the supplied quote epoch, so the substitution this issue removes would show
+    up as `1_234_567` in either arm: an absent book must land as `None` and
+    keep `quote_freshness` vetoing, and a real book's `fetched_at` must land
+    verbatim -- with its genuine age, not a zero one.
+
+    Args:
+        quote_epoch_s: The caller's quote epoch, absent or real.
+        expected: What must land on `MarketView.quote_snapshot_epoch_s`.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.scheduler.loop import build_evaluation_context
+
+    context = build_evaluation_context(
+        WindbreakConfig(),
+        now_epoch_s=1_234_567,
+        verification=None,
+        instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
+        quote_snapshot_epoch_s=quote_epoch_s,
+        equity_start_of_day=None,
+        visible_depth=None,
+    )
+
+    assert context.market.quote_snapshot_epoch_s == expected
 
 
 # --- equity math (scaled ints only, no float) ----------------------------------
@@ -603,6 +648,7 @@ def _context_with(*, status, status_epoch_s: int | None, heartbeat_epoch_s: int 
         exchange_status=status,
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
+        quote_snapshot_epoch_s=None,
         equity_start_of_day=None,
         visible_depth=None,
     )
@@ -898,6 +944,7 @@ def _exposure_context(*, equity_start_of_day, visible_depth):
         exchange_status=ExchangeTradingStatus.OPEN,
         exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
         pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+        quote_snapshot_epoch_s=None,
         equity_start_of_day=equity_start_of_day,
         visible_depth=visible_depth,
     )
