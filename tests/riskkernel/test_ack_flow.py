@@ -70,7 +70,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tests.riskkernel.conftest import make_context, make_intent
-from windbreak.numeric.types import MoneyMicros
+from windbreak.numeric.types import ContractCentis, MoneyMicros
 from windbreak.riskkernel import checks as checks_module
 from windbreak.riskkernel.ack_flow import (
     AckFileWatcher,
@@ -254,6 +254,99 @@ def test_resubmitting_while_the_ack_is_still_pending_is_idempotent(
         event for event in ack_writer.events if event.event_type == "HumanAckRequested"
     ]
     assert len(requested) == 1
+
+
+def test_a_second_distinct_intent_opens_its_own_ack_rather_than_aliasing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second, distinct over-threshold intent opens its *own* pending
+    acknowledgement rather than aliasing the one already open for a different
+    intent: `_request_or_existing_hold` scans past the non-matching entry
+    instead of returning the first thing it finds.
+
+    Both requests stay open side by side, the second carries the second
+    intent's *own* worst-case cost (twice the first's, since it is twice the
+    size), and two distinctly-identified `HumanAckRequested` events are
+    ledgered in issue order. An operator must bless each over-threshold intent
+    individually -- a grant on one can never silently authorize the other.
+    """
+    _isolate_checks(monkeypatch, "human_ack_satisfied")
+    _ledger, ack_queue, ack_writer, coordinator = _build_coordinator()
+    context = make_context(require_human_ack_above_micros=MoneyMicros(1_000_000))
+    first_intent = make_intent()
+    second_intent = make_intent(
+        intent_id="intent-0002",
+        size=ContractCentis(2_000),
+        idempotency_key="idem-0002",
+    )
+
+    first = coordinator.submit(first_intent, context)
+    second = coordinator.submit(second_intent, context)
+
+    assert first.pending_ack is not None
+    assert second.pending_ack is not None
+    assert second.held is True
+    assert second.token is None
+    assert second.pending_ack.intent_id == "intent-0002"
+    assert second.pending_ack.approval_id != first.pending_ack.approval_id
+    assert second.pending_ack.worst_case_cost == MoneyMicros(10_000_000)
+    assert first.pending_ack.worst_case_cost == MoneyMicros(5_000_000)
+    assert second.pending_ack.requested_at == context.now_epoch_s
+    assert ack_queue.pending_acks(context.now_epoch_s) == (
+        first.pending_ack,
+        second.pending_ack,
+    )
+    requested = [
+        event for event in ack_writer.events if event.event_type == "HumanAckRequested"
+    ]
+    assert [event.payload["intent_id"] for event in requested] == [
+        "intent-0001",
+        "intent-0002",
+    ]
+    assert [event.payload["worst_case_cost_micros"] for event in requested] == [
+        5_000_000,
+        10_000_000,
+    ]
+
+
+def test_resubmitting_scans_past_a_non_matching_ack_to_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With two intents held, resubmitting the *second* returns that second
+    intent's own pending acknowledgement -- the scan skips the first intent's
+    non-matching entry and matches on intent id, not on position.
+
+    Guards the mirror-image mistake of the test above: returning the first
+    non-matching entry (or the first entry outright) would hand back the wrong
+    intent's approval id, letting one grant release an intent the operator
+    never looked at. Nothing new is requested, so the ledger still holds
+    exactly the two original requests.
+    """
+    _isolate_checks(monkeypatch, "human_ack_satisfied")
+    _ledger, _ack_queue, ack_writer, coordinator = _build_coordinator()
+    context = make_context(require_human_ack_above_micros=MoneyMicros(1_000_000))
+    first_intent = make_intent()
+    second_intent = make_intent(
+        intent_id="intent-0002",
+        size=ContractCentis(2_000),
+        idempotency_key="idem-0002",
+    )
+    first = coordinator.submit(first_intent, context)
+    second = coordinator.submit(second_intent, context)
+    assert first.pending_ack is not None
+    assert second.pending_ack is not None
+
+    resubmitted = coordinator.submit(second_intent, context)
+
+    assert resubmitted.held is True
+    assert resubmitted.token is None
+    assert resubmitted.pending_ack is not None
+    assert resubmitted.pending_ack == second.pending_ack
+    assert resubmitted.pending_ack.approval_id != first.pending_ack.approval_id
+    requested = [
+        event for event in ack_writer.events if event.event_type == "HumanAckRequested"
+    ]
+    assert len(requested) == 2
 
 
 def test_multi_reason_veto_is_not_held_and_requests_no_ack(
