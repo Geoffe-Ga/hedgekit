@@ -1,9 +1,10 @@
 # ADR-0006: `ForecastConfig.ensemble` vs. `ForecastConfig.vote_ensemble` — a documented split, not a rename
 
-- **Status:** Accepted
-- **Date:** 2026-07-16
+- **Status:** Accepted; fully implemented as of #294 (the scheduler
+  composition-root wiring this ADR originally deferred — see Consequences)
+- **Date:** 2026-07-16 (amended 2026-08-08 by #294)
 - **Issue:** #240 (epic #183: forecast provider seam and live adapters; depends
-  on #184)
+  on #184); follow-up #294
 
 ## Context
 
@@ -120,21 +121,40 @@ behavior, it does not alter the schema shape.
   triage/promotion; warning on a key an operator cannot stop using would be
   unactionable noise. Deprecation here is documentary (this ADR + the
   `ForecastConfig` docstring), not a runtime signal.
-- **Deferred, not resolved here: wiring `vote_ensemble` into the scheduler
-  composition root.** `windbreak.scheduler.loop`'s pipeline invocation calls
-  `run_pipeline(...)` without an `ensemble=` argument, so
-  `pipeline.collect_model_votes` falls back to its own
-  `DEFAULT_VOTE_ENSEMBLE` — a triple that is mirror-equal in provenance to
-  `ForecastConfig`'s `_default_vote_ensemble()`, but not the *same object*,
-  and not sourced from an operator's non-default `config.forecast.vote_ensemble`
-  override. A config file that customizes `vote_ensemble` away from the
-  default therefore does not yet change which providers the scheduler's vote
-  stage actually calls; only the egress allowlist (this ADR's change) and any
-  direct `run_pipeline(ensemble=...)` caller see the override today. Threading
-  `config.forecast.vote_ensemble` through `windbreak/scheduler/loop.py` into
-  `run_pipeline`'s `ensemble` parameter is intentionally out of scope for this
-  issue and is left as a follow-up, to be filed and scoped separately.
-- **Cross-references:** #240 (this ADR's issue), #184 / ADR-0005 (introduced
+- **~~Deferred, not resolved here~~ — resolved by #294: wiring `vote_ensemble`
+  into the scheduler composition root.** When this ADR was written,
+  `windbreak.scheduler.loop`'s pipeline invocation called `run_pipeline(...)`
+  without an `ensemble=` argument, so the vote stage fell back to the forecast
+  package's own `DEFAULT_VOTE_ENSEMBLE` — a triple mirror-equal in provenance
+  to `ForecastConfig`'s `_default_vote_ensemble()`, but not sourced from an
+  operator's `config.forecast.vote_ensemble` override. A config customizing
+  `vote_ensemble` therefore changed the egress allowlist (this ADR's change)
+  without changing which providers the scheduler actually called — a
+  configured-but-inert knob.
+
+  #294 closes that gap: `windbreak.scheduler.loop._forecast_stage` now passes
+  `ensemble=deps.config.forecast.vote_ensemble` into `run_pipeline`, making
+  `vote_ensemble` authoritative on the PAPER loop and not merely in the
+  schema's documentation. Two properties are pinned by
+  `tests/integration/test_provider_vote_costing.py`, both observed through the
+  `ProviderVoteRecorded` rows' `provider`/`model_version` fields:
+
+  - *Default-path byte-identity.* The default `vote_ensemble` is
+    provenance-identical to `DEFAULT_VOTE_ENSEMBLE`, so a default config drives
+    the same three members in the same order as before the wiring — the
+    cassette/replay determinism guarantee is unchanged, and no config-hash
+    input moved (this remains a wiring-only change with no schema edit).
+  - *Fail-closed on an emptied ensemble.* The configured tuple is passed
+    through verbatim rather than coalesced to the default when empty, so an
+    operator who empties `forecast.vote_ensemble` gets zero votes and an
+    abstaining, live-ineligible record. Resurrecting a default triple the
+    operator deleted would be silently voting with providers nobody
+    configured. (The reason stamped is `all_votes_discarded`, the forecast
+    package's zero-survivor classification;
+    `provider_unavailable` is reserved for an all-transport-fault wipeout,
+    which requires at least one actual discard.)
+- **Cross-references:** #240 (this ADR's issue), #294 (the composition-root
+  wiring above), #184 / ADR-0005 (introduced
   `vote_ensemble` and the `ForecastProvider` seam this decision leaves
   untouched), #183 (the epic both issues belong to), #191 (the config-hash
   stability guarantee obstacle 1 protects), SPEC §5.2/§7.1 (the egress

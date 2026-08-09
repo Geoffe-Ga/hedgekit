@@ -965,6 +965,16 @@ def _forecast_stage(
     and ``market_price_baseline_pips`` (issue #188), the two fields the weekly
     evaluation/cost-meter fold reads verbatim off the payload.
 
+    The vote stage is driven from ``config.forecast.vote_ensemble`` -- the
+    authoritative vote-stage ensemble (ADR-0006), threaded here so an operator's
+    configured ensemble is the one the PAPER loop actually calls (issue #294).
+    It is passed through verbatim, never defaulted away: the default config's
+    ensemble is provenance-identical to the engine's own
+    :data:`~windbreak.forecast.providers.DEFAULT_VOTE_ENSEMBLE`, so the default
+    path is byte-identical, while an operator who empties the field gets zero
+    votes and a fail-closed abstention rather than a silent fallback to a
+    triple they configured away.
+
     Research runs under the bundle's budget (issue #339). On a budget breach the
     pipeline raises, and this stage answers ``None`` rather than fabricating a
     forecast: in a hash-chained audit ledger an honest gap beats a
@@ -1000,6 +1010,7 @@ def _forecast_stage(
             research_tools=deps.research_tools,
             ledger=vote_ledger,
             budget=deps.budget,
+            ensemble=deps.config.forecast.vote_ensemble,
         )
     except (DailyBudgetExhaustedError, PerForecastBudgetExceededError):
         return None
