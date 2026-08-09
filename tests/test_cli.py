@@ -9,15 +9,12 @@ after a bounded number of beats.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
 from windbreak.ledger.store import SqliteLedgerStore
 from windbreak.main import build_parser, main
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_build_parser_parses_run_with_defaults() -> None:
@@ -149,10 +146,10 @@ def test_alert_test_subcommand_dispatches_and_exits_zero(
 ) -> None:
     """`alert-test mode-change` dispatches via the log-only fallback and exits 0.
 
-    With no real sinks configured, `_run_alert_test` builds a dispatcher
-    with an empty sink list, so the fallback (log-only) fires and the
-    ledger writer logs an `AlertEmitted` line -- both observable as JSON on
-    stderr.
+    With no `--config`, `_run_alert_test` builds its dispatcher from the SPEC
+    §16 defaults, whose one ntfy sink is still a placeholder -- so no sink is
+    built, the fallback (log-only) fires, and the ledger writer logs an
+    `AlertEmitted` line, both observable as JSON on stderr.
     """
     exit_code = main(["alert-test", "mode-change"])
 
@@ -223,6 +220,80 @@ def test_alert_test_subcommand_message_can_be_overridden() -> None:
     args = build_parser().parse_args(["alert-test", "veto", "--message", "custom body"])
 
     assert args.message == "custom body"
+
+
+# --- issue #274: `alert-test` dispatches through the *configured* sinks -------
+
+
+def test_alert_test_subcommand_accepts_a_config_path() -> None:
+    """`--config` is how an operator proves their real sinks deliver."""
+    args = build_parser().parse_args(["alert-test", "veto", "--config", "wb.yaml"])
+
+    assert args.config == Path("wb.yaml")
+
+
+def test_alert_test_subcommand_config_defaults_to_none() -> None:
+    """Omitting `--config` falls back to the built-in §16 defaults."""
+    assert build_parser().parse_args(["alert-test", "veto"]).config is None
+
+
+def test_alert_test_subcommand_fails_closed_on_an_unreadable_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `--config` that cannot be loaded is fatal, not silently ignored."""
+    exit_code = main(["alert-test", "veto", "--config", str(tmp_path / "absent.yaml")])
+
+    assert exit_code == 1
+    assert "FATAL" in capsys.readouterr().err
+
+
+def test_alert_test_subcommand_fails_closed_on_an_off_allowlist_sink(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A webhook aimed off the declared allowlist stops the command (issue #274).
+
+    The end-to-end fail-closed proof at the CLI boundary: a sink the deployment
+    may not dial must never degrade to a healthy-looking log-only dispatch. No
+    network is touched -- the URL is refused at composition, before any POST.
+    """
+    config_path = tmp_path / "windbreak.yaml"
+    config_path.write_text(
+        "alerts:\n"
+        "  allowed_hosts: [hooks.example.com]\n"
+        "  sinks:\n"
+        "    - type: webhook\n"
+        "      url: https://169.254.169.254/latest/meta-data\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["alert-test", "veto", "--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "FATAL" in captured.err
+    assert "169.254.169.254" in captured.err
+
+
+def test_alert_test_subcommand_never_logs_a_configured_ntfy_topic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unconfigured sink is skipped loudly without leaking its topic.
+
+    An ntfy topic is a bearer capability: anyone holding it can publish to (and
+    subscribe to) the operator's alert channel, so it must never reach a log.
+    """
+    config_path = tmp_path / "windbreak.yaml"
+    config_path.write_text(
+        "alerts:\n  sinks:\n    - type: ntfy\n      topic: s3cr3t-capability\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["alert-test", "veto", "--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "s3cr3t-capability" not in captured.err
+    assert "log-only" in captured.err
 
 
 # --- issue #48: the four new `run` flags gating the always-on PAPER loop ------

@@ -5,9 +5,17 @@ Each sink implements the :class:`AlertSink` protocol -- a ``name`` plus
 call to an injectable transport, so tests exercise the wiring without touching
 a socket. Every delivery failure surfaces uniformly as :class:`SinkSendError`.
 
-Config-driven sink construction (issue #11) will wire the ``*SinkConfig``
-dataclasses here to real configuration; that seam is intentionally a plain
-dataclass with no ``windbreak.config`` dependency.
+Each ``*SinkConfig`` is intentionally a plain dataclass with no
+``windbreak.config`` dependency: the config-to-sink mapping lives one module
+over, in :mod:`windbreak.alerts.factory`, so this module stays usable (and
+testable) without a configuration at all.
+
+Every sink that dials the network -- :class:`NtfySink`, :class:`WebhookSink`,
+and :class:`SmtpSink` -- requires an :class:`~windbreak.net.allowlist.OutboundAllowlist`
+and screens its destination at *construction*, so an off-allowlist host is
+refused before a single packet leaves. :class:`DesktopSink` is exempt because it
+never leaves the machine, and :class:`LogOnlySink` because it never leaves the
+process.
 """
 
 from __future__ import annotations
@@ -217,6 +225,16 @@ def _send_http(
         raise SinkSendError(f"transport for {url!r} returned status {status}")
 
 
+#: The real HTTPS transport every network sink defaults to. Exposed under a
+#: public name so :mod:`windbreak.alerts.factory` can hand it through as an
+#: ordinary argument instead of branching on "was a test transport injected?".
+DEFAULT_HTTP_TRANSPORT: Final[HttpTransport] = _https_post
+
+#: The real SMTP transport :class:`SmtpSink` defaults to; public for the same
+#: reason as :data:`DEFAULT_HTTP_TRANSPORT`.
+DEFAULT_SMTP_TRANSPORT: Final[SmtpTransport] = _smtp_send
+
+
 class NtfySink:
     """Publish alerts to an ntfy topic over HTTPS."""
 
@@ -236,9 +254,11 @@ class NtfySink:
             transport: The HTTP transport to use. Defaults to
                 :func:`_https_post`.
             allowlist: The required outbound-network allowlist the configured
-                ``base_url`` host (and its ``https`` scheme) must satisfy. A
-                sink's host is supplied here rather than derived from config,
-                since the SPEC S16 ``AlertSink`` schema carries no ``base_url``.
+                ``base_url`` host (and its ``https`` scheme) must satisfy. The
+                allowlist is a constructor argument rather than something the
+                sink derives from its own config, so the permitted host set
+                stays an independent operator declaration the destination has
+                to clear (see :mod:`windbreak.net.allowlist`).
 
         Raises:
             EgressDeniedError: If ``config.base_url``'s host is off the
@@ -278,15 +298,31 @@ class WebhookSink:
     name = "webhook"
 
     def __init__(
-        self, config: WebhookSinkConfig, *, transport: HttpTransport = _https_post
+        self,
+        config: WebhookSinkConfig,
+        *,
+        transport: HttpTransport = _https_post,
+        allowlist: OutboundAllowlist,
     ) -> None:
-        """Initialize the sink.
+        """Initialize the sink, validating the configured endpoint up front.
 
         Args:
             config: The webhook endpoint settings.
             transport: The HTTP transport to use. Defaults to
                 :func:`_https_post`.
+            allowlist: The required outbound-network allowlist ``config.url``
+                must satisfy. Required, with no default, because a webhook URL
+                is operator-supplied config: without this screen a mistyped or
+                tampered ``url`` would let alert delivery reach an internal host
+                (SSRF). Kept identical to :class:`NtfySink`'s contract so no
+                sibling sink is the weak one.
+
+        Raises:
+            EgressDeniedError: If ``config.url``'s host is off the allowlist or
+                its scheme is not http(s) -- rejected at construction, before
+                any network call.
         """
+        allowlist.require(config.url)
         self._config = config
         self._transport = transport
 
@@ -320,15 +356,29 @@ class SmtpSink:
     name = "smtp"
 
     def __init__(
-        self, config: SmtpSinkConfig, *, transport: SmtpTransport = _smtp_send
+        self,
+        config: SmtpSinkConfig,
+        *,
+        transport: SmtpTransport = _smtp_send,
+        allowlist: OutboundAllowlist,
     ) -> None:
-        """Initialize the sink.
+        """Initialize the sink, validating the configured relay host up front.
 
         Args:
             config: The SMTP connection and addressing settings.
             transport: The SMTP transport to use. Defaults to
                 :func:`_smtp_send`.
+            allowlist: The required outbound-network allowlist ``config.host``
+                must satisfy. SMTP has no URL to screen, so the bare host goes
+                through :meth:`~windbreak.net.allowlist.OutboundAllowlist.require_host`;
+                without it SMTP would be the one outbound path with no egress
+                check at all.
+
+        Raises:
+            EgressDeniedError: If ``config.host`` is off the allowlist --
+                rejected at construction, before any connection is opened.
         """
+        allowlist.require_host(config.host)
         self._config = config
         self._transport = transport
 

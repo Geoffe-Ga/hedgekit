@@ -8,10 +8,11 @@ and the configured alert sink -- and *nothing else*, mirroring
 prompt-based) egress gate: parse-differential SSRF screening, exact
 lowercased hostname matching, and fail-closed on any parse ambiguity.
 
-`windbreak/net/allowlist.py` (and the `windbreak/net/` package itself) does
-not exist yet, so every import below fails collection with
-`ModuleNotFoundError: No module named 'windbreak.net'` -- the expected Gate 1
-RED state for issue #57.
+`windbreak/net/allowlist.py` has since shipped, so these tests are GREEN; the
+"proposed shape" notes below are retained as the record of what was agreed.
+Issue #274 added `OutboundAllowlist.require_host` (the non-URL screen an SMTP
+relay host goes through) and the `alerts.allowed_hosts` derivation in
+`allowlist_from_config`; both are covered near the bottom of this file.
 
 Proposed public shape (the implementation specialist must build to this
 exactly, or confirm/rename via the handoff):
@@ -50,14 +51,12 @@ exactly, or confirm/rename via the handoff):
     ``"api.anthropic.com"``, ``"openai"`` contributes ``"api.openai.com"``;
     any other provider name (e.g. the default triage model's
     ``"cheapest-adequate"``) contributes no host.
-  - **Open question, NOT tested here (flagged for the architect/implementer
-    to resolve):** the plan also calls for deriving a host from each
-    configured alert sink, but today's ``windbreak.config.schema.AlertSink``
-    has only ``type``/``topic`` -- no ``base_url`` -- so there is no
-    schema-level field to derive that host from without either adding a
-    banned ``type: ignore`` to force a not-yet-existing keyword argument
-    through mypy, or a test-only file editing the production schema itself.
-    See the note near the bottom of this file.
+  - ``config.alerts.allowed_hosts`` -- the operator's explicit declaration of
+    which alert-destination hosts this deployment may dial (issue #274, which
+    resolved the open question originally flagged here). Deliberately NOT the
+    per-sink ``base_url``/``url``/``smtp.host`` destinations: an allowlist
+    derived from the URLs it screens could never veto one of them. Empty by
+    default, so an undeclared deployment reaches no alert host.
 
 Issue #192 additionally derives hosts from ``config.forecast.research``
 (``windbreak.config.schema.ResearchSettings``, itself new in #192): the parsed
@@ -78,6 +77,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from windbreak.config.schema import (
+    AlertsConfig,
+    AlertSink,
     EnsembleMemberConfig,
     ForecastConfig,
     ModelRef,
@@ -474,22 +475,103 @@ def test_allowlist_from_config_research_settings_fixture_assumption() -> None:
     assert ForecastConfig().research == ResearchSettings()
 
 
-# --- ModelRef sanity (documents the fixture assumption above) ------------------
+# --- Alert-sink host derivation (issue #274 resolved the open question) --------
 #
-# NOTE (flagged for implementation/architect to confirm, not itself tested
-# here): the architect's plan also calls for deriving an allowlist host from
-# each configured alert sink's ``base_url``. Today's
-# ``windbreak.config.schema.AlertSink`` has only ``type``/``topic`` -- no
-# ``base_url`` -- so there is no schema-level field to derive that host from
-# yet, and this file cannot pin that sub-behavior without either (a) adding a
-# banned ``type: ignore`` to force a not-yet-existing keyword argument
-# through mypy, or (b) itself editing the production schema (out of scope for
-# a test-only file). Whether ``AlertSink`` should gain a ``base_url`` field,
-# or the alert-sink host should instead be derived from the runtime
-# ``windbreak.alerts.sinks.NtfySinkConfig`` the operator separately
-# constructs, is an open question for the chief architect / implementation
-# specialist to resolve; `allowlist_from_config`'s exchange- and
-# forecast-provider-host derivation below does not depend on the answer.
+# The question flagged here for the architect -- where the configured alert
+# sink's host comes from -- is answered by issue #274: it comes from
+# ``alerts.allowed_hosts``, a dedicated operator-declared list, and NOT from
+# the per-sink ``base_url``/``url``/``smtp.host`` destination fields the same
+# section now also carries. Deriving the allowlist from the very URLs it
+# screens would make the check unfalsifiable (every configured sink would
+# admit itself), so the declaration is kept independent of the destination.
+# The tests below pin both halves of that.
+
+
+def test_allowlist_from_config_derives_declared_alert_hosts() -> None:
+    """Each ``alerts.allowed_hosts`` entry joins the allowlist, case-insensitively."""
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        alerts=AlertsConfig(allowed_hosts=("Ntfy.Example", "hooks.example")),
+    )
+
+    allowlist = allowlist_from_config(config)
+
+    allowlist.require("https://ntfy.example/topic")
+    allowlist.require("https://hooks.example/incoming")
+
+
+def test_allowlist_from_config_ignores_the_sink_destination_fields() -> None:
+    """A sink destination alone never admits its own host.
+
+    This is what keeps the egress check able to *veto* a configured sink: if
+    `base_url` fed the allowlist, no configured sink could ever be denied and
+    the check would be decorative.
+    """
+    config = dataclasses.replace(
+        WindbreakConfig(),
+        alerts=AlertsConfig(
+            sinks=(
+                AlertSink(type="ntfy", topic="ops", base_url="https://ntfy.example"),
+            ),
+        ),
+    )
+
+    with pytest.raises(EgressDeniedError):
+        allowlist_from_config(config).require("https://ntfy.example/ops")
+
+
+def test_allowlist_from_config_derives_no_alert_host_by_default() -> None:
+    """The shipped default declares no alert host, so alert egress is closed."""
+    assert WindbreakConfig().alerts.allowed_hosts == ()
+
+    with pytest.raises(EgressDeniedError):
+        allowlist_from_config(WindbreakConfig()).require("https://ntfy.sh/topic")
+
+
+class TestRequireHost:
+    """Tests for `OutboundAllowlist.require_host`, the non-URL egress screen.
+
+    SMTP (`windbreak.alerts.sinks.SmtpSink`) speaks to a bare host over a
+    non-http scheme, so `require`'s URL shape cannot screen it; without
+    `require_host` SMTP would be the one outbound path with no allowlist.
+    """
+
+    def test_allowlisted_host_is_permitted(self) -> None:
+        """A declared host passes, case-insensitively."""
+        OutboundAllowlist(frozenset({"smtp.example"})).require_host("SMTP.Example")
+
+    def test_off_list_host_raises(self) -> None:
+        """An undeclared host is denied."""
+        with pytest.raises(EgressDeniedError):
+            OutboundAllowlist(frozenset({"smtp.example"})).require_host(
+                "relay.internal"
+            )
+
+    def test_empty_host_raises(self) -> None:
+        """An empty host is denied rather than treated as a wildcard."""
+        with pytest.raises(EgressDeniedError):
+            OutboundAllowlist(frozenset({"smtp.example"})).require_host("")
+
+    def test_control_character_in_host_raises(self) -> None:
+        """A control/whitespace byte fails closed before any matching."""
+        with pytest.raises(EgressDeniedError):
+            OutboundAllowlist(frozenset({"smtp.example"})).require_host(
+                "smtp.example\nrelay.internal"
+            )
+
+    def test_denial_records_an_egress_denied_event_and_still_raises(self) -> None:
+        """Telemetry is additive: the recorder never suppresses the refusal."""
+        recorder = _RecordingRecorder()
+        allowlist = OutboundAllowlist(frozenset({"smtp.example"}), recorder=recorder)
+
+        with pytest.raises(EgressDeniedError):
+            allowlist.require_host("relay.internal")
+
+        assert [event.event_type for event in recorder.events] == ["EgressDenied"]
+        assert recorder.events[0].payload == {"host": "relay.internal"}
+
+
+# --- ModelRef sanity (documents the fixture assumption above) ------------------
 
 
 def test_default_ensemble_providers_are_anthropic_and_openai() -> None:

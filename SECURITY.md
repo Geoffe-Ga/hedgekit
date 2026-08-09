@@ -83,11 +83,40 @@ lowercased hostname before the dial is permitted; anything else raises
 `EgressDeniedError` and — when a ledger recorder is wired — records exactly
 one `EgressDenied` event (telemetry never gates the refusal; the raise always
 happens first). `allowlist_from_config` derives the permitted host set from
-`config.exchange.provider`, `config.exchange.environment`, and each
-recognized provider in `config.forecast.ensemble`,
-`config.forecast.triage_model`, and `config.forecast.vote_ensemble`; an
-unrecognized provider contributes no host, so an unknown exchange or model
-can never silently inherit network access.
+`config.exchange.provider`, `config.exchange.environment`, each recognized
+provider in `config.forecast.ensemble`, `config.forecast.triage_model`, and
+`config.forecast.vote_ensemble`, the `config.forecast.research` hosts, and
+`config.alerts.allowed_hosts`; an unrecognized provider contributes no host, so
+an unknown exchange or model can never silently inherit network access.
+
+### Alert-sink egress
+
+Every alert sink that leaves the box — `NtfySink`, `WebhookSink`, and
+`SmtpSink` — takes the allowlist as a **required** constructor argument and
+screens its destination at construction, so an off-list host is refused before
+a single packet is sent (`SmtpSink` has no URL, so its bare relay host goes
+through `OutboundAllowlist.require_host`). `DesktopSink` and `LogOnlySink` are
+exempt: neither leaves the machine.
+
+The hosts an alert may reach come from `alerts.allowed_hosts` **only** — never
+from the sink entries' own `base_url`/`url`/`smtp.host` fields. Deriving the
+allowlist from the URLs it screens would make the check unfalsifiable: every
+configured sink would admit itself and the veto could never fire. Requiring the
+host in two independent fields means a single mistyped or tampered destination
+cannot open egress on its own. `alerts.allowed_hosts` is empty by default, so a
+deployment that has declared nothing reaches nothing.
+
+A sink whose destination is off the allowlist, whose type is unrecognized, or
+which cannot deliver as configured raises `AlertSinkConfigError` at composition
+and stops the process — a broken alerting path is never degraded to a
+healthy-looking log-only dispatch. A sink the operator simply has not filled in
+yet is skipped with a WARNING naming its *type only*, and the alert still
+surfaces through the dispatcher's log-only fallback.
+
+Alert destinations are treated as secrets: an ntfy topic is a bearer capability
+and a webhook URL can embed a token, so no log line or error message emitted by
+`windbreak.alerts.factory` ever contains more of a destination than its
+hostname.
 
 ## Supply chain
 

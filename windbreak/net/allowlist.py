@@ -8,21 +8,26 @@ boundary **structural rather than advisory**, mirroring
 screened for parse-differential SSRF bytes and matched by exact, lowercased
 hostname against a fixed allowlist before a connector may dial it.
 
-:class:`OutboundAllowlist` fails closed: :meth:`~OutboundAllowlist.require`
-*always* raises :class:`EgressDeniedError` on a denial, and only *additionally*
-records an ``EgressDenied`` ledger event when a recorder is wired -- telemetry
-never gates the refusal. :func:`allowlist_from_config` derives the host set from
-a :class:`~windbreak.config.schema.WindbreakConfig`: the exchange host (by
+:class:`OutboundAllowlist` fails closed: :meth:`~OutboundAllowlist.require` and
+:meth:`~OutboundAllowlist.require_host` *always* raise
+:class:`EgressDeniedError` on a denial, and only *additionally* record an
+``EgressDenied`` ledger event when a recorder is wired -- telemetry never gates
+the refusal. :func:`allowlist_from_config` derives the host set from a
+:class:`~windbreak.config.schema.WindbreakConfig`: the exchange host (by
 provider/environment) and each forecast provider host. An unrecognized provider
 contributes no host, so an unknown exchange or model can never silently inherit
 network access.
 
-Alert-sink hosts are deliberately *not* derived here: the SPEC S16
-:class:`~windbreak.config.schema.AlertSink` schema carries only ``type``/
-``topic`` (no ``base_url``), and SPEC S16 is canonical with unknown keys fatal,
-so there is no config field to derive one from. An alert sink's host is instead
-supplied at :class:`~windbreak.alerts.sinks.NtfySink` construction time via its
-own explicit allowlist.
+Alert-sink hosts *are* derived here (issue #274), from
+:attr:`~windbreak.config.schema.AlertsConfig.allowed_hosts` -- and from that
+field **only**, never from the per-sink ``base_url``/``url``/``smtp.host``
+destinations the same section carries. Deriving the allowlist from the very URLs
+it screens would make the check unfalsifiable: every configured sink would admit
+itself and the veto could never fire. Keeping the declaration separate means an
+operator must state the host twice, in two independent fields, so a single
+mistyped or tampered destination cannot open egress on its own.
+``allowed_hosts`` is empty by default, so an undeclared deployment reaches no
+alert host at all.
 
 This module sits on the network boundary but off the money path; it is
 float-free by construction (it does no arithmetic).
@@ -37,6 +42,7 @@ from windbreak.ledger.events import Event
 
 if TYPE_CHECKING:
     from windbreak.config.schema import (
+        AlertsConfig,
         ExchangeConfig,
         ForecastConfig,
         ResearchSettings,
@@ -191,6 +197,29 @@ class OutboundAllowlist:
         if hostname.lower() not in self._hosts:
             self._deny(url, hostname)
 
+    def require_host(self, host: str) -> None:
+        """Permit a bare hostname if allowlisted, else record (if wired) and raise.
+
+        The URL-shaped :meth:`require` cannot screen a destination that is not a
+        URL. An SMTP relay (:class:`windbreak.alerts.sinks.SmtpSink`) is exactly
+        that: a host and a port spoken to over a non-http scheme. Without this
+        method SMTP egress would be the one outbound path with no allowlist at
+        all, so the same host set gates it here.
+
+        Args:
+            host: The bare outbound hostname to check (no scheme, no port).
+
+        Raises:
+            EgressDeniedError: If the host contains a control or whitespace
+                character, is empty, or is not on the allowlist.
+        """
+        if _has_unsafe_url_chars(host):
+            self._deny(host, None)
+        if not host:
+            self._deny(host, None)
+        if host.lower() not in self._hosts:
+            self._deny(host, host)
+
     def _deny(self, url: str, host: str | None) -> NoReturn:
         """Record an ``EgressDenied`` event (if wired), then always raise.
 
@@ -279,6 +308,21 @@ def _research_hosts(research: ResearchSettings) -> frozenset[str]:
     return frozenset(hosts)
 
 
+def _alert_hosts(alerts: AlertsConfig) -> frozenset[str]:
+    """Derive the alert-destination host set from the alerts configuration.
+
+    Args:
+        alerts: The alerts configuration section.
+
+    Returns:
+        Each ``allowed_hosts`` entry, lowercased. The per-sink destination
+        fields contribute nothing (see the module docstring): a host the
+        operator has not separately declared is not reachable, which is what
+        keeps the allowlist able to veto a configured sink at all.
+    """
+    return frozenset(host.lower() for host in alerts.allowed_hosts)
+
+
 def allowlist_from_config(
     config: WindbreakConfig, *, recorder: EventRecorder | None = None
 ) -> OutboundAllowlist:
@@ -286,11 +330,11 @@ def allowlist_from_config(
 
     The host set is the union of the exchange host (:func:`_exchange_hosts`), the
     forecast-provider hosts (:func:`_forecast_hosts`, spanning the legacy
-    ``ensemble``, the ``triage_model``, and each ``vote_ensemble`` member), and
-    the live-research hosts (:func:`_research_hosts`). Alert-sink hosts are not
-    derived here (see the module docstring). An unrecognized exchange or model
-    provider, and an unconfigured research section, each contribute no host, so
-    the resulting allowlist fails closed.
+    ``ensemble``, the ``triage_model``, and each ``vote_ensemble`` member), the
+    live-research hosts (:func:`_research_hosts`), and the operator-declared
+    alert-destination hosts (:func:`_alert_hosts`). An unrecognized exchange or
+    model provider, an unconfigured research section, and an undeclared alerts
+    section each contribute no host, so the resulting allowlist fails closed.
 
     Args:
         config: The windbreak configuration to derive hosts from.
@@ -304,5 +348,6 @@ def allowlist_from_config(
         _exchange_hosts(config.exchange)
         | _forecast_hosts(config.forecast)
         | _research_hosts(config.forecast.research)
+        | _alert_hosts(config.alerts)
     )
     return OutboundAllowlist(hosts, recorder=recorder)

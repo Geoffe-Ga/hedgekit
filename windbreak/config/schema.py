@@ -13,6 +13,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+#: The repo-wide "the operator must fill this in" placeholder. A field still
+#: holding it is *unconfigured*, and every consumer treats it as such by failing
+#: closed (contributing no allowlist host, building no sink) rather than by
+#: inventing a plausible-looking real-world default.
+UNCONFIGURED_PLACEHOLDER = "configured-by-operator"
+
 #: Metadata tag naming the YAML key a field is read from when it differs from
 #: the field's own name (e.g. ``bootstrap_confidence`` -> ``*_ppm``).
 _YAML_KEY = "yaml_key"
@@ -48,16 +54,63 @@ class ModelRef:
 
 
 @dataclass(frozen=True, slots=True)
+class SmtpSinkSettings:
+    """SMTP relay settings for an ``smtp``-type :class:`AlertSink` (issue #274).
+
+    The config-schema mirror of
+    :class:`windbreak.alerts.sinks.SmtpSinkConfig`. ``host``/``sender`` carry no
+    safe real-world default, so they ship as :data:`UNCONFIGURED_PLACEHOLDER`
+    and an untouched section builds no SMTP sink at all.
+
+    Attributes:
+        host: The SMTP relay hostname. Screened against the outbound allowlist
+            before a sink is built, exactly like an ntfy/webhook host.
+        port: The SMTP relay port; ``587`` is the STARTTLS submission port the
+            sink's transport upgrades on.
+        sender: The envelope/from address alerts are sent as.
+        recipients: The operator addresses alerts are delivered to. Empty means
+            unconfigured: an email with no recipient cannot be delivered.
+    """
+
+    host: str = UNCONFIGURED_PLACEHOLDER
+    port: int = 587
+    sender: str = UNCONFIGURED_PLACEHOLDER
+    recipients: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class AlertSink:
     """A destination for operator alerts.
 
+    One flat entry describes every supported sink type, with only the fields
+    that type needs filled in (issue #274 bridged SPEC S16's original
+    ``type``/``topic`` pair to the concrete
+    ``windbreak.alerts.sinks.*SinkConfig`` shapes). The alternative -- a
+    separate schema class per sink type -- cannot be expressed in a single
+    homogeneous ``tuple[AlertSink, ...]`` the loader can build, so the union is
+    carried here and :func:`windbreak.alerts.factory.build_sinks` reads only the
+    fields belonging to ``type``. Every destination field defaults to
+    :data:`UNCONFIGURED_PLACEHOLDER`, so an entry the operator has not finished
+    filling in builds no sink instead of dialing a made-up endpoint.
+
     Attributes:
-        type: The sink transport (e.g. ``ntfy``).
-        topic: The operator-configured topic or channel to publish to.
+        type: The sink transport: ``ntfy``, ``webhook``, ``smtp``, or
+            ``desktop``. Anything else is fatal at sink-construction time.
+        topic: The ntfy topic to publish to. Unused by the other types. Treat it
+            as a credential -- an ntfy topic is a bearer capability -- so it is
+            never logged.
+        base_url: The ``https://`` ntfy server base URL. Unused by other types.
+        url: The ``https://`` endpoint a ``webhook`` sink POSTs to. Unused by
+            other types, and treated as secret-bearing (it may embed a token),
+            so only its host is ever named in a log line or error.
+        smtp: The relay settings an ``smtp`` sink connects with.
     """
 
     type: str
-    topic: str
+    topic: str = UNCONFIGURED_PLACEHOLDER
+    base_url: str = UNCONFIGURED_PLACEHOLDER
+    url: str = UNCONFIGURED_PLACEHOLDER
+    smtp: SmtpSinkSettings = field(default_factory=SmtpSinkSettings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +292,7 @@ class FutureSearchProviderSettings:
             (strict) or proceeds with a logged warning.
     """
 
-    endpoint_url: str = "configured-by-operator"
+    endpoint_url: str = UNCONFIGURED_PLACEHOLDER
     pinned_forecaster_versions: tuple[str, ...] = ("pinned-by-operator",)
     api_key_env: str = "FUTURESEARCH_API_KEY"
     per_call_ceiling_micros: int = 2000000
@@ -274,7 +327,7 @@ class ResearchSettings:
         allowed_content_types: The response media types a live fetch accepts.
     """
 
-    search_endpoint_url: str = "configured-by-operator"
+    search_endpoint_url: str = UNCONFIGURED_PLACEHOLDER
     search_api_key_env: str = "RESEARCH_SEARCH_API_KEY"
     allowed_research_hosts: tuple[str, ...] = ()
     fetch_timeout_seconds: int = 30
@@ -384,15 +437,31 @@ class OpsConfig:
 
 
 def _default_alert_sinks() -> tuple[AlertSink, ...]:
-    """Return the SPEC §16 default single ntfy alert sink."""
-    return (AlertSink("ntfy", "configured-by-operator"),)
+    """Return the SPEC §16 default single, deliberately unconfigured ntfy sink."""
+    return (AlertSink("ntfy", UNCONFIGURED_PLACEHOLDER),)
 
 
 @dataclass(frozen=True, slots=True)
 class AlertsConfig:
-    """Operator alert-sink fan-out configuration."""
+    """Operator alert-sink fan-out configuration.
+
+    Attributes:
+        sinks: The destinations each alert fans out to. The SPEC §16 default is
+            one placeholder ntfy sink, which builds nothing until an operator
+            fills in its ``base_url``/``topic``.
+        allowed_hosts: The alert-destination hosts this deployment may dial,
+            unioned into :func:`windbreak.net.allowlist.allowlist_from_config`'s
+            egress allowlist. Deliberately *separate* from the per-sink
+            destination fields (issue #274): if the allowlist were derived from
+            the sink URLs themselves it could never veto one of them, and a
+            check that cannot fail is worse than no check. Requiring the host to
+            be declared twice, in two independent fields, means a single
+            mistyped or tampered destination cannot open egress on its own.
+            Empty by default, so an undeclared deployment reaches nothing.
+    """
 
     sinks: tuple[AlertSink, ...] = field(default_factory=_default_alert_sinks)
+    allowed_hosts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

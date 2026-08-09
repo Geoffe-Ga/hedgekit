@@ -309,6 +309,56 @@ pass.
 - Weekly reports are structural stubs (`No data yet.` bodies); the real
   report content is a later pass.
 
+## Operator alerts
+
+Alerts reach you only through the sinks `config.alerts` declares. Until you
+declare one, every alert falls back to the log-only sink: it appears on stderr
+as a JSON `AlertEmitted` line and **nowhere else**. That is the shipped default
+(`alerts.sinks` holds one `configured-by-operator` ntfy placeholder), so treat
+configuring a real sink as a prerequisite for any unattended run.
+
+### Configure a sink
+
+Each entry needs `type` plus the fields that type uses, and every destination
+host must **also** be declared in `alerts.allowed_hosts` — the outbound egress
+allowlist is deliberately separate from the destination, so a mistyped URL
+cannot open egress by itself:
+
+```yaml
+alerts:
+  allowed_hosts: [ntfy.sh, hooks.example.com, smtp.example.com]
+  sinks:
+    - type: ntfy
+      base_url: https://ntfy.sh
+      topic: your-private-topic     # a bearer capability: keep it secret
+    - type: webhook
+      url: https://hooks.example.com/services/TOKEN
+    - type: smtp
+      smtp:
+        host: smtp.example.com
+        port: 587
+        sender: windbreak@example.com
+        recipients: [ops@example.com]
+```
+
+`desktop` is also a valid type, but only for a process that supplies a desktop
+notifier; the CLI does not, so a `desktop` entry makes it exit 1 rather than
+pretend it can notify you.
+
+### Verify delivery
+
+```bash
+windbreak alert-test mode-change --config /path/to/windbreak.yaml
+```
+
+Read the `AlertEmitted` line's per-sink outcomes on stderr. `"ntfy=ok:True"`
+means it was delivered; a `log-only` outcome means no sink was built or every
+sink failed. Startup **fails closed** (exit 1, `FATAL:` on stderr) when a sink
+names an unknown type, targets a host missing from `allowed_hosts`, or cannot
+deliver as configured — a half-wired alerting path is never silently downgraded.
+A sink you have not finished filling in is skipped with a WARNING naming its
+type only; no topic or webhook URL is ever logged.
+
 ## Provider operations
 
 Fleet-observability provider canaries (issue #195, SPEC S8.4/S16 extended

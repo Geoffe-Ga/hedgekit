@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from windbreak.alerts import AlertDispatcher, AlertType, LoggingLedgerWriter, cli_token
+from windbreak.alerts.factory import AlertSinkConfigError, build_sinks
 from windbreak.config import (
     ConfigError,
     InMemoryConfigEventRecorder,
@@ -529,6 +530,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_ALERT_MESSAGE,
         help="Alert body to dispatch (default: %(default)s).",
     )
+    alert_parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to a SPEC §16 YAML config whose alert sinks to dispatch "
+        "through (default: built-in §16 defaults, i.e. log-only).",
+    )
     return parser
 
 
@@ -628,13 +636,43 @@ def _load_configured(
     return load_default_config(recorder=recorder)
 
 
+def _build_alert_dispatcher(config: WindbreakConfig) -> AlertDispatcher:
+    """Compose the alert dispatcher from the configured sinks (issue #274).
+
+    The single place the CLI turns ``alerts.sinks`` into live delivery channels,
+    screened against the deployment's own egress allowlist. Every process shares
+    it so no composition site can quietly regress to the log-only fallback the
+    way all three did before this existed.
+
+    Args:
+        config: The loaded configuration whose alerts section supplies the
+            sinks and whose whole shape supplies the egress allowlist.
+
+    Returns:
+        A dispatcher over every deliverable configured sink. With none
+        configured the sink list is empty and the dispatcher's ``log-only``
+        fallback carries the alert.
+
+    Raises:
+        AlertSinkConfigError: If a sink names an unknown type, targets a host
+            outside ``alerts.allowed_hosts``, or cannot deliver as configured.
+    """
+    from windbreak.net.allowlist import allowlist_from_config
+
+    return AlertDispatcher(
+        sinks=build_sinks(config.alerts, allowlist=allowlist_from_config(config)),
+        ledger_writer=LoggingLedgerWriter(),
+    )
+
+
 def _run_preflight(args: argparse.Namespace) -> int:
     """Run the production-readiness checklist and print its report (SPEC S3.3).
 
     Builds the injected seams -- a fixture-backed read-only connector, an honest
     no-self-test scope prober (the real self-test client is issue #57), a
-    trade-key environment-leak prober over :data:`os.environ`, a log-only alert
-    dispatcher, and the configured secrets paths -- runs the seven checks, and
+    trade-key environment-leak prober over :data:`os.environ`, an alert
+    dispatcher over the *configured* sinks (issue #274; log-only when none are
+    configured), and the configured secrets paths -- runs the seven checks, and
     prints the report as JSON or a table to stdout. The connector and preflight
     imports are local so the RESEARCH heartbeat path never imports them.
 
@@ -673,7 +711,11 @@ def _run_preflight(args: argparse.Namespace) -> int:
         _LOGGER.critical("FATAL: %s", exc)
         return 1
     connector = FakeExchange.from_fixture_dir(args.fixture_dir)
-    dispatcher = AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter())
+    try:
+        dispatcher = _build_alert_dispatcher(config)
+    except AlertSinkConfigError as exc:
+        _LOGGER.critical("FATAL: %s", exc)
+        return 1
     report = run_preflight(
         connector=connector,
         scope_prober=_NullScopeProber(),
@@ -738,21 +780,31 @@ def _run_drill(args: argparse.Namespace) -> int:
 
 
 def _run_alert_test(args: argparse.Namespace) -> int:
-    """Dispatch a single test alert through the log-only fallback.
+    """Dispatch a single test alert through the configured sinks.
 
-    With no real sinks configured, the dispatcher's fallback fires and the
+    The operator's end-to-end proof that alerting works: with ``--config`` the
+    alert travels the real sinks that config declares, and with none (or none
+    configured) the dispatcher's log-only fallback fires instead. Either way the
     ledger writer logs the resulting :class:`~windbreak.alerts.AlertEmitted`
-    event, both observable as JSON on stderr.
+    event, whose per-sink outcomes are observable as JSON on stderr -- so a sink
+    that silently fails to deliver is visible here rather than during an
+    incident.
 
     Args:
-        args: Parsed ``alert-test`` arguments carrying ``type`` and
-            ``message``.
+        args: Parsed ``alert-test`` arguments carrying ``type``, ``message``,
+            and ``config``.
 
     Returns:
-        The process exit code (always 0).
+        The process exit code: 0 on dispatch, 1 on a fatal ``--config`` or
+        sink-configuration error.
     """
     alert_type = _TOKEN_TO_ALERT_TYPE[args.type]
-    dispatcher = AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter())
+    recorder = InMemoryConfigEventRecorder()
+    try:
+        dispatcher = _build_alert_dispatcher(_load_configured(args, recorder))
+    except (ConfigError, AlertSinkConfigError) as exc:
+        _LOGGER.critical("FATAL: %s", exc)
+        return 1
     dispatcher.dispatch(alert_type, args.message)
     return 0
 
@@ -1256,8 +1308,9 @@ def _build_risk_kernel(
     :meth:`RiskKernel.from_events`. The shared writer means each cycle's
     verification *event* lands on the same hash-chained ledger the kernel
     persists to; the shared dispatcher means mismatch and jurisdiction *alerts*
-    fan out through the same sink chain the kill switch uses (log-only in this
-    composition, whose dispatcher has no persisting sinks). This is what makes the
+    fan out through the same sink chain the kill switch uses -- since issue #274
+    the sinks ``config.alerts`` declares, falling back to log-only only when the
+    operator has configured none. This is what makes the
     ``AUTO_RECONCILIATION`` auto-kill trigger *live* rather than
     composed-but-dormant: a sustained reconciliation ``BREACH`` now feeds the
     shared monitor and engages the shared kill switch. With no connector the
@@ -1294,6 +1347,9 @@ def _build_risk_kernel(
         OSError: If ``ops.state_dir`` cannot be created (fail-closed startup).
         ChainIntegrityError: If a supplied ``ledger_store``'s hash chain fails
             verification (fail-closed replay).
+        AlertSinkConfigError: If ``config.alerts`` declares a sink that cannot
+            work -- the kernel refuses to start rather than run the money path
+            believing it can page an operator when it cannot.
     """
     from windbreak.riskkernel.kill import (
         KillFileWatcher,
@@ -1320,8 +1376,8 @@ def _build_risk_kernel(
         history = ()
     # One dispatcher shared by the kill switch's HALT_KILL alerts and (when a
     # verification connector is wired) the verifier's mismatch/jurisdiction
-    # alerts, so both fan out through the same ledger-writing sink chain.
-    dispatcher = AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter())
+    # alerts, so both fan out through the same configured sinks (issue #274).
+    dispatcher = _build_alert_dispatcher(config)
     switch = KillSwitch.from_events(
         history, machine, writer, dispatcher, state_dir=state_dir
     )
