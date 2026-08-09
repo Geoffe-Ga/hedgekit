@@ -2033,3 +2033,62 @@ class TestReplayAnchor:
         assert exchange.get_order_book("MKT-DEEP").fetched_at == datetime(
             2025, 1, 1, tzinfo=UTC
         )
+
+
+class TestReplayAnchorMovesTheVenueClock:
+    """`get_exchange_time` follows the replay anchor, never the read instant."""
+
+    def test_anchor_shifts_the_venue_clock_by_the_recordings_own_offset(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The venue clock moves by the same offset the books moved by (#377).
+
+        `deep_walk` records its `exchange_time` at the same instant as its
+        earliest book, so an anchored replay puts the venue clock on the anchor
+        -- the recording's internal relationship between venue clock and book is
+        preserved, exactly as the inter-step deltas are.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk", replay_anchor=_REPLAY_ANCHOR
+        )
+
+        assert exchange.get_exchange_time() == _REPLAY_ANCHOR
+
+    def test_the_venue_clock_does_not_renew_itself_on_every_read(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Two reads at different observation instants return one answer (#377).
+
+        This is the property the whole issue turns on. `get_exchange_status`
+        legitimately restamps `fetched_at` per read, because that field records
+        *when we observed*, and an in-process answer genuinely happened now. A
+        venue *clock* records what the venue thinks the time is, and restamping
+        it from our own clock would make `clock_skew_limit` compare the local
+        clock with itself -- skew zero, forever, for any drift. So the clock is
+        anchored once and left alone, even as the observation clock advances.
+        """
+        instants = [_REPLAY_ANCHOR]
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "deep_walk",
+            clock=lambda: instants[0],
+            replay_anchor=_REPLAY_ANCHOR,
+        )
+
+        first = exchange.get_exchange_time()
+        instants[0] = _REPLAY_ANCHOR + timedelta(hours=1)
+        second = exchange.get_exchange_time()
+
+        assert first == second == _REPLAY_ANCHOR
+        assert exchange.get_exchange_status().fetched_at == instants[0]
+
+    def test_an_unanchored_replay_keeps_the_recorded_venue_clock(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """Without an anchor the fixture's own recorded clock survives untouched.
+
+        The anchor is opt-in; a caller replaying verbatim gets the recording's
+        literals, so this change cannot silently re-date an existing consumer.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
+
+        assert exchange.get_exchange_time() == _TS

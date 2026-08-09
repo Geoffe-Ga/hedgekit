@@ -107,17 +107,28 @@ _SURVIVING_VETO_REASONS = (
     "participation cap exceeded",
 )
 
-#: What `_SURVIVING_VETO_REASONS` becomes once the replayed book has aged past
-#: `quote_ttl_seconds`, in SPEC S10.3 check order: `quote_freshness` sits at
-#: position 14, between `concentration_limits` (10) and
-#: `participation_cap_compliance` (17), so the new reason lands *between* the
-#: two survivors rather than after them. Exact equality again, for the same
-#: reason: a membership check would not prove the veto arrived in the right
-#: place, nor that nothing else changed when the clock moved.
+#: What `_SURVIVING_VETO_REASONS` becomes once the run's clock has advanced
+#: past `quote_ttl_seconds` while the replay stayed where it was, in SPEC S10.3
+#: check order:
+#:
+#: * `quote is stale or missing` (position 14) -- the point of issue #369. It
+#:   lands *between* the two original survivors (`concentration_limits` at 10,
+#:   `participation_cap_compliance` at 17) rather than after them.
+#: * `clock skew exceeds limit` (position 21) -- issue #377's consequence, and
+#:   a genuine one rather than a nuisance. A replay's venue clock does not
+#:   advance with wall time, so eleven seconds of wall clock against a
+#:   two-second `clock_skew_max_seconds` is real divergence between our clock
+#:   and the venue's. Before #377 this reason was unreachable at any drift.
+#:
+#: Both arrive from the same single act of moving the clock, which is precisely
+#: why the tuple is compared with exact equality: a membership check would not
+#: prove either veto arrived in the right place, nor that nothing *else*
+#: changed when the clock moved.
 _STALE_QUOTE_VETO_REASONS = (
     "concentration limit exceeded",
     "quote is stale or missing",
     "participation cap exceeded",
+    "clock skew exceeds limit",
 )
 
 
@@ -162,6 +173,7 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
         exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
         pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
+        exchange_clock_epoch_s=int(deps.exchange.get_exchange_time().timestamp()),
         open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
         equity_start_of_day=start_of_day_equity_micros(
             deps.store.read_all(), now_epoch_s=now_epoch_s
@@ -503,7 +515,9 @@ def test_loop_context_vetoes_a_book_aged_past_its_quote_ttl(
       surviving reasons are exactly `_SURVIVING_VETO_REASONS` -- no quote
       reason;
     * one second past `quote_ttl_seconds` the very same book vetoes, and the
-      reason lands at its SPEC S10.3 position (`_STALE_QUOTE_VETO_REASONS`).
+      reason lands at its SPEC S10.3 position (`_STALE_QUOTE_VETO_REASONS`) --
+      alongside `clock skew exceeds limit`, since the same clock move also
+      drifts the run away from the replay's own venue clock (issue #377).
 
     Only the clock moves between the two evaluations. The exchange, the ledger,
     the verification snapshot, and the book itself are identical, so the
