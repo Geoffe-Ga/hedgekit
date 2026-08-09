@@ -25,10 +25,16 @@ frozen fixture, the ledger-derived *expectation* and the exchange-reported
 could not fail for any reason -- checks that structurally cannot fail are worse
 than no checks at all.
 
-Consistency guard (issue #18): a taker walk can span multiple book levels, each
-needing its own :class:`~windbreak.connector.models.Fill` price, so the
-constructor rejects any balance semantics whose ``partial_fill_representation``
-is not :attr:`PartialFillRepresentation.PER_FILL_RECORDS`.
+Consistency guard (issues #18, #362): the constructor rejects any fixture whose
+:class:`~windbreak.connector.semantics.BalanceSemantics` claims a behavior this
+simulator does not implement (see :data:`_SEMANTICS_REQUIREMENTS`). A taker walk
+spans multiple book levels, each needing its own
+:class:`~windbreak.connector.models.Fill` price, so partial fills must be
+``PER_FILL_RECORDS``; and the three collateral answers are implemented exactly
+one way each by :meth:`PaperExchange.get_balances` and
+:meth:`PaperExchange.cancel_order`. A semantics record that disagrees with the
+behavior is worse than one that admits ignorance: ``UNKNOWN`` makes a consumer
+fail closed, a confidently wrong flag makes it fail open.
 
 This package is float-denylisted by ``scripts/lint_no_floats.py``: no ``/`` true
 division, no ``float`` literal, cast, or annotation appears here.
@@ -69,7 +75,12 @@ from windbreak.connector.models import (
     OrderBookLevel,
     Position,
 )
-from windbreak.connector.semantics import PartialFillRepresentation
+from windbreak.connector.semantics import (
+    CancelCollateralRelease,
+    OrderCollateralInAvailable,
+    OrderCollateralInTotal,
+    PartialFillRepresentation,
+)
 from windbreak.numeric import (
     ContractCentis,
     MoneyMicros,
@@ -81,6 +92,7 @@ from windbreak.numeric import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from enum import Enum
     from typing import Any, Literal
 
     from windbreak.connector.fees import FeeModel
@@ -116,6 +128,76 @@ _MONEY_ROUNDING: Final[RoundingDirection] = RoundingDirection.OVERSTATE_COST
 #: at more than it cost. Matches the PAPER loop's own ``notional // quantity``
 #: position projection (``windbreak/scheduler/loop.py``).
 _PRICE_ROUNDING: Final[RoundingDirection] = RoundingDirection.UNDERSTATE_EQUITY
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticsRequirement:
+    """One balance-semantics answer this simulator implements in exactly one way.
+
+    Attributes:
+        field: The :class:`~windbreak.connector.semantics.BalanceSemantics`
+            field being constrained.
+        required: The only member of that field's enum whose meaning this
+            simulator's behavior actually matches.
+        because: The behavior that pins it, quoted into the rejection message so
+            a fixture author is told *why* the fixture cannot be simulated.
+    """
+
+    field: str
+    required: Enum
+    because: str
+
+
+#: The answers :class:`PaperExchange` hard-codes by construction. A fixture that
+#: claims a different one is refused rather than simulated wrong (issues #18,
+#: #362): ``get_balance_semantics`` is the contract a consumer reads to decide
+#: how much of ``available`` it may commit, so it must describe this class's
+#: real behavior and not the venue a fixture author wishes were being replayed.
+_SEMANTICS_REQUIREMENTS: Final[tuple[_SemanticsRequirement, ...]] = (
+    _SemanticsRequirement(
+        field="partial_fill_representation",
+        required=PartialFillRepresentation.PER_FILL_RECORDS,
+        because="the taker walk emits one Fill per consumed book level",
+    ),
+    _SemanticsRequirement(
+        field="open_order_collateral_in_available",
+        required=OrderCollateralInAvailable.DEDUCTED_FROM_AVAILABLE,
+        because="get_balances withholds every resting order's collateral from "
+        "available",
+    ),
+    _SemanticsRequirement(
+        field="open_order_collateral_in_total",
+        required=OrderCollateralInTotal.INCLUDED,
+        because="get_balances debits total only when a fill executes, so a "
+        "resting order's collateral is still inside total",
+    ),
+    _SemanticsRequirement(
+        field="cancel_collateral_release",
+        required=CancelCollateralRelease.IMMEDIATE,
+        because="cancel_order drops the resting order outright, so the next "
+        "get_balances already counts its collateral as free",
+    ),
+)
+
+
+def _require_implemented_semantics(semantics: BalanceSemantics) -> None:
+    """Reject a semantics record this simulator would misreport.
+
+    Args:
+        semantics: The fixture's balance-interpretation semantics.
+
+    Raises:
+        ValueError: If any field in :data:`_SEMANTICS_REQUIREMENTS` holds a
+            member other than the one this class implements. The message names
+            the field, the required member, and the behavior that pins it.
+    """
+    for requirement in _SEMANTICS_REQUIREMENTS:
+        actual = getattr(semantics, requirement.field)
+        if actual is not requirement.required:
+            raise ValueError(
+                f"{requirement.field} must be {requirement.required.name}, got "
+                f"{actual.name}; {requirement.because}"
+            )
 
 
 class TwoSidedPositionError(RuntimeError):
@@ -296,7 +378,9 @@ class PaperExchange:
     prints. Crossing orders fill immediately via the pessimistic taker walk;
     remainders rest and fill only on a later step's trade-through. Positions and
     balances are both folded from the resulting fill log (issue #352), so they
-    move only when the simulator actually trades.
+    move only when the simulator actually trades -- and ``available`` also
+    withholds every resting order's collateral (issue #362), so the balance
+    semantics this connector advertises is the one it implements.
 
     Attributes:
         markets: Ticker-keyed normalized markets.
@@ -342,19 +426,14 @@ class PaperExchange:
             max_participation_ppm: The participation cap on recorded depth, in ppm.
 
         Raises:
-            ValueError: If ``balance_semantics.partial_fill_representation`` is
-                not :attr:`PartialFillRepresentation.PER_FILL_RECORDS`; a taker
-                walk emits one fill per consumed level, so aggregated partial
-                fills would lose per-level prices (issue #18).
+            ValueError: If ``balance_semantics`` answers any question in
+                :data:`_SEMANTICS_REQUIREMENTS` differently from the way this
+                class behaves -- aggregated partial fills would lose the taker
+                walk's per-level prices (issue #18), and a collateral answer
+                this simulator does not implement would make
+                :meth:`get_balance_semantics` a lying flag (issue #362).
         """
-        if (
-            balance_semantics.partial_fill_representation
-            is not PartialFillRepresentation.PER_FILL_RECORDS
-        ):
-            raise ValueError(
-                "partial_fill_representation must be PER_FILL_RECORDS; "
-                "the taker walk emits one Fill per consumed book level"
-            )
+        _require_implemented_semantics(balance_semantics)
         self.markets = markets
         self.sessions = sessions
         self.exchange_status = exchange_status
@@ -469,29 +548,59 @@ class PaperExchange:
         return self.exchange_time
 
     def get_balance_semantics(self) -> BalanceSemantics:
-        """Return the fixture balance semantics."""
+        """Return the fixture balance semantics, every answer of which is implemented.
+
+        The constructor refuses any fixture whose collateral or partial-fill
+        answers this class does not actually behave like
+        (:data:`_SEMANTICS_REQUIREMENTS`), so this record is a description of
+        :meth:`get_balances` and :meth:`cancel_order`, not an aspiration about
+        the venue a session was recorded from (issues #18, #362).
+
+        Returns:
+            The venue's balance-interpretation semantics.
+        """
         return self.balance_semantics
 
     def get_balances(self) -> BalanceSnapshot:
-        """Return the opening balance less everything this exchange has spent.
+        """Return the opening balance less what is spent and what is pledged.
 
-        Every fill debits its book cost plus the fee schedule's charge on that
-        fill, from both ``total`` and ``available``: buying a fully
-        collateralized binary converts cash into contracts, and the contracts
-        are reported separately by :meth:`get_positions`. The slippage haircut
+        ``total`` is the opening total less every *executed* cash movement: each
+        fill's book cost plus the fee schedule's charge on that fill. Buying a
+        fully collateralized binary converts cash into contracts, and the
+        contracts are reported separately by :meth:`get_positions`. Resting
+        collateral is not taken out of ``total`` -- the money is pledged, not
+        gone -- which is exactly the ``INCLUDED`` answer
+        :meth:`get_balance_semantics` gives for
+        ``open_order_collateral_in_total``.
+
+        ``available`` is that same figure less every resting order's
+        reservation, making the advertised ``DEDUCTED_FROM_AVAILABLE`` true
+        rather than merely claimed (issue #362). Without the withholding a
+        consumer reading ``available`` as spendable could authorize a second
+        order against cash already committed to a live one -- a wrong flag makes
+        callers fail open, which is worse than the ``UNKNOWN`` that makes them
+        fail closed.
+
+        A reservation is the resting order's book cost *plus* the same
+        worst-case fee bound the fill will be charged. Reserving the fee is not
+        a fee debit -- ``total`` still moves only at execution, honoring
+        ``fee_debit_timing == AT_EXECUTION`` -- it keeps the reservation an
+        upper bound on the cash the order will consume, so a caller that spends
+        all of ``available`` cannot be left a fee short. Understating a
+        reservation is the direction that lets cash be double-committed, and it
+        makes a resting fill land as a continuous conversion: what was withheld
+        is precisely what gets spent, so ``available`` does not move when a
+        resting order fills at its own limit.
+
+        The slippage haircut
         (:data:`~windbreak.connector.fills.DEFAULT_FEE_HAIRCUT_PPM`) is
-        deliberately *not* debited -- it is a pessimism allowance the sizing
-        path reasons with, not money the venue takes.
+        deliberately *not* charged anywhere here -- it is a pessimism allowance
+        the sizing path reasons with, not money the venue takes.
 
-        The debit is never floored at zero. A paper account that spent more than
-        it opened with reports a negative balance, because clamping would hide
-        exactly the simulator-fidelity bug the number exists to expose.
-
-        Known gap (deliberately out of issue #352's scope): resting-order
-        collateral is not withheld from ``available``, even though the fixture
-        :meth:`get_balance_semantics` advertises
-        ``DEDUCTED_FROM_AVAILABLE``. Only *filled* cash movements are modeled,
-        so ``available`` overstates free cash while an order rests.
+        Neither figure is floored at zero. A paper account that spent or pledged
+        more than it opened with reports a negative balance, because clamping
+        would hide exactly the simulator-fidelity bug the number exists to
+        expose.
 
         Returns:
             The current balances, stamped at the observation instant.
@@ -499,7 +608,9 @@ class PaperExchange:
         spent = self._cash_spent_micros()
         return BalanceSnapshot(
             total=MoneyMicros(self.balances.total.value - spent),
-            available=MoneyMicros(self.balances.available.value - spent),
+            available=MoneyMicros(
+                self.balances.available.value - spent - self._reserved_micros()
+            ),
             fetched_at=self._clock(),
         )
 
@@ -519,15 +630,55 @@ class PaperExchange:
             The total book cost plus fees across every simulated fill, in
             micros.
         """
-        spent = 0
-        for fill in self._fills:
-            spent += money_from_price_and_count(
-                fill.price, fill.quantity, rounding=_MONEY_ROUNDING
-            ).value
-            spent += self.get_fee_model(fill.ticker).max_trading_fee_micros(
-                fill.price.value, fill.quantity.value
-            )
-        return spent
+        return sum(
+            self._order_cash_micros(fill.ticker, fill.price, fill.quantity)
+            for fill in self._fills
+        )
+
+    def _reserved_micros(self) -> int:
+        """Return the cash this exchange's resting orders have pledged, in micros.
+
+        Each resting order reserves what it would cost to fill entirely at its
+        own limit -- the same book-cost-plus-fee arithmetic
+        :meth:`_cash_spent_micros` applies to a completed fill, which is what
+        makes filling a resting order balance-neutral for ``available``. A
+        cancelled order leaves :attr:`_resting` immediately, so its reservation
+        disappears from the next reading (``CancelCollateralRelease.IMMEDIATE``).
+
+        Returns:
+            The total collateral withheld for currently resting orders, in
+            micros.
+        """
+        return sum(
+            self._order_cash_micros(order.ticker, order.price, order.quantity)
+            for order in self._resting
+        )
+
+    def _order_cash_micros(
+        self, ticker: str, price: PricePips, quantity: ContractCentis
+    ) -> int:
+        """Return the cash ``quantity`` at ``price`` moves on ``ticker``, in micros.
+
+        Both sides are priced in their own frame: a NO order's notional is its
+        NO price times its size, matching how :meth:`get_positions` folds the
+        fill log, so a NO reservation is never taken at the YES complement.
+
+        Args:
+            ticker: The market the cash moves on (selects the fee schedule).
+            price: The trade or limit price, in that side's own pips.
+            quantity: The size, in contract-centis; must be positive, which
+                every emitted fill and every resting remainder is.
+
+        Returns:
+            The book cost plus the venue's worst-case trading fee, in micros.
+        """
+        book_cost = money_from_price_and_count(
+            price, quantity, rounding=_MONEY_ROUNDING
+        ).value
+        fee = self.get_fee_model(ticker).max_trading_fee_micros(
+            price.value, quantity.value
+        )
+        return book_cost + fee
 
     def get_positions(self) -> tuple[Position, ...]:
         """Return the holdings this exchange's own fills have accumulated.
@@ -901,6 +1052,11 @@ class PaperExchange:
 
     def cancel_order(self, order_id: str) -> None:
         """Remove the resting order with ``order_id`` (a no-op if absent).
+
+        The order leaves the resting book here and nowhere else, so the next
+        :meth:`get_balances` no longer withholds its collateral -- the
+        ``CancelCollateralRelease.IMMEDIATE`` answer
+        :meth:`get_balance_semantics` advertises (issue #362).
 
         Args:
             order_id: The identifier of the resting order to cancel.
