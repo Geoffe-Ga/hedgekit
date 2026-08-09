@@ -59,7 +59,7 @@ _SECURITY_SCRIPT = _SCRIPTS_DIR / "security.sh"
 #: `test_architecture_scripts_inherited_path_is_documented` for the reason it is
 #: the one documented still-inherited sub-check.
 _GATE_SCRIPT_TOOLS: dict[str, tuple[str, ...]] = {
-    "lint.sh": ("ruff", "python3"),
+    "lint.sh": ("ruff", "python3", "pre-commit"),
     "format.sh": ("ruff",),
     "typecheck.sh": ("mypy",),
     "security.sh": ("bandit", "pip-audit", "pre-commit"),
