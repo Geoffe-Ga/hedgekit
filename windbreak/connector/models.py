@@ -22,11 +22,12 @@ keep importing the whole SPEC S6.2 surface from one place.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from windbreak.connector.fees import FeeModel as FeeModel
 from windbreak.connector.semantics import BalanceSemantics as BalanceSemantics
+from windbreak.timekeeping import iso_z, require_aware
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -177,7 +178,11 @@ class NormalizedMarket:
             TypeError: If a unit int field is a ``bool`` or non-``int``.
             ValueError: If ``market_type`` or ``jurisdiction_status`` is
                 unrecognized, a strictly-positive unit int field is non-positive,
-                ``volume_24h_micros`` is negative, or the payload hash is empty.
+                ``volume_24h_micros`` is negative, the payload hash is empty, or
+                ``close_time``/``expected_resolution_time`` carries no UTC
+                offset (issue #397). An offsetless ``close_time`` decides
+                whether a market reads as open or closed, so it is refused here
+                rather than measured against the host's timezone.
         """
         _require_market_type(self.market_type)
         _require_jurisdiction(self.jurisdiction_status)
@@ -188,6 +193,9 @@ class NormalizedMarket:
         _require_nonnegative_unit_int(self.volume_24h_micros, "volume_24h_micros")
         if not self.raw_exchange_payload_hash:
             raise ValueError("raw_exchange_payload_hash must be non-empty")
+        require_aware(self.close_time, "close_time")
+        if self.expected_resolution_time is not None:
+            require_aware(self.expected_resolution_time, "expected_resolution_time")
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,18 +311,6 @@ class Fill:
     ts: datetime
 
 
-def _iso_z(moment: datetime) -> str:
-    """Render a datetime as ISO-8601 UTC with a trailing ``Z``.
-
-    Args:
-        moment: The (timezone-aware) datetime to render; normalized to UTC.
-
-    Returns:
-        A string like ``2024-12-18T19:00:00.000000Z``.
-    """
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-
 def _jsonable_field(value: object) -> object:
     """Convert one market field value into a JSON-safe leaf.
 
@@ -326,7 +322,7 @@ def _jsonable_field(value: object) -> object:
     Returns:
         The JSON-safe projection of ``value``.
     """
-    return _iso_z(value) if isinstance(value, datetime) else value
+    return iso_z(value) if isinstance(value, datetime) else value
 
 
 def market_to_payload(market: NormalizedMarket) -> dict[str, object]:

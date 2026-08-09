@@ -36,6 +36,7 @@ from datetime import UTC
 from typing import TYPE_CHECKING, Final, Protocol
 
 from windbreak.numeric.rounding import RoundingDirection, divide
+from windbreak.timekeeping import iso_z, require_aware
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -178,28 +179,25 @@ DEFAULT_PROVIDER_PRICE_TABLE: Final[ProviderPriceTable] = ProviderPriceTable(
 def _utc_day_key(at: datetime) -> str:
     """Return the ISO ``YYYY-MM-DD`` UTC-day key for an instant.
 
+    The single choke point for the day bucket: :meth:`ResearchBudget.ensure_day_open`
+    and :meth:`ResearchBudget.charge_forecast` both route through it (and
+    :meth:`ResearchBudget.charge_stage` delegates to the latter), so guarding
+    the awareness invariant here covers every spend path at once.
+
     Args:
-        at: The (timezone-aware) instant to bucket.
+        at: The instant to bucket, which **must** be timezone-aware.
 
     Returns:
         The instant's UTC calendar date as an ISO-8601 date string.
+
+    Raises:
+        ValueError: If ``at`` carries no UTC offset. A naive instant read as
+            host-local time buckets spend to the wrong calendar day (issue
+            #397), so the daily ceiling silently resets or double-counts across
+            the UTC-midnight boundary.
     """
+    require_aware(at, "at")
     return at.astimezone(UTC).date().isoformat()
-
-
-def _iso_z(moment: datetime) -> str:
-    """Render a datetime as ISO-8601 UTC with a trailing ``Z``.
-
-    Follows the local-``_iso_z`` precedent in ``triage.py``/``pipeline.py``/
-    ``records.py`` (each module defines its own) rather than sharing one.
-
-    Args:
-        moment: The (timezone-aware) datetime to render; normalized to UTC.
-
-    Returns:
-        A string like ``2024-12-10T12:00:00.000000Z``.
-    """
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,7 +366,7 @@ class ResearchBudget:
                 "budget_micros": self._per_day_micros,
             }
             self._ledger.record(
-                BudgetEvent(BUDGET_DAY_EXHAUSTED_EVENT, payload, _iso_z(at))
+                BudgetEvent(BUDGET_DAY_EXHAUSTED_EVENT, payload, iso_z(at))
             )
             raise DailyBudgetExhaustedError(spent, self._per_day_micros, day)
 
@@ -410,7 +408,7 @@ class ResearchBudget:
                 "utc_day": day,
             }
             self._ledger.record(
-                BudgetEvent(BUDGET_FORECAST_EXCEEDED_EVENT, payload, _iso_z(at))
+                BudgetEvent(BUDGET_FORECAST_EXCEEDED_EVENT, payload, iso_z(at))
             )
             raise PerForecastBudgetExceededError(
                 forecast_cost_micros, self._per_forecast_micros
@@ -553,5 +551,5 @@ def report_research_costs(
         payload["cost_per_resolved_forecast_micros"] = per_resolved
     if per_profitable is not None:
         payload["cost_per_profitable_trade_micros"] = per_profitable
-    ledger.record(BudgetEvent(COST_REPORT_EVENT, payload, _iso_z(at)))
+    ledger.record(BudgetEvent(COST_REPORT_EVENT, payload, iso_z(at)))
     return report

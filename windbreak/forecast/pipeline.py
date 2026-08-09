@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, Protocol
 
 from windbreak.forecast.calibration import ensure_temporal_integrity
@@ -56,9 +55,11 @@ from windbreak.forecast.sanitize import (
     extract_quote,
     sanitize_content,
 )
+from windbreak.timekeeping import iso_z
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+    from datetime import datetime
 
     from windbreak.connector.models import NormalizedMarket
     from windbreak.forecast.budget import ResearchBudget
@@ -423,18 +424,6 @@ def _clamp_between(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
-def _iso_z(moment: datetime) -> str:
-    """Render a datetime as ISO-8601 UTC with a trailing ``Z``.
-
-    Args:
-        moment: The (timezone-aware) datetime to render; normalized to UTC.
-
-    Returns:
-        A string like ``2024-12-10T12:00:00.000000Z``.
-    """
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-
 def _baseline_probability_ppm(baseline: BaselineQuoteSnapshot) -> int:
     """Convert a baseline pip price into a clamped ppm probability.
 
@@ -665,7 +654,7 @@ def _build_discard_recorder(
         raise ValueError(
             "collect_model_votes requires created_at when a ledger is supplied"
         )
-    return _DiscardRecorder(ledger=ledger, ts=_iso_z(created_at))
+    return _DiscardRecorder(ledger=ledger, ts=iso_z(created_at))
 
 
 def _build_model_vote(forecast: ProviderForecast) -> ModelVote:
@@ -1072,7 +1061,7 @@ def _forecast_id(question_hash: str, snapshot_id: str, created_at: datetime) -> 
         A sha256 hex digest over the canonical JSON of the three inputs.
     """
     canonical = json.dumps(
-        [question_hash, snapshot_id, _iso_z(created_at)],
+        [question_hash, snapshot_id, iso_z(created_at)],
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -1355,7 +1344,7 @@ def _apply_and_record_calibration(
             "output_ppm": calibrated_ppm,
         }
         ledger.record(
-            ForecastEvent(CALIBRATION_MAP_APPLIED_EVENT, payload, _iso_z(created_at))
+            ForecastEvent(CALIBRATION_MAP_APPLIED_EVENT, payload, iso_z(created_at))
         )
     return calibrated_ppm
 
@@ -1399,7 +1388,7 @@ def _provider_gate_open(
             "min_brier_skill_ppm": provider_gate.min_brier_skill_ppm,
         }
         ledger.record(
-            ForecastEvent(PROVIDER_GATE_HELD_EVENT, payload, _iso_z(created_at))
+            ForecastEvent(PROVIDER_GATE_HELD_EVENT, payload, iso_z(created_at))
         )
     return False
 
@@ -1466,7 +1455,7 @@ def _reported_citation(citation: ProviderCitation) -> Citation:
         The audit-trail citation.
     """
     publication_iso = (
-        _iso_z(citation.publication_date)
+        iso_z(citation.publication_date)
         if citation.publication_date is not None
         else None
     )

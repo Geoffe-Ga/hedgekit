@@ -18,8 +18,10 @@ as lists of dicts, no float leaf anywhere) for ledger/event emission.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING
+
+from windbreak.timekeeping import iso_z, require_aware
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -238,11 +240,12 @@ class BaselineQuoteSnapshot:
 
         Raises:
             TypeError: If ``price_pips`` is a ``bool`` or non-``int``.
-            ValueError: If ``price_pips`` is non-positive or ``snapshot_id``
-                is empty.
+            ValueError: If ``price_pips`` is non-positive, ``snapshot_id`` is
+                empty, or ``fetched_at`` carries no UTC offset (issue #397).
         """
         _require_positive_unit_int(self.price_pips, "price_pips")
         _require_non_empty(self.snapshot_id, "snapshot_id")
+        require_aware(self.fetched_at, "fetched_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,7 +308,8 @@ class ForecastRecord:
         Raises:
             TypeError: If any ppm field is a ``bool`` or non-``int``.
             ValueError: If any ppm field is out of range, ``forecast_id`` or
-                ``market_ticker`` is empty, ``triage_stage`` is unrecognized,
+                ``market_ticker`` is empty, ``created_at`` carries no UTC offset
+                (issue #397), ``triage_stage`` is unrecognized,
                 or the record is ``eligible_for_live`` while any
                 live-ineligibility trigger holds. Three independent triggers each
                 force live-ineligibility: ``triage_stage == "triage_only"`` (a
@@ -319,6 +323,7 @@ class ForecastRecord:
             _require_ppm(getattr(self, field_name), field_name)
         _require_non_empty(self.forecast_id, "forecast_id")
         _require_non_empty(self.market_ticker, "market_ticker")
+        require_aware(self.created_at, "created_at")
         if self.triage_stage not in _TRIAGE_STAGES:
             allowed = ", ".join(sorted(_TRIAGE_STAGES))
             raise ValueError(
@@ -339,18 +344,6 @@ class ForecastRecord:
             )
 
 
-def _iso_z(moment: datetime) -> str:
-    """Render a datetime as ISO-8601 UTC with a trailing ``Z``.
-
-    Args:
-        moment: The (timezone-aware) datetime to render; normalized to UTC.
-
-    Returns:
-        A string like ``2024-12-10T12:00:00.000000Z``.
-    """
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-
 def _jsonable(value: object) -> object:
     """Convert one record value into a JSON-safe node, recursively.
 
@@ -366,7 +359,7 @@ def _jsonable(value: object) -> object:
         The JSON-safe projection of ``value``.
     """
     if isinstance(value, datetime):
-        return _iso_z(value)
+        return iso_z(value)
     if isinstance(value, tuple):
         return [_jsonable(item) for item in value]
     if isinstance(value, ModelVote | Citation):
