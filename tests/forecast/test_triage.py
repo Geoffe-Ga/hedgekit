@@ -121,9 +121,11 @@ if TYPE_CHECKING:
 #: reads against the same, single source of truth.
 _BASELINE_PPM = 450_000
 
-#: The fixed Stage-0 prior cost, in micros (2% of `PER_FORECAST_BUDGET_MICROS`),
-#: restated as a literal so a mutant to the module's divisor is caught rather
-#: than mirrored.
+#: The fixed Stage-0 prior cost, in micros -- 2% of the *full-pipeline research
+#: cost* this stage exists to avoid paying, not 2% of the per-forecast ceiling
+#: (SPEC S8.4; deriving it from the ceiling would be self-referential, since the
+#: ceiling is itself derived from this cost -- issue #394). Restated as a
+#: literal so a mutant to the module's divisor is caught rather than mirrored.
 _STAGE0_COST_MICROS = 60_000
 
 #: The research cost a full `run_pipeline` run charges with this package's
@@ -132,8 +134,12 @@ _STAGE0_COST_MICROS = 60_000
 _FULL_RUN_RESEARCH_COST_MICROS = 3_000_000
 
 #: What one PROCEED-path triaged run truly costs: the full pipeline plus the
-#: Stage-0 prior folded into it. Deliberately *greater* than the SPEC S16
-#: per-forecast default, which is why the budget must see the total.
+#: Stage-0 prior folded into it. Greater than either stage alone, which is why
+#: the per-forecast ceiling must be checked against this total and never per
+#: stage. How it compares to the shipped per-forecast default is *asserted*
+#: rather than narrated here -- see
+#: `test_a_triaged_run_fits_under_the_shipped_per_forecast_default`, because a
+#: comment stating that comparison went stale when the default moved (#394).
 _TRIAGED_RUN_TOTAL_COST_MICROS = _FULL_RUN_RESEARCH_COST_MICROS + _STAGE0_COST_MICROS
 
 
@@ -210,6 +216,19 @@ def test_triage_threshold_and_budget_constants_have_expected_values() -> None:
     """
     assert TRIAGE_THRESHOLD_PPM == 50_000
     assert PER_FORECAST_BUDGET_MICROS == 6_060_000
+
+
+def test_a_triaged_run_fits_under_the_shipped_per_forecast_default() -> None:
+    """A real PROCEED-path triaged run is affordable at the shipped default.
+
+    The relationship issue #394 settled, asserted from the triage side. The two
+    constants were once both `3_000_000`, so this very total (`3_060_000`)
+    exceeded the default ceiling and a *correct* triaged run failed closed
+    before producing anything. Stated as an assertion rather than a comment
+    because the comment that used to state it went stale the moment either
+    constant moved.
+    """
+    assert _TRIAGED_RUN_TOTAL_COST_MICROS < PER_FORECAST_BUDGET_MICROS
 
 
 # --- Stage-0 prior: parsing, cost, and the single-call contract ------------------

@@ -1454,19 +1454,25 @@ def test_pipeline_cost_overrun_member_run_survives_with_a_generous_budget(
     votes survive into a full record.
     """
     ledger = InMemoryForecastLedger()
-    # A genuinely generous per-forecast ceiling: comfortably above the run's
-    # full charge (`_FULL_RUN_RESEARCH_COST_MICROS` + the 750_000 discarded
-    # cost-overrun member cost), so the fail-closed budget never trips and the
-    # two surviving votes aggregate into a full record. The default ceiling
-    # (`DEFAULT_PER_FORECAST_BUDGET_MICROS`, 3_000_000) is *below* that charge,
-    # so it would raise -- which the adjacent ceiling-trick test asserts.
+    # A genuinely generous per-forecast ceiling: strictly above the run's full
+    # charge (research plus the discarded cost-overrun member's cost), so the
+    # fail-closed budget never trips and the two surviving votes aggregate into
+    # a full record. The generosity is *asserted* rather than described: this
+    # was a comment comparing the ceiling to a module constant, and it silently
+    # went false when that constant moved (issue #394). An assertion cannot.
+    failed_member_cost_micros = 750_000
+    exact_charge_micros = _FULL_RUN_RESEARCH_COST_MICROS + failed_member_cost_micros
+    generous_per_forecast_micros = 10_000_000
+    assert generous_per_forecast_micros > exact_charge_micros
     generous_budget = ResearchBudget(
-        per_forecast_micros=10_000_000, ledger=InMemoryBudgetLedger()
+        per_forecast_micros=generous_per_forecast_micros, ledger=InMemoryBudgetLedger()
     )
     routes: dict[str, ForecastProvider] = {
         _MEMBER_A.model_version: _success_provider(_MEMBER_A),
         _MEMBER_B.model_version: _FailingProvider(
-            ProviderCostOverrunError(cost_micros=750_000, ceiling_micros=1_000_000)
+            ProviderCostOverrunError(
+                cost_micros=failed_member_cost_micros, ceiling_micros=1_000_000
+            )
         ),
         _MEMBER_C.model_version: _success_provider(_MEMBER_C),
     }
