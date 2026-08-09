@@ -71,7 +71,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.config import config_hash
@@ -92,9 +92,15 @@ from windbreak.forecast.budget import (
 )
 from windbreak.forecast.cassettes import ReplayCassette
 from windbreak.forecast.pipeline import (
+    PROVIDER_GATE_HELD_EVENT,
     PROVIDER_VOTE_COSTED_EVENT,
     InMemoryForecastLedger,
     run_pipeline,
+)
+from windbreak.forecast.providers.track_record import (
+    InMemoryTrackRecordSource,
+    ProviderTrackRecordGate,
+    parse_track_records,
 )
 from windbreak.forecast.records import BaselineQuoteSnapshot
 from windbreak.forecast.sandbox import build_research_tools
@@ -106,6 +112,7 @@ from windbreak.ledger.events import (
     ModeHeartbeat,
     PipelineHeartbeatRecorded,
     PositionsSnapshotRecorded,
+    ProviderGateHeld,
     ProviderVoteRecorded,
     ResearchBudgetHalted,
     SelectorDecisionRecorded,
@@ -250,6 +257,14 @@ _SAMPLE_EPOCH_KEY = "epoch_s"
 #: built when a caller supplies none. The offline default never actually
 #: searches, so nothing is ever fetched against it.
 _DEFAULT_RESEARCH_HOST = "research.local"
+
+#: The M6 per-provider track-record artifact the loop's live-eligibility gate
+#: reads, resolved inside the same ``report_dir`` every other evaluation
+#: artifact is written to (issue #305). Public because it is an operator- and
+#: test-facing convention: the file an evaluation pass must write for a provider
+#: to become live-eligible. Absent, the loop bootstraps fail-closed (every
+#: provider unproven); malformed, it refuses to start.
+PROVIDER_TRACK_RECORD_FILENAME: Final = "provider-track-records.json"
 
 
 # --- approval seam (the load-bearing constraint) --------------------------------
@@ -990,6 +1005,13 @@ class PaperTickDeps:
             anything on an always-on loop. :func:`dataclasses.replace` shares
             the same instance by design, so swapping the ``approval`` seam
             cannot reset the day.
+        provider_gate: The per-provider track-record live-eligibility gate every
+            tick's forecast runs under (issue #305). Built once per process from
+            the M6 track-record artifact and the configured thresholds, and
+            deliberately non-optional: a ``None`` here would be a loop that
+            grants live eligibility to providers with no measured edge, which
+            SPEC S19 forbids outright, so the type makes an ungated loop
+            unrepresentable rather than merely discouraged.
     """
 
     config: WindbreakConfig
@@ -1007,6 +1029,7 @@ class PaperTickDeps:
     report_dir: Path
     clock: Callable[[], int]
     budget: ResearchBudget
+    provider_gate: ProviderTrackRecordGate
 
 
 def _default_clock() -> int:
@@ -1261,6 +1284,64 @@ def _build_research_budget(
     )
 
 
+def _build_provider_gate(
+    report_dir: Path, config: WindbreakConfig
+) -> ProviderTrackRecordGate:
+    """Build the loop's per-provider track-record gate from artifact + config.
+
+    The gate is a *read model* over M6's evaluation output (SPEC S13/S16, S19):
+    it consumes each provider's resolved-forecast count and Brier skill from the
+    :data:`PROVIDER_TRACK_RECORD_FILENAME` artifact beside the loop's other
+    evaluation artifacts, and never recomputes a score itself.
+
+    Two policies are deliberate and both fail *closed*:
+
+    * **Bootstrap (artifact absent).** Before the first evaluation pass has
+      written a record, every provider is unproven, so every full forecast is
+      held back from live eligibility. That is the honest reading of "no
+      measured edge yet", and it is the direction a mistake must point: a loop
+      that granted live eligibility while no track record existed would let an
+      entirely unmeasured provider back a live order.
+    * **Malformed artifact.** :func:`parse_track_records` raises, and this
+      function lets the raise out, aborting startup. Degrading to an empty
+      source would *also* withhold eligibility, but it would do so while
+      silently discarding an operator's evaluation output -- a broken pass and
+      a genuinely empty one must not look the same from the outside.
+
+    The thresholds come from ``config.forecast.provider_gate`` -- the dedicated
+    per-provider knob whose defaults mirror ``config.evaluation``'s own
+    promotion bars (``min_resolved_for_calibration`` /
+    ``brier_skill_required_ppm``) -- and are never defaulted away to the gate's
+    own module-level constants, so an operator who raises the bar gets the bar
+    they raised.
+
+    Args:
+        report_dir: The evaluation-artifact directory the track-record document
+            is resolved inside.
+        config: The active configuration supplying the two thresholds.
+
+    Returns:
+        The process-lived per-provider live-eligibility gate.
+
+    Raises:
+        ValueError: If the artifact exists but is not a readable, strictly
+            integer track-record document -- aborting startup rather than
+            trading on a record the loop could not parse.
+    """
+    artifact = report_dir / PROVIDER_TRACK_RECORD_FILENAME
+    records = (
+        parse_track_records(artifact.read_text(encoding="utf-8"))
+        if artifact.is_file()
+        else {}
+    )
+    bars = config.forecast.provider_gate
+    return ProviderTrackRecordGate(
+        InMemoryTrackRecordSource(records.values()),
+        min_resolved=bars.min_resolved,
+        min_brier_skill_ppm=bars.min_brier_skill_ppm,
+    )
+
+
 def build_paper_deps(
     *,
     books_dir: Path,
@@ -1278,6 +1359,13 @@ def build_paper_deps(
     signing key shared by the kernel and gateway (SPEC S10.6), and wires the real
     approval seam, gateway (boot-recovered), and reconciler over them.
 
+    It also builds the process's one per-provider track-record gate from
+    ``report_dir``'s M6 artifact and ``config.forecast.provider_gate`` (see
+    :func:`_build_provider_gate`). Like the research budget there is deliberately
+    no ``provider_gate`` parameter: config plus artifact are the only sources, so
+    an ungated -- and therefore unmeasured-edge-granting -- loop has no injection
+    door to arrive through.
+
     Args:
         books_dir: The paper-exchange fixture directory (books/markets/fees).
         cassette_path: The recorded LLM cassette the offline replay transport
@@ -1291,6 +1379,11 @@ def build_paper_deps(
 
     Returns:
         A fully wired :class:`PaperTickDeps`.
+
+    Raises:
+        ValueError: If a configured ceiling is negative, or the track-record
+            artifact exists but cannot be read as a strict integer document --
+            either way refusing to start rather than running unguarded.
     """
     resolved_clock = clock if clock is not None else _default_clock
     # The exchange must observe on the same clock the tick reads, or its status
@@ -1333,6 +1426,7 @@ def build_paper_deps(
         report_dir=report_dir,
         clock=resolved_clock,
         budget=_build_research_budget(store, config),
+        provider_gate=_build_provider_gate(report_dir, config),
     )
 
 
@@ -1423,6 +1517,15 @@ def _forecast_stage(
     votes and a fail-closed abstention rather than a silent fallback to a
     triple they configured away.
 
+    Live eligibility additionally runs through the bundle's per-provider
+    track-record gate (issue #305), so SPEC S13/S16's "earned, never granted"
+    promotion bar is enforced by the PAPER loop itself rather than merely being
+    available at the ``run_pipeline`` seam. A provider the M6 track record has
+    not proven cannot back a live order: its votes still run and still cost
+    (that is how a paper track record accrues at all), only the record's
+    ``eligible_for_live`` is forced ``False``, and the reason is ledgered as a
+    ``ProviderGateHeld`` row.
+
     Research runs under the bundle's budget (issue #339). On a budget breach the
     pipeline raises, and this stage answers ``None`` rather than fabricating a
     forecast: in a hash-chained audit ledger an honest gap beats a
@@ -1459,6 +1562,7 @@ def _forecast_stage(
             ledger=vote_ledger,
             budget=deps.budget,
             ensemble=deps.config.forecast.vote_ensemble,
+            provider_gate=deps.provider_gate,
         )
     except (DailyBudgetExhaustedError, PerForecastBudgetExceededError):
         return None
@@ -1475,7 +1579,46 @@ def _forecast_stage(
         )
     )
     _ledger_provider_votes(deps, forecast.forecast_id, vote_ledger)
+    _ledger_provider_gate_holds(deps, forecast, vote_ledger)
     return forecast
+
+
+def _ledger_provider_gate_holds(
+    deps: PaperTickDeps, forecast: ForecastRecord, vote_ledger: InMemoryForecastLedger
+) -> None:
+    """Fold a buffered provider-gate hold into a durable ``ProviderGateHeld`` row.
+
+    The pipeline buffers at most one :data:`PROVIDER_GATE_HELD_EVENT` per run
+    (only a full run that reaches aggregation screens providers at all, and it
+    screens them once); this composition-root fold stamps it with the tick's own
+    ``forecast_id`` and ``market_ticker`` -- neither of which the forecast-side
+    payload carries -- and appends it to the durable store after the tick's
+    ``ForecastCreated`` and its ``ProviderVoteRecorded`` rows. Ordering the hold
+    *after* the vote rows keeps the audit trail in causal order: the votes
+    happened, then their providers were screened.
+
+    A run that abstains before the vote stage buffers no such event, so a
+    default offline tick's ledger is unchanged by this fold.
+
+    Args:
+        deps: The tick's dependency bundle (its ``store`` receives the row).
+        forecast: The tick's forecast record, supplying the correlating
+            ``forecast_id`` and ``market_ticker``.
+        vote_ledger: The in-memory ledger the pipeline buffered the hold into.
+    """
+    for event in vote_ledger.events_by_type(PROVIDER_GATE_HELD_EVENT):
+        payload = event.payload
+        deps.store.append(
+            ProviderGateHeld(
+                component=_COMPONENT,
+                forecast_id=forecast.forecast_id,
+                market_ticker=forecast.market_ticker,
+                unproven_providers=cast("str", payload["unproven_providers"]),
+                unproven_count=cast("int", payload["unproven_count"]),
+                min_resolved=cast("int", payload["min_resolved"]),
+                min_brier_skill_ppm=cast("int", payload["min_brier_skill_ppm"]),
+            )
+        )
 
 
 def _ledger_provider_votes(
