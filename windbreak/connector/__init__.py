@@ -10,7 +10,13 @@ surface: caller-scoped freshness checks (:mod:`windbreak.connector.freshness`),
 schema-drift validation (:mod:`windbreak.connector.validation`), and rate
 limiting / retry / circuit breaking (:mod:`windbreak.connector.resilience`).
 :mod:`windbreak.connector.readonly` narrows the surface further still, to the
-five account/market reads a verification cycle may hold (SPEC S1.1 invariant 3).
+five account/market reads a verification cycle may hold (SPEC S1.1 invariant 3),
+and :mod:`windbreak.connector.live` narrows it along the other axis -- the five
+*market-data* reads a live-book paper session may hold -- and builds one over a
+real Kalshi connector (issue #343). That module alone is deliberately *not*
+re-exported below: it imports the venue HTTP client, and importing this package
+must stay cheap for the forecast sandbox, which reaches it transitively through
+:mod:`windbreak.connector.models`.
 Everything on the price/money path uses :mod:`windbreak.numeric` scaled-integer
 types -- never floats (enforced by ``scripts/lint_no_floats.py``).
 """

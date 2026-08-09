@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     from typing import Any, Literal
 
     from windbreak.connector.fees import FeeModel
+    from windbreak.connector.live import MarketDataSource
     from windbreak.connector.models import (
         BalanceSemantics,
         ExchangeStatus,
@@ -130,6 +131,7 @@ if TYPE_CHECKING:
 __all__ = [
     "COMPLEMENT_PIPS",
     "PAPER_FILL_MODEL_VERSION",
+    "LiveBookPaperExchange",
     "PaperExchange",
     "PaperOrderIntent",
     "TwoSidedPositionError",
@@ -1224,3 +1226,254 @@ class PaperExchange:
             order_id: The identifier of the resting order to cancel.
         """
         self._resting = [order for order in self._resting if order.id != order_id]
+
+
+class LiveBookPaperExchange(PaperExchange):
+    """A paper session whose market data is live: real books, paper fills.
+
+    The configuration an operator actually runs (issue #343). Everything about
+    *the market* -- the book, the market document, the exchange status, the
+    venue clock, the fee schedule -- is read from a
+    :class:`~windbreak.connector.live.MarketDataSource` on every call, while
+    everything about *the account* -- fills, positions, balances, resting orders
+    -- stays simulated by :class:`PaperExchange`. Real prices in, paper money
+    out. PAPER remains the ceiling: no order ever leaves this process, because
+    the object holding the venue is a
+    :class:`~windbreak.connector.live.MarketDataOnlyView` with no order surface
+    to reach for (SPEC S1.1 invariant 3).
+
+    It deliberately lives in this module rather than beside its market-data
+    seam. ``windbreak.connector.paper`` is the single module the
+    order-submission-client import boundary reserves to the Order Gateway and
+    the PAPER composition root (SPEC S5.2/S5.3, ``plans/architecture/
+    .importlinter``); a live-book *order submitter* published from a new module
+    would be a hole straight through that boundary, so the subclass stays inside
+    the module the boundary already names.
+
+    The one override that does the work is :meth:`_current_step`, which
+    manufactures a fresh single-step "session" from the venue's current book.
+    :meth:`PaperExchange.get_order_book` and :meth:`PaperExchange.place_order`
+    both route through it, so the tick's snapshot and the taker walk read the
+    same live book -- and a fill is priced and dated off that book, never off a
+    frozen boot snapshot.
+
+    Two absences are deliberate, and both are fail-closed:
+
+    * **No replay anchor.** A recording's frozen literals are stale against
+      every ttl forever, which is why :class:`PaperExchange` re-dates them
+      (issue #369). Live data has no such problem, and shifting a venue
+      timestamp would fabricate freshness the venue never claimed -- so a live
+      book's ``fetched_at`` is passed through untouched and ``quote_freshness``
+      can genuinely veto a stale one.
+    * **No trade tape.** The live read path this class consumes carries books,
+      not trade prints, so :attr:`PaperExchange.sessions` is empty:
+      :meth:`PaperExchange.advance` has nothing to replay and a resting order
+      never fills. That is an honest absence of evidence -- crediting a fill
+      nobody observed would be exactly the fabricated positive claim the loop's
+      fail-closed discipline forbids.
+
+    Attributes:
+        market_data: The read-only venue surface every market read reaches.
+        ticker: The single market this session is bound to. The multi-market
+            universe is a separate concern (issue #345).
+    """
+
+    def __init__(
+        self,
+        *,
+        market_data: MarketDataSource,
+        ticker: str,
+        balances: BalanceSnapshot,
+        balance_semantics: BalanceSemantics,
+        clock: Callable[[], datetime] = _utc_now,
+        haircut_ppm: int = DEFAULT_FEE_HAIRCUT_PPM,
+        max_participation_ppm: int = DEFAULT_MAX_PARTICIPATION_PPM,
+    ) -> None:
+        """Wire a paper account onto a live market-data source.
+
+        The constructor reads the venue three times -- the bound market, the
+        exchange status, and the venue clock -- and that is a deliberate boot
+        preflight, not incidental. It proves at wiring time that the ticker is
+        an offered, allowed binary, that the venue is open, and that its clock
+        is readable; a venue that refuses any of those refuses every later tick
+        too, and failing at startup is the loud version of that answer. The
+        stored values are the boot observations only: every accessor re-reads.
+
+        Args:
+            market_data: The read-only venue surface (typically a
+                :class:`~windbreak.connector.live.MarketDataOnlyView`).
+            ticker: The single market this session trades.
+            balances: The paper account's *opening* balances. Simulated money:
+                the venue's own balances are neither read nor readable here.
+            balance_semantics: The simulator's balance-interpretation semantics,
+                still validated against what this class actually implements.
+            clock: The observation clock stamping :meth:`get_balances`. Note it
+                never stamps a book or the venue clock -- those are the venue's.
+            haircut_ppm: The slippage haircut on modeled fees, in ppm.
+            max_participation_ppm: The participation cap on visible depth, in
+                ppm.
+
+        Raises:
+            UnknownMarketError: If the venue does not offer ``ticker``.
+        """
+        self.market_data = market_data
+        self.ticker = ticker
+        super().__init__(
+            markets={ticker: market_data.get_market(ticker)},
+            # No recorded steps: the live surface carries books, not a trade
+            # tape, so there is nothing to replay and nothing to re-date.
+            sessions={},
+            exchange_status=market_data.get_exchange_status(),
+            exchange_time=market_data.get_exchange_time(),
+            clock=clock,
+            balances=balances,
+            balance_semantics=balance_semantics,
+            # Empty by design: `get_fee_model` resolves live, so a cached
+            # schedule here could only ever go stale behind the venue's.
+            fee_models={},
+            haircut_ppm=haircut_ppm,
+            max_participation_ppm=max_participation_ppm,
+        )
+
+    @classmethod
+    def from_account_dir(
+        cls,
+        path: str | Path,
+        *,
+        market_data: MarketDataSource,
+        ticker: str,
+        clock: Callable[[], datetime] = _utc_now,
+        **overrides: int,
+    ) -> LiveBookPaperExchange:
+        """Build a live-book session whose paper *account* comes from a fixture.
+
+        Only ``balances.json`` and ``balance_semantics.json`` are read: the
+        market fixtures in the same directory are deliberately ignored, because
+        the whole point of this session is that its market data is the venue's.
+        Paper money still has to start somewhere, and a declared opening balance
+        is that somewhere.
+
+        Args:
+            path: The directory holding the account JSON fixtures.
+            market_data: The read-only venue surface.
+            ticker: The single market this session trades.
+            clock: The observation clock forwarded to the constructor.
+            **overrides: Optional ``haircut_ppm`` / ``max_participation_ppm``
+                keyword overrides forwarded to the constructor.
+
+        Returns:
+            The wired live-book paper exchange.
+        """
+        directory = Path(path)
+        return cls(
+            market_data=market_data,
+            ticker=ticker,
+            balances=_load_balances(directory),
+            balance_semantics=_load_balance_semantics(directory),
+            clock=clock,
+            **overrides,
+        )
+
+    def _current_step(self, ticker: str) -> _SessionStep:
+        """Return a one-off step carrying the venue's *current* book.
+
+        Re-reading here rather than caching is what makes the session live:
+        :meth:`PaperExchange.get_order_book` and
+        :meth:`PaperExchange.place_order` both come through this method, so the
+        tick's snapshot and the taker walk see the same freshly fetched book,
+        and the fills the walk emits are stamped at that book's own
+        ``fetched_at`` -- the venue's instant, never ours.
+
+        The step carries no trade prints, because the live read path publishes
+        none. That is why a resting remainder never fills: see the class
+        docstring.
+
+        Args:
+            ticker: The market whose book to read.
+
+        Returns:
+            A single replay step wrapping the venue's current book.
+
+        Raises:
+            UnknownMarketError: Propagated from the venue when it does not
+                offer ``ticker``.
+        """
+        return _SessionStep(book=self.market_data.get_order_book(ticker), trades=())
+
+    def list_markets(self) -> tuple[NormalizedMarket, ...]:
+        """Return the one market this session is bound to, read live.
+
+        Single-ticker by construction; enumerating the venue's whole catalog is
+        the market-universe concern (issue #345), not this one.
+
+        Returns:
+            A one-element tuple holding the bound market.
+        """
+        return (self.get_market(self.ticker),)
+
+    def get_market(self, ticker: str) -> NormalizedMarket:
+        """Return the venue's current market document for ``ticker``.
+
+        Args:
+            ticker: The market ticker to look up.
+
+        Returns:
+            The normalized market, verbatim from the venue. A real Kalshi
+            market carries ``jurisdiction_status="unknown"`` -- the venue
+            publishes no per-market eligibility signal -- and it is passed
+            through unchanged, so the kernel's eligibility check keeps vetoing
+            rather than being handed an invented verdict.
+
+        Raises:
+            UnknownMarketError: Propagated from the venue.
+        """
+        return self.market_data.get_market(ticker)
+
+    def get_exchange_status(self) -> ExchangeStatus:
+        """Return the venue's status observation, verbatim.
+
+        Deliberately *not* restamped the way :meth:`PaperExchange.get_exchange_status`
+        is. That override exists because a committed fixture's status carries a
+        frozen literal while the in-process answer genuinely happened now; a
+        live status carries the connector's own observation instant already, and
+        renewing it would make ``exchange_status_ok``'s staleness bound
+        unfalsifiable.
+
+        Returns:
+            The venue's exchange status.
+        """
+        return self.market_data.get_exchange_status()
+
+    def get_exchange_time(self) -> datetime:
+        """Return the venue's own clock reading, verbatim.
+
+        The check that guards the other guards: quote freshness, status
+        staleness, and the pipeline heartbeat are each measured as
+        ``now - stamp`` and each mismeasure when ``now`` is wrong relative to
+        the venue, so ``clock_skew_limit`` must compare *our* clock against
+        *theirs*. Answering from the local clock would compare it with itself.
+
+        Returns:
+            The venue's clock, in UTC.
+        """
+        return self.market_data.get_exchange_time()
+
+    def get_fee_model(self, market_or_series: str) -> FeeModel:
+        """Return the venue's fee schedule for a market or series.
+
+        Resolved live rather than from a fixture, so the fee the sizing path
+        reasons with and the fee the simulated fill is charged are both the
+        schedule the venue currently publishes.
+
+        Args:
+            market_or_series: A market ticker or a bare series ticker.
+
+        Returns:
+            The venue's normalized fee model.
+
+        Raises:
+            UnknownFeeModelError: Propagated from the venue when it publishes
+                no schedule this adapter models -- fail closed, never a
+                fabricated zero-fee default.
+        """
+        return self.market_data.get_fee_model(market_or_series)
