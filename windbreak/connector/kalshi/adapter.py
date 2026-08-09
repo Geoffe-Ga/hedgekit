@@ -11,6 +11,20 @@ allowlist and ledgers one ``PRODUCT_REFUSED`` event per refused product through
 an injected :class:`~windbreak.connector.snapshot.EventLedgerWriter`, isolating a
 broken writer so one bad record never aborts a run.
 
+``get_order_book`` gates on the market's product type before it will contact
+``/orderbook``, but the ``/orderbook`` payload carries no ``market_type``, so the
+verdict has to come from the ``/markets`` catalog. Issue #302: taking that
+literally meant one fully paginated catalog walk *per book read*, which the
+universe screen of PR #408 put on the hot path -- a tick costs
+``(1 + universe) x pages``. The catalog's *derived allowlist verdicts* are
+therefore retained in a :class:`_GateIndex` for :data:`DEFAULT_GATE_TTL`, and
+every full catalog walk (``list_markets`` included) refreshes it for free, so a
+tick pays for one walk. Only the verdicts are retained -- never a book, never a
+quote, never a price. That boundary is deliberate and load-bearing: a cached
+quote would be compared against "now" by ``quote_freshness`` and
+``clock_skew_limit`` and would rob them of their veto, whereas a product type is
+compared against nothing but an allowlist and is fixed for a market's life.
+
 The fee-model and balance-semantics methods are implemented here (issue #18):
 :meth:`KalshiConnector.get_fee_model` resolves a series' fee schedule and
 :meth:`KalshiConnector.get_balance_semantics` returns the recorded
@@ -24,7 +38,9 @@ them. This module sits on the money path guarded by
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, cast
 
 from windbreak.connector.fees import FeeModel, UnknownFeeModelError
@@ -99,6 +115,20 @@ _BPS_TO_PPM: Final = 100
 #: The only fee-formula family whose schedule the SPEC fee-bound math models; a
 #: series advertising any other ``fee_type`` fails closed as unknown.
 _QUADRATIC_FEE_TYPE: Final = "quadratic"
+
+#: Default lifetime of the cached product-type gate index (issue #302). A
+#: market's ``market_type`` is fixed for its life, so the index decays in only
+#: one direction: a market listed *after* the catalog was read is unknown to it,
+#: and an unknown ticker is refused. A minute therefore bounds how long a brand
+#: new listing stays unreachable while collapsing a whole tick's book reads onto
+#: one catalog walk. Every decay path fails closed -- see
+#: :meth:`KalshiConnector._require_allowed_binary`.
+DEFAULT_GATE_TTL: Final = timedelta(seconds=60)
+
+#: The refusal reason recorded for a ticker no page of the catalog listed. Any
+#: non-None verdict refuses, so an absent ticker is refused exactly like a
+#: non-binary one.
+_ABSENT_FROM_CATALOG: Final = "ticker is not offered by the venue"
 
 #: A market ticker's series ticker is the segment before the first ``-`` (e.g.
 #: ``"KXFED-24DEC"`` -> ``"KXFED"``); a bare series ticker has no separator.
@@ -242,6 +272,32 @@ class KalshiPaginationError(RuntimeError):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _GateIndex:
+    """Every catalogued ticker's product-allowlist verdict, and when it was read.
+
+    This is the *derived verdict* of :func:`gate_product` over one observed
+    catalog -- deliberately not the catalog itself. Nothing here is market data:
+    no price, no size, no quote instant. That distinction is the whole safety
+    argument for retaining it (issue #302). A cached quote would be compared
+    against "now" by ``quote_freshness`` / ``clock_skew_limit`` and would make
+    those checks unable to veto; a cached *product type* is compared against
+    nothing but an allowlist, and a market's ``market_type`` is fixed for its
+    life. ``observed_at`` is stamped once, when the catalog was genuinely read,
+    and is never refreshed on a hit -- it exists to expire the index, never to
+    re-date an observation.
+
+    Attributes:
+        verdicts: Ticker to its refusal reason, or None when it is an allowed
+            binary. First occurrence wins, matching the catalog scan this
+            replaces.
+        observed_at: The instant the catalog behind these verdicts was read.
+    """
+
+    verdicts: Mapping[str, str | None]
+    observed_at: datetime
+
+
 class KalshiConnector:
     """A read-only :class:`MarketConnector` backed by :class:`KalshiClient`."""
 
@@ -251,6 +307,7 @@ class KalshiConnector:
         ledger_writer: EventLedgerWriter,
         *,
         clock: Callable[[], datetime] = _utc_now,
+        gate_ttl: timedelta = DEFAULT_GATE_TTL,
     ) -> None:
         """Initialize the connector.
 
@@ -259,10 +316,15 @@ class KalshiConnector:
             ledger_writer: The seam that records ``PRODUCT_REFUSED`` events.
             clock: Returns "now"; injected so snapshots are deterministic in
                 tests. Defaults to wall-clock UTC.
+            gate_ttl: How long a product-type gate index stays usable before the
+                catalog behind it is re-read. Defaults to
+                :data:`DEFAULT_GATE_TTL`.
         """
         self._client = client
         self._ledger_writer = ledger_writer
         self._clock = clock
+        self._gate_ttl = gate_ttl
+        self._gate_index: _GateIndex | None = None
 
     def _ensure_operational(self) -> None:
         """Fail closed while the exchange is not open for trading.
@@ -323,8 +385,70 @@ class KalshiConnector:
         raise KalshiPaginationError(endpoint, _MAX_PAGES)
 
     def _raw_markets(self) -> list[Mapping[str, Any]]:
-        """Fetch every page of ``/markets`` and return the raw market payloads."""
-        return self._paginate("markets", "markets")
+        """Fetch every page of ``/markets``, recording the gate index it implies.
+
+        Every full catalog walk refreshes the product-type gate index for free,
+        which is what lets a tick that already called :meth:`list_markets` gate
+        each of its book reads without walking the catalog again (issue #302).
+
+        Returns:
+            The raw market payloads from every page.
+        """
+        raw = self._paginate("markets", "markets")
+        self._record_gate_index(raw)
+        return raw
+
+    def _record_gate_index(self, raw_markets: list[Mapping[str, Any]]) -> _GateIndex:
+        """Derive, store, and return the gate index of a just-observed catalog.
+
+        Args:
+            raw_markets: The raw market payloads, observed now.
+
+        Returns:
+            The stored index, stamped with the instant the catalog was read.
+        """
+        verdicts: dict[str, str | None] = {}
+        for raw in raw_markets:
+            ticker = raw.get("ticker")
+            if isinstance(ticker, str) and ticker not in verdicts:
+                verdicts[ticker] = gate_product(raw)
+        index = _GateIndex(
+            verdicts=MappingProxyType(verdicts), observed_at=self._clock()
+        )
+        self._gate_index = index
+        return index
+
+    def _fresh_gate_index(self) -> _GateIndex:
+        """Return a gate index within its TTL, re-reading the catalog when it is not.
+
+        Returns:
+            An index no older than ``gate_ttl``.
+        """
+        cached = self._gate_index
+        if cached is not None and self._clock() - cached.observed_at < self._gate_ttl:
+            return cached
+        return self._record_gate_index(self._paginate("markets", "markets"))
+
+    def _require_allowed_binary(self, ticker: str) -> None:
+        """Refuse ``ticker`` unless the gate index calls it an offered binary.
+
+        The same allowlist verdict :meth:`_gated_raw_market` computes, resolved
+        from the retained index instead of a fresh catalog walk. Both ways a
+        verdict can go missing refuse: a ticker absent from the catalog and a
+        ticker whose payload carried no ``market_type`` are each a non-None
+        reason, so the gate is fail-closed warm exactly as it is cold.
+
+        Args:
+            ticker: The market ticker to gate.
+
+        Raises:
+            UnknownMarketError: If the ticker is refused or not offered.
+                Deliberately does not ledger a ``PRODUCT_REFUSED`` event, for
+                the reason given on :meth:`_gated_raw_market`.
+        """
+        index = self._fresh_gate_index()
+        if index.verdicts.get(ticker, _ABSENT_FROM_CATALOG) is not None:
+            raise UnknownMarketError(ticker)
 
     def _event_index(self) -> dict[str, Mapping[str, Any]]:
         """Fetch every page of ``/events``, indexing raw events by event ticker."""
@@ -483,10 +607,15 @@ class KalshiConnector:
     def get_order_book(self, ticker: str) -> OrderBookSnapshot:
         """Return the current YES order book for ``ticker``.
 
-        Applies the product allowlist via :meth:`_gated_raw_market` before
+        Applies the product allowlist via :meth:`_require_allowed_binary` before
         contacting the venue, so a non-binary product's book is never fetched
-        (fail closed, SPEC §7.1). The market payload is read purely to gate:
-        the ``/orderbook`` route carries no ``market_type`` of its own.
+        (fail closed, SPEC §7.1). The gate needs a product type and the
+        ``/orderbook`` route carries no ``market_type`` of its own, so it is
+        resolved from the retained :class:`_GateIndex` -- one catalog walk per
+        ``gate_ttl``, rather than one per book read (issue #302). The book
+        itself is never cached: each call contacts ``/orderbook`` and is stamped
+        with the clock at that moment, so ``quote_freshness`` and
+        ``clock_skew_limit`` still judge a genuine observation instant.
 
         Args:
             ticker: The market ticker to look up.
@@ -500,7 +629,7 @@ class KalshiConnector:
                 not offered, or the venue has no book for it.
         """
         self._ensure_operational()
-        self._gated_raw_market(ticker)  # refuse non-binary/absent before fetching
+        self._require_allowed_binary(ticker)  # refuse before fetching a book
         try:
             response = self._client.get("markets", ticker, "orderbook")
         except KalshiApiError as exc:
