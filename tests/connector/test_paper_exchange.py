@@ -716,31 +716,82 @@ class TestPaperExchangeProtocolConformance:
         assert overridden.max_participation_ppm == 1_000_000
 
 
-class TestPaperExchangeConstructorRejectsInconsistentSemantics:
-    """The #18 consistency requirement: partial fills must be per-fill records.
+def _fixture_dir_with_semantics_override(
+    books_fixture_dir: Path, tmp_path: Path, field: str, value: str
+) -> Path:
+    """Copy the `deep_walk` fixture with one `balance_semantics.json` field changed.
 
-    A `BalanceSemantics` record whose `partial_fill_representation` is not
-    `PER_FILL_RECORDS` is incompatible with a taker walk that can span
-    multiple book levels (each level needs its own `Fill.price`), so
-    construction must reject it rather than silently aggregating.
+    Args:
+        books_fixture_dir: The shared books-fixture root.
+        tmp_path: Scratch directory for the mutated copy.
+        field: The semantics field to overwrite.
+        value: The enum member *name* to write into that field.
+
+    Returns:
+        The mutated fixture directory.
+    """
+    broken_dir = tmp_path / "books"
+    shutil.copytree(books_fixture_dir / "deep_walk", broken_dir)
+    original = json.loads(
+        (books_fixture_dir / "deep_walk" / "balance_semantics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    (broken_dir / "balance_semantics.json").write_text(
+        json.dumps({**original, field: value}), encoding="utf-8"
+    )
+    return broken_dir
+
+
+class TestPaperExchangeConstructorRejectsInconsistentSemantics:
+    """The simulator refuses any fixture whose semantics it does not implement.
+
+    The #18 requirement: a `BalanceSemantics` record whose
+    `partial_fill_representation` is not `PER_FILL_RECORDS` is incompatible with
+    a taker walk that can span multiple book levels (each level needs its own
+    `Fill.price`), so construction must reject it rather than silently
+    aggregating.
+
+    The #362 requirement: the three collateral answers are *implemented* by
+    `get_balances` / `cancel_order` in exactly one way each, so a fixture
+    claiming a different one would make `get_balance_semantics` a lying flag --
+    and a wrong flag makes a consumer fail open, which is worse than a fixture
+    that refuses to load.
     """
 
     def test_rejects_a_fixture_whose_partial_fill_representation_is_aggregated(
         self, books_fixture_dir: Path, tmp_path: Path
     ) -> None:
-        broken_dir = tmp_path / "books"
-        shutil.copytree(books_fixture_dir / "deep_walk", broken_dir)
-        original = json.loads(
-            (books_fixture_dir / "deep_walk" / "balance_semantics.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        broken = {**original, "partial_fill_representation": "AGGREGATED"}
-        (broken_dir / "balance_semantics.json").write_text(
-            json.dumps(broken), encoding="utf-8"
+        broken_dir = _fixture_dir_with_semantics_override(
+            books_fixture_dir, tmp_path, "partial_fill_representation", "AGGREGATED"
         )
 
         with pytest.raises(ValueError, match="partial_fill_representation"):
+            paper.PaperExchange.from_fixture_dir(broken_dir)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("open_order_collateral_in_available", "INCLUDED_IN_AVAILABLE"),
+            ("open_order_collateral_in_available", "UNKNOWN"),
+            ("open_order_collateral_in_total", "EXCLUDED"),
+            ("open_order_collateral_in_total", "UNKNOWN"),
+            ("cancel_collateral_release", "DELAYED"),
+            ("cancel_collateral_release", "UNKNOWN"),
+        ],
+    )
+    def test_rejects_a_fixture_advertising_collateral_behavior_it_does_not_implement(
+        self, books_fixture_dir: Path, tmp_path: Path, field: str, value: str
+    ) -> None:
+        """The rejection names the offending field and the member the simulator
+        does implement, so a fixture author is told what to fix rather than
+        being handed a paper account whose `available` means something other
+        than what its own semantics record claims."""
+        broken_dir = _fixture_dir_with_semantics_override(
+            books_fixture_dir, tmp_path, field, value
+        )
+
+        with pytest.raises(ValueError, match=field):
             paper.PaperExchange.from_fixture_dir(broken_dir)
 
 
@@ -1547,7 +1598,12 @@ class TestPaperExchangeDebitsFilledNotionalAndFees:
     ) -> None:
         """book cost 1_390_000 + fee 60_000 == 1_450_000 micros leaves the
         account; the slippage haircut is a modeling allowance, not a cash
-        movement, so it is not debited."""
+        movement, so it is not debited.
+
+        This 1000-centi order also leaves a 700-centi remainder resting, whose
+        3_420_000-micro collateral is withheld from `available` on top of the
+        fill debit (issue #362) -- `total` carries the fill debit alone.
+        """
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
 
         exchange.place_order(
@@ -1558,7 +1614,9 @@ class TestPaperExchangeDebitsFilledNotionalAndFees:
         )
 
         balances = exchange.get_balances()
-        assert balances.available == MoneyMicros(_OPENING_BALANCE_MICROS - 1_450_000)
+        assert balances.available == MoneyMicros(
+            _OPENING_BALANCE_MICROS - 1_450_000 - _DEEP_WALK_COLLATERAL_MICROS
+        )
         assert balances.total == MoneyMicros(_OPENING_BALANCE_MICROS - 1_450_000)
 
     def test_the_debited_fee_is_the_venue_fee_schedule_not_a_constant(
@@ -1566,7 +1624,13 @@ class TestPaperExchangeDebitsFilledNotionalAndFees:
     ) -> None:
         """The fee component is re-derived from the same `FeeModel` the taker
         walk charged, per consumed level -- so a fee-schedule change moves the
-        balance, and a hardcoded fee cannot pass this."""
+        balance, and a hardcoded fee cannot pass this.
+
+        Read off `total`, which carries filled cash movements only: this order's
+        unfilled remainder also reserves collateral out of `available`, and that
+        reservation is pinned separately by
+        `TestPaperExchangeWithholdsRestingOrderCollateral`.
+        """
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
         fee_model = exchange.get_fee_model("MKT-DEEP")
 
@@ -1580,13 +1644,18 @@ class TestPaperExchangeDebitsFilledNotionalAndFees:
         expected_fee = fee_model.max_trading_fee_micros(
             4600, 200
         ) + fee_model.max_trading_fee_micros(4700, 100)
-        debited = _OPENING_BALANCE_MICROS - exchange.get_balances().available.value
+        debited = _OPENING_BALANCE_MICROS - exchange.get_balances().total.value
         assert debited - 1_390_000 == expected_fee
 
     def test_a_resting_trade_through_fill_also_debits_cash(
         self, books_fixture_dir: Path
     ) -> None:
-        """A resting fill spends cash exactly like a taker fill does."""
+        """A resting fill spends cash exactly like a taker fill does.
+
+        Measured on `total`: `available` had already withheld the resting
+        order's collateral, so filling it converts a reservation into a spend
+        rather than freeing new cash (issue #362).
+        """
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "trade_through"
         )
@@ -1596,11 +1665,11 @@ class TestPaperExchangeDebitsFilledNotionalAndFees:
             ),
             approval_token=object(),
         )
-        before = exchange.get_balances().available
+        before = exchange.get_balances().total
 
         exchange.advance()
 
-        assert exchange.get_balances().available.value < before.value
+        assert exchange.get_balances().total.value < before.value
 
     def test_balances_are_stamped_at_the_observation_instant(
         self, books_fixture_dir: Path
@@ -1614,3 +1683,177 @@ class TestPaperExchangeDebitsFilledNotionalAndFees:
         )
 
         assert exchange.get_balances().fetched_at == observed_at
+
+
+# --- Issue #362: the advertised collateral semantics is the implemented one ---
+#
+# `get_balance_semantics()` advertises `DEDUCTED_FROM_AVAILABLE` -- the contract
+# that a resting order's collateral is *already* withheld from `available`. Until
+# #362 it was not withheld, so `available` counted cash pledged to a live order
+# and a consumer trusting the flag could authorize a second order against the
+# same money. A confidently wrong flag is worse than `UNKNOWN`: `UNKNOWN` makes
+# callers fail closed, a wrong flag makes them fail open.
+#
+# Every golden number below is hand-derived from the same formulas the fill path
+# uses: book cost `price_pips * quantity_centis` micros, plus `FeeModel`'s
+# ceil-to-the-cent bound `rate_ppm * count * price * (10_000 - price) / 1e14`.
+
+#: `resting_full_consume`'s resting order, 100 centis at 4200 pips: book cost
+#: 4200 * 100 == 420_000 micros, worst-case fee
+#: ceil(70_000 * 100 * 4200 * 5_800 / 1e14) == 2 cents == 20_000 micros.
+_FULLCONSUME_COLLATERAL_MICROS = 440_000
+
+#: `deep_walk`'s unfilled remainder, 700 centis at 4700 pips: book cost
+#: 4700 * 700 == 3_290_000 micros, worst-case fee
+#: ceil(70_000 * 700 * 4700 * 5_300 / 1e14) == 13 cents == 130_000 micros.
+_DEEP_WALK_COLLATERAL_MICROS = 3_420_000
+
+#: `no_side_resting`'s resting NO order, 1000 centis at 4200 *NO* pips: book cost
+#: 4200 * 1000 == 4_200_000 micros, worst-case fee
+#: ceil(70_000 * 1000 * 4200 * 5_800 / 1e14) == 18 cents == 180_000 micros.
+_NO_SIDE_COLLATERAL_MICROS = 4_380_000
+
+
+def _rest_one_hundred_at_4200(exchange: PaperExchange) -> None:
+    """Rest 100 centis at 4200 pips on `resting_full_consume`'s market.
+
+    The fixture's best ask is 4400, so a 4200 bid crosses nothing and the whole
+    order rests -- an isolated reservation with no fill debit mixed into it.
+
+    Args:
+        exchange: A `PaperExchange` loaded from the `resting_full_consume`
+            fixture directory.
+    """
+    exchange.place_order(
+        paper.PaperOrderIntent(
+            "MKT-FULLCONSUME", "yes", PricePips(4200), ContractCentis(100)
+        ),
+        approval_token=object(),
+    )
+
+
+class TestPaperExchangeWithholdsRestingOrderCollateral:
+    """`get_balances` implements the collateral semantics it advertises (#362)."""
+
+    def test_a_resting_order_is_withheld_from_available_as_advertised(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The issue #362 invariant, read off both surfaces in one test: the
+        exchange advertises `DEDUCTED_FROM_AVAILABLE`, and `available` really is
+        the opening balance less the resting order's 440_000-micro reservation.
+        A consumer that spends `available` therefore cannot double-commit the
+        cash already pledged to the live order."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "resting_full_consume"
+        )
+
+        _rest_one_hundred_at_4200(exchange)
+
+        semantics = exchange.get_balance_semantics()
+        assert (
+            semantics.open_order_collateral_in_available
+            is OrderCollateralInAvailable.DEDUCTED_FROM_AVAILABLE
+        )
+        assert exchange.get_balances().available == MoneyMicros(
+            _OPENING_BALANCE_MICROS - _FULLCONSUME_COLLATERAL_MICROS
+        )
+
+    def test_a_resting_order_is_still_counted_inside_total_as_advertised(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The same record advertises `INCLUDED` for the *total* balance, and
+        `total` moves only when a fill executes. Withholding the reservation
+        from `total` too would report the money as gone rather than as pledged,
+        which is a different lie in the opposite direction."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "resting_full_consume"
+        )
+
+        _rest_one_hundred_at_4200(exchange)
+
+        semantics = exchange.get_balance_semantics()
+        assert (
+            semantics.open_order_collateral_in_total is OrderCollateralInTotal.INCLUDED
+        )
+        assert exchange.get_balances().total == MoneyMicros(_OPENING_BALANCE_MICROS)
+
+    def test_the_withheld_fee_component_is_the_venue_fee_schedule(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The reservation is book cost plus the same `FeeModel` bound the fill
+        will charge, re-derived rather than hardcoded -- so a fee-schedule change
+        moves the reservation, and a constant cannot pass this."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "resting_full_consume"
+        )
+        fee_model = exchange.get_fee_model("MKT-FULLCONSUME")
+
+        _rest_one_hundred_at_4200(exchange)
+
+        withheld = _OPENING_BALANCE_MICROS - exchange.get_balances().available.value
+        assert withheld - 420_000 == fee_model.max_trading_fee_micros(4200, 100)
+
+    def test_a_resting_fill_converts_the_reservation_into_spend(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """A resting order that fills at its own limit spends exactly what was
+        reserved for it, so `available` does not move at all while `total` drops
+        by the whole 440_000 micros. That continuity is the point of the flag:
+        cash committed to a live order was never spendable in the first place."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "resting_full_consume"
+        )
+        _rest_one_hundred_at_4200(exchange)
+        before = exchange.get_balances()
+
+        exchange.advance()
+
+        assert exchange.get_open_orders() == ()
+        after = exchange.get_balances()
+        assert after.available == before.available
+        assert after.total == MoneyMicros(
+            _OPENING_BALANCE_MICROS - _FULLCONSUME_COLLATERAL_MICROS
+        )
+
+    def test_cancelling_a_resting_order_releases_its_reservation_immediately(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The record advertises `IMMEDIATE` cancel-collateral release, and
+        `cancel_order` drops the order outright, so the very next `get_balances`
+        reports the cash free again -- no fill happened, so nothing was spent."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "resting_full_consume"
+        )
+        _rest_one_hundred_at_4200(exchange)
+        resting = exchange.get_open_orders()
+        assert len(resting) == 1
+
+        exchange.cancel_order(resting[0].id)
+
+        semantics = exchange.get_balance_semantics()
+        assert semantics.cancel_collateral_release is CancelCollateralRelease.IMMEDIATE
+        balances = exchange.get_balances()
+        assert balances.available == MoneyMicros(_OPENING_BALANCE_MICROS)
+        assert balances.total == MoneyMicros(_OPENING_BALANCE_MICROS)
+
+    def test_a_resting_no_order_is_withheld_at_its_own_no_price(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """A NO order's collateral is its NO-frame notional (4200 * 1000), not
+        the complement: buying NO at 4200 pledges 42 cents a contract, and
+        reserving the 5800-pip complement instead would withhold the wrong money
+        on every NO order the simulator ever rests."""
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "no_side_resting"
+        )
+
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-NORESTING", "no", PricePips(4200), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+
+        assert exchange.get_balances().available == MoneyMicros(
+            _OPENING_BALANCE_MICROS - _NO_SIDE_COLLATERAL_MICROS
+        )
