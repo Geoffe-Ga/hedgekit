@@ -64,13 +64,14 @@ from windbreak.ledger.store import (
     ChainHead,
     LatestRecordLookup,
     LedgerRecord,
+    ReverseTypeScan,
     SqliteLedgerStore,
     compute_event_hash,
     events_from_records,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from pathlib import Path
     from typing import Any, NoReturn
 
@@ -726,3 +727,109 @@ def test_latest_record_lookup_is_not_satisfied_by_a_bare_ledger_store() -> None:
             """Do nothing; the double holds no resources."""
 
     assert not isinstance(_BareStore(), LatestRecordLookup)
+
+
+# --- issue #370: bounded reverse scan of ONE event type -------------------------
+#
+# `windbreak.scheduler.loop.start_of_day_equity_micros` needs the EARLIEST
+# `EquitySampled` row of the current UTC day, which `latest_record_of_types`
+# cannot answer -- it returns the newest row, and reading the newest sample would
+# raise the daily-loss threshold every time equity grew intraday. Answering it
+# without a full `read_all()` on every tick needs a LAZY, newest-first walk over
+# rows of one type, so the consumer can stop the moment it crosses the day
+# boundary.
+#
+# `iter_records_of_type_reversed` and the narrow `ReverseTypeScan` capability it
+# is declared through do not exist yet, so this module's import of
+# `ReverseTypeScan` fails collection with `ImportError: cannot import name
+# 'ReverseTypeScan' from 'windbreak.ledger.store'` -- the expected Gate 1 RED
+# state for issue #370.
+
+
+def test_iter_records_of_type_reversed_yields_only_that_type_newest_first(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """The walk yields rows of the requested type ONLY, in descending sequence
+    order. Newest-first is the whole point: a consumer bounded by a recency
+    predicate can stop early only if the newest rows arrive first.
+    """
+    store = ledger_store_factory()
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=1))
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=2))
+
+    walked = list(store.iter_records_of_type_reversed("ModeHeartbeat"))
+
+    assert [record.sequence_number for record in walked] == [3, 1]
+    assert walked == [store.read_all()[2], store.read_all()[0]]
+
+
+def test_iter_records_of_type_reversed_is_empty_when_no_row_matches(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """A type with no rows walks to nothing rather than raising, so an absent
+    answer stays distinguishable from a corrupt one.
+    """
+    store = ledger_store_factory()
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+
+    assert list(store.iter_records_of_type_reversed("ModeHeartbeat")) == []
+
+
+def test_iter_records_of_type_reversed_is_lazy_and_abandonable(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+) -> None:
+    """The walk is a true `Iterator`, not a materialized list, and abandoning it
+    after one row leaves the store fully usable.
+
+    Laziness is the load-bearing half of the bound: a `fetchall()` behind this
+    method would still read every row of the type out of SQLite, so the
+    consumer's early stop would save JSON decoding and nothing else. Abandoning
+    matters because early-stopping is the normal case -- if the unfinished read
+    left a lock behind, the very next `append` would fail.
+    """
+    store = ledger_store_factory()
+    for beat in range(5):
+        store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=beat))
+
+    walk: Iterator[LedgerRecord] = store.iter_records_of_type_reversed("ModeHeartbeat")
+    first = next(walk)
+    del walk
+
+    assert not isinstance(store.iter_records_of_type_reversed("ModeHeartbeat"), list)
+    assert first.sequence_number == 5
+    assert store.append(ConfigLoaded(component="p", config_hash="a", diff={})) == 6
+
+
+def test_sqlite_ledger_store_satisfies_the_reverse_type_scan_capability() -> None:
+    """`SqliteLedgerStore` structurally satisfies `ReverseTypeScan`, which is how
+    the start-of-day equity read dispatches onto the bounded walk instead of the
+    full scan.
+    """
+    assert issubclass(SqliteLedgerStore, ReverseTypeScan)
+
+
+def test_reverse_type_scan_is_not_satisfied_by_a_bare_ledger_store() -> None:
+    """A hand-rolled `LedgerStore` double does NOT satisfy `ReverseTypeScan` --
+    proof this second capability is separately declared too, so `LedgerStore`
+    stayed exactly as wide as it was and every existing double still works.
+    """
+
+    class _BareStore:
+        """A minimal structural `LedgerStore` with no reverse walk."""
+
+        def append(self, event: Event) -> int:
+            """Raise; this double is never appended to."""
+            raise NotImplementedError(event)
+
+        def read_all(self) -> list[LedgerRecord]:
+            """Return no records."""
+            return []
+
+        def verify_chain(self) -> None:
+            """Do nothing; the double has no chain."""
+
+        def close(self) -> None:
+            """Do nothing; the double holds no resources."""
+
+    assert not isinstance(_BareStore(), ReverseTypeScan)
