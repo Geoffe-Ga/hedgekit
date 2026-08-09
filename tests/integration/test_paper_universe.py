@@ -62,6 +62,33 @@ def _fixed_clock() -> int:
 #: exactly this admits the first market's forecast and halts the second.
 _RESEARCH_COST_MICROS = 3_000_000
 
+#: The `two_ticker_isolation` fixture's opening available cash, in micros.
+_OPENING_CAPITAL_MICROS = 100_000_000
+
+#: A limit deliberately far through `MKT-ISO-A`'s resting ask, so the order
+#: fills outright against the book rather than resting as a remainder.
+_CROSSING_LIMIT_PIPS = 9_900
+
+#: The price `MKT-ISO-A`'s resting ask actually sits at, and so the price the
+#: crossing order above fills at -- a taker pays the book, not its own limit.
+_RESTING_ASK_PIPS = 4_400
+
+#: The quantity filled, in contract-centis. Small enough to be taken by the
+#: fixture's single 1_000-centi resting ask level without walking it.
+_FILL_SIZE_CENTIS = 50
+
+#: The fill's notional, in micros: a pip is 1e-4 $ and a centi 1e-2 contracts,
+#: so `centis * pips` is exactly micros (50 * 4_400).
+_FILL_NOTIONAL_MICROS = _FILL_SIZE_CENTIS * _RESTING_ASK_PIPS
+
+#: The fee the fixture's fee model charges on that fill, in micros.
+_FILL_FEE_MICROS = 10_000
+
+#: What remains deployable after the fill: opening cash less notional and fee.
+_CAPITAL_AFTER_FILL_MICROS = (
+    _OPENING_CAPITAL_MICROS - _FILL_NOTIONAL_MICROS - _FILL_FEE_MICROS
+)
+
 
 def _config(
     *,
@@ -352,21 +379,42 @@ def test_two_runs_over_identical_inputs_ledger_byte_identical_payloads(
     assert json.dumps(legs[0], sort_keys=True) == json.dumps(legs[1], sort_keys=True)
 
 
-def test_candidate_capital_depletes_across_markets_within_one_tick(
+def test_a_fill_on_the_first_market_debits_what_the_second_can_deploy(
     two_ticker_books_dir: Path,
     cassette_path: Path,
     report_dir: Path,
     research_tools_factory,
     tmp_path: Path,
 ) -> None:
-    """The second market sizes against the cash the first one left.
+    """The second market sizes against the cash the first one's fill debited.
 
     Concentration across a universe is only meaningful if the tick's markets see
-    each other's effect. The selector's capital input is read per candidate off
-    the live exchange balances, so a fill on `MKT-ISO-A` is already reflected
-    when `MKT-ISO-B` is sized -- rather than both markets each sizing as though
-    the account were untouched.
+    each other's effect. `_position_input` is read *per candidate* off the live
+    exchange balances, so a fill on `MKT-ISO-A` is already reflected when
+    `MKT-ISO-B` is sized -- rather than both markets sizing as though the
+    account were untouched.
+
+    The fill is placed directly on the loop's own exchange rather than routed
+    through a tick, for the same reason
+    `test_paper_fill_reconciliation.py::_fill_the_account` does it: **a PAPER
+    tick does not currently mint a token at all** -- the concentration and
+    participation checks still veto every intent (see
+    `tests/integration/test_paper_verification.py`). So what this pins is the
+    wiring, which is the honest claim: *if* a candidate fills, the next
+    candidate's deployable capital is smaller by exactly what that fill cost.
+    It does not claim that a stock tick produces such a fill today.
+
+    Every figure is pinned exactly rather than by inequality, so a change that
+    merely perturbs the balance cannot pass this by accident:
+
+    * Opening balance: 100_000_000 micros (the fixture's own `balances.json`).
+    * The fill: 50 contract-centis taking the resting ask at 4_400 pips. A pip
+      is 1e-4 dollars and a centi 1e-2 contracts, so the notional is exactly
+      50 * 4_400 = 220_000 micros, plus a 10_000-micro fee.
+    * Remaining: 100_000_000 - 230_000 = 99_770_000 micros.
     """
+    from windbreak.connector.paper import PaperOrderIntent
+    from windbreak.numeric.types import ContractCentis, PricePips
     from windbreak.scheduler.loop import _position_input
 
     deps = _build_deps(
@@ -378,12 +426,36 @@ def test_candidate_capital_depletes_across_markets_within_one_tick(
         research_tools_factory=research_tools_factory,
     )
 
-    first = _position_input(deps, "MKT-ISO-A")
-    assert first.snapshot_id == "MKT-ISO-A-positions"
-    second = _position_input(deps, "MKT-ISO-B")
-    assert second.snapshot_id == "MKT-ISO-B-positions"
-    # Same account, read twice: identical until something spends it.
-    assert first.above_floor_capital_micros == second.above_floor_capital_micros
+    before = _position_input(deps, "MKT-ISO-A")
+    assert before.snapshot_id == "MKT-ISO-A-positions"
+    assert before.above_floor_capital_micros.value == _OPENING_CAPITAL_MICROS
+
+    placement = deps.exchange.place_order(
+        PaperOrderIntent(
+            ticker="MKT-ISO-A",
+            side="yes",
+            price=PricePips(_CROSSING_LIMIT_PIPS),
+            quantity=ContractCentis(_FILL_SIZE_CENTIS),
+        ),
+        None,
+    )
+    assert placement.resting_order is None, "no remainder may rest"
+    (fill,) = placement.fills
+    assert fill.price.value == _RESTING_ASK_PIPS
+    assert fill.quantity.value == _FILL_SIZE_CENTIS
+
+    after = _position_input(deps, "MKT-ISO-B")
+
+    assert after.snapshot_id == "MKT-ISO-B-positions"
+    # The load-bearing assertion: strictly less, by exactly the fill's cost.
+    assert after.above_floor_capital_micros.value == _CAPITAL_AFTER_FILL_MICROS
+    assert (
+        before.above_floor_capital_micros.value - after.above_floor_capital_micros.value
+        == _FILL_NOTIONAL_MICROS + _FILL_FEE_MICROS
+    )
+    # The deploy cap tracks it too, so the second market cannot size against
+    # capital the first one already spent.
+    assert after.total_deploy_cap_micros.value == _CAPITAL_AFTER_FILL_MICROS
 
 
 def test_a_halt_on_the_second_market_ledgers_its_snapshot_but_no_forecast(
@@ -511,8 +583,13 @@ def test_a_halt_on_the_first_market_leaves_the_next_one_entirely_unrun(
     # nothing else.
     assert ("MarketSnapshotRecorded", "MKT-ISO-B") not in shape
     assert ("ScreenDecisionRecorded", "MKT-ISO-B") in shape
+    # `candidate_tickers` is the screened-in set, not a record of what ran:
+    # `MKT-ISO-B` is listed here having never reached `_run_candidate` at all.
+    # Comparing it against `forecast_ids` is what says how far the tick got.
     assert outcome.candidate_tickers == _TICKERS
+    assert "MKT-ISO-B" in outcome.candidate_tickers
     assert outcome.forecast_ids == ()
+    assert len(outcome.forecast_ids) < len(outcome.candidate_tickers)
     assert outcome.research_halted is True
 
 

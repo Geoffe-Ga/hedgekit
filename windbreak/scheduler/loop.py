@@ -1879,13 +1879,17 @@ class TickOutcome:
 
     Attributes:
         beat: The 1-based tick sequence number.
-        candidate_tickers: The markets that passed the screen and were offered
-            to the forecast stage, in the ascending ticker order they were
-            processed in. Empty when the whole universe screened out, which is a
-            tick that correctly forecast nothing.
+        candidate_tickers: The markets that passed the screen, in the ascending
+            ticker order the walk would take them in. This is the *screened-in
+            set*, not a record of what ran: a budget halt stops the walk, so
+            markets after the halting one appear here having never reached
+            :func:`_run_candidate` at all. Empty when the whole universe
+            screened out, which is a tick that correctly forecast nothing.
         forecast_ids: One forecast id per market this tick actually forecast, in
             processing order. Shorter than ``candidate_tickers`` exactly when
-            research halted part-way through the universe.
+            research halted part-way through the universe -- so comparing the
+            two lengths, not reading ``candidate_tickers`` alone, is what tells
+            an operator how far the tick got.
         intent_count: How many normalized intents the selector emitted, summed
             over every candidate.
         filled_centis: The quantity filled through the gateway this tick, in
