@@ -605,6 +605,40 @@ def test_list_markets_aggregates_every_event_page_via_cursor(
     assert market.mutually_exclusive_group_id == "E2"
 
 
+def test_the_product_gate_keeps_the_first_verdict_and_skips_non_string_tickers(
+    ledger: InMemoryEventLedgerWriter, clock: Callable[[], datetime]
+) -> None:
+    """Indexing the catalog for the gate (#302) preserves the scan it replaced.
+
+    The gate used to scan the catalog and stop at the *first* payload matching
+    the ticker; the index built in its place must resolve the same verdict, so a
+    catalog that lists a ticker twice gates on the earlier entry, not the later
+    one. A payload whose ``ticker`` is not a string is left out of the index
+    entirely -- and, since an unindexed ticker is refused, that omission fails
+    closed rather than admitting a market on an unusable key.
+    """
+    session = _PaginatedSession(
+        {
+            "/markets": [
+                {
+                    "markets": [
+                        _binary_market("KX-DUP", "E1"),
+                        _binary_market("KX-DUP", "E1", market_type="perpetual"),
+                        {**_binary_market("KX-NUMERIC", "E1"), "ticker": 12345},
+                    ],
+                    "cursor": "",
+                }
+            ],
+            "/orderbook": [{"orderbook": {"yes": [], "no": []}}],
+        }
+    )
+    connector = _connector_over(session, ledger, clock)
+
+    assert connector.get_order_book("KX-DUP").ticker == "KX-DUP"
+    with pytest.raises(UnknownMarketError):
+        connector.get_order_book("12345")
+
+
 def test_list_markets_raises_when_market_pagination_exceeds_the_cap(
     ledger: InMemoryEventLedgerWriter, clock: Callable[[], datetime]
 ) -> None:
