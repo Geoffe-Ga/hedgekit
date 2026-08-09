@@ -475,6 +475,10 @@ def test_unexhausted_budget_leaves_the_tick_ledger_payloads_byte_identical(
         "RecoveryCompleted",
         "MarketSnapshotRecorded",
         "PipelineHeartbeatRecorded",
+        # Issue #353: the tick now runs one read-only verification cycle before
+        # it decides anything, and that cycle records exactly one event -- here
+        # a clean pass, since nothing has traded yet.
+        "VerificationPassed",
         "ForecastCreated",
         "SelectorDecisionRecorded",
         "ExchangeStatusObserved",

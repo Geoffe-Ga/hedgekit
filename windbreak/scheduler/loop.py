@@ -14,15 +14,39 @@ appending one audit event to the ledger at every stage, plus a per-tick
 
 The approval seam is the load-bearing safety boundary: :class:`KernelApproval`
 composes the *real* ``RiskKernel.evaluate_intent`` with the *real*
-``ApprovalPipeline.approve``. Every SPEC S10.3 check is now real (issue
-#340 promoted the last one) and the loop now observes real exchange status
-and stamps a real pipeline heartbeat each tick (issue #342), so
-``exchange_status_ok`` and ``pipeline_heartbeat_ok`` evaluate genuine evidence
-and can pass. The PAPER tick still never fills, for one remaining honest
-reason: the three reconciliation checks fail closed on the ``verification=None``
-this loop supplies, because no read-only verification cycle runs in PAPER
-yet. The fill leg is proven separately by driving the gateway with a genuinely
-minted token through a doubled seam.
+``ApprovalPipeline.approve``. Every SPEC S10.3 check is now real (issue #340
+promoted the last one), the loop observes real exchange status and stamps a
+real pipeline heartbeat each tick (issue #342), and -- since issue #353 -- it
+runs a real read-only verification cycle each tick and threads that snapshot
+into the approval context, so the three SPEC S10.3 reconciliation checks
+evaluate real evidence and pass on a clean cycle.
+
+Two honest zero/``None`` feeds still veto every PAPER intent, and neither is a
+verification concern -- both live in the account/market view this module
+composes, not in the kernel:
+
+* ``daily_loss_limit`` vetoes because :func:`_account_from_verification` leaves
+  ``equity_start_of_day`` at zero, which floors the loss threshold at zero and
+  makes ``realized_loss_today >= threshold`` true for a flat account.
+* ``participation_cap_compliance`` vetoes because
+  :func:`build_evaluation_context` supplies ``visible_depth=None``.
+
+They are left as they are on purpose: fabricating a start-of-day equity or a
+depth figure to unblock a fill would loosen two real exposure limits on
+invented evidence, which is the exact failure mode issues #340/#342/#353 each
+removed by supplying *genuine* evidence instead. Until those two feeds are
+real, ``filled_centis`` stays ``0``; the fill leg is proven separately by
+driving the gateway with a genuinely minted token through a doubled seam.
+
+Verification is also the loop's one HALT path. The baseline the cycle
+reconciles against is frozen at startup from the venue's own opening state
+(``LedgerExpectationSource``; see :func:`_build_verifier` for why freezing it
+is what makes the comparison falsifiable at all), and the ledger carries no
+fill amounts that could update it. So the first tick after a fill grades a
+``BREACH``, the kernel transitions to ``HALT``, and every later approval vetoes
+on the halted mode. That is the honest fail-closed reading of "our books cannot
+account for the venue" -- and it is the reason an always-on PAPER deployment
+must watch :attr:`TickOutcome.kernel_halted`.
 
 Money and equity fields are scaled integers (micros/centis/pips), never floats
 (SPEC S6.1); this package is on ``scripts/lint_no_floats.py``'s denylist.
@@ -36,10 +60,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, cast
 
+from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.config import config_hash
 from windbreak.connector.freshness import is_fresh
 from windbreak.connector.interface import UnknownMarketError
 from windbreak.connector.paper import PaperExchange
+from windbreak.connector.readonly import ReadOnlyConnectorView, ReadOnlyVenueView
 from windbreak.forecast.budget import (
     BUDGET_DAY_EXHAUSTED_EVENT,
     BUDGET_FORECAST_EXCEEDED_EVENT,
@@ -67,8 +93,8 @@ from windbreak.ledger.events import (
     ResearchBudgetHalted,
     SelectorDecisionRecorded,
 )
-from windbreak.ledger.store import SqliteLedgerStore
-from windbreak.numeric import MoneyMicros, PricePips
+from windbreak.ledger.store import SqliteLedgerStore, events_from_records
+from windbreak.numeric import ContractCentis, MoneyMicros, PricePips
 from windbreak.order_gateway.gateway import OrderGateway, PaperSubmitter
 from windbreak.order_gateway.ledger_writer import SqliteGatewayLedgerWriter
 from windbreak.order_gateway.reconciler import Reconciler
@@ -90,6 +116,11 @@ from windbreak.riskkernel.reservations import (
     ReservationLedger,
 )
 from windbreak.riskkernel.tokens import TokenIssuer
+from windbreak.riskkernel.verification import (
+    LedgerExpectationSource,
+    ReadOnlyVerifier,
+    VerificationTolerances,
+)
 from windbreak.scheduler.eligibility import (
     project_exchange_status,
     project_jurisdiction,
@@ -142,8 +173,9 @@ _FULL_PPM = 1_000_000
 _DEFAULT_FORECAST_TTL_SECONDS = 3600
 
 #: Default max admissible verification-snapshot age, in seconds. The PAPER loop
-#: supplies ``verification=None`` (fail-closed), so this only bounds a future
-#: live cycle; a conservative one-hour default suffices.
+#: runs a real cycle every tick (issue #353), so this genuinely bounds how long
+#: a stalled reconciliation may go unnoticed; a conservative one-hour default
+#: suffices for a loop that re-verifies every tick.
 _DEFAULT_VERIFICATION_TTL_SECONDS = 3600
 
 #: Default max admissible exchange-status age, in seconds (SPEC S7.3
@@ -487,24 +519,50 @@ def _build_limits(
     )
 
 
-def _zero_account() -> AccountState:
-    """Return a flat, zero-valued account snapshot.
+def _account_from_verification(
+    verification: VerificationSnapshot | None,
+) -> AccountState:
+    """Return the account snapshot the tick's verification evidence supports.
 
-    The PAPER loop honestly supplies ``verification=None``, so the reconciliation
-    checks fail closed regardless of account contents; a zeroed account keeps the
-    composed context valid and deterministic without pretending to know figures a
-    live verification cycle would supply.
+    Only the two terms a verification cycle actually observes are populated:
+    the venue-reported available cash and the observed drift (as the
+    reconciliation-uncertainty buffer). That mirrors
+    ``RiskKernel._stamp_verification`` exactly, and mirroring it is
+    load-bearing rather than decorative: the kernel stamps those two terms onto
+    its *own* copy of the context, but
+    :meth:`~windbreak.riskkernel.reservations.ApprovalPipeline.approve`
+    re-evaluates every check over the *caller's* context. If this function left
+    verified cash at zero, the kernel would pass the floor invariant on the
+    figures it stamped and the pipeline would then veto the same intent on the
+    zeros the caller supplied -- a token that can never mint, for a reason
+    invisible in the kernel's ledgered verdict.
+
+    Every other term stays zero: they are the ones the ledger cannot yet
+    justify (start-of-day equity, high-water mark, exposures, velocity), and a
+    fabricated figure there would loosen a limit rather than tighten it. With
+    ``verification=None`` the whole account is zero, exactly as before, so the
+    fail-closed path is unchanged.
+
+    Args:
+        verification: The tick's verification snapshot, or ``None`` when no
+            cycle has produced one (the fail-closed reading).
 
     Returns:
-        A zero-valued :class:`~windbreak.riskkernel.context.AccountState`.
+        The composed :class:`~windbreak.riskkernel.context.AccountState`.
     """
     zero = MoneyMicros(0)
+    verified_cash = (
+        verification.exchange_verified_available_cash
+        if verification is not None
+        else zero
+    )
+    drift = verification.cash_drift if verification is not None else zero
     return AccountState(
-        exchange_verified_available_cash=zero,
+        exchange_verified_available_cash=verified_cash,
         guaranteed_terminal_value_of_positions=zero,
         pending_kernel_reservations=zero,
         unresolved_fee_upper_bounds=zero,
-        reconciliation_uncertainty_buffer=zero,
+        reconciliation_uncertainty_buffer=drift,
         equity_start_of_day=zero,
         equity_high_water_mark=zero,
         realized_loss_today=zero,
@@ -536,6 +594,10 @@ def build_evaluation_context(
     production default in its place, so a forgotten wiring must fail closed via
     the reconciliation checks rather than open (mirroring
     :class:`~windbreak.riskkernel.context.EvaluationContext`'s own contract).
+    The account is derived from that same snapshot
+    (:func:`_account_from_verification`), so the verified cash the floor
+    invariant reads and the snapshot the reconciliation checks read describe
+    one observation, never two.
 
     The exchange status and pipeline heartbeat are caller-supplied rather than
     hardcoded (issue #342), so the loop can pass genuine observations. They are
@@ -588,7 +650,7 @@ def build_evaluation_context(
     return EvaluationContext(
         mode=Mode.PAPER,
         limits=_build_limits(config, instrument_whitelist),
-        account=_zero_account(),
+        account=_account_from_verification(verification),
         market=market_view,
         fees=fees,
         now_epoch_s=now_epoch_s,
@@ -617,9 +679,21 @@ class PaperTickDeps:
         ticker: The single market ticker this loop ticks.
         store: The hash-chained ledger every stage appends to.
         exchange: The replay-driven paper exchange orders fill against.
+        verification_view: The narrow, read-only view of that same exchange the
+            verification cycle observes through. It exposes only the five
+            account/market reads -- no ``place_order``/``cancel_order`` -- so
+            the verification path structurally cannot trade (SPEC S1.1
+            invariant 3), even though it watches the very exchange this loop
+            fills against.
         gateway: The recovered Order Gateway submissions route through.
         reconciler: The bounded reconciler run to fixpoint after a fill.
         approval: The approval seam intents are decided through.
+        kernel: The very Risk Kernel inside ``approval``, exposed so the tick
+            can drive its per-tick verification cycle, thread the resulting
+            snapshot into the approval context, and stamp the kernel's *real*
+            mode on the tick heartbeat. Held separately from ``approval``
+            precisely because ``approval`` is swappable: a test that doubles
+            the seam still ticks the real kernel's verification.
         verification_key: The ephemeral per-process signing key the kernel mints
             and the gateway verifies under (SPEC S10.6 symmetric tokens).
         transport: The offline LLM transport the forecast vote stage would use.
@@ -643,9 +717,11 @@ class PaperTickDeps:
     ticker: str
     store: SqliteLedgerStore
     exchange: PaperExchange
+    verification_view: ReadOnlyVenueView
     gateway: OrderGateway
     reconciler: Reconciler
     approval: ApprovalSeam
+    kernel: RiskKernel
     verification_key: bytes
     transport: LlmTransport
     research_tools: ResearchTools
@@ -722,9 +798,76 @@ class _OfflineResearchTransport:
         )
 
 
+def _build_verifier(
+    store: SqliteLedgerStore,
+    config: WindbreakConfig,
+    view: ReadOnlyVenueView,
+    writer: _SqliteKernelLedgerWriter,
+) -> ReadOnlyVerifier:
+    """Wire the PAPER loop's read-only verification cycle (issue #353).
+
+    Mirrors ``windbreak.main._build_verifier``'s live composition, over the same
+    hash-chained ``store``: a :class:`~windbreak.riskkernel.verification.\
+LedgerExpectationSource` folds the replayed history *once, here at startup*
+    into one frozen baseline, and the verifier diffs the venue against it each
+    cycle. That freeze is what makes the comparison falsifiable rather than a
+    tautology. Every PAPER dimension falls back to this view's startup capture
+    (nothing stamps ``component="riskkernel"`` position snapshots), so the
+    baseline is the account *as it stood before this process traded*: flat,
+    with the fixture's opening cash and no resting orders. Since issue #352 the
+    exchange derives its balances and positions from its own fill log, so every
+    later cycle compares a live, moving observation against that fixed
+    baseline -- a comparison that can, and on any real fill does, fail.
+
+    The consequence is deliberate and load-bearing: once a PAPER order fills,
+    the venue has moved away from the only baseline the ledger can justify
+    (fills are not ledgered with amounts, so no ledgered fact can update it),
+    the next cycle grades a ``BREACH``, and the kernel HALTs per issue #32.
+    That is the fail-closed answer to "our books cannot explain the venue", not
+    an accident of wiring -- and it is strictly better than the alternative of
+    re-reading the expectation off the same connector every cycle, which would
+    make all three dimensions structurally incapable of failing.
+
+    The tolerances come from ``config.risk`` (both default to ``0``: exact
+    match). The dispatcher fans mismatch and unknown-jurisdiction alerts out
+    through the log-only fallback, matching every other no-sink composition
+    root in ``windbreak.main``.
+
+    Args:
+        store: The hash-chained ledger whose replayed history seeds the
+            baseline.
+        config: The configuration supplying the two drift tolerances.
+        view: The narrow read-only venue view the cycle observes through -- it
+            exposes no ``place_order``/``cancel_order`` (SPEC S1.1 invariant 3).
+        writer: The kernel ledger writer each cycle's event is recorded through.
+
+    Returns:
+        The composed :class:`~windbreak.riskkernel.verification.ReadOnlyVerifier`.
+    """
+    history = events_from_records(store.read_all())
+    return ReadOnlyVerifier(
+        connector=view,
+        expectation_source=LedgerExpectationSource(history, view),
+        tolerances=VerificationTolerances(
+            balance_tolerance=MoneyMicros(
+                config.risk.verification_balance_tolerance_micros
+            ),
+            position_tolerance=ContractCentis(
+                config.risk.verification_position_tolerance_centis
+            ),
+        ),
+        dispatcher=AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
+        ledger_writer=writer,
+    )
+
+
 def _build_approval(
-    store: SqliteLedgerStore, config: WindbreakConfig, key: bytes
-) -> KernelApproval:
+    store: SqliteLedgerStore,
+    config: WindbreakConfig,
+    key: bytes,
+    view: ReadOnlyVenueView,
+    clock: Callable[[], int],
+) -> tuple[KernelApproval, RiskKernel]:
     """Wire the real kernel + approval pipeline into a `KernelApproval` seam.
 
     The kernel tracks PAPER mode (so its ledgered evaluation stamps PAPER) with
@@ -734,13 +877,22 @@ def _build_approval(
     LIVE_MICRO promotion reads its three thresholds from the pre-registered gate
     plan on the ledger, failing closed when none is registered.
 
+    Issue #353 additionally wires a real read-only verifier and the tick's own
+    injected ``clock``, so every cycle the kernel runs is stamped at the same
+    instant the rest of the tick reads -- a snapshot aged against an unrelated
+    wall clock could go stale against ``now_epoch_s`` for no real reason.
+
     Args:
         store: The ledger both the kernel and the pipeline record through.
         config: The configuration whose hash is stamped into minted tokens.
         key: The ephemeral 32-byte signing key.
+        view: The read-only venue view the verification cycle observes through.
+        clock: The injected epoch-second clock the verification cycle stamps
+            its snapshots at.
 
     Returns:
-        The composed :class:`KernelApproval` seam.
+        The composed :class:`KernelApproval` seam and the kernel inside it, so
+        the tick can drive that kernel's verification cycle and read its mode.
     """
     writer = _SqliteKernelLedgerWriter(store)
     mode_machine = ModeStateMachine(
@@ -749,13 +901,15 @@ def _build_approval(
     kernel = RiskKernel(
         writer,
         mode_machine=mode_machine,
+        verifier=_build_verifier(store, config, view, writer),
+        clock=clock,
         gate_plan_store=store,
         kill_integration=None,
     )
     ledger = ReservationLedger(writer)
     issuer = TokenIssuer.from_key_material(key)
     pipeline = ApprovalPipeline(ledger, issuer, config_hash=config_hash(config))
-    return KernelApproval(kernel, pipeline)
+    return KernelApproval(kernel, pipeline), kernel
 
 
 def _build_gateway(
@@ -870,7 +1024,13 @@ def build_paper_deps(
     ticker = next(iter(exchange.markets))
     store = SqliteLedgerStore(ledger_path)
     key = secrets.token_bytes(_SIGNING_KEY_BYTES)
-    approval = _build_approval(store, config, key)
+    # The verification path gets a view, never the exchange: `PaperExchange`
+    # exposes `place_order`/`cancel_order` alongside its reads, and the
+    # read-only cycle must not be able to reach them (SPEC S1.1 invariant 3).
+    verification_view = ReadOnlyConnectorView(exchange)
+    approval, kernel = _build_approval(
+        store, config, key, verification_view, resolved_clock
+    )
     gateway = _build_gateway(exchange, store, key, resolved_clock, ledger_path)
     reconciler = Reconciler(
         gateway,
@@ -883,9 +1043,11 @@ def build_paper_deps(
         ticker=ticker,
         store=store,
         exchange=exchange,
+        verification_view=verification_view,
         gateway=gateway,
         reconciler=reconciler,
         approval=approval,
+        kernel=kernel,
         verification_key=key,
         transport=ReplayCassette.from_path(cassette_path),
         research_tools=_resolve_research_tools(research_tools, ledger_path),
@@ -907,12 +1069,18 @@ class TickOutcome:
         forecast_id: The forecast this tick produced.
         intent_count: How many normalized intents the selector emitted.
         filled_centis: The quantity filled through the gateway this tick, in
-            contract-centis (``0`` whenever the real kernel vetoes, as it always
-            does today).
+            contract-centis (``0`` whenever the kernel vetoed every intent).
         equity_micros: The sampled account equity this tick, in micros.
         research_halted: Whether this tick's research was halted fail-closed on
             a budget ceiling. When ``True`` no forecast exists, so
             ``forecast_id`` is ``""`` and no selector decision was made.
+        kernel_halted: Whether the Risk Kernel is in ``HALT`` at the end of this
+            tick -- today only a verification ``BREACH`` puts it there (issue
+            #32). A halted kernel vetoes every later intent, so an always-on
+            driver must treat this as "stop and get a human", not as a
+            transient. Reported per tick rather than raised, because the tick
+            must still finish ledgering its heartbeat, equity, and positions:
+            the halt is exactly when that audit trail matters most.
     """
 
     beat: int
@@ -921,6 +1089,7 @@ class TickOutcome:
     filled_centis: int
     equity_micros: int
     research_halted: bool = False
+    kernel_halted: bool = False
 
 
 def _snapshot_stage(deps: PaperTickDeps) -> OrderBookSnapshot:
@@ -1182,8 +1351,16 @@ def _approve_stage(
     (issue #342). The status *value* comes from the connector and is never
     synthesized, so a paused or closed exchange still vetoes.
 
-    PAPER fills nonetheless stay gated: ``verification=None`` still fails the
-    three reconciliation checks, so ``filled_centis`` remains ``0``.
+    Threads the kernel's own latest verification snapshot onto the context
+    (issue #353). This is not redundant with the kernel stamping it internally:
+    ``RiskKernel.evaluate_intent`` stamps its snapshot on a private copy, but
+    :meth:`~windbreak.riskkernel.reservations.ApprovalPipeline.approve`
+    re-evaluates every check over the context handed *here*, so without this
+    thread the three reconciliation checks would pass in the kernel and veto in
+    the pipeline, and no token could ever mint. The snapshot is read straight
+    off the kernel rather than re-derived, so both halves judge one identical
+    observation. Before the first cycle it is ``None`` and everything still
+    fails closed.
 
     A market the exchange cannot resolve becomes ``None`` rather than an
     exception, so an unknown ticker vetoes the tick instead of aborting it.
@@ -1217,7 +1394,7 @@ def _approve_stage(
     context = build_evaluation_context(
         deps.config,
         now_epoch_s=deps.clock(),
-        verification=None,
+        verification=deps.kernel.latest_verification,
         instrument_whitelist=frozenset({deps.ticker}),
         market=market,
         exchange_status=project_exchange_status(observed.status),
@@ -1340,6 +1517,32 @@ def _heartbeat_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
     return now_epoch_s
 
 
+def _verification_stage(deps: PaperTickDeps) -> None:
+    """Run one read-only verification cycle, HALTing the kernel on a breach.
+
+    Runs early in the tick -- before any order can route -- so an account that
+    has already drifted away from the reconciled baseline is caught *before*
+    this tick adds to the drift, not after. The cycle observes the exchange
+    through ``deps.verification_view``, which carries no order-placing method,
+    and it runs on every tick including one whose research halted: reconciling
+    the venue is a liveness duty, not a consequence of trading.
+
+    Everything the cycle can do is already the kernel's contract
+    (:meth:`~windbreak.riskkernel.process.RiskKernel.run_verification_cycle`):
+    it records exactly one ``VerificationPassed`` / ``VerificationDrift`` /
+    ``VerificationMismatch`` event, retains the snapshot for this tick's
+    approvals, and on a ``BREACH`` transitions the kernel to ``HALT`` and
+    records a ``VerificationMismatchHalt`` (issue #32). A venue the view cannot
+    even describe -- ``PaperExchange.get_positions`` refuses to net a two-sided
+    holding -- is graded a forced breach there rather than escaping as an
+    exception, so an unobservable venue halts instead of killing the tick.
+
+    Args:
+        deps: The tick's dependency bundle.
+    """
+    deps.kernel.run_verification_cycle()
+
+
 def _decide_and_approve(
     deps: PaperTickDeps,
     order_book: OrderBookSnapshot,
@@ -1381,10 +1584,20 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     :func:`windbreak.scheduler.weekly_data.weekly_report_body` so the report
     carries genuine evaluation and cost-meter data (issue #188), built lazily so
     the fold is paid for only on the genuine per-week write. Every stage appends
-    an audit event to the shared hash-chained ledger. With the real kernel the
-    approval still vetoes every intent -- on the honest ``None`` verification,
-    exchange status, and pipeline heartbeat this loop supplies, not on a stub --
-    so no order routes and ``filled_centis`` is ``0``.
+    an audit event to the shared hash-chained ledger.
+
+    Since issue #353 the tick also runs one read-only verification cycle
+    (:func:`_verification_stage`) before deciding anything, and threads its
+    snapshot into the approval context, so the three reconciliation checks now
+    evaluate real evidence rather than failing closed on ``None``. Two other
+    honest zero/``None`` feeds still veto every intent (see the module
+    docstring), so ``filled_centis`` is still ``0`` -- but no longer for any
+    verification reason.
+
+    A cycle that grades a ``BREACH`` halts the kernel instead (issue #32); the
+    tick still completes and still ledgers its heartbeat, equity sample, and
+    positions snapshot, but every later approval vetoes on the halted mode, and
+    :attr:`TickOutcome.kernel_halted` says so.
 
     A tick whose per-forecast or per-UTC-day research budget is exhausted halts
     fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row, skips
@@ -1405,13 +1618,16 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     created_at = datetime.fromtimestamp(now_epoch_s, UTC)
     order_book = _snapshot_stage(deps)
     heartbeat_epoch_s = _heartbeat_stage(deps, now_epoch_s)
+    _verification_stage(deps)
     forecast = _forecast_stage(deps, order_book, created_at)
     forecast_id, intent_count, filled = _decide_and_approve(
         deps, order_book, forecast, created_at, heartbeat_epoch_s
     )
-    deps.store.append(
-        ModeHeartbeat(component=_COMPONENT, mode=Mode.PAPER.name, beat=beat)
-    )
+    # The kernel's *real* mode, never a hardcoded PAPER: a verification breach
+    # drives it to HALT mid-tick, and a heartbeat still claiming PAPER would be
+    # the loop's own audit trail lying about whether it is trading.
+    mode = deps.kernel.mode
+    deps.store.append(ModeHeartbeat(component=_COMPONENT, mode=mode.name, beat=beat))
     equity = _equity_and_positions_stage(deps, now_epoch_s)
     report_date = created_at.date()
     maybe_write_weekly(
@@ -1426,4 +1642,5 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
         filled_centis=filled,
         equity_micros=equity,
         research_halted=forecast is None,
+        kernel_halted=mode is Mode.HALT,
     )
