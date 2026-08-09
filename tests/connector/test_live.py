@@ -547,3 +547,23 @@ def test_live_session_is_never_re_dated_the_way_a_replay_is(
 
     assert exchange.get_order_book(_TICKER).fetched_at == ancient
     assert exchange.get_exchange_time() == ancient
+
+
+def test_a_live_session_is_never_exhausted_the_way_a_replay_is(
+    exchange: LiveBookPaperExchange,
+) -> None:
+    """Running the cursor off the end leaves the venue clock readable (#382).
+
+    A replay stops answering once it has consumed its recording, because a
+    recording substantiates the venue's clock only for the span it covers. A
+    live session's single step is manufactured fresh from the venue on every
+    read and its clock is the venue's own, so there is no recording to run out
+    of -- `advance` reporting no further step says nothing about whether the
+    venue can state its time.
+
+    Args:
+        exchange: The live-book paper session.
+    """
+    assert exchange.advance() is False
+
+    assert exchange.get_exchange_time() == _VENUE_CLOCK

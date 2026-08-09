@@ -81,6 +81,7 @@ from windbreak.connector.paper import (
     COMPLEMENT_PIPS,
     LiveBookPaperExchange,
     PaperExchange,
+    ReplayExhaustedError,
     TwoSidedPositionError,
 )
 from windbreak.connector.readonly import ReadOnlyConnectorView, ReadOnlyVenueView
@@ -782,6 +783,50 @@ def read_open_position_centis(
         if position.ticker == ticker:
             return position.quantity
     return ContractCentis(0)
+
+
+def read_exchange_clock_epoch_s(exchange: PaperExchange) -> int | None:
+    """Return what the venue says the time is, or ``None`` when it cannot say.
+
+    The one reading ``clock_skew_limit`` measures our clock against (issue
+    #377), taken from the venue rather than from this tick's own clock -- a
+    check fed its own ``now_epoch_s`` reports a skew of exactly zero for any
+    venue at any drift.
+
+    Two answers, and the second is what issue #382 adds:
+
+    * **The venue's own instant**, in whole epoch seconds, while the replay's
+      recording still covers this run. Whether that agrees with our clock is
+      exactly the question the check exists to ask, so the reading is passed
+      through untouched however far it sits from ours.
+    * **``None``** when the replay refuses
+      (:class:`~windbreak.connector.paper.ReplayExhaustedError`): its cursor has
+      consumed the recording, or an anchored run has outlived the recorded
+      span. The recording holds no observation covering this instant, so there
+      is no venue clock to report and ``clock_skew_limit`` vetoes with
+      "exchange clock unknown". Substituting the anchored reading would state a
+      venue time the recording never witnessed, and substituting our own would
+      be the identically-zero skew #377 removed -- an exhausted replay is
+      precisely the case where both substitutions look most reassuring and are
+      least supported.
+
+    Note that the cast is to whole seconds, so a sub-second venue instant floors
+    onto the same integer timeline ``now_epoch_s`` uses; the tolerance is
+    measured in whole seconds too (SPEC S6.1 keeps every epoch off the float
+    path).
+
+    Args:
+        exchange: The paper exchange whose replay answers for the venue.
+
+    Returns:
+        The venue's clock in whole epoch seconds, or ``None`` when the replay
+        can no longer substantiate one.
+    """
+    try:
+        venue_now = exchange.get_exchange_time()
+    except ReplayExhaustedError:
+        return None
+    return int(venue_now.timestamp())
 
 
 def _human_ack_micros(config: WindbreakConfig) -> MoneyMicros | None:
@@ -2094,7 +2139,10 @@ def _approve_stage(
     ``now_epoch_s``, so ``clock_skew_limit`` measures our clock against the
     venue's instead of against itself. ``PaperExchange.get_exchange_time``
     answers from the anchored replay timeline and deliberately does not renew
-    itself per read -- a clock that did could never disagree.
+    itself per read -- a clock that did could never disagree. A replay that has
+    run out of recording reports no clock at all rather than a stale one (issue
+    #382; see :func:`read_exchange_clock_epoch_s`), so a run that outlives its
+    recording vetoes for a stated reason instead of on accumulated drift.
 
     Threads the venue's own open position (issue #373), read here rather than
     taken from :func:`_equity_and_positions_stage`, which runs *after* this
@@ -2161,7 +2209,7 @@ def _approve_stage(
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
-        exchange_clock_epoch_s=int(deps.exchange.get_exchange_time().timestamp()),
+        exchange_clock_epoch_s=read_exchange_clock_epoch_s(deps.exchange),
         forecast_epoch_s=int(forecast.created_at.timestamp()),
         open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
         equity_start_of_day=read_start_of_day_equity_micros(
