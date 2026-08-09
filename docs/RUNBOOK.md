@@ -276,11 +276,12 @@ windbreak ack --approval-id <32-hex-approval-id> --state-dir <dir>
 writes `<dir>/acks/<approval_id>`, which the kernel's ack-file watcher grants on
 its next beat and then removes. The `--approval-id` must be exactly 32 lowercase
 hex characters (the shape the kernel mints); any other token is rejected as a
-usage error before a file is written. Alternatively, `POST /ack` on the
-dashboard (below) grants the same acknowledgement over the authenticated
-loopback surface. As with the kill switch, the live loop that polls the ack
-drop-box is not wired yet — this verb writes the durable grant signal a future
-live loop consumes.
+usage error before a file is written. This CLI verb is the **only** way to
+grant an acknowledgement today: the dashboard's `POST /ack` route is an
+unwired seam that answers `404` under `windbreak run --process dashboard` (see
+the route table [below](#observing-via-the-dashboard)). As with the kill
+switch, the live loop that polls the ack drop-box is not wired yet — this verb
+writes the durable grant signal a future live loop consumes.
 
 ### Observing via the dashboard
 
@@ -293,25 +294,43 @@ live loop consumes.
   missing/wrong token gets a `401` with a `WWW-Authenticate: Bearer`
   challenge.
 
-Routes:
+Routes. The **Status** column is what `windbreak run --process dashboard`
+actually answers for that method and path with a valid bearer token — not what
+a future build might. Every row is replayed against the running CLI-built
+server by `tests/docs/test_operator_control_claims.py`, which also fails if the
+server grows a route this table omits, so a row here can never quietly become
+a claim about a control that is not wired (issue #449).
 
-| Path | Renders |
-|------|---------|
-| `/` | Current mode and last-heartbeat status. |
-| `/positions` | The latest open-positions snapshot. |
-| `/equity` | The equity curve vs. the configured capital floor. |
-| `/decisions` | The interleaved selector decisions, including skip/veto reasons. |
-| `/providers` | The fleet-observability provider panel: one summary per provider (id, canary status; resolved count and Brier skill from the #194 track-record fold; abstention rate and per-provider `cost_per_forecast` from the #281 per-provider vote-cost fold) plus a fleet-wide cost-per-forecast line. Any figure falls back to `n/a` only for a provider its respective fold does not (yet) cover. See [Provider operations](#provider-operations) below. |
-| `GET /acks` | The pending human acknowledgements awaiting an operator (SPEC S10.8). |
-| `POST /ack` | Grant a pending acknowledgement — JSON body `{"approval_id": "<32-hex>"}`. |
+<!-- dashboard-routes:begin -->
 
-`POST /ack` is the dashboard's only write surface: it shares the same bearer
+| Method | Path | Status | Renders |
+|---|---|---|---|
+| `GET` | `/` | `200` | Current mode and last-heartbeat status. |
+| `GET` | `/positions` | `200` | The latest open-positions snapshot. |
+| `GET` | `/equity` | `200` | The equity curve vs. the configured capital floor. |
+| `GET` | `/decisions` | `200` | The interleaved selector decisions, including skip/veto reasons. |
+| `GET` | `/execution` | `200` | Execution quality: each fill's slippage against its decision reference (issue #58). |
+| `GET` | `/divergence` | `200` | Live-vs-paper divergence: each sampled or breached row's two series against their thresholds, plus the firing trigger (issue #58). |
+| `GET` | `/providers` | `200` | The fleet-observability provider panel: one summary per provider (id, canary status; resolved count and Brier skill from the #194 track-record fold; abstention rate and per-provider `cost_per_forecast` from the #281 per-provider vote-cost fold) plus a fleet-wide cost-per-forecast line. Any figure falls back to `n/a` only for a provider its respective fold does not (yet) cover. See [Provider operations](#provider-operations) below. |
+| `GET` | `/acks` | `200` | The pending human acknowledgements awaiting an operator (SPEC S10.8) — always the empty placeholder under the CLI-built server, which wires no `pending_acks_source`. |
+| `POST` | `/ack` | `404` | Nothing. The route exists in the handler but the CLI wires no `ack_granter`, so **the shipped dashboard has no working mutation surface**; use `windbreak ack` instead. |
+
+<!-- dashboard-routes:end -->
+
+**The dashboard is read-only as shipped.** `POST /ack` is the handler's only
+write route and it is an unwired seam: `windbreak run --process dashboard`
+builds the server with no `ack_granter`, so the route answers `404` and no
+acknowledgement can be granted over HTTP. `GET /acks` does answer `200`, but
+with no `pending_acks_source` wired it renders its empty placeholder rather
+than real pending acknowledgements — an empty page there means "nothing is
+wired", never "nothing is pending".
+
+A library caller that passes both seams to `create_server` gets the full
+behaviour the handler already implements: `POST /ack` shares the same bearer
 gate as every read route (an unauthenticated post gets a `401` and never
-reaches the granter), 404s when `create_server` was built with no `ack_granter`
-seam wired, and rejects a malformed, oversized, or non-32-hex body with a `400`
-before invoking the granter. It is enabled only when both `ack_granter` and
-`pending_acks_source` are passed to `create_server`; the default build exposes
-neither route.
+reaches the granter) and rejects a malformed, oversized, or non-32-hex body
+with a `400` before invoking the granter. Wiring those seams changes the table
+above, and the suite will say so.
 
 `windbreak run --process dashboard` is the primary operator path (issue #79).
 The bearer token is read only from the `WINDBREAK_DASHBOARD_TOKEN` environment
