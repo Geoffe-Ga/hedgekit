@@ -20,7 +20,11 @@ fail-closed contract can be exercised with values
 
 from __future__ import annotations
 
-from windbreak.riskkernel.context import JurisdictionStatus, ProductType
+from windbreak.riskkernel.context import (
+    ExchangeTradingStatus,
+    JurisdictionStatus,
+    ProductType,
+)
 
 #: The only raw ``jurisdiction_status`` values that project onto a kernel value.
 #: The connector's third literal, ``"unknown"``, is deliberately absent: it must
@@ -69,3 +73,32 @@ def project_product_type(market_type: str | None) -> ProductType | None:
     if market_type is None:
         return None
     return _PRODUCT_TYPE_BY_RAW.get(market_type)
+
+
+#: The raw ``ExchangeStatus.status`` literals that project onto a kernel status.
+#: All three connector values are represented, because ``PAUSED``/``CLOSED`` are
+#: genuine observations that must be distinguishable from *no* observation: the
+#: check vetoes both, but with different reasons ("not open for trading" versus
+#: "stale or missing"), and an operator needs to tell those apart.
+_EXCHANGE_STATUS_BY_RAW: dict[str, ExchangeTradingStatus] = {
+    "open": ExchangeTradingStatus.OPEN,
+    "paused": ExchangeTradingStatus.PAUSED,
+    "closed": ExchangeTradingStatus.CLOSED,
+}
+
+
+def project_exchange_status(status: str | None) -> ExchangeTradingStatus | None:
+    """Return the kernel trading status for a raw connector value.
+
+    Args:
+        status: The exchange's raw ``ExchangeStatus.status``, or ``None`` when
+            no status could be observed at all.
+
+    Returns:
+        The matching :class:`ExchangeTradingStatus` for a recognized value;
+        ``None`` for ``None`` or anything unrecognized -- which
+        ``exchange_status_ok`` fails closed on.
+    """
+    if status is None:
+        return None
+    return _EXCHANGE_STATUS_BY_RAW.get(status)

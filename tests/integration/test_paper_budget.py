@@ -474,8 +474,10 @@ def test_unexhausted_budget_leaves_the_tick_ledger_payloads_byte_identical(
     assert _event_types(legs[0]) == [
         "RecoveryCompleted",
         "MarketSnapshotRecorded",
+        "PipelineHeartbeatRecorded",
         "ForecastCreated",
         "SelectorDecisionRecorded",
+        "ExchangeStatusObserved",
         "ModeHeartbeat",
         "EquitySampled",
         "PositionsSnapshotRecorded",

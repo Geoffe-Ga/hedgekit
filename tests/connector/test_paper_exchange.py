@@ -1355,3 +1355,55 @@ class TestPaperExchangeMultiTickerRestingIsolation:
         assert [(f.ticker, f.price.value, f.quantity.value) for f in recorded] == [
             ("MKT-ISO-A", 4200, 100)
         ]
+
+
+# --- Issue #342: the status observation is stamped at read time -------------
+
+
+def test_get_exchange_status_stamps_fetched_at_from_the_injected_clock(
+    books_fixture_dir: Path,
+) -> None:
+    """`get_exchange_status` reports *when it was observed*, not the fixture literal.
+
+    The committed fixtures all carry `status_fetched_at: 2025-01-01T00:00:00Z`,
+    which is far outside any sane freshness TTL. Returning that verbatim would
+    make `exchange_status_ok` veto forever on a healthy exchange. The paper
+    exchange answers synchronously and in-process, so the observation genuinely
+    did occur now -- stamping it is honest, and it mirrors
+    `KalshiConnector.get_exchange_status`, which likewise does not trust the
+    venue's own timestamp.
+
+    Args:
+        books_fixture_dir: The shared books-fixture root.
+    """
+    observed_at = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
+    exchange = paper.PaperExchange.from_fixture_dir(
+        books_fixture_dir / "deep_walk", clock=lambda: observed_at
+    )
+
+    assert exchange.get_exchange_status().fetched_at == observed_at
+
+
+def test_get_exchange_status_keeps_the_fixture_status_value(
+    books_fixture_dir: Path, tmp_path: Path
+) -> None:
+    """The status *value* is never synthesized -- only its timestamp is stamped.
+
+    This is the line between honest and fabricated evidence: hardcoding `open`
+    would make the unhealthy-exchange veto unreachable, so a `paused` fixture
+    must still report `paused`.
+
+    Args:
+        books_fixture_dir: The shared books-fixture root.
+        tmp_path: Scratch directory for the mutated copy.
+    """
+    paused_dir = tmp_path / "paused_books"
+    shutil.copytree(books_fixture_dir / "deep_walk", paused_dir)
+    exchange_json = paused_dir / "exchange.json"
+    payload = json.loads(exchange_json.read_text(encoding="utf-8"))
+    payload["status"] = "paused"
+    exchange_json.write_text(json.dumps(payload), encoding="utf-8")
+
+    exchange = paper.PaperExchange.from_fixture_dir(paused_dir)
+
+    assert exchange.get_exchange_status().status == "paused"

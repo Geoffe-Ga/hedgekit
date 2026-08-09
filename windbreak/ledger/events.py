@@ -1330,6 +1330,63 @@ class ResearchBudgetHalted(Event):
         _derive_typed_event(self, payload)
 
 
+@dataclass(frozen=True)
+class ExchangeStatusObserved(Event):
+    """Records one observation of the exchange's trading status (issue #342).
+
+    Appended by the scheduler each tick, at the instant the status is read, so
+    the evidence the ``exchange_status_ok`` check consumed is auditable after
+    the fact. The ``status`` string is the connector's own value, never
+    synthesized; ``observed_at_epoch_s`` is when the observation happened, which
+    is what the freshness check measures against.
+
+    Attributes:
+        status: The exchange's raw trading status (``"open"``/``"paused"``/
+            ``"closed"``), verbatim from the connector.
+        observed_at_epoch_s: Epoch second the status was observed.
+    """
+
+    status: str
+    observed_at_epoch_s: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {
+            "status": self.status,
+            "observed_at_epoch_s": self.observed_at_epoch_s,
+        }
+        _derive_typed_event(self, payload)
+
+
+@dataclass(frozen=True)
+class PipelineHeartbeatRecorded(Event):
+    """Records that the tick pipeline was alive at an instant (issue #342).
+
+    Stamped once per tick, after the snapshot stage has proven the pipeline is
+    genuinely running, and read by the ``pipeline_heartbeat_ok`` check. It is a
+    distinct concept from :class:`ModeHeartbeat`, which carries the operating
+    mode and beat number but no instant, and which is appended too late in the
+    tick to serve as evidence for the approve stage.
+
+    Attributes:
+        heartbeat_epoch_s: Epoch second at which the pipeline was observed
+            alive.
+    """
+
+    heartbeat_epoch_s: int
+    event_type: str = field(init=False)
+    payload_schema_version: int = field(init=False)
+    payload: dict[str, object] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Assemble the payload and derive the base ``Event`` fields."""
+        payload: dict[str, object] = {"heartbeat_epoch_s": self.heartbeat_epoch_s}
+        _derive_typed_event(self, payload)
+
+
 #: Maps each event_type string to its class, so a persisted envelope can be
 #: reconstructed as ``EVENT_TYPES[event_type](component=..., **data)``.
 EVENT_TYPES: dict[str, type[Event]] = {
@@ -1365,4 +1422,6 @@ EVENT_TYPES: dict[str, type[Event]] = {
     "PromotionBlocked": PromotionBlocked,
     "ProviderVoteRecorded": ProviderVoteRecorded,
     "ResearchBudgetHalted": ResearchBudgetHalted,
+    "ExchangeStatusObserved": ExchangeStatusObserved,
+    "PipelineHeartbeatRecorded": PipelineHeartbeatRecorded,
 }

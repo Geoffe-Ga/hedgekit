@@ -76,17 +76,22 @@ The weekly report stub (below) is also (re-)written each tick.
 **Known limitation -- today's tick never actually fills.** The `approve`
 stage composes the real `RiskKernel.evaluate_intent` with the real
 `ApprovalPipeline.approve` (`KernelApproval` in `windbreak/scheduler/loop.py`).
-Right now that seam can never mint an approval token, for two independent
-reasons (issue #340 removed a third -- `jurisdiction_product_eligibility` is a
-real check now, and it passes over a market with eligible metadata):
+Right now that seam can never mint an approval token, for **one** remaining
+reason. Two earlier causes have been removed: issue #340 made
+`jurisdiction_product_eligibility` a real check (it passes over a market with
+eligible metadata), and issue #342 wired real exchange-status and
+pipeline-heartbeat evidence, so `exchange_status_ok` and
+`pipeline_heartbeat_ok` now evaluate genuine observations and pass on a healthy
+exchange.
 
-- `exchange_status_ok` and `pipeline_heartbeat_ok` are now real checks (issue
-  #110), but the loop honestly supplies no exchange-status feed and no
-  pipeline heartbeat (`exchange_status=None`, `pipeline_heartbeat_epoch_s=None`),
-  so both fail closed and veto today.
 - The reconciliation checks fail closed on `verification=None`, which is
-  exactly what the loop honestly supplies today -- no live exchange
+  exactly what the loop honestly supplies today -- no read-only exchange
   verification cycle runs in PAPER yet.
+
+Note the status **value** is read from the connector every tick and never
+synthesized, so a `paused` or `closed` exchange still vetoes -- with the
+distinct reason `exchange not open for trading` rather than `stale or missing`,
+so an operator can tell "the venue is shut" from "we have no reading".
 
 So a real PAPER tick ledgers a full decision trail (snapshot, forecast,
 selector decision, and an `IntentVetoed`) but routes nothing and fills
