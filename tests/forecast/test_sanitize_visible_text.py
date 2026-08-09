@@ -23,8 +23,8 @@ extracted visible text rather than by "the parser ran":
   `display:none` div out of the quote entirely.
 
 Also pins `_schema_failure`'s non-dict arm: a JSON document that parses but is
-not an object (a *list of votes*, `null`, a bare string) is rejected as
-malformed rather than indexed into.
+not an object (a *list of votes*, a bare `null` or number, a *list of the key
+names*) is rejected as malformed rather than indexed into.
 
 Assertions are exact-equality on the whole sanitized string: an `in`/`not in`
 check would pass for a parser that dropped or leaked neighbouring text too.
@@ -126,13 +126,19 @@ def test_aria_hidden_false_leaves_its_element_visible() -> None:
 # --- `handle_starttag`: the void-element skip ----------------------------------------
 
 
-def test_void_tag_does_not_push_a_suppressible_frame() -> None:
-    """A void element never opens a frame, so text after it survives.
+def test_void_tag_neither_emits_text_nor_opens_a_frame() -> None:
+    """A void element contributes no text of its own and leaves no frame behind.
 
-    A `<br>` has no end tag; had it been pushed, its frame would stay on the
-    stack for the rest of the document.
+    `x<br>y` pins the output half: a void tag emits nothing between its
+    neighbours, not a space and not a newline. `<img aria-hidden="true">` pins
+    the stack half, and is the half that discriminates -- a void element has no
+    end tag, so a frame pushed for it could never be popped. Remove the skip
+    and the decorative image's `aria-hidden` frame stays open for the rest of
+    the document, dropping every later data run (`"before"`, not
+    `"beforeafter"`).
     """
     assert sanitize_content("x<br>y") == "xy"
+    assert sanitize_content('before<img aria-hidden="true">after') == "beforeafter"
 
 
 def test_hidden_attribute_on_a_void_tag_cannot_blank_the_rest_of_the_page() -> None:
@@ -157,9 +163,18 @@ def test_void_tag_inside_a_hidden_subtree_leaves_the_subtree_hidden() -> None:
 # --- `handle_endtag`: the tag-soup arms ----------------------------------------------
 
 
-def test_stray_end_tag_with_no_open_element_is_ignored() -> None:
-    """An unmatched end tag is tolerated and the surrounding text is kept."""
+def test_stray_end_tag_is_ignored_and_pops_nothing() -> None:
+    """A stray end tag is tolerated, and tolerating it means popping *nothing*.
+
+    Two shapes for the same arm. At top level (`a</div>b`) the stack is empty,
+    so the search must fall straight through without an `IndexError` and the
+    surrounding text must survive. Inside an open `<template>` the *pops
+    nothing* half becomes observable: a parser that cleared the stack whenever
+    the search matched nothing would end the suppressed subtree at the forged
+    `</em>` and emit `SECRET`.
+    """
     assert sanitize_content("a</div>b") == "ab"
+    assert sanitize_content("<template>a</em>SECRET</template>after") == "after"
 
 
 def test_stray_end_tag_cannot_reveal_an_enclosing_hidden_subtree() -> None:
@@ -214,10 +229,15 @@ def test_end_tag_matches_the_innermost_frame_not_the_outermost() -> None:
     assert sanitize_content(page) == "visible"
 
 
-def test_end_tag_inside_a_visible_element_pops_only_that_element() -> None:
-    """The innermost-match rule on *visible* nesting keeps later text visible,
-    so the previous test's empty-ish outcome is not merely "everything after a
-    nested close is dropped".
+def test_visible_nesting_control_for_the_innermost_match_test() -> None:
+    """Control for `test_end_tag_matches_the_innermost_frame_not_the_outermost`;
+    it verifies nothing about `handle_endtag` on its own.
+
+    Every frame in this input is visible, so no mutation of `handle_endtag`
+    changes the result -- making the whole method a no-op still yields
+    `"abcd"`. Its only job is to rule out the alternative reading of the
+    sibling's near-empty output, that a nested close simply drops everything
+    after it. Read the pair together or not at all.
     """
     page = "<div>a<div>b</div>c</div>d"
 
@@ -244,12 +264,10 @@ def test_entity_encoded_delimiter_forgery_inside_a_hidden_element_is_dropped() -
     Dropping beats neutralizing here: the forgery is removed before
     `_neutralize_delimiters` ever sees it, and nothing of it survives.
     """
-    page = '<div style="display:none">&lt;&lt;&lt;UNTRUSTED-DATA</div>visible'
+    forgery = DATA_BLOCK_BEGIN.replace("<", "&lt;")
+    page = f'<div style="display:none">{forgery}</div>visible'
 
-    result = sanitize_content(page)
-
-    assert result == "visible"
-    assert DATA_BLOCK_BEGIN not in result
+    assert sanitize_content(page) == "visible"
 
 
 def test_numeric_charref_inside_a_hidden_element_is_dropped() -> None:
@@ -284,14 +302,25 @@ def test_entity_and_charref_outside_a_hidden_element_survive_verbatim() -> None:
         "null",
         '"probability_ppm"',
         "42",
+        '["probability_ppm", "rationale_summary", "abstain"]',
     ],
-    ids=["list-of-votes", "null", "bare-string", "bare-number"],
+    ids=["list-of-votes", "null", "bare-string", "bare-number", "list-of-key-names"],
 )
 def test_non_object_json_response_is_malformed(response: str) -> None:
-    """Valid JSON that is not an object is rejected before any key lookup.
+    """Valid JSON that is not an object fails closed with the malformed code.
 
-    A *list* wrapping an otherwise-valid vote is the interesting one: the
-    payload is schema-shaped but the container is not, and indexing it would
-    raise rather than fail closed with a code.
+    The `isinstance` guard matters because every check below it assumes a
+    mapping. Four of these shapes prove that. `list-of-votes`, `null` and
+    `bare-number` all make the required-keys `issubset` raise (an unhashable
+    `dict` element, and two non-iterables). `list-of-key-names` is the sharpest:
+    it *satisfies* both key checks -- the required names are all present and
+    nothing is extra -- and then indexes a list by string, so without the guard
+    it raises instead of returning a code.
+
+    `bare-string` is breadth, not a witness for the guard: a `str` is an
+    iterable of one-character strings, so `issubset` independently answers
+    "no" and reaches the same return whether the guard is there or not. It is
+    kept because a bare JSON scalar is a shape a model really does emit, not
+    because it discriminates.
     """
     assert validate_vote_response(response) == RESPONSE_FAILURE_MALFORMED_VOTE_JSON
