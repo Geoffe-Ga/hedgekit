@@ -45,12 +45,19 @@ This module pins the crash-recovery contract:
       (no resting remainder left) is retired, returning its full headroom.
     * `.recover()` never leaves `accepting_approvals` `True` while a halt
       condition stands (SPEC S11.4 ordering).
+    * A journalled intent whose payload no longer re-derives the
+      `client_order_id` it was stored under is *refused*, never reconciled
+      under either id: `read_all()` raises `ValueError` naming both ids by
+      role, one corrupt record poisons the whole read (no partial recovery),
+      and a Gateway whose `.recover()` hits one stays shut -- re-presenting
+      the same intent is refused `REFUSED_RECOVERY_PENDING` rather than
+      submitted a second time (issue #252).
 """
 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -67,6 +74,7 @@ from tests.order_gateway.test_reduce_only import (
     _StubPositionSource,
 )
 from windbreak.connector.paper import PaperOrderIntent
+from windbreak.ledger.events import canonical_json
 from windbreak.ledger.store import SqliteLedgerStore
 from windbreak.numeric.types import ContractCentis, PricePips
 from windbreak.order_gateway.client_order_id import client_order_id
@@ -847,3 +855,314 @@ def test_wal_is_append_only_jsonl_one_record_per_line(tmp_path: Path) -> None:
     assert len(lines) == 2
     for line in lines:
         json.loads(line)
+
+
+# --- 8. WAL corruption is refused, never guessed (issue #252) -------------------
+
+#: A syntactically well-formed but wrong client-order-id (64 lowercase hex
+#: characters, like a real SHA-256 digest) to overwrite a journalled id with.
+#: It cannot collide with any real derivation: `client_order_id` hashes the
+#: intent's nine fields, and no fixture below hashes to a repeating "dead".
+_FOREIGN_COID = "dead" * 16
+
+#: The width of a `client_order_id`: a 64-character lowercase-hex SHA-256
+#: digest. Asserted as a precondition below so the near-miss tamperings that
+#: flip the first/last digit really are flipping the ends of a full digest.
+_COID_HEX_LENGTH = 64
+
+#: The price a tampered payload is rewritten to, in pips -- deliberately
+#: different from `make_intent`'s 4600-pip default so the re-derived id is a
+#: genuinely different digest rather than an accidental match.
+_TAMPERED_PRICE_PIPS = 4700
+
+#: Three distinct sizes (in contract-centis) for the multi-record journal, so
+#: the three records differ in a money-path field as well as in their
+#: idempotency key: no two can hash alike, and a mixed-up record is visible.
+_MULTI_RECORD_SIZES = (100, 150, 175)
+
+
+def _read_wal_objects(wal_path: Path) -> list[dict[str, object]]:
+    """Parse the journal into one mutable mapping per JSONL line.
+
+    Args:
+        wal_path: Path to the JSONL journal.
+
+    Returns:
+        One decoded mapping per non-empty line, in append order.
+    """
+    text = wal_path.read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line]
+
+
+def _rewrite_wal_objects(wal_path: Path, objects: list[dict[str, object]]) -> None:
+    """Rewrite the journal from `objects`, one canonical-JSON line each.
+
+    Round-tripping through `canonical_json` -- the same encoder
+    `WriteAheadLog._append` uses -- means a tampered file is byte-shaped
+    exactly like a genuine one, so the read path rejects it on the
+    content-addressed id check and not incidentally on malformed JSON.
+
+    Args:
+        wal_path: Path to the JSONL journal to overwrite.
+        objects: The record mappings to write, in order.
+    """
+    wal_path.write_text(
+        "".join(canonical_json(obj) + "\n" for obj in objects), encoding="utf-8"
+    )
+
+
+def _with_flipped_hex_digit(coid: str, index: int) -> str:
+    """Return `coid` with the hex digit at `index` swapped for a different one.
+
+    Used to build a *near-miss* id that differs from the true one in exactly
+    one character. A guard that compared only a prefix (or only a suffix) of
+    the two ids would wave such a record through, so flipping each end in turn
+    is what proves the whole 64-character digest is compared.
+
+    Args:
+        coid: The client-order-id to perturb.
+        index: The character position to change.
+
+    Returns:
+        A 64-character hex id differing from `coid` at exactly `index`.
+    """
+    replacement = "1" if coid[index] == "0" else "0"
+    return coid[:index] + replacement + coid[index + 1 :]
+
+
+def _expected_corruption_message(rederived: str, journalled: str) -> str:
+    """Build the exact `ValueError` message a corrupt journal must raise with.
+
+    Spelled out here rather than imported from `wal.py` so the assertion is an
+    independent statement of the contract: a reworded message, or one that
+    swaps which id is reported as re-derived and which as journalled, fails
+    these tests instead of silently agreeing with itself.
+
+    Args:
+        rederived: The id re-derived from the journalled intent payload.
+        journalled: The id the record was actually stored under.
+
+    Returns:
+        The exact expected `str(ValueError)`.
+    """
+    return (
+        f"write-ahead log corrupt: intent re-derives client_order_id "
+        f"{rederived!r} but was journalled under {journalled!r}"
+    )
+
+
+def _assert_exactly_value_error(error: BaseException, expected_message: str) -> None:
+    """Assert `error` is a plain `ValueError` carrying exactly `expected_message`.
+
+    The type check is `is ValueError`, not `isinstance`: a malformed journal
+    line makes `json.loads` raise `json.JSONDecodeError`, which *subclasses*
+    `ValueError`, so a bare `pytest.raises(ValueError)` would pass for
+    entirely the wrong reason -- the record never reaching the integrity check
+    at all. Pinning the exact type and the exact message is what makes these
+    tests evidence that the corruption guard fired.
+
+    Args:
+        error: The exception raised by the read path.
+        expected_message: The exact message it must carry.
+    """
+    assert type(error) is ValueError
+    assert str(error) == expected_message
+
+
+@pytest.mark.parametrize(
+    "flip_index",
+    [None, 0, _COID_HEX_LENGTH - 1],
+    ids=["wholly-foreign-id", "first-digit-differs", "last-digit-differs"],
+)
+def test_read_all_refuses_an_intent_record_whose_journalled_coid_was_tampered(
+    tmp_path: Path, flip_index: int | None
+) -> None:
+    """Rewriting the stored id (payload intact) is refused, not silently trusted.
+
+    The journalled payload still re-derives its true id, so the two sides
+    disagree and the read must fail closed rather than adopt either one: a
+    WAL that recovered under the wrong `client_order_id` could resubmit or
+    orphan a live order. The message must report the *payload's* id as
+    re-derived and the *tampered* id as journalled.
+
+    Three tamperings, because "the ids differ" is not the same claim as "the
+    guard compares them in full": besides a wholly foreign id, the stored id
+    is perturbed in only its first digit and then in only its last. A guard
+    that compared a prefix of the two digests would accept the last-digit
+    near miss, and one that compared a suffix would accept the first-digit
+    near miss -- both of them silently recovering an order under an id that
+    is not its own.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    wal = WriteAheadLog(wal_path)
+    intent = make_intent(idempotency_key="idem-wal-coid-tampered")
+    true_coid = client_order_id(intent)
+    assert len(true_coid) == _COID_HEX_LENGTH
+    wrong_coid = (
+        _FOREIGN_COID
+        if flip_index is None
+        else _with_flipped_hex_digit(true_coid, flip_index)
+    )
+    assert wrong_coid != true_coid
+    assert len(wrong_coid) == _COID_HEX_LENGTH
+    wal.append_intent(intent, true_coid)
+
+    objects = _read_wal_objects(wal_path)
+    objects[0]["client_order_id"] = wrong_coid
+    _rewrite_wal_objects(wal_path, objects)
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value, _expected_corruption_message(true_coid, wrong_coid)
+    )
+
+
+def test_read_all_refuses_an_intent_record_whose_payload_was_tampered(
+    tmp_path: Path,
+) -> None:
+    """Rewriting a money-path field (id intact) is refused, not silently trusted.
+
+    The mirror image of the tampered-id case: here the *payload* is the
+    altered side, so the re-derived id is the tampered one and the journalled
+    id is the true one -- exactly the opposite roles. Asserting both
+    directions pins which id the message reports as which, so an
+    implementation that swapped them (or that resolved the mismatch by
+    trusting whichever side it read first) cannot pass both tests.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    wal = WriteAheadLog(wal_path)
+    intent = make_intent(idempotency_key="idem-wal-payload-tampered")
+    journalled_coid = client_order_id(intent)
+    wal.append_intent(intent, journalled_coid)
+
+    objects = _read_wal_objects(wal_path)
+    payload = cast("dict[str, object]", objects[0]["intent"])
+    assert payload["price"] != _TAMPERED_PRICE_PIPS
+    payload["price"] = _TAMPERED_PRICE_PIPS
+    _rewrite_wal_objects(wal_path, objects)
+
+    tampered_intent = make_intent(
+        idempotency_key="idem-wal-payload-tampered",
+        price=PricePips(_TAMPERED_PRICE_PIPS),
+    )
+    tampered_coid = client_order_id(tampered_intent)
+    assert tampered_coid != journalled_coid
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value, _expected_corruption_message(tampered_coid, journalled_coid)
+    )
+
+
+@pytest.mark.parametrize(
+    "corrupt_index",
+    range(len(_MULTI_RECORD_SIZES)),
+    ids=["first-record", "middle-record", "last-record"],
+)
+def test_read_all_refuses_the_whole_journal_wherever_the_corrupt_record_sits(
+    tmp_path: Path, corrupt_index: int
+) -> None:
+    """One corrupt record poisons the entire read -- there is no partial recovery.
+
+    Three sound records are journalled and read back intact (so the raise
+    below can only be caused by the tampering, not by an always-failing read).
+    Exactly one is then corrupted, at each position in turn. `read_all()` must
+    raise every time: with the corruption last, two perfectly good records
+    precede it and are still not returned; with it first or in the middle, a
+    guard that only checked the opening record would let a corrupt journal
+    through. Handing back a truncated prefix would be the worst outcome of
+    all -- a Gateway recovering from a silently shortened WAL has no durable
+    ack for orders it already placed.
+    """
+    wal_path = tmp_path / "wal.jsonl"
+    wal = WriteAheadLog(wal_path)
+    intents = [
+        make_intent(idempotency_key=f"idem-wal-multi-{size}", size=ContractCentis(size))
+        for size in _MULTI_RECORD_SIZES
+    ]
+    coids = [client_order_id(intent) for intent in intents]
+    assert len(set(coids)) == len(_MULTI_RECORD_SIZES)
+    for intent, coid in zip(intents, coids, strict=True):
+        wal.append_intent(intent, coid)
+
+    sound = WriteAheadLog(wal_path).read_all()
+    assert [record.client_order_id for record in sound] == coids
+
+    objects = _read_wal_objects(wal_path)
+    objects[corrupt_index]["client_order_id"] = _FOREIGN_COID
+    _rewrite_wal_objects(wal_path, objects)
+
+    with pytest.raises(ValueError) as excinfo:
+        WriteAheadLog(wal_path).read_all()
+
+    _assert_exactly_value_error(
+        excinfo.value,
+        _expected_corruption_message(coids[corrupt_index], _FOREIGN_COID),
+    )
+
+
+def test_recover_over_a_corrupt_wal_keeps_the_gateway_shut_and_resubmits_nothing(
+    tmp_path: Path, paper_exchange: PaperExchange
+) -> None:
+    """A corrupt journal stops recovery dead: no ledger write, no resubmission.
+
+    The end-to-end consequence the guard exists for. One intent is driven all
+    the way to `ACKED`, leaving a partially filled order resting on the
+    exchange, and its journalled id is then tampered. A fresh Gateway over the
+    same durable state must refuse rather than guess: `.recover()` raises the
+    corruption `ValueError`, writes nothing to the ledger, and -- critically
+    -- leaves `accepting_approvals` `False`, so re-presenting the *same*
+    intent and token is refused `REFUSED_RECOVERY_PENDING` instead of being
+    submitted a second time. The exchange still shows exactly the one resting
+    order it had before recovery, not two.
+    """
+    db_path = tmp_path / "ledger.db"
+    wal_path = tmp_path / "wal.jsonl"
+    store = SqliteLedgerStore(db_path)
+    gateway = _build_recovering_gateway(paper_exchange, store, WriteAheadLog(wal_path))
+    assert gateway.recover().halted is False
+
+    intent = make_intent(idempotency_key="idem-wal-corrupt-recover")
+    token = issue_matching_token(intent)
+    true_coid = client_order_id(intent)
+    assert gateway.process_intent(intent, token).outcome is SubmitOutcome.ACKED
+    resting_before = paper_exchange.get_open_orders()
+    assert len(resting_before) == 1
+    ledger_rows_before = len(store.read_all())
+    store.close()
+
+    objects = _read_wal_objects(wal_path)
+    objects[0]["client_order_id"] = _FOREIGN_COID
+    _rewrite_wal_objects(wal_path, objects)
+
+    fresh_store = SqliteLedgerStore(db_path)
+    fresh_gateway = _build_recovering_gateway(
+        paper_exchange, fresh_store, WriteAheadLog(wal_path)
+    )
+    assert fresh_gateway.accepting_approvals is False
+
+    with pytest.raises(ValueError) as excinfo:
+        fresh_gateway.recover()
+
+    _assert_exactly_value_error(
+        excinfo.value, _expected_corruption_message(true_coid, _FOREIGN_COID)
+    )
+    assert fresh_gateway.accepting_approvals is False
+    assert len(fresh_store.read_all()) == ledger_rows_before
+
+    replayed = fresh_gateway.process_intent(intent, token)
+
+    assert replayed.outcome is SubmitOutcome.REFUSED_RECOVERY_PENDING
+    assert replayed.ack is None
+    assert paper_exchange.get_open_orders() == resting_before
+    refusals = [
+        row for row in fresh_store.read_all() if row.event_type == "SubmissionRefused"
+    ]
+    assert len(refusals) == 1
+    assert json.loads(refusals[0].payload_json)["data"]["reason"] == "recovery_pending"
+    fresh_store.verify_chain()
+    fresh_store.close()
