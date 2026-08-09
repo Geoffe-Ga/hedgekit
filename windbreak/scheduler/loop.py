@@ -915,6 +915,7 @@ def build_evaluation_context(
     exchange_status_epoch_s: int | None,
     pipeline_heartbeat_epoch_s: int | None,
     quote_snapshot_epoch_s: int | None,
+    exchange_clock_epoch_s: int | None,
     open_position: ContractCentis | None,
     equity_start_of_day: MoneyMicros | None,
     visible_depth: ContractCentis | None,
@@ -949,6 +950,19 @@ def build_evaluation_context(
     the SPEC S7.3 snapshot-TTL guarantee, the one check standing between the
     kernel and an order priced off a stale book. A caller holding no book
     passes ``None`` and the check keeps vetoing.
+
+    The exchange clock is caller-supplied and subject to the same prohibition
+    (issue #377): it is the *venue's* reading, from
+    :meth:`~windbreak.connector.paper.PaperExchange.get_exchange_time`, never
+    this function's ``now_epoch_s``. Fed the local clock it produced a skew of
+    identically zero, so ``clock_skew_limit`` could not veto for any venue at
+    any drift -- and that is the check guarding all the others, because quote
+    freshness, exchange-status staleness, and the pipeline heartbeat are each
+    measured as ``now - stamp`` and each mismeasure when ``now`` is wrong
+    relative to the venue. A caller who cannot read the venue's clock passes
+    ``None`` and the check vetoes with ``exchange clock unknown``; defaulting to
+    the local clock instead would report perfect agreement, which is the most
+    reassuring answer available and the least evidenced.
 
     The open position is caller-supplied too (issue #373), from
     :func:`read_open_position_centis`. It was a hardcoded ``None``, so
@@ -992,6 +1006,11 @@ def build_evaluation_context(
             ``fetched_at``, never from the tick's clock: a quote stamped
             ``now`` is zero seconds old by construction and ``quote_freshness``
             could never veto.
+        exchange_clock_epoch_s: The venue's own clock, in epoch seconds, or
+            ``None`` when it could not be read -- which fails closed (issue
+            #377). Never the tick's clock: comparing the local clock with
+            itself yields a skew of zero and makes ``clock_skew_limit``
+            unfalsifiable.
         open_position: The signed YES-frame holding in this tick's market, in
             contract-centis, or ``None`` when the venue could not describe it
             -- which fails closed (issue #373). A venue-reported flat account is
@@ -1008,11 +1027,17 @@ def build_evaluation_context(
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
     """
+    # `forecast_epoch_s` is the last `*_epoch_s` still fed this function's own
+    # clock, and it makes `forecast_freshness` unfalsifiable exactly as the
+    # quote and the exchange clock were (issue #380). It is not fixed here
+    # because the honest stamp is the forecast's own `created_at`, which means
+    # threading the forecast itself down to the approval stage -- a different
+    # change from this one, tracked separately rather than bundled.
     market_view = MarketView(
         quote_snapshot_epoch_s=quote_snapshot_epoch_s,
         forecast_epoch_s=now_epoch_s,
         visible_depth=visible_depth,
-        exchange_clock_epoch_s=now_epoch_s,
+        exchange_clock_epoch_s=exchange_clock_epoch_s,
         open_position=open_position,
         exchange_status=exchange_status,
         exchange_status_epoch_s=exchange_status_epoch_s,
@@ -1908,6 +1933,12 @@ def _approve_stage(
     reading only became honest once :func:`build_paper_deps` anchored the
     replay, so the recording's frozen literals age against this run's clock.
 
+    Threads the venue's own clock (issue #377) rather than this stage's
+    ``now_epoch_s``, so ``clock_skew_limit`` measures our clock against the
+    venue's instead of against itself. ``PaperExchange.get_exchange_time``
+    answers from the anchored replay timeline and deliberately does not renew
+    itself per read -- a clock that did could never disagree.
+
     Threads the venue's own open position (issue #373), read here rather than
     taken from :func:`_equity_and_positions_stage`, which runs *after* this
     stage on purpose: the position an approval is proven against must be the
@@ -1958,6 +1989,7 @@ def _approve_stage(
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
+        exchange_clock_epoch_s=int(deps.exchange.get_exchange_time().timestamp()),
         open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
         equity_start_of_day=read_start_of_day_equity_micros(
             deps.store, now_epoch_s=now_epoch_s

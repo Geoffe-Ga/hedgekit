@@ -38,6 +38,16 @@ selector's entry-condition reference. A book that renewed its own timestamp on
 every read could never be stale, which is the unfalsifiable check the anchor
 exists to avoid.
 
+The venue clock (issue #377) moves by that same offset, for a different reason
+that lands in the same place. ``fetched_at`` on a status says *when we
+observed*; :meth:`PaperExchange.get_exchange_time` says what *the venue* thinks
+the time is. Answering the latter from our own clock would make
+``clock_skew_limit`` compare the local clock with itself -- skew zero for any
+venue at any drift -- and that check is the one guarding all the others, since
+quote freshness, status staleness, and the pipeline heartbeat are each measured
+as ``now - stamp`` and each mismeasure when ``now`` is wrong relative to the
+venue. So the clock is anchored once and never renewed.
+
 Consistency guard (issues #18, #362): the constructor rejects any fixture whose
 :class:`~windbreak.connector.semantics.BalanceSemantics` claims a behavior this
 simulator does not implement (see :data:`_SEMANTICS_REQUIREMENTS`). A taker walk
@@ -434,10 +444,33 @@ def _shift_step(step: _SessionStep, offset: timedelta) -> _SessionStep:
     )
 
 
+def _replay_offset(
+    sessions: Mapping[str, tuple[_SessionStep, ...]], anchor: datetime | None
+) -> timedelta | None:
+    """Return the single shift that re-dates a recording onto ``anchor``.
+
+    One offset for the whole recording, computed once and applied to every
+    recorded instant -- books, trade prints, and the venue clock alike (issues
+    #369, #377) -- so their recorded relationships survive the move exactly.
+
+    Args:
+        sessions: The loaded ticker-keyed replay steps.
+        anchor: The declared re-enactment start, or ``None`` to replay verbatim.
+
+    Returns:
+        The offset, or ``None`` when no anchor was given or the recording holds
+        no step to measure an origin from.
+    """
+    if anchor is None:
+        return None
+    origin = _recording_origin(sessions)
+    return None if origin is None else anchor - origin
+
+
 def _anchor_sessions(
-    sessions: Mapping[str, tuple[_SessionStep, ...]], anchor: datetime
+    sessions: Mapping[str, tuple[_SessionStep, ...]], offset: timedelta | None
 ) -> dict[str, tuple[_SessionStep, ...]]:
-    """Re-date a recorded session so its earliest book lands on ``anchor``.
+    """Re-date a recorded session by ``offset`` so its earliest book leads.
 
     Every recorded instant moves by the same offset, so all inter-step and
     cross-ticker deltas survive exactly. This is what keeps ``quote_freshness``
@@ -447,15 +480,13 @@ def _anchor_sessions(
 
     Args:
         sessions: The loaded ticker-keyed replay steps.
-        anchor: The instant the re-enactment is declared to start at.
+        offset: The whole recording's shift, or ``None`` to replay verbatim.
 
     Returns:
-        The re-dated sessions, unchanged when the recording holds no steps.
+        The re-dated sessions, unchanged when there is no offset to apply.
     """
-    origin = _recording_origin(sessions)
-    if origin is None:
+    if offset is None:
         return dict(sessions)
-    offset = anchor - origin
     return {
         ticker: tuple(_shift_step(step, offset) for step in steps)
         for ticker, steps in sessions.items()
@@ -478,7 +509,8 @@ class PaperExchange:
         sessions: Ticker-keyed replay steps, re-dated onto ``replay_anchor``
             when one was given (issue #369).
         exchange_status: The exchange's trading status.
-        exchange_time: The exchange's server time.
+        exchange_time: The exchange's server time, re-dated onto
+            ``replay_anchor`` when one was given (issue #377).
         balances: The account's *opening* balances, before any fill is debited;
             :meth:`get_balances` reports the current ones.
         balance_semantics: The venue's balance-interpretation semantics.
@@ -519,11 +551,11 @@ class PaperExchange:
             max_participation_ppm: The participation cap on recorded depth, in ppm.
             replay_anchor: The instant this recording is declared to be
                 re-enacted from, or ``None`` to replay its recorded timestamps
-                verbatim (issue #369). When given, every book and trade print
-                shifts by the single offset that puts the earliest recorded book
-                on the anchor, so the recording's internal timing is preserved
-                while its absolute dates become measurable against the run's own
-                clock.
+                verbatim (issue #369). When given, every book, trade print, and
+                the venue clock (issue #377) shifts by the single offset that
+                puts the earliest recorded book on the anchor, so the
+                recording's internal timing is preserved while its absolute
+                dates become measurable against the run's own clock.
 
         Raises:
             ValueError: If ``balance_semantics`` answers any question in
@@ -534,14 +566,11 @@ class PaperExchange:
                 :meth:`get_balance_semantics` a lying flag (issue #362).
         """
         _require_implemented_semantics(balance_semantics)
+        offset = _replay_offset(sessions, replay_anchor)
         self.markets = markets
-        self.sessions = (
-            sessions
-            if replay_anchor is None
-            else _anchor_sessions(sessions, replay_anchor)
-        )
+        self.sessions = _anchor_sessions(sessions, offset)
         self.exchange_status = exchange_status
-        self.exchange_time = exchange_time
+        self.exchange_time = exchange_time if offset is None else exchange_time + offset
         self._clock = clock
         self.balances = balances
         self.balance_semantics = balance_semantics
@@ -653,7 +682,31 @@ class PaperExchange:
         return replace(self.exchange_status, fetched_at=self._clock())
 
     def get_exchange_time(self) -> datetime:
-        """Return the fixture exchange time."""
+        """Return the venue's own clock: the recorded one, moved by the anchor.
+
+        Deliberately *not* restamped per read the way
+        :meth:`get_exchange_status` is, and the asymmetry is the whole point of
+        issue #377. ``fetched_at`` on a status records *when we observed*, and
+        an in-process answer genuinely happened now. A venue clock records what
+        *the venue* thinks the time is, so answering it from our own clock would
+        make ``clock_skew_limit`` compare the local clock with itself -- skew
+        zero, for any venue, at any drift. That is the check that guards the
+        other guards (quote freshness, status staleness, and the heartbeat are
+        all measured as ``now - stamp`` and all mismeasure when ``now`` is wrong
+        relative to the venue), so leaving it unfalsifiable is the costliest
+        version of this bug.
+
+        Anchoring gives it the same treatment the book got: the recording's
+        venue clock moves by the one shared replay offset, so its recorded
+        relationship to the books survives and the reading is measurable against
+        the run's own clock instead of being a frozen 2025 literal. A replay's
+        venue clock does not advance with wall time, which is exactly why the
+        skew it produces is real: a long-running re-enactment genuinely drifts
+        away from the wall clock, and the fail-closed answer is to say so.
+
+        Returns:
+            The venue's clock, in UTC.
+        """
         return self.exchange_time
 
     def get_balance_semantics(self) -> BalanceSemantics:

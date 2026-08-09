@@ -226,6 +226,7 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        exchange_clock_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
@@ -255,6 +256,7 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        exchange_clock_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
@@ -285,6 +287,7 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        exchange_clock_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
@@ -319,6 +322,7 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        exchange_clock_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
@@ -344,6 +348,7 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=None,
+        exchange_clock_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
@@ -385,6 +390,7 @@ def test_build_evaluation_context_never_stamps_the_quote_with_its_own_clock(
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
         quote_snapshot_epoch_s=quote_epoch_s,
+        exchange_clock_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
@@ -655,6 +661,7 @@ def _context_with(*, status, status_epoch_s: int | None, heartbeat_epoch_s: int 
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
         quote_snapshot_epoch_s=None,
+        exchange_clock_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
         visible_depth=None,
@@ -952,6 +959,7 @@ def _exposure_context(*, equity_start_of_day, visible_depth):
         exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
         pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
         quote_snapshot_epoch_s=None,
+        exchange_clock_epoch_s=None,
         open_position=None,
         equity_start_of_day=equity_start_of_day,
         visible_depth=visible_depth,
@@ -1342,6 +1350,7 @@ def _position_context(open_position):
         exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
         pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
         quote_snapshot_epoch_s=DEFAULT_NOW_EPOCH_S,
+        exchange_clock_epoch_s=DEFAULT_NOW_EPOCH_S,
         open_position=open_position,
         equity_start_of_day=None,
         visible_depth=None,
@@ -1463,3 +1472,118 @@ def test_an_unknown_ticker_reports_flat_rather_than_another_markets_holding() ->
 
     assert exchange.get_positions()[0].ticker == _DEEP_WALK_TICKER
     assert position == ContractCentis(0)
+
+
+# --- Issue #377: the venue's clock, not our own, drives `clock_skew_limit` ----
+
+
+def _skew_context(exchange_clock_epoch_s):
+    """Build a PAPER context carrying the given venue-clock reading.
+
+    Every other feed is the loop's own production wiring; only the figure issue
+    #377 supplies varies, so each assertion below isolates it.
+
+    Args:
+        exchange_clock_epoch_s: The venue's own epoch second, or `None` when it
+            could not be read.
+
+    Returns:
+        The composed `EvaluationContext`.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+    from windbreak.scheduler.loop import build_evaluation_context
+
+    return build_evaluation_context(
+        WindbreakConfig(),
+        now_epoch_s=DEFAULT_NOW_EPOCH_S,
+        verification=None,
+        instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=ExchangeTradingStatus.OPEN,
+        exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+        quote_snapshot_epoch_s=DEFAULT_NOW_EPOCH_S,
+        exchange_clock_epoch_s=exchange_clock_epoch_s,
+        open_position=None,
+        equity_start_of_day=None,
+        visible_depth=None,
+    )
+
+
+#: The SPEC S16 default `clock_skew_max_seconds`, pinned rather than read back
+#: from the config: a test that derived its own boundary from the value under
+#: test would pass against any tolerance, including a widened one.
+_CLOCK_SKEW_MAX_SECONDS = 2
+
+
+@pytest.mark.parametrize(
+    ("skew_seconds", "expected_vetoed"),
+    [(-3, True), (-2, False), (0, False), (2, False), (3, True)],
+    ids=[
+        "behind-past-limit",
+        "behind-at-limit",
+        "agreed",
+        "ahead-at-limit",
+        "ahead-past-limit",
+    ],
+)
+def test_clock_skew_vetoes_exactly_past_its_limit_in_either_direction(
+    skew_seconds: int, expected_vetoed: bool
+) -> None:
+    """The check binds at the tolerance and one second past it, both ways.
+
+    The `at-limit` and `agreed` cases are the ones carrying signal: while
+    `exchange_clock_epoch_s` was fed the tick's own `now_epoch_s`, the skew was
+    identically zero and *every* case approved, so the two vetoing cases here
+    could not have been produced by any venue at any drift.
+
+    Args:
+        skew_seconds: How far the venue's clock sits from the tick's, signed.
+        expected_vetoed: Whether `clock_skew_limit` must veto.
+    """
+    context = _skew_context(DEFAULT_NOW_EPOCH_S + skew_seconds)
+
+    result = _check_named("clock_skew_limit")(make_intent(), context)
+
+    assert context.limits.clock_skew_max_seconds == _CLOCK_SKEW_MAX_SECONDS
+    assert result.vetoed is expected_vetoed
+
+
+def test_an_unreadable_venue_clock_stays_none_and_still_vetoes() -> None:
+    """A venue whose clock cannot be read fails closed, never to the local one.
+
+    Defaulting to `now_epoch_s` is the defect this issue removes: it reads as
+    perfect agreement, which is the single most reassuring answer the check can
+    give and the one least supported by evidence.
+    """
+    context = _skew_context(None)
+
+    result = _check_named("clock_skew_limit")(make_intent(), context)
+
+    assert context.market.exchange_clock_epoch_s is None
+    assert result.vetoed is True
+    assert result.reason == "exchange clock unknown"
+
+
+def test_the_loop_reads_the_venue_clock_rather_than_restamping_its_own() -> None:
+    """The context's venue clock is the exchange's answer, not the tick's clock.
+
+    Asserted against a `now_epoch_s` deliberately unequal to the anchored venue
+    clock, so the removed substitution would show up as a skew of exactly zero.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    from windbreak.connector import paper
+
+    anchor = _datetime.fromtimestamp(DEFAULT_NOW_EPOCH_S - 3_600, _UTC)
+    exchange = paper.PaperExchange.from_fixture_dir(
+        _books_fixture_dir() / "deep_walk", replay_anchor=anchor
+    )
+
+    context = _skew_context(int(exchange.get_exchange_time().timestamp()))
+
+    assert context.market.exchange_clock_epoch_s == DEFAULT_NOW_EPOCH_S - 3_600
+    assert context.market.exchange_clock_epoch_s != context.now_epoch_s
+    assert _check_named("clock_skew_limit")(make_intent(), context).vetoed is True
