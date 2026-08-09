@@ -201,6 +201,17 @@ class RiskConfig:
             position drift, in contract-centis, before the live verifier grades
             a ``BREACH`` (issue #236). Defaults to ``0`` -- fail-closed
             exact-match, as above.
+        max_pos_total_pct_ppm: The share of worst-case equity the account's
+            *total* exposure plus one order's cost may reach, in ppm (issue
+            #407). Previously a ``_FULL_PPM`` literal hardcoded into the
+            scheduler's limits builder, which is why it appears here with the
+            same 100% default rather than a tighter invented one: this change
+            moves the policy from a constant no operator could see into a
+            declared value they can tighten, and does not choose the firm's
+            risk appetite on their behalf. It is a live ceiling either way now
+            that ``total_exposure`` is fed real figures -- at 100% it refuses
+            to deploy past total equity, where against the former hardcoded
+            zero exposure it could never bind at all.
     """
 
     min_net_edge_ppm: int = 30000
@@ -227,6 +238,63 @@ class RiskConfig:
     kill_after_consecutive_mismatches: int = 3
     verification_balance_tolerance_micros: int = 0
     verification_position_tolerance_centis: int = 0
+    max_pos_total_pct_ppm: int = 1000000
+
+
+@dataclass(frozen=True, slots=True)
+class CorrelationTagConfig:
+    """One operator-declared correlation-bucket assignment (SPEC S9.9, #407).
+
+    SPEC S9.9 describes bucket tagging as "LLM-assisted ... human-overridable,
+    stored as data". This is the *stored as data* half, and it is the only
+    honest producer of a :class:`~windbreak.selector.correlation.CorrelationTag`
+    that exists today.
+
+    Deriving a bucket from venue metadata was considered and rejected. A
+    correlation bucket is a claim about which markets move *together*; the seed
+    taxonomy (``us-election``, ``fed-policy``, ``inflation``, ...) is a risk
+    taxonomy, not a venue one. ``NormalizedMarket.category`` is a free-form
+    string passed through verbatim from the exchange, whose "Politics" spans US
+    elections, foreign elections, and legislation alike. Any table mapping it
+    onto a bucket would be this codebase's judgment wearing the venue's name,
+    and stamping such a tag with a new ``source`` value would put a provenance
+    in the audit trail that no component actually holds. An operator writing a
+    bucket here, by contrast, genuinely is the human that
+    :data:`~windbreak.selector.correlation.TagSource`'s ``"human"`` names.
+
+    Attributes:
+        ticker: The market this assignment applies to.
+        bucket_ids: The correlation buckets the market belongs to. Each must be
+            a seed-taxonomy id or a ``geopolitics-<region>`` id;
+            :class:`~windbreak.selector.correlation.CorrelationTag` refuses
+            anything else at construction, so a typo here fails loudly rather
+            than silently placing a market in a bucket of its own.
+        tagged_at: When the operator made this assignment, as an ISO-8601
+            timestamp carrying a UTC offset. Required rather than defaulted to
+            the tick's clock: a tag stamped "now" on every tick would claim a
+            provenance instant that never happened. An offsetless value is
+            refused (issue #397) rather than read as host-local.
+    """
+
+    ticker: str
+    bucket_ids: tuple[str, ...]
+    tagged_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class CorrelationConfig:
+    """The operator's declared correlation-bucket assignments (SPEC S9.9, #407).
+
+    Empty by default, and an empty declaration is *not* permissive: a market
+    absent from :attr:`tags` is unbucketable, and
+    :func:`windbreak.scheduler.exposure.project_exposure` refuses to size it
+    rather than letting the per-bucket cap read a fabricated zero exposure.
+
+    Attributes:
+        tags: The declared per-market bucket assignments.
+    """
+
+    tags: tuple[CorrelationTagConfig, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,12 +802,16 @@ class WindbreakConfig:
 
     Attributes:
         mode_ceiling: The highest operating mode the runtime may ever reach.
+        correlation: The operator's declared correlation-bucket assignments
+            (SPEC S9.9, issue #407). Empty by default, which refuses to size
+            any market rather than sizing every market against an empty bucket.
     """
 
     mode_ceiling: str = "paper"
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     capital: CapitalConfig = field(default_factory=CapitalConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    correlation: CorrelationConfig = field(default_factory=CorrelationConfig)
     screener: ScreenerConfig = field(default_factory=ScreenerConfig)
     forecast: ForecastConfig = field(default_factory=ForecastConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
