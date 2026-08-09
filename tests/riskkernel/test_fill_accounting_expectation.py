@@ -1,4 +1,4 @@
-"""Failing-first tests for ledgered fill accounting (issue #365, RED).
+"""Tests for the ledgered advance of the reconciliation baseline (#365, #390).
 
 `LedgerExpectationSource` freezes its baseline at construction, which is what
 keeps the three reconciliation dimensions falsifiable rather than tautological
@@ -21,8 +21,20 @@ Fail closed: an entry whose accounting cannot be reconstructed is never skipped
 past. The expectation stops advancing and latches, so the unexplained gap still
 surfaces as divergence and still halts.
 
-Neither ``FillAccounted`` nor the ``fill_accounting`` seam exists yet, so every
-test below fails -- the expected Gate 1 RED state for issue #365.
+Issue #390 extends the same machinery to the third dimension. A ``FillAccounted``
+now names the resting order it executed against, and a ``RestingOrderAccounted``
+books an order's arrival on the venue's resting book, so the expectation can say
+"this order rests because I placed it" and "this order is gone because a fill I
+booked exhausted it". Before that, venue order ids were never ledgered at all:
+an outright fill reconciled, but a partially filled order's surviving remainder
+read as unexplained venue movement and halted the loop.
+
+The advance is still never a relaxation. The open-order set moves only by booked
+arrivals and booked fills, never by re-reading ``get_open_orders`` -- which is
+the view the cycle compares against, and mirroring it would make that dimension
+structurally incapable of failing. Both directions are pinned below: an order
+the venue rests that nobody booked still breaches, and an order that vanishes
+with no booked fill behind it still breaches.
 """
 
 from __future__ import annotations
@@ -49,7 +61,12 @@ from windbreak.connector.semantics import (
     PartialFillRepresentation,
     UnsettledProceeds,
 )
-from windbreak.ledger.events import ConfigLoaded, Event, FillAccounted
+from windbreak.ledger.events import (
+    ConfigLoaded,
+    Event,
+    FillAccounted,
+    RestingOrderAccounted,
+)
 from windbreak.numeric.types import ContractCentis, MoneyMicros, PricePips
 from windbreak.riskkernel.process import InMemoryKernelLedgerWriter
 from windbreak.riskkernel.verification import (
@@ -191,8 +208,9 @@ def _booked_fill(
     ticker: str = _TICKER,
     cash_delta_micros: int = -5_000_000,
     position_delta_centis: int = 100,
+    venue_order_id: str = "",
 ) -> FillAccounted:
-    """Build one `FillAccounted` entry booking a fill's two signed deltas.
+    """Build one `FillAccounted` entry booking a fill's signed deltas.
 
     Args:
         fill_id: The venue's own identifier for the booked fill.
@@ -200,6 +218,8 @@ def _booked_fill(
         cash_delta_micros: The signed available-cash movement, in micros.
         position_delta_centis: The signed YES-frame position movement, in
             contract-centis.
+        venue_order_id: The resting order this fill executed against; `""` --
+            the default -- for an outright taker execution that never rested.
 
     Returns:
         The constructed `FillAccounted` event.
@@ -210,6 +230,51 @@ def _booked_fill(
         ticker=ticker,
         cash_delta_micros=cash_delta_micros,
         position_delta_centis=position_delta_centis,
+        venue_order_id=venue_order_id,
+    )
+
+
+def _booked_resting_order(
+    *,
+    venue_order_id: str = "paper-order-1",
+    ticker: str = _TICKER,
+    resting_quantity_centis: int = 200,
+) -> RestingOrderAccounted:
+    """Build one `RestingOrderAccounted` entry booking an order's arrival.
+
+    Args:
+        venue_order_id: The venue's identifier for the order now resting.
+        ticker: The market the order rests in.
+        resting_quantity_centis: The quantity that came to rest, in
+            contract-centis.
+
+    Returns:
+        The constructed `RestingOrderAccounted` event.
+    """
+    return RestingOrderAccounted(
+        component="scheduler",
+        venue_order_id=venue_order_id,
+        ticker=ticker,
+        resting_quantity_centis=resting_quantity_centis,
+    )
+
+
+def _resting(order_id: str, centis: int) -> OpenOrder:
+    """Return one venue-reported resting order of `centis` on `_TICKER`.
+
+    Args:
+        order_id: The venue's identifier for the order.
+        centis: The resting quantity, in contract-centis.
+
+    Returns:
+        The constructed `OpenOrder`.
+    """
+    return OpenOrder(
+        id=order_id,
+        ticker=_TICKER,
+        side="yes",
+        price=PricePips(5000),
+        quantity=ContractCentis(centis),
     )
 
 
@@ -500,22 +565,237 @@ def test_an_empty_drain_leaves_the_expectation_object_identical() -> None:
     assert source.get_expectations() is source.get_expectations()
 
 
-def test_the_open_order_dimension_is_untouched_by_fill_accounting() -> None:
-    """Fill accounting books cash and positions only. Venue order ids are never
-    ledgered, so the open-order expectation stays exactly what the baseline
-    captured -- a fill that retires a resting order still diverges, and still
-    halts."""
-    resting = OpenOrder(
-        id="paper-order-1",
-        ticker=_TICKER,
-        side="yes",
-        price=PricePips(5000),
-        quantity=ContractCentis(100),
+def test_a_fill_naming_no_resting_order_leaves_the_open_order_set_alone() -> None:
+    """An outright taker execution rests nothing and retires nothing.
+
+    Such a fill carries no ``venue_order_id``, so it moves cash and positions
+    and leaves the open-order dimension exactly where the baseline captured it.
+    """
+    venue = _MutableVenue(
+        available=MoneyMicros(100_000_000),
+        open_orders=(_resting("paper-order-1", 100),),
     )
-    venue = _MutableVenue(available=MoneyMicros(100_000_000), open_orders=(resting,))
     feed = _StubFeed(batches=[(_booked_fill(),)])
     source = LedgerExpectationSource([], venue, fill_accounting=feed)
 
     expectations = source.get_expectations()
 
     assert expectations.expected_open_order_ids == frozenset({"paper-order-1"})
+
+
+def test_a_booked_resting_order_enters_the_open_order_expectation() -> None:
+    """The headline of issue #390: a partial fill leaving a remainder is clean.
+
+    A limit that crosses part of the book fills that part and rests the rest.
+    Before #390 the expectation had no way to learn the remainder's venue order
+    id -- ids were never ledgered at all -- so the surviving remainder read as
+    unexplained venue movement and HALTed the loop the moment it rested an
+    order.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_fill(cash_delta_micros=-5_000_000, position_delta_centis=100),
+                _booked_resting_order(resting_quantity_centis=200),
+            )
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    venue.available = MoneyMicros(95_000_000)
+    venue.positions = _held(100)
+    venue.open_orders = (_resting("paper-order-1", 200),)
+    outcome, writer = _run_cycle(venue, source)
+
+    assert outcome is VerificationOutcome.CLEAN
+    assert [event.event_type for event in writer.events] == ["VerificationPassed"]
+
+
+def test_a_fill_naming_its_resting_order_shrinks_then_retires_it() -> None:
+    """A booked fill names the order it filled against and consumes it.
+
+    The remainder shrinks by the fill's own size while it survives, and the id
+    leaves the expectation exactly when the order is exhausted -- which is what
+    lets an outright retirement reconcile instead of reading as an open order
+    that vanished for no reason.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (_booked_resting_order(resting_quantity_centis=300),),
+            (
+                _booked_fill(
+                    fill_id="paper-fill-1",
+                    cash_delta_micros=-5_000_000,
+                    position_delta_centis=100,
+                    venue_order_id="paper-order-1",
+                ),
+            ),
+            (
+                _booked_fill(
+                    fill_id="paper-fill-2",
+                    cash_delta_micros=-10_000_000,
+                    position_delta_centis=200,
+                    venue_order_id="paper-order-1",
+                ),
+            ),
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    assert source.get_expectations().expected_open_order_ids == frozenset(
+        {"paper-order-1"}
+    )
+    assert source.get_expectations().expected_open_order_ids == frozenset(
+        {"paper-order-1"}
+    )
+    assert source.get_expectations().expected_open_order_ids == frozenset()
+
+
+def test_a_resting_order_nobody_booked_still_breaches() -> None:
+    """Non-vacuity: an order the venue rests that no booking explains halts.
+
+    This is the guard against "advancing" the open-order dimension by mirroring
+    ``get_open_orders`` into the expectation, which would compare the venue
+    against itself and could never fail (issue #352).
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    source = LedgerExpectationSource([], venue, fill_accounting=_StubFeed())
+
+    venue.open_orders = (_resting("phantom-order-9", 300),)
+    outcome, writer = _run_cycle(venue, source)
+
+    assert outcome is VerificationOutcome.BREACH
+    assert [event.event_type for event in writer.events] == ["VerificationMismatch"]
+
+
+def test_a_resting_order_that_vanished_unexplained_still_breaches() -> None:
+    """The mirror non-vacuity case: an order that left with no booked fill.
+
+    A venue-side cancel or expiry retires an order without any execution behind
+    it. Nothing in the books explains the disappearance, so the expectation
+    keeps the id and the cycle breaches.
+    """
+    venue = _MutableVenue(
+        available=MoneyMicros(100_000_000),
+        open_orders=(_resting("paper-order-1", 300),),
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=_StubFeed())
+
+    venue.open_orders = ()
+    outcome, _ = _run_cycle(venue, source)
+
+    assert outcome is VerificationOutcome.BREACH
+
+
+def test_a_fill_retiring_less_than_the_venue_did_still_breaches() -> None:
+    """A booking that under-explains the retirement does not absorb it.
+
+    The books say the order shrank to 200; the venue dropped it entirely. Only
+    the explained part of the movement is absorbed, so the disagreement survives.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_resting_order(resting_quantity_centis=300),
+                _booked_fill(
+                    cash_delta_micros=-5_000_000,
+                    position_delta_centis=100,
+                    venue_order_id="paper-order-1",
+                ),
+            )
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    venue.available = MoneyMicros(95_000_000)
+    venue.positions = _held(100)
+    venue.open_orders = ()
+    outcome, _ = _run_cycle(venue, source)
+
+    assert outcome is VerificationOutcome.BREACH
+
+
+def test_a_fill_naming_an_order_the_books_never_rested_is_a_gap() -> None:
+    """Fail closed: a fill cannot retire an order the expectation never held.
+
+    Applying it would silently invent -- then discard -- a resting order, which
+    is exactly the unexplained gap the latch exists to preserve.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (_booked_fill(venue_order_id="never-rested-1"),),
+            (_booked_fill(fill_id="paper-fill-2"),),
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    source.get_expectations()
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(100_000_000)
+
+
+def test_a_malformed_resting_order_entry_is_a_gap() -> None:
+    """A resting-order entry whose quantity is not a scaled int is a gap.
+
+    Same fail-closed narrowing every other booked leaf gets: a malformed payload
+    is not a fact, and the advance stops at it rather than stepping past it.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    malformed = Event(
+        event_type="RestingOrderAccounted",
+        component="scheduler",
+        payload_schema_version=1,
+        payload={
+            "venue_order_id": "paper-order-1",
+            "ticker": _TICKER,
+            "resting_quantity_centis": "300",
+        },
+    )
+    feed = _StubFeed(batches=[(malformed,), (_booked_fill(),)])
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    source.get_expectations()
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(100_000_000)
+
+
+def test_a_non_positive_booked_resting_quantity_is_a_gap() -> None:
+    """An order booked as resting nothing is malformed, not a retirement.
+
+    Retirement is expressed by a fill naming the order, never by booking a
+    zero-sized arrival, so a non-positive quantity means the seam delivered
+    something it should not have.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[(_booked_resting_order(resting_quantity_centis=0),), (_booked_fill(),)]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    source.get_expectations()
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(100_000_000)
+
+
+def test_the_open_order_baseline_still_carries_the_startup_capture() -> None:
+    """Booking changes only the advance; the startup seed is untouched.
+
+    The baseline is still the connector's resting-order set as captured once at
+    construction, so an order already resting when the process started is
+    expected without any booking at all.
+    """
+    venue = _MutableVenue(
+        available=MoneyMicros(100_000_000),
+        open_orders=(_resting("pre-existing-1", 500),),
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=_StubFeed())
+
+    venue.open_orders = ()
+
+    assert source.get_expectations().expected_open_order_ids == frozenset(
+        {"pre-existing-1"}
+    )

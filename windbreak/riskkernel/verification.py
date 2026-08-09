@@ -216,6 +216,21 @@ _FILL_ACCOUNTED_EVENT_TYPE = "FillAccounted"
 _FILL_CASH_DELTA_KEY = "cash_delta_micros"
 _FILL_POSITION_DELTA_KEY = "position_delta_centis"
 
+#: The ledger ``event_type`` booking one order's arrival on the venue's resting
+#: book (see :class:`~windbreak.ledger.events.RestingOrderAccounted`). Together
+#: with :data:`_FILL_ACCOUNTED_EVENT_TYPE` these are the only two types the
+#: fill-accounting seam may deliver; anything else is an unreconstructable entry.
+_RESTING_ORDER_ACCOUNTED_EVENT_TYPE = "RestingOrderAccounted"
+
+#: The payload key naming the venue order an entry is about. It appears on a
+#: ``RestingOrderAccounted`` (the order that came to rest) and, since issue #390,
+#: on a ``FillAccounted`` (the resting order the execution consumed, or ``""``
+#: for an outright taker walk that rested nothing).
+_VENUE_ORDER_ID_KEY = "venue_order_id"
+
+#: The ``RestingOrderAccounted`` payload key carrying the quantity that rested.
+_RESTING_QUANTITY_KEY = "resting_quantity_centis"
+
 
 def _own_component_events(events: tuple[Event, ...]) -> Iterator[Event]:
     """Return an iterator over only the events this kernel itself recorded.
@@ -386,10 +401,10 @@ def _rows_to_positions(rows: object) -> dict[str, ContractCentis]:
     return positions
 
 
-def _seed_open_order_ids(
+def _seed_open_orders(
     events: tuple[Event, ...], connector: ReadOnlyVenueView
-) -> frozenset[str]:
-    """Return the open-order-id baseline seeded from history, else the connector.
+) -> dict[str, int]:
+    """Return the resting-order baseline seeded from history, else the connector.
 
     Empty *only* while the history ends KILLED and unrearmed: a kill cancels
     every resting order (recording a ``CancelAllDirective`` alongside its
@@ -402,14 +417,24 @@ def _seed_open_order_ids(
     open-order expectation and the replayed mode can never disagree.
 
     Once that kill is re-armed (or the history never killed), the expectation
-    falls back to the connector's currently reported resting-order ids. This is
+    falls back to the connector's currently reported resting orders. This is
     load-bearing: a *past* kill -- including a routine kill/re-arm drill -- must
     never permanently zero the expectation, or every legitimately-resting order
     after the re-arm would be a false-positive breach for the life of the
     ledger (and could spuriously auto-kill a correctly-operating kernel via the
-    reconciliation-mismatch monitor). Venue order ids are never ledgered (an
-    ``OrderTransitionLedgered`` carries only its client_order_id), so the
-    connector is the only source of the live resting-order id set.
+    reconciliation-mismatch monitor).
+
+    This one startup read is the *only* place the venue's aggregate open-order
+    view reaches the expectation, and that is deliberate. Issue #390 gave the
+    open-order dimension a way to *advance* -- from ledgered arrival and fill
+    entries -- precisely so that no later cycle ever needs to re-read this view.
+    A baseline re-derived from the same connector the cycle then compares
+    against would agree by construction and could never fail (issue #352).
+
+    Each order's resting quantity is carried alongside its id, not discarded.
+    The comparison itself is still an id-set match, but the advance needs the
+    quantity: a booked fill names the order it consumed and says how much, and
+    the id may only leave the expectation once those consumptions exhaust it.
 
     The :func:`~windbreak.riskkernel.kill.kill_state_in` import is deferred to
     call time because :mod:`windbreak.riskkernel.kill` imports this module at
@@ -418,37 +443,45 @@ def _seed_open_order_ids(
 
     Args:
         events: The startup event history, oldest first.
-        connector: The read-only connector supplying the fallback ids.
+        connector: The read-only connector supplying the fallback orders.
 
     Returns:
-        The expected resting-order id set.
+        The expected resting quantity, in contract-centis, per venue order id.
     """
     from windbreak.riskkernel.kill import kill_state_in
 
     if kill_state_in(events).killed:
-        return frozenset()
-    return frozenset(order.id for order in connector.get_open_orders())
+        return {}
+    return {order.id: order.quantity.value for order in connector.get_open_orders()}
 
 
 class FillAccountingFeed(Protocol):
-    """The seam a live expectation reads *this account's* booked fills through.
+    """The seam a live expectation reads *this account's* booked entries through.
 
     The contract is deliberately narrow and stateful: :meth:`drain` returns the
-    :class:`~windbreak.ledger.events.FillAccounted` entries booked for this
-    account that it has not returned before, oldest first, and never returns
-    them again. Everything the kernel must not decide for itself -- which ledger
-    the entries live in, which component is trusted to book them, and where the
+    :class:`~windbreak.ledger.events.FillAccounted` and
+    :class:`~windbreak.ledger.events.RestingOrderAccounted` entries booked for
+    this account that it has not returned before, oldest first, and never
+    returns them again. Chain order across the two kinds is part of the
+    contract: a fill draws down the resting order it names, so an arrival
+    delivered after its own fill would present as a fill naming an order the
+    expectation has never held -- an unexplained gap that latches the advance
+    off. Everything the kernel must not decide for itself -- which ledger the
+    entries live in, which component is trusted to book them, and where the
     baseline's cursor starts -- is settled by the composition root that builds
     the feed, exactly as the SPEC S5 trust boundary requires. This module sees
     only ``int``/``str`` payload leaves and never a connector type.
     """
 
     def drain(self) -> tuple[Event, ...]:
-        """Return the booked fill entries not yet returned, oldest first.
+        """Return the booked entries not yet returned, oldest first.
 
         Returns:
-            The newly booked :class:`~windbreak.ledger.events.FillAccounted`
-            events; empty when nothing has been booked since the last call.
+            The newly booked
+            :class:`~windbreak.ledger.events.RestingOrderAccounted` and
+            :class:`~windbreak.ledger.events.FillAccounted` events, interleaved
+            in chain order; empty when nothing has been booked since the last
+            call.
         """
         ...
 
@@ -460,12 +493,58 @@ class _FillEntry:
     Attributes:
         ticker: The market that traded.
         cash_delta: The signed available-cash movement, in micros.
-        position_delta: The signed YES-frame position movement, in centis.
+        position_delta: The signed YES-frame position movement, in centis. Its
+            magnitude is the fill's own size, which is what the named resting
+            order is drawn down by.
+        venue_order_id: The resting order this fill executed against, or ``""``
+            when it retired none -- an outright taker walk, or an entry booked
+            before issue #390 recorded ids at all.
     """
 
     ticker: str
     cash_delta: MoneyMicros
     position_delta: ContractCentis
+    venue_order_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RestingEntry:
+    """One booked order arrival, ready to apply.
+
+    Attributes:
+        venue_order_id: The venue's identifier for the order now resting.
+        quantity_centis: The quantity that came to rest, in contract-centis;
+            always strictly positive.
+    """
+
+    venue_order_id: str
+    quantity_centis: int
+
+
+def _resting_entry(event: Event) -> _RestingEntry | None:
+    """Reconstruct one booked order arrival, or ``None`` if it cannot be.
+
+    Same fail-closed narrowing as :func:`_fill_entry`. A non-positive quantity
+    is rejected as malformed rather than treated as a retirement: an order that
+    rested nothing never rested, and retirement is expressed only by a fill
+    naming the order. Admitting it here would let a zero-sized arrival silently
+    stand in for a retirement nobody executed.
+
+    Args:
+        event: The event drained from the fill-accounting seam, already known to
+            carry the resting-order ``event_type``.
+
+    Returns:
+        The reconstructed :class:`_RestingEntry`, or ``None`` when this entry
+        cannot be accounted for.
+    """
+    order_id = event.payload.get(_VENUE_ORDER_ID_KEY)
+    quantity = event.payload.get(_RESTING_QUANTITY_KEY)
+    if not (isinstance(order_id, str) and order_id):
+        return None
+    if not (_is_scaled_int(quantity) and quantity > 0):
+        return None
+    return _RestingEntry(venue_order_id=order_id, quantity_centis=quantity)
 
 
 def _fill_entry(event: Event) -> _FillEntry | None:
@@ -478,54 +557,56 @@ def _fill_entry(event: Event) -> _FillEntry | None:
     so a malformed leaf takes this ``None`` path instead of reaching a
     constructor that raises.
 
-    An event of any other ``event_type`` also returns ``None``. The feed's
-    contract is "this account's booked fill accounting", so anything else on it
-    means the seam is not delivering what it promised -- which is a gap in the
-    books, not a row to ignore.
+    ``venue_order_id`` is the one leaf allowed to be absent: a ``FillAccounted``
+    booked before issue #390 (payload schema v1) carries no such key, and such a
+    row genuinely retired nothing it could name. It defaults to ``""``, which
+    the advance reads as "this fill consumed no resting order". A key that is
+    *present* but not a ``str`` is still a gap.
 
     Args:
-        event: The event drained from the fill-accounting seam.
+        event: The event drained from the fill-accounting seam, already known to
+            carry the fill-accounting ``event_type``.
 
     Returns:
         The reconstructed :class:`_FillEntry`, or ``None`` when this event
         cannot be accounted for.
     """
-    if event.event_type != _FILL_ACCOUNTED_EVENT_TYPE:
-        return None
     ticker = event.payload.get(_ROW_TICKER_KEY)
     cash = event.payload.get(_FILL_CASH_DELTA_KEY)
     position = event.payload.get(_FILL_POSITION_DELTA_KEY)
+    order_id = event.payload.get(_VENUE_ORDER_ID_KEY, "")
     if not (isinstance(ticker, str) and _is_scaled_int(cash)):
         return None
-    if not _is_scaled_int(position):
+    if not (_is_scaled_int(position) and isinstance(order_id, str)):
         return None
     return _FillEntry(
         ticker=ticker,
         cash_delta=MoneyMicros(cash),
         position_delta=ContractCentis(position),
+        venue_order_id=order_id,
     )
 
 
 def _advanced(
-    expectations: LedgerExpectations, entry: _FillEntry
+    expectations: LedgerExpectations,
+    entry: _FillEntry,
+    open_orders: Mapping[str, int],
 ) -> LedgerExpectations:
-    """Return ``expectations`` advanced by one booked fill's two deltas.
+    """Return ``expectations`` advanced by one booked fill's deltas.
 
-    Only the two ledger-derived dimensions move. The open-order expectation is
-    carried through untouched: venue order ids are never ledgered (an
-    ``OrderTransitionLedgered`` carries only the client_order_id), so no booked
-    fill can name the resting order it retired. A fill that empties a resting
-    order therefore still diverges on that dimension and still halts -- the
-    fail-closed answer, and the reason this advance can never quietly turn the
-    open-order check into one that cannot fail.
+    The cash and position dimensions move by the entry's own two deltas; the
+    open-order dimension is rebuilt from ``open_orders``, which the caller has
+    already drawn down by whatever this fill consumed. Splitting it that way
+    keeps the resting-order bookkeeping -- which spans entries, since an order
+    can be whittled away by several fills -- in the one place that owns it.
 
     Args:
         expectations: The expectation to advance.
         entry: The booked fill's reconstructed accounting.
+        open_orders: The resting quantity per venue order id, after this fill.
 
     Returns:
-        A new :class:`LedgerExpectations` with the cash and position dimensions
-        moved by ``entry``'s deltas.
+        A new :class:`LedgerExpectations` with every dimension moved.
     """
     positions = dict(expectations.expected_positions)
     held = positions.get(entry.ticker, ContractCentis(0))
@@ -535,7 +616,31 @@ def _advanced(
             expectations.expected_available_cash.value + entry.cash_delta.value
         ),
         expected_positions=positions,
-        expected_open_order_ids=expectations.expected_open_order_ids,
+        expected_open_order_ids=frozenset(open_orders),
+    )
+
+
+def _with_open_orders(
+    expectations: LedgerExpectations, open_orders: Mapping[str, int]
+) -> LedgerExpectations:
+    """Return ``expectations`` with only its open-order dimension rebuilt.
+
+    A booked order arrival moves neither cash nor positions: an order coming to
+    rest posts collateral the venue's *balance* already reflects, and holds no
+    position until it fills. Only the set of ids the venue should be reporting
+    changes.
+
+    Args:
+        expectations: The expectation to rebuild.
+        open_orders: The resting quantity per venue order id.
+
+    Returns:
+        A new :class:`LedgerExpectations` carrying the updated id set.
+    """
+    return LedgerExpectations(
+        expected_available_cash=expectations.expected_available_cash,
+        expected_positions=expectations.expected_positions,
+        expected_open_order_ids=frozenset(open_orders),
     )
 
 
@@ -552,23 +657,45 @@ class LedgerExpectationSource:
     than the issue #352 tautology of grading the venue against itself.
 
     The baseline is not frozen forever, though. When a ``fill_accounting`` feed
-    is supplied it advances -- from *ledgered evidence only* (issue #365). Each
-    fill is booked once, at execution, as a durable hash-chained
-    :class:`~windbreak.ledger.events.FillAccounted` entry, and each
-    :meth:`get_expectations` call folds whatever the feed has newly drained onto
-    the running expectation. Without that, the baseline stayed at the account
-    *as it stood before this process traded*, so the first real fill moved the
-    venue off it permanently: the next cycle graded ``BREACH``, the kernel
-    HALTed per issue #32, and only a restart cleared it -- an always-on PAPER
-    deployment could not survive its own first fill.
+    is supplied it advances -- from *ledgered evidence only* (issues #365 and
+    #390). The feed delivers two kinds of durable, hash-chained entry, and
+    between them they cover all three dimensions:
+
+    * a :class:`~windbreak.ledger.events.FillAccounted`, booked once at
+      execution, carrying that fill's signed cash and position deltas and the
+      venue order id it executed against (``""`` when it rested nothing); and
+    * a :class:`~windbreak.ledger.events.RestingOrderAccounted`, booked from the
+      venue's placement receipt, saying that an order came to rest and with what
+      size.
+
+    Each :meth:`get_expectations` call folds whatever the feed has newly drained
+    onto the running expectation. Without the fill entries the baseline stayed at
+    the account *as it stood before this process traded*, so the first real fill
+    moved the venue off it permanently: the next cycle graded ``BREACH``, the
+    kernel HALTed per issue #32, and only a restart cleared it -- an always-on
+    PAPER deployment could not survive its own first fill. Without the arrival
+    entries the same was true of the open-order dimension the moment the loop
+    routed anything other than an outright marketable order: the remainder left
+    resting was an order the ledger had never heard of.
 
     The advance is not a relaxation, because a booked entry and an observation
     remain independent. The entry is frozen at execution and describes one
-    discrete movement; the observation is the venue's live *aggregate* balance
-    and position. A venue that moved by something other than what was booked --
-    an unbooked fill, a fee charged differently, a settlement, a phantom
-    position, a retired resting order -- still diverges and still halts. Only
-    the *explained* part of the movement is absorbed.
+    discrete movement; the observation is the venue's live *aggregate* balance,
+    position, and resting book. A venue that moved by something other than what
+    was booked -- an unbooked fill, a fee charged differently, a settlement, a
+    phantom position, an order that rested unbidden, a resting order that
+    vanished with no fill behind it -- still diverges and still halts. Only the
+    *explained* part of the movement is absorbed.
+
+    Known residual, and deliberately out of scope here: a resting order also
+    withholds collateral from the venue's ``available`` cash on a venue whose
+    :class:`~windbreak.connector.semantics.OrderCollateralInAvailable` is
+    ``DEDUCTED_FROM_AVAILABLE``, and no entry accounts for that reservation. So
+    an order coming to rest still moves the *cash* dimension further than the
+    books explain, and still breaches there. That fails closed, which is why it
+    is safe to leave: booking a reservation correctly means releasing it
+    pro-rata as the order fills, against per-call fee rounding, and honouring
+    venues that do not deduct at all.
 
     Fail closed: an entry whose accounting cannot be reconstructed (a malformed
     payload leaf, or an event the seam should never have delivered) is never
@@ -579,7 +706,10 @@ class LedgerExpectationSource:
 
     Omitting ``fill_accounting`` restores the pre-#365 behavior exactly: the
     baseline never moves, and :meth:`get_expectations` returns one identical
-    object every call.
+    object every call. That is the correct wiring wherever nothing books the
+    evidence -- ``windbreak/main.py``'s LIVE composition still omits it
+    deliberately, because a feed there would advance the expectation on evidence
+    no process records, which is a fail-*open* regression.
 
     The projection is *scoped*, not a full venue reconstruction, because the
     ledger is not a complete record of intended venue state -- each dimension is
@@ -596,19 +726,22 @@ class LedgerExpectationSource:
     * **positions** (ledger-seeded): the rows of the last
       ``PositionsSnapshotRecorded`` event *this component recorded*. Fallback:
       the connector's positions.
-    * **open orders** (startup-connector-captured): empty only while the history
-      ends KILLED and unrearmed (a ``KillEngaged`` -- whose kill cancelled every
-      resting order -- with no matching later ``KillReArmed``), otherwise the
-      connector's resting-order ids. The killed-vs-rearmed decision reuses the
+    * **open orders** (startup-connector-captured, then ledger-advanced): empty
+      only while the history ends KILLED and unrearmed (a ``KillEngaged`` --
+      whose kill cancelled every resting order -- with no matching later
+      ``KillReArmed``), otherwise the connector's resting orders, each carried
+      with the quantity it rests for. The killed-vs-rearmed decision reuses the
       kernel's one canonical kill fold
       (:func:`~windbreak.riskkernel.kill.kill_state_in`), so it can never
       disagree with the mode the kernel replays to; scoping it to the *current*
       kill (not any historical one) is what stops a past kill or routine
       kill/re-arm drill from permanently zeroing the expectation and turning
       every later legitimately-resting order into a false-positive breach. Open
-      orders can never be ledger-*seeded* positively: venue order ids are never
-      ledgered (``OrderTransitionLedgered`` carries only the client_order_id),
-      so the ledger cannot name the resting orders a restart should expect. This
+      orders still cannot be ledger-*seeded* across a restart -- a booked arrival
+      says an order rested, not that it is still resting now -- so the startup
+      capture remains the connector's. What issue #390 added is the *advance*:
+      once captured, the set moves only by booked arrivals and by booked fills
+      naming the order they consumed, never by re-reading the venue. This
       dimension is also deliberately *not* component-scoped, precisely because it
       delegates to that one kill fold -- the same fold ``KillSwitch.from_events``
       and ``RiskKernel.from_events`` run over the same unfiltered history -- so
@@ -658,24 +791,26 @@ class LedgerExpectationSource:
             history: The replayed startup event history, oldest first.
             connector: The read-only market connector supplying the per-dimension
                 fallbacks. It is read exactly here, at construction.
-            fill_accounting: The seam newly booked fills are folded in through
-                (issue #365). ``None`` -- the default -- leaves the baseline
-                frozen for the life of the source, which is the correct wiring
-                for a composition root where nothing books fill accounting: an
-                expectation that advanced on evidence nobody records would drift
-                away from the venue silently.
+            fill_accounting: The seam newly booked fills and order arrivals are
+                folded in through (issues #365 and #390). ``None`` -- the
+                default -- leaves the baseline frozen for the life of the
+                source, which is the correct wiring for a composition root where
+                nothing books this accounting: an expectation that advanced on
+                evidence nobody records would drift away from the venue
+                silently.
         """
         events = tuple(history)
         self._fill_accounting = fill_accounting
         self._unaccountable = False
+        self._open_orders = _seed_open_orders(events, connector)
         self._expectations = LedgerExpectations(
             expected_available_cash=_seed_cash(events, connector),
             expected_positions=_seed_positions(events, connector),
-            expected_open_order_ids=_seed_open_order_ids(events, connector),
+            expected_open_order_ids=frozenset(self._open_orders),
         )
 
     def get_expectations(self) -> LedgerExpectations:
-        """Return the baseline, advanced by every fill booked since the last call.
+        """Return the baseline, advanced by every entry booked since the last call.
 
         The connector is never touched here -- only the ledgered entries the
         fill-accounting seam drains. Once an unreconstructable entry has been
@@ -690,12 +825,74 @@ class LedgerExpectationSource:
         if self._fill_accounting is None or self._unaccountable:
             return self._expectations
         for event in self._fill_accounting.drain():
-            entry = _fill_entry(event)
-            if entry is None:
+            advanced = self._advance(event)
+            if advanced is None:
                 self._unaccountable = True
                 break
-            self._expectations = _advanced(self._expectations, entry)
+            self._expectations = advanced
         return self._expectations
+
+    def _advance(self, event: Event) -> LedgerExpectations | None:
+        """Return the expectation advanced by one booked entry, or ``None``.
+
+        The seam promises exactly two kinds of entry -- a booked fill and a
+        booked order arrival -- so an event of any other type means it is not
+        delivering what it promised, which is a gap in the books rather than a
+        row to skip.
+
+        Args:
+            event: The event drained from the fill-accounting seam.
+
+        Returns:
+            The advanced :class:`LedgerExpectations`, or ``None`` when this
+            entry cannot be accounted for.
+        """
+        if event.event_type == _FILL_ACCOUNTED_EVENT_TYPE:
+            entry = _fill_entry(event)
+            if entry is None or not self._consume(entry):
+                return None
+            return _advanced(self._expectations, entry, self._open_orders)
+        if event.event_type == _RESTING_ORDER_ACCOUNTED_EVENT_TYPE:
+            arrival = _resting_entry(event)
+            if arrival is None:
+                return None
+            self._open_orders[arrival.venue_order_id] = arrival.quantity_centis
+            return _with_open_orders(self._expectations, self._open_orders)
+        return None
+
+    def _consume(self, entry: _FillEntry) -> bool:
+        """Draw the named resting order down by this fill, reporting success.
+
+        A fill that names no order consumes nothing and trivially succeeds. A
+        fill that names an order the expectation has never held fails instead of
+        inventing one: applying it would conjure a resting order and discard it
+        in the same step, quietly absorbing a retirement the books cannot
+        explain. That is the exact fail-open shape this dimension exists to
+        refuse, so it is reported as a gap and latches the advance.
+
+        The drawdown is the fill's own size -- the magnitude of its signed
+        position delta -- and the id leaves the expectation only once the order
+        is exhausted. Consuming *more* than the order held still retires it and
+        no more: the surplus is not silently absorbed anywhere else, so a venue
+        that moved further than the books explain still diverges.
+
+        Args:
+            entry: The booked fill's reconstructed accounting.
+
+        Returns:
+            Whether the named order could be drawn down.
+        """
+        if not entry.venue_order_id:
+            return True
+        remaining = self._open_orders.get(entry.venue_order_id)
+        if remaining is None:
+            return False
+        remaining -= abs(entry.position_delta.value)
+        if remaining > 0:
+            self._open_orders[entry.venue_order_id] = remaining
+        else:
+            del self._open_orders[entry.venue_order_id]
+        return True
 
 
 def _classify(
