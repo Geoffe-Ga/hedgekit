@@ -51,6 +51,15 @@ done
 
 cd "$PROJECT_ROOT"
 
+# Resolve radon/xenon from the PINNED toolchain, not the caller's PATH (issue
+# #366). This also replaces `command -v` guards that SKIPPED the checks when the
+# tools were missing -- xenon is the only enforcing half of this script, so a
+# silent skip turned the whole gate into a check that could not fail. A missing
+# tool now vetoes (toolchain_tool fails closed).
+TOOLCHAIN_ENV="$SCRIPT_DIR/toolchain-env.sh"
+RADON="$(bash "$TOOLCHAIN_ENV" --print-tool radon)"
+XENON="$(bash "$TOOLCHAIN_ENV" --print-tool xenon)"
+
 # Set verbosity
 if $VERBOSE; then
     set -x
@@ -58,30 +67,21 @@ fi
 
 echo "=== Code Complexity Analysis ==="
 
-# Check Cyclomatic Complexity with Radon
-if command -v radon &> /dev/null; then
-    echo ""
-    echo "Cyclomatic Complexity (should be <= 10):"
-    radon cc -a windbreak/ || true
+# Radon reports only -- xenon below is what enforces the thresholds.
+echo ""
+echo "Cyclomatic Complexity (should be <= 10):"
+"$RADON" cc -a windbreak/ || true
 
-    echo ""
-    echo "Maintainability Index (should be >= 20):"
-    radon mi -a windbreak/ || true
-else
-    echo "Warning: radon not installed, skipping cyclomatic complexity check" >&2
-fi
+echo ""
+echo "Maintainability Index (should be >= 20):"
+"$RADON" mi -a windbreak/ || true
 
 # Check complexity with Xenon
-if command -v xenon &> /dev/null; then
-    if $VERBOSE; then
-        echo "Running Xenon complexity check..."
-    fi
-    xenon --max-absolute B --max-modules B --max-average B windbreak/ ||         { echo "✗ Complexity exceeds thresholds" >&2; exit 1; }
-else
-    if $VERBOSE; then
-        echo "Note: xenon not installed for strict complexity checks"
-    fi
+if $VERBOSE; then
+    echo "Running Xenon complexity check..."
 fi
+"$XENON" --max-absolute B --max-modules B --max-average B windbreak/ \
+    || { echo "✗ Complexity exceeds thresholds" >&2; exit 1; }
 
 echo "✓ Complexity analysis completed"
 exit 0

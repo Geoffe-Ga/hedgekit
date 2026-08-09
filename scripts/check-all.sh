@@ -27,7 +27,7 @@ Runs:
   2. Architecture boundary checks (import-linter)
   3. Formatting (ruff format)
   4. Type checking (MyPy)
-  5. Security checks (Bandit + Safety)
+  5. Security checks (Bandit + pip-audit + detect-secrets)
   6. Complexity analysis (Radon)
   7. Unit tests
   8. Coverage report
@@ -58,17 +58,19 @@ cd "$PROJECT_ROOT"
 
 # Shared pinned-toolchain venv (issue #133): resolve the single shared .venv at
 # the main repo root. When it exists, fail loudly on drift and prepend it to
-# PATH so pip-audit and every sub-check see the pinned toolchain. The venv is
-# OPTIONAL -- when absent we note it and fall through to ambient tools.
-VENV_DIR="$(bash "$SCRIPT_DIR/provision-venv.sh" --print-venv 2>/dev/null || true)"
-if [[ -n "$VENV_DIR" && -x "$VENV_DIR/bin/python" ]]; then
+# PATH so any subprocess a tool spawns also sees the pinned toolchain. The venv
+# is OPTIONAL -- CI installs the toolchain into the runner's interpreter instead,
+# and toolchain-env.sh announces that fallback out loud rather than silently.
+#
+# The sub-scripts no longer *depend* on this PATH: since issue #366 each one
+# resolves its own tools by absolute path through toolchain-env.sh, so a check
+# run directly reaches the identical verdict it reaches through Gate 1.
+VENV_DIR="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-venv)"
+if [[ -n "$VENV_DIR" ]]; then
     bash "$SCRIPT_DIR/provision-venv.sh" --check
     export PATH="$VENV_DIR/bin:$PATH"  # .venv/bin first so the pinned toolchain wins
-else
-    echo "Note: shared .venv not found; run scripts/provision-venv.sh to pin the"
-    echo "      toolchain. Falling back to ambient tools for this run."
-    echo ""
 fi
+echo ""
 
 # Set verbosity
 VERBOSE_FLAG=""

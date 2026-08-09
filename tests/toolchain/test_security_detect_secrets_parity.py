@@ -42,6 +42,7 @@ gap.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from tests.toolchain.test_toolchain_pins import _find_repo
@@ -58,9 +59,17 @@ _SECURITY_SCRIPT_PATH = _REPO_ROOT / "scripts" / "security.sh"
 #: flag itself as a "Secret Keyword" finding.
 _DETECT_HOOK_REPO_SUBSTRING = "detect-secrets"
 
-#: The exact command `scripts/security.sh` must run to enforce detect-secrets
+#: The command `scripts/security.sh` must run to enforce detect-secrets
 #: identically to the pre-commit hook (same hook, same `.secrets.baseline`).
+#: Matched as a pattern rather than a literal because issue #366 replaced the
+#: bare `pre-commit` command name with an absolute path resolved from the pinned
+#: toolchain (`"$PRE_COMMIT" run detect-secrets --all-files`), so which
+#: pre-commit runs no longer depends on the caller's PATH. The load-bearing
+#: part -- delegating to the same hook over all files -- is unchanged.
 _ENFORCING_INVOCATION = "pre-commit run detect-secrets --all-files"
+_ENFORCING_INVOCATION_PATTERN = re.compile(
+    r'(?:\bpre-commit|"\$PRE_COMMIT") run detect-secrets --all-files'
+)
 
 #: A remediation keyword that must accompany any `.secrets.baseline`
 #: reference in a failure/guidance context, steering a developer away from
@@ -124,7 +133,7 @@ def test_security_script_runs_enforcing_precommit_invocation() -> None:
     """
     source = _security_source()
 
-    assert _ENFORCING_INVOCATION in source, (
+    assert _ENFORCING_INVOCATION_PATTERN.search(source), (
         f"scripts/security.sh does not run {_ENFORCING_INVOCATION!r} -- "
         "detect-secrets enforcement does not match the pre-commit hook"
     )

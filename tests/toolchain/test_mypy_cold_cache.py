@@ -74,10 +74,14 @@ _EXPORT_PATTERN = re.compile(r"export\s+MYPY_CACHE_DIR\b")
 #: dir specifically, not just any EXIT trap the script might register.
 _EXIT_TRAP_PATTERN = re.compile(r"trap\s+.*MYPY_CACHE_DIR.*\bEXIT\b")
 
-#: The exact mypy invocation guarded (in lockstep with the pre-commit
-#: hook's scope) by test_precommit_scope.py; re-pinned here so this
-#: feature cannot mangle it while wiring up MYPY_CACHE_DIR.
-_PINNED_MYPY_COMMAND = "mypy windbreak/ scripts/"
+#: The mypy invocation guarded (in lockstep with the pre-commit hook's scope)
+#: by test_precommit_scope.py; re-pinned here so this feature cannot mangle it
+#: while wiring up MYPY_CACHE_DIR. Matched as a pattern rather than a literal
+#: because issue #366 replaced the bare `mypy` command name with an absolute
+#: path resolved from the pinned toolchain (`"$MYPY" windbreak/ scripts/`), so
+#: which binary runs no longer depends on the caller's PATH. The load-bearing
+#: part -- the checked target list -- is what this guard pins either way.
+_PINNED_MYPY_COMMAND = re.compile(r'(?:\bmypy|"\$MYPY") windbreak/ scripts/')
 
 
 def _read_typecheck_source() -> str:
@@ -160,18 +164,18 @@ def test_typecheck_script_traps_exit_to_remove_the_temp_cache_dir() -> None:
 
 
 def test_typecheck_script_still_runs_the_pinned_mypy_command() -> None:
-    """The literal `mypy windbreak/ scripts/` invocation must stay intact.
+    """The `mypy windbreak/ scripts/` invocation must stay intact.
 
     Guards this cold-cache fix specifically against mangling the pinned
     command while wiring up MYPY_CACHE_DIR -- complementing (not
     replacing) `test_precommit_scope.py`'s lockstep guard, which pins the
-    same substring against the pre-commit mypy hook's scope.
+    same scope against the pre-commit mypy hook.
     """
     source = _read_typecheck_source()
 
-    assert _PINNED_MYPY_COMMAND in source, (
-        f"scripts/typecheck.sh no longer runs {_PINNED_MYPY_COMMAND!r} -- "
-        "the cold-cache fix must not change the mypy invocation itself"
+    assert _PINNED_MYPY_COMMAND.search(source), (
+        f"scripts/typecheck.sh no longer runs {_PINNED_MYPY_COMMAND.pattern!r} "
+        "-- the cold-cache fix must not change the mypy invocation itself"
     )
 
 
@@ -188,10 +192,12 @@ def test_typecheck_script_run_does_not_touch_repo_root_mypy_cache() -> None:
     cache file without bumping the top-level directory's mtime.
 
     Fails loudly (never skips) if `mypy` is unavailable: mypy is a
-    required Gate-2 tool, and a missing binary would make this test pass
-    for the wrong reason (the script's "Warning: mypy not installed,
-    skipping" early-exit path) rather than actually exercising the
-    cold-cache isolation mechanism. Resolves mypy from the running
+    required Gate-2 tool, and a missing binary used to make this test pass
+    for the wrong reason via the script's "Warning: mypy not installed,
+    skipping" early-exit. Issue #366 deleted that fail-open branch (a
+    missing mypy now vetoes), and this assertion stays so the test still
+    proves it exercised the cold-cache isolation mechanism rather than an
+    error path. Resolves mypy from the running
     interpreter's own bin dir (the shared `.venv/bin` in the real Gate-2
     path) so the test finds the same `mypy` the real Gate-2 run uses, and
     stays robust regardless of how the enclosing pytest process itself
@@ -243,8 +249,8 @@ def test_config_driven_mypy_catches_a_real_implicit_reexport(
 
     Positive-detection regression for issue #179. The cold-cache fix alone is
     inert on this bug class: `no-implicit-reexport` is a `--strict`-only check,
-    and `scripts/typecheck.sh` runs the *bare* command `mypy windbreak/
-    scripts/`, taking its strictness solely from pyproject.toml's `[tool.mypy]`.
+    and `scripts/typecheck.sh` runs `mypy windbreak/ scripts/` with no explicit
+    flags, taking its strictness solely from pyproject.toml's `[tool.mypy]`.
     Empirically, before this fix that config passed cleanly on a real implicit
     re-export (cold cache made no difference), so the #158/#178 pattern still
     false-greened locally and only failed CI's separate `--strict` pre-commit

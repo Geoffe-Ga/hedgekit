@@ -59,6 +59,12 @@ done
 
 cd "$PROJECT_ROOT"
 
+# Resolve tools from the PINNED toolchain, not the caller's PATH (issue #366).
+# A failed resolution exits nonzero here and, under `set -e`, aborts the check.
+TOOLCHAIN_ENV="$SCRIPT_DIR/toolchain-env.sh"
+RUFF="$(bash "$TOOLCHAIN_ENV" --print-tool ruff)"
+FLOAT_LINT_PYTHON="$(bash "$TOOLCHAIN_ENV" --print-python)"
+
 # Set verbosity
 if $VERBOSE; then
     set -x
@@ -70,13 +76,13 @@ if $FIX; then
     if $VERBOSE; then
         echo "Fixing linting issues..."
     fi
-    ruff check . --fix
+    "$RUFF" check . --fix
     EXIT_CODE=$?
 else
     if $VERBOSE; then
         echo "Checking for linting issues..."
     fi
-    ruff check .
+    "$RUFF" check .
     EXIT_CODE=$?
 fi
 
@@ -89,7 +95,7 @@ echo "✓ Linting checks passed"
 echo "=== Float lint (AST) ==="
 # Enforce "no floats on the money path" (SPEC S6.1/S17.3). No autofix exists,
 # so --fix and check modes run the identical scan of the denylisted packages.
-if python3 scripts/lint_no_floats.py; then
+if "$FLOAT_LINT_PYTHON" scripts/lint_no_floats.py; then
     echo "✓ Float-lint checks passed"
 else
     echo "✗ Float-lint checks failed" >&2
