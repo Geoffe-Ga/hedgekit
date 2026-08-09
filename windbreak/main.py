@@ -1555,8 +1555,16 @@ def _drive_risk_kernel(
     The inner half of :func:`_run_riskkernel`, split out so the store's
     open/close lifecycle stays a single ``try``/``finally`` there while this
     function owns the fail-closed build and the run. A build that raises
-    (uncreatable state dir, bad ceiling, or a tampered ledger chain) logs
-    ``FATAL`` and returns 1 before the loop is entered, emitting no heartbeat.
+    (uncreatable state dir, bad ceiling, a tampered ledger chain, or an alert
+    sink that cannot work) logs ``FATAL`` and returns 1 before the loop is
+    entered, emitting no heartbeat.
+
+    ``AlertSinkConfigError`` is named alongside the rest because
+    :func:`_build_risk_kernel` composes ``config.alerts`` into the kill
+    switch's dispatcher (issue #274): a misconfigured sink must fail this
+    process closed with the same ``FATAL`` + exit-1 contract ``preflight`` and
+    ``alert-test`` honor, not escape as an unhandled traceback out of the one
+    process that runs the kill switch.
 
     When ``--snapshot-fixture-dir`` is given, a read-only
     :class:`~windbreak.connector.fake.FakeExchange` is built over it *inside*
@@ -1583,7 +1591,7 @@ def _drive_risk_kernel(
             ledger_store=ledger_store,
             verification_connector=verification_connector,
         )
-    except (OSError, ValueError, ChainIntegrityError) as exc:
+    except (OSError, ValueError, ChainIntegrityError, AlertSinkConfigError) as exc:
         _LOGGER.critical("FATAL: %s", exc)
         return 1
     state = ShutdownState()
