@@ -26,6 +26,10 @@ hold, checked by `_paper_activated`:
    | `--ledger-path` | Path to the PAPER loop's hash-chained SQLite ledger database (a sibling `<name>.wal` file backs its write-ahead log). |
    | `--report-dir` | Directory the weekly report stub is written into. |
 
+   A fifth flag, `--paper-live-ticker`, is optional and does *not* gate
+   activation; it swaps the fixture books for the venue's live ones. See
+   [Running against live venue books](#running-against-live-venue-books-issue-343).
+
 If the ceiling forbids PAPER, or even one of the four flags is missing, none
 of this is wired: `windbreak run` falls back to its plain RESEARCH heartbeat
 (optionally with `--snapshot-fixture-dir` snapshotting, if given) -- **byte
@@ -58,6 +62,50 @@ windbreak run \
 - Stop the loop with `Ctrl-C` (SIGINT) or SIGTERM; it shuts down cleanly and
   logs the shutdown reason. `--max-beats N` stops it automatically after `N`
   heartbeats (useful for a bounded smoke run).
+
+### Running against live venue books (issue #343)
+
+Adding one optional fifth flag points the loop at the exchange's **real,
+current order books** while every fill, position, and balance stays simulated
+-- real prices in, paper money out:
+
+```bash
+windbreak run \
+  --paper-books-dir tests/fixtures/books/deep_walk \
+  --paper-live-ticker KXFED-25DEC \
+  --cassette-path /path/to/cassette.json \
+  --ledger-path /path/to/state/ledger.db \
+  --report-dir /path/to/state/reports
+```
+
+- **One flag, not two.** `--paper-live-ticker`'s *presence* selects live books
+  and its *value* names the market, so the mode and the market cannot
+  disagree. Omit it and the loop replays `--paper-books-dir`'s recorded books
+  exactly as before -- byte identical.
+- **`--paper-books-dir` is still required**, but in live mode only its
+  *account* fixtures (`balances.json`, `balance_semantics.json`) are read.
+  Paper money has to start somewhere; the market data comes from the venue.
+- **One market.** A live session trades exactly the ticker you name. The
+  multi-market universe is separate work (issue #345).
+- **No credentials, and no order can leave.** The venue is reached through a
+  read-only market-data view built by
+  `windbreak.connector.live.build_kalshi_market_data`: Kalshi's market-data
+  routes are public, so no API key is configured or held, and the object the
+  loop holds has no `place_order` method at all (SPEC S1.1 invariant 3).
+- **Egress is still gated.** The venue base URL is resolved from
+  `exchange.environment` (`demo` | `production`) and screened against the
+  deployment's own outbound allowlist before any session is created (SPEC
+  S15). An unrecognized environment, or a Kalshi host the config's allowlist
+  does not admit, refuses at startup rather than dialing.
+- **Stale data still vetoes.** A live book carries the venue's own
+  observation instant, passed through untouched -- unlike the fixture path,
+  which re-dates a recording to the run's clock (issue #369). That is
+  deliberate: it is what leaves `quote_freshness` and the clock-skew check
+  able to actually veto.
+- **Every consumer shares one exchange.** The gateway (submitter, status
+  source, reconciliation source), the `Reconciler`, and the read-only
+  verification view all hold the *same* live-book session object, so the loop
+  can never reason about one venue and fill against another.
 
 ### What one PAPER tick actually does
 

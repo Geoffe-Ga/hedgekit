@@ -8,7 +8,10 @@ reconcile), appending an audit event to the hash-chained ledger at every stage.
 
 This package is the *only* legitimate importer of
 :mod:`windbreak.connector.paper` outside the Order Gateway: it constructs a
-`PaperExchange` in its `build_paper_deps` PAPER factory. The RESEARCH loop never
+`PaperExchange` -- or, when the operator names a live market, the
+`LiveBookPaperExchange` subclass that reads real venue books while still
+simulating every fill -- inside `build_paper_deps`'s own
+`_build_paper_exchange` helper, and nowhere else. The RESEARCH loop never
 imports this package (``windbreak.main`` wires the PAPER tick via a local import
 only when PAPER is actually activated), so the paper fake stays off the
 RESEARCH/LIVE trading path.
