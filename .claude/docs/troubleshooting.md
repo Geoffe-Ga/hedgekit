@@ -199,14 +199,17 @@ git commit -m "feat(module): add feature (#123)"
 [tool.coverage.report]
 fail_under = 70  # Reduced from 90 because it's hard
 
-[tool.pylint.main]
-fail-under = 7.0  # Reduced from 9.0
+```
+
+```bash
+# In scripts/complexity.sh - WRONG
+xenon --max-absolute C  # Relaxed from B because a function grew
 ```
 
 ✅ **REQUIRED - Meet the standards:**
 ```python
 # Write better tests to reach 90% coverage
-# Refactor code to improve pylint score
+# Refactor the function until it fits under the complexity ceiling
 # If truly impossible, create issue to discuss threshold adjustment
 ```
 
