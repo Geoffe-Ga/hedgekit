@@ -2,7 +2,9 @@
 
 Per SPEC S5.2 this package models only *public, read-only market access* and
 carries no trade credentials. It targets Kalshi's current API generation
-(SPEC S7.1) at ``https://api.elections.kalshi.com/trade-api/v2`` and delivers
+(SPEC S7.1) at :data:`~windbreak.connector.kalshi.client.KALSHI_API_BASE`, or
+:data:`~windbreak.connector.kalshi.client.KALSHI_DEMO_API_BASE` for a ``demo``
+deployment (SPEC S16's ``exchange.environment``), and delivers
 the read-only market-data surface: :class:`KalshiConnector` normalizes markets,
 order books, exchange status, and server time, applying a binary-only product
 allowlist and ledgering a :data:`PRODUCT_REFUSED_EVENT` for every refused

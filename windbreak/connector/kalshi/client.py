@@ -53,6 +53,15 @@ if TYPE_CHECKING:
 #: The current-generation Kalshi public API base (SPEC S7.1).
 KALSHI_API_BASE: Final = "https://api.elections.kalshi.com/trade-api/v2"
 
+#: The Kalshi *demo* API base, the other half of SPEC S16's
+#: ``exchange.environment: demo | production`` pair. Its host mirrors
+#: :mod:`windbreak.net.allowlist`'s ``_KALSHI_DEMO_HOST``, which is what a
+#: ``demo`` deployment's derived egress allowlist admits. Reaching it still
+#: demands an explicit ``allowlist`` argument: the implicit
+#: :data:`_CANONICAL_ALLOWLIST_HOSTS` covers only the production host, so a demo
+#: base can never be dialed by a client whose deployment did not declare it.
+KALSHI_DEMO_API_BASE: Final = "https://demo-api.kalshi.co/trade-api/v2"
+
 #: The single host implicitly permitted when no explicit ``allowlist`` is
 #: supplied: exactly the canonical :data:`KALSHI_API_BASE` host, so the stock
 #: constructor works while any other base URL demands an explicit allowlist.
