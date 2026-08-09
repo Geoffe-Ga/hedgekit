@@ -68,6 +68,17 @@ events recorded, or a fail-closed exit code of `0` instead of `1`) against
 today's connector-less, snapshot-fixture-dir-ignoring composition -- both are
 the expected Gate 1 RED state for issue #236, independent of (and in addition
 to) issues #144 and #235's tests above.
+
+Issue #274 (compose `config.alerts` into the kill switch's `AlertDispatcher`)
+adds one more fail-closed startup case alongside the uncreatable-state-dir
+test: a misconfigured `alerts.sinks` entry makes `_build_risk_kernel` raise
+`AlertSinkConfigError`, which is not an `OSError`/`ValueError`/
+`ChainIntegrityError` and so had to be named explicitly in
+`_drive_risk_kernel`'s except tuple. Before that, the error escaped `main()`
+as an unhandled traceback rather than the `FATAL` + exit-1 contract every
+other entry point honors -- so the test below fails with a raw
+`AlertSinkConfigError: unknown alert sink type 'carrier-pigeon'` propagating
+out of `main`, not an `AssertionError`.
 """
 
 from __future__ import annotations
@@ -531,6 +542,56 @@ def test_run_process_riskkernel_fails_closed_when_state_dir_cannot_be_created(
     payloads = _json_lines(capsys.readouterr().err)
     assert any(
         payload.get("level") == "CRITICAL" and "FATAL" in str(payload.get("msg", ""))
+        for payload in payloads
+    )
+    assert not any("heartbeat" in str(payload.get("msg", "")) for payload in payloads)
+
+
+@pytest.mark.timeout(30)
+def test_run_process_riskkernel_fails_closed_on_a_misconfigured_alert_sink(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bad `alerts.sinks` entry fails closed exactly like a bad state dir.
+
+    Issue #274 made `_build_risk_kernel` compose the configured alert sinks, so
+    it can now raise `AlertSinkConfigError` -- an operator mistake the kernel
+    must refuse to start on rather than run the money path believing it can
+    page a human when it cannot. That error is not an `OSError`/`ValueError`/
+    `ChainIntegrityError`, so `_drive_risk_kernel` must name it explicitly;
+    otherwise the kill-switch process dies with an unhandled traceback instead
+    of the `FATAL` + exit-1 contract `preflight` and `alert-test` both honor.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "ops": {"state_dir": str(tmp_path)},
+                "alerts": {"sinks": [{"type": "carrier-pigeon"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "run",
+            "--process",
+            "riskkernel",
+            "--max-beats",
+            "1",
+            "--heartbeat-interval",
+            "0",
+            "--config",
+            str(config_path),
+        ]
+    )
+
+    assert exit_code == 1
+    payloads = _json_lines(capsys.readouterr().err)
+    assert any(
+        payload.get("level") == "CRITICAL"
+        and "FATAL" in str(payload.get("msg", ""))
+        and "carrier-pigeon" in str(payload.get("msg", ""))
         for payload in payloads
     )
     assert not any("heartbeat" in str(payload.get("msg", "")) for payload in payloads)

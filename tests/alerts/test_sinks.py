@@ -38,7 +38,7 @@ from windbreak.alerts.sinks import (
     _https_post,
     _smtp_send,
 )
-from windbreak.net.allowlist import OutboundAllowlist
+from windbreak.net.allowlist import EgressDeniedError, OutboundAllowlist
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -46,6 +46,16 @@ if TYPE_CHECKING:
 #: Allowlist admitting the ntfy host every ``TestNtfySink`` construction uses,
 #: now that ``NtfySink`` requires an explicit outbound allowlist (issue #57).
 _NTFY_ALLOWLIST = OutboundAllowlist(frozenset({"ntfy.example.com"}))
+
+#: Allowlist admitting the webhook host every ``TestWebhookSink`` construction
+#: uses. ``WebhookSink`` requires the same explicit allowlist ``NtfySink`` does
+#: (issue #274), so a config-supplied URL can never reach an internal host.
+_WEBHOOK_ALLOWLIST = OutboundAllowlist(frozenset({"hooks.example.com"}))
+
+#: Allowlist admitting the SMTP relay host every ``TestSmtpSink`` construction
+#: uses; ``SmtpSink`` screens its bare host through ``require_host`` (issue
+#: #274) so SMTP is not the one unscreened outbound path.
+_SMTP_ALLOWLIST = OutboundAllowlist(frozenset({"smtp.example.com"}))
 
 
 class _FakeHTTPSResponse:
@@ -243,7 +253,9 @@ class TestWebhookSink:
             return 200
 
         config = WebhookSinkConfig(url="https://hooks.example.com/incoming")
-        sink = WebhookSink(config, transport=spy_transport)
+        sink = WebhookSink(
+            config, transport=spy_transport, allowlist=_WEBHOOK_ALLOWLIST
+        )
 
         sink.send(AlertType.DISK_HALT, AlertSeverity.CRITICAL, "disk full")
 
@@ -262,7 +274,9 @@ class TestWebhookSink:
             return 503
 
         config = WebhookSinkConfig(url="https://hooks.example.com/incoming")
-        sink = WebhookSink(config, transport=failing_transport)
+        sink = WebhookSink(
+            config, transport=failing_transport, allowlist=_WEBHOOK_ALLOWLIST
+        )
 
         with pytest.raises(SinkSendError):
             sink.send(AlertType.VETO, AlertSeverity.WARNING, "vetoed")
@@ -274,10 +288,42 @@ class TestWebhookSink:
             raise OSError("dns failure")
 
         config = WebhookSinkConfig(url="https://hooks.example.com/incoming")
-        sink = WebhookSink(config, transport=raising_transport)
+        sink = WebhookSink(
+            config, transport=raising_transport, allowlist=_WEBHOOK_ALLOWLIST
+        )
 
         with pytest.raises(SinkSendError):
             sink.send(AlertType.VETO, AlertSeverity.WARNING, "vetoed")
+
+    def test_construction_rejects_a_url_off_the_allowlist(self) -> None:
+        """An off-allowlist webhook URL is refused before any POST (issue #274).
+
+        Closes the SSRF gap the sink shipped with: `WebhookSink` used to accept
+        any config-supplied `https` URL, so a mistyped or tampered endpoint
+        could reach an internal host. It now screens at construction exactly as
+        `NtfySink` does -- the transport is never even consulted.
+        """
+        transport_calls: list[str] = []
+
+        def spy_transport(url: str, body: bytes, headers: Mapping[str, str]) -> int:
+            transport_calls.append(url)
+            return 200
+
+        config = WebhookSinkConfig(url="https://169.254.169.254/latest/meta-data")
+
+        with pytest.raises(EgressDeniedError):
+            WebhookSink(config, transport=spy_transport, allowlist=_WEBHOOK_ALLOWLIST)
+
+        assert transport_calls == []
+
+    def test_construction_rejects_a_non_https_url(self) -> None:
+        """A `file://` webhook endpoint is refused by the allowlist's scheme check."""
+        config = WebhookSinkConfig(url="file:///etc/passwd")
+
+        with pytest.raises(EgressDeniedError):
+            WebhookSink(
+                config, transport=lambda *_args: 200, allowlist=_WEBHOOK_ALLOWLIST
+            )
 
 
 class TestDefaultHttpsPost:
@@ -342,7 +388,7 @@ class TestSmtpSink:
             sender="alerts@example.com",
             recipients=("ops@example.com", "oncall@example.com"),
         )
-        sink = SmtpSink(config, transport=spy_transport)
+        sink = SmtpSink(config, transport=spy_transport, allowlist=_SMTP_ALLOWLIST)
 
         sink.send(AlertType.BACKUP_FAILURE, AlertSeverity.WARNING, "backup job failed")
 
@@ -367,10 +413,34 @@ class TestSmtpSink:
             sender="a@example.com",
             recipients=("b@example.com",),
         )
-        sink = SmtpSink(config, transport=raising_transport)
+        sink = SmtpSink(config, transport=raising_transport, allowlist=_SMTP_ALLOWLIST)
 
         with pytest.raises(SinkSendError):
             sink.send(AlertType.VETO, AlertSeverity.WARNING, "vetoed")
+
+    def test_construction_rejects_a_relay_host_off_the_allowlist(self) -> None:
+        """An off-allowlist SMTP relay is refused before any connection (#274).
+
+        SMTP has no URL to screen, so the bare host goes through
+        `OutboundAllowlist.require_host`; without it SMTP would be the one
+        outbound alert path with no egress check at all.
+        """
+        transport_calls: list[SmtpSinkConfig] = []
+
+        def spy_transport(config: SmtpSinkConfig, message: EmailMessage) -> None:
+            transport_calls.append(config)
+
+        config = SmtpSinkConfig(
+            host="relay.internal",
+            port=25,
+            sender="a@example.com",
+            recipients=("b@example.com",),
+        )
+
+        with pytest.raises(EgressDeniedError):
+            SmtpSink(config, transport=spy_transport, allowlist=_SMTP_ALLOWLIST)
+
+        assert transport_calls == []
 
 
 class TestDefaultSmtpSend:
@@ -483,12 +553,14 @@ class TestLogOnlySink:
         lambda: WebhookSink(
             WebhookSinkConfig(url="https://w.example.com"),
             transport=lambda *_args: 200,
+            allowlist=OutboundAllowlist(frozenset({"w.example.com"})),
         ),
         lambda: SmtpSink(
             SmtpSinkConfig(
                 host="h", port=25, sender="a@example.com", recipients=("b@example.com",)
             ),
             transport=lambda *_args: None,
+            allowlist=OutboundAllowlist(frozenset({"h"})),
         ),
         lambda: DesktopSink(notifier=lambda *_args: None),
         lambda: LogOnlySink(),

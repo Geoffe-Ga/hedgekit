@@ -210,6 +210,10 @@ class KeyRotationDrill(Drill):
             scope_prober=_NullScopeProber(),
             leak_prober=EnvTradeKeyLeakProber(environ={}, var=_TRADE_KEY_VAR),
             eligible_markets=(),
+            # Deliberately sink-less, unlike the CLI's own preflight (issue
+            # #274): a drill is a *rehearsal*, so grading the checklist must
+            # never page the operator through the real configured sinks. The
+            # dispatcher's log-only fallback keeps the outcome observable.
             alert_dispatcher=AlertDispatcher(
                 sinks=[], ledger_writer=LoggingLedgerWriter()
             ),

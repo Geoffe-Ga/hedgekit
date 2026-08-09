@@ -1,0 +1,502 @@
+"""Build the concrete alert sinks a configuration asks for (issue #274).
+
+This is the composition seam between :mod:`windbreak.config` and
+:mod:`windbreak.alerts.sinks`: :func:`build_sinks` turns each
+:class:`~windbreak.config.schema.AlertSink` entry into a live sink instance that
+:class:`~windbreak.alerts.dispatch.AlertDispatcher` fans alerts out to. Before
+it existed every production dispatcher was built with ``sinks=[]``, so operator
+alerts never left the box.
+
+Three rules govern the mapping, and all three are about not lying to the
+operator:
+
+1. **Unconfigured is skipped, loudly.** A sink entry still holding
+   :data:`~windbreak.config.schema.UNCONFIGURED_PLACEHOLDER` in a field it needs
+   cannot deliver anything, so it builds nothing and logs a WARNING naming its
+   type. The alert still surfaces: with no sink built, the dispatcher's
+   ``log-only`` fallback fires. This mirrors the fail-closed placeholder idiom
+   :class:`~windbreak.config.schema.ResearchSettings` already uses, and it is
+   why the shipped SPEC S16 default (one placeholder ntfy sink) does not make
+   every process refuse to start.
+2. **Misconfigured is fatal.** An unknown sink type, an off-allowlist
+   destination, or a sink that cannot possibly deliver (a ``desktop`` entry with
+   no notifier) raises :class:`AlertSinkConfigError` at composition. These are
+   operator mistakes, not absent configuration, and degrading them to log-only
+   would hide a broken alerting path behind a healthy-looking process.
+3. **Destinations are secrets, and never live in configuration.** An ntfy topic
+   is a bearer capability and a webhook URL can embed a token, so
+   :class:`~windbreak.config.schema.AlertSink` stores only the *name* of the
+   environment variable each destination is read from, and this module resolves
+   it here -- the same ``*_api_key_env`` indirection
+   :class:`~windbreak.config.schema.ResearchSettings` already uses. Keeping the
+   values out of the config object keeps them out of
+   :func:`windbreak.config.versioning.diff_configs`, out of the hash-chained
+   ``ConfigLoaded`` ledger event, and out of the plaintext
+   ``config_versions.json`` read model -- all append-only, so a value that
+   reaches them cannot be redacted afterwards. On top of that, no message this
+   module raises or logs ever contains more of a resolved destination than its
+   hostname -- and when a hostname cannot be *proven* (a URL whose netloc will
+   not parse, a bare-host field holding something that is not a bare host), it
+   contains none of the destination at all. The redaction is driven by what can
+   be proven safe, not by enumerating the separators a leak might use, so an
+   unanticipated malformed destination fails closed onto saying nothing.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from string import ascii_letters, digits
+from typing import TYPE_CHECKING, Final
+from urllib.parse import urlsplit
+
+from windbreak.alerts.sinks import (
+    DEFAULT_HTTP_TRANSPORT,
+    DEFAULT_SMTP_TRANSPORT,
+    DesktopSink,
+    NtfySink,
+    NtfySinkConfig,
+    SmtpSink,
+    SmtpSinkConfig,
+    WebhookSink,
+    WebhookSinkConfig,
+)
+from windbreak.config.schema import UNCONFIGURED_PLACEHOLDER
+from windbreak.net.allowlist import EgressDeniedError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    from windbreak.alerts.sinks import (
+        AlertSink,
+        HttpTransport,
+        SmtpTransport,
+    )
+    from windbreak.config.schema import AlertsConfig
+    from windbreak.config.schema import AlertSink as AlertSinkSpec
+    from windbreak.net.allowlist import OutboundAllowlist
+
+_LOGGER = logging.getLogger("windbreak.alerts")
+
+#: The sink ``type`` token for each supported channel, so a typo in a config
+#: file is compared against one authoritative spelling.
+_NTFY: Final = "ntfy"
+_WEBHOOK: Final = "webhook"
+_SMTP: Final = "smtp"
+_DESKTOP: Final = "desktop"
+
+#: Every recognized ``type``, named in the error an unknown type raises so the
+#: operator is told what the valid choices are.
+_KNOWN_TYPES: Final = (_NTFY, _WEBHOOK, _SMTP, _DESKTOP)
+
+#: The characters a hostname may contain. Used as an allowlist (not a blocklist
+#: of URL punctuation) so a value is named in an error only when every one of
+#: its characters is proven harmless, rather than when none of the separators we
+#: happened to think of is present.
+_HOST_CHARS: Final = frozenset(ascii_letters + digits + ".-_")
+
+
+class AlertSinkConfigError(Exception):
+    """Raised when an alert sink is configured in a way that cannot work.
+
+    Distinct from a skipped *unconfigured* sink: this signals an operator
+    mistake (an unknown type, an undeliverable sink, a destination off the
+    egress allowlist) that must stop the process rather than silently degrade
+    alerting to the log-only fallback.
+    """
+
+
+def _is_configured(value: str) -> bool:
+    """Return whether an operator has actually filled a destination field in.
+
+    Args:
+        value: The raw field value from the configuration.
+
+    Returns:
+        ``True`` unless the value is empty or still the shipped
+        :data:`~windbreak.config.schema.UNCONFIGURED_PLACEHOLDER`.
+    """
+    return bool(value) and value != UNCONFIGURED_PLACEHOLDER
+
+
+def _skip_unconfigured(sink_type: str, missing: str) -> None:
+    """Log that an unconfigured sink was skipped, naming no destination.
+
+    Args:
+        sink_type: The sink's configured ``type``.
+        missing: The name of the field the operator has not filled in. A field
+            *name* only -- never its value, which may be a topic or token.
+    """
+    _LOGGER.warning(
+        "alert sink %r is unconfigured (%s not set) and was skipped; "
+        "alerts fall back to log-only",
+        sink_type,
+        missing,
+        extra={"component": "alerts", "sink": sink_type},
+    )
+
+
+def _resolve(
+    sink_type: str, field: str, var: str, environ: Mapping[str, str]
+) -> str | None:
+    """Resolve the destination a sink's ``*_env`` field points at.
+
+    The single seam turning an environment-variable *name* held in
+    configuration into the destination value the sink dials, so no caller has
+    to remember that alert destinations are never config leaves.
+
+    Args:
+        sink_type: The sink's configured ``type``.
+        field: The ``*_env`` configuration field being resolved, named in any
+            message so an operator knows exactly what to correct.
+        var: The environment-variable name that field holds.
+        environ: The environment mapping to read, injected rather than reached
+            for so a test never has to mutate the real process environment.
+
+    Returns:
+        The resolved destination, or ``None`` when ``field`` is still
+        :data:`~windbreak.config.schema.UNCONFIGURED_PLACEHOLDER` (or empty) --
+        an entry the operator has not finished filling in, which is skipped
+        loudly rather than treated as an error.
+
+    Raises:
+        AlertSinkConfigError: If ``field`` names a variable that is unset or
+            empty. Naming a variable and then not exporting it is an operator
+            mistake, not absent configuration: building the sink anyway would
+            need an invented destination, and skipping it silently would leave a
+            process that looks alert-wired but is not. Only the variable's
+            *name* appears in the message -- there is no value to disclose, and
+            the message is logged verbatim as ``FATAL:`` on stderr by
+            :mod:`windbreak.main`.
+    """
+    if not _is_configured(var):
+        _skip_unconfigured(sink_type, field)
+        return None
+    value = environ.get(var, "")
+    if not value:
+        raise AlertSinkConfigError(
+            f"alert sink {sink_type!r} reads its destination from the "
+            f"environment variable named by {field}, {var!r}, which is unset or "
+            f"empty. Export {var!r} before starting windbreak, or clear "
+            f"{field} to disable this sink deliberately; an unresolvable "
+            "destination is never built into a sink that would look healthy "
+            "and deliver nothing."
+        )
+    return value
+
+
+def _is_bare_host(value: str) -> bool:
+    """Return whether ``value`` provably carries nothing but a hostname.
+
+    Args:
+        value: The configured destination value.
+
+    Returns:
+        ``True`` when every character is hostname-legal, so naming the value
+        cannot disclose a path, query, port, or userinfo. Fails closed: any
+        other character -- including the colons of an IPv6 literal, or the
+        ``/``/``?`` of a URL an operator mistyped into a bare-host field --
+        reads as "cannot prove this is only a host", and the value is redacted
+        rather than echoed on the chance that it is well-formed.
+    """
+    return bool(value) and all(char in _HOST_CHARS for char in value)
+
+
+def _denied(sink_type: str, field: str, host: str | None) -> AlertSinkConfigError:
+    """Build the denial error, naming ``host`` only when one was proven.
+
+    :class:`~windbreak.net.allowlist.EgressDeniedError`'s own message quotes the
+    whole URL, which for a webhook may carry a token in its path or query. Every
+    caller raises this replacement with ``from None`` so that URL-bearing
+    message cannot resurface in a traceback either.
+
+    Args:
+        sink_type: The sink's configured ``type``.
+        field: The configuration field the destination came from -- for an
+            HTTPS sink the ``*_env`` field naming its environment variable, for
+            SMTP the literal ``smtp.host`` -- so an operator is told exactly
+            what to correct without being shown its value.
+        host: The destination's hostname, or ``None`` when none could be proven.
+
+    Returns:
+        The :class:`AlertSinkConfigError` to raise in the denial's place. With
+        no hostname the remediation differs as well as the redaction: the fault
+        is a malformed destination, so telling the operator to add it to
+        ``alerts.allowed_hosts`` would be misdirection -- there is nothing
+        addable to declare.
+    """
+    if host is None:
+        return AlertSinkConfigError(
+            f"alert sink {sink_type!r} has a malformed destination: no hostname "
+            f"could be parsed from the value {field} supplies, so it can never "
+            f"clear the outbound egress allowlist. Correct the destination "
+            f"{field} supplies; its value is withheld from this message because "
+            "an alert destination can embed a token."
+        )
+    return AlertSinkConfigError(
+        f"alert sink {sink_type!r} destination host {host!r} is not on the "
+        "outbound egress allowlist; declare it in alerts.allowed_hosts"
+    )
+
+
+def _denied_url(sink_type: str, field: str, url: str) -> AlertSinkConfigError:
+    """Translate an egress denial for a URL-shaped destination.
+
+    Args:
+        sink_type: The sink's configured ``type``.
+        field: The configuration field holding ``url``.
+        url: The denied URL. Treated as secret-bearing throughout: only the
+            hostname :func:`~urllib.parse.urlsplit` parses out of it -- which
+            excludes userinfo, port, path, query, and fragment -- is ever named.
+
+    Returns:
+        The :class:`AlertSinkConfigError` to raise in the denial's place.
+    """
+    return _denied(sink_type, field, urlsplit(url).hostname or None)
+
+
+def _denied_host(sink_type: str, field: str, host: str) -> AlertSinkConfigError:
+    """Translate an egress denial for a bare-hostname destination.
+
+    An SMTP relay is configured as a host, not a URL, so there is no URL to
+    parse and the value is normally safe to name in full. It is still screened
+    by :func:`_is_bare_host` first, so an operator who mistypes a token-bearing
+    URL into the field gets the same redaction the URL branch gives.
+
+    Args:
+        sink_type: The sink's configured ``type``.
+        field: The configuration field holding ``host``.
+        host: The denied hostname.
+
+    Returns:
+        The :class:`AlertSinkConfigError` to raise in the denial's place.
+    """
+    return _denied(sink_type, field, host if _is_bare_host(host) else None)
+
+
+def _build_ntfy(
+    spec: AlertSinkSpec,
+    allowlist: OutboundAllowlist,
+    transport: HttpTransport,
+    environ: Mapping[str, str],
+) -> AlertSink | None:
+    """Build an ntfy sink, or ``None`` when the entry is unconfigured.
+
+    Args:
+        spec: The configuration entry to build from.
+        allowlist: The egress allowlist the resolved base URL's host must clear.
+        transport: The HTTP transport the sink delivers through.
+        environ: The environment the destination variables are read from.
+
+    Returns:
+        The sink, or ``None`` if ``base_url_env`` or ``topic_env`` is still a
+        placeholder.
+
+    Raises:
+        AlertSinkConfigError: If either named variable is unset or empty, or if
+            the resolved base URL's host is off the allowlist.
+    """
+    base_url = _resolve(spec.type, "base_url_env", spec.base_url_env, environ)
+    if base_url is None:
+        return None
+    topic = _resolve(spec.type, "topic_env", spec.topic_env, environ)
+    if topic is None:
+        return None
+    config = NtfySinkConfig(base_url=base_url, topic=topic)
+    try:
+        return NtfySink(config, transport=transport, allowlist=allowlist)
+    except EgressDeniedError:
+        raise _denied_url(spec.type, "base_url_env", base_url) from None
+
+
+def _build_webhook(
+    spec: AlertSinkSpec,
+    allowlist: OutboundAllowlist,
+    transport: HttpTransport,
+    environ: Mapping[str, str],
+) -> AlertSink | None:
+    """Build a webhook sink, or ``None`` when the entry is unconfigured.
+
+    Args:
+        spec: The configuration entry to build from.
+        allowlist: The egress allowlist the resolved URL's host must clear.
+        transport: The HTTP transport the sink delivers through.
+        environ: The environment the destination variable is read from.
+
+    Returns:
+        The sink, or ``None`` if ``url_env`` is still a placeholder.
+
+    Raises:
+        AlertSinkConfigError: If the named variable is unset or empty, or if the
+            resolved URL's host is off the allowlist.
+    """
+    url = _resolve(spec.type, "url_env", spec.url_env, environ)
+    if url is None:
+        return None
+    try:
+        return WebhookSink(
+            WebhookSinkConfig(url=url), transport=transport, allowlist=allowlist
+        )
+    except EgressDeniedError:
+        raise _denied_url(spec.type, "url_env", url) from None
+
+
+def _build_smtp(
+    spec: AlertSinkSpec, allowlist: OutboundAllowlist, transport: SmtpTransport
+) -> AlertSink | None:
+    """Build an SMTP sink, or ``None`` when the entry is unconfigured.
+
+    Args:
+        spec: The configuration entry to build from.
+        allowlist: The egress allowlist the relay ``host`` must clear.
+        transport: The SMTP transport the sink delivers through.
+
+    Returns:
+        The sink, or ``None`` if the relay host, sender, or recipient list is
+        unset.
+
+    Raises:
+        AlertSinkConfigError: If the relay host is off the allowlist.
+    """
+    smtp = spec.smtp
+    if not _is_configured(smtp.host):
+        _skip_unconfigured(spec.type, "smtp.host")
+        return None
+    if not _is_configured(smtp.sender):
+        _skip_unconfigured(spec.type, "smtp.sender")
+        return None
+    if not smtp.recipients:
+        _skip_unconfigured(spec.type, "smtp.recipients")
+        return None
+    config = SmtpSinkConfig(
+        host=smtp.host,
+        port=smtp.port,
+        sender=smtp.sender,
+        recipients=smtp.recipients,
+    )
+    try:
+        return SmtpSink(config, transport=transport, allowlist=allowlist)
+    except EgressDeniedError:
+        raise _denied_host(spec.type, "smtp.host", smtp.host) from None
+
+
+def _build_desktop(
+    spec: AlertSinkSpec, notifier: Callable[[str, str], None] | None
+) -> AlertSink:
+    """Build a desktop sink, requiring a notifier that can actually deliver.
+
+    Args:
+        spec: The configuration entry to build from.
+        notifier: The ``(title, body) -> None`` callable that raises the
+            notification.
+
+    Returns:
+        The desktop sink.
+
+    Raises:
+        AlertSinkConfigError: If no notifier was supplied. A notifier-less
+            :class:`~windbreak.alerts.sinks.DesktopSink` raises on every send,
+            which would quietly downgrade this process's alerting to the
+            fallback; refusing at composition surfaces the gap at startup.
+    """
+    if notifier is None:
+        raise AlertSinkConfigError(
+            f"alert sink {spec.type!r} is configured but this process supplies "
+            "no desktop notifier, so it could never deliver an alert"
+        )
+    return DesktopSink(notifier)
+
+
+def _build_one(
+    spec: AlertSinkSpec,
+    *,
+    allowlist: OutboundAllowlist,
+    http_transport: HttpTransport,
+    smtp_transport: SmtpTransport,
+    desktop_notifier: Callable[[str, str], None] | None,
+    environ: Mapping[str, str],
+) -> AlertSink | None:
+    """Dispatch one configuration entry to its type's builder.
+
+    Args:
+        spec: The configuration entry to build from.
+        allowlist: The egress allowlist every network destination must clear.
+        http_transport: The HTTP transport ntfy/webhook sinks deliver through.
+        smtp_transport: The SMTP transport an smtp sink delivers through.
+        desktop_notifier: The notifier a desktop sink delivers through.
+        environ: The environment each ``*_env`` destination is resolved against.
+
+    Returns:
+        The built sink, or ``None`` when the entry is unconfigured.
+
+    Raises:
+        AlertSinkConfigError: If ``spec.type`` is unrecognized, or the type's
+            builder rejects the entry.
+    """
+    if spec.type == _NTFY:
+        return _build_ntfy(spec, allowlist, http_transport, environ)
+    if spec.type == _WEBHOOK:
+        return _build_webhook(spec, allowlist, http_transport, environ)
+    if spec.type == _SMTP:
+        return _build_smtp(spec, allowlist, smtp_transport)
+    if spec.type == _DESKTOP:
+        return _build_desktop(spec, desktop_notifier)
+    raise AlertSinkConfigError(
+        f"unknown alert sink type {spec.type!r}; expected one of "
+        f"{', '.join(_KNOWN_TYPES)}"
+    )
+
+
+def build_sinks(
+    alerts: AlertsConfig,
+    *,
+    allowlist: OutboundAllowlist,
+    http_transport: HttpTransport = DEFAULT_HTTP_TRANSPORT,
+    smtp_transport: SmtpTransport = DEFAULT_SMTP_TRANSPORT,
+    desktop_notifier: Callable[[str, str], None] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[AlertSink, ...]:
+    """Build every deliverable sink the alerts configuration declares.
+
+    Args:
+        alerts: The configuration's alerts section.
+        allowlist: The deployment egress allowlist every network destination is
+            screened against, normally
+            :func:`windbreak.net.allowlist.allowlist_from_config`. Required, so
+            no caller can compose an unscreened alert path.
+        http_transport: The HTTP transport ntfy and webhook sinks deliver
+            through. Injectable so tests exercise the real wiring without a
+            socket.
+        smtp_transport: The SMTP transport an smtp sink delivers through.
+        desktop_notifier: The ``(title, body) -> None`` callable a desktop sink
+            delivers through. ``None`` (the default for every headless process)
+            makes a configured desktop sink an error rather than a silent no-op.
+        environ: The environment mapping each sink's ``*_env`` destination field
+            is resolved against; ``None`` reads the real :data:`os.environ`.
+            Injectable for the same reason
+            :class:`windbreak.riskkernel.signing.SigningKeyHandle`'s is: a test
+            drives a plain dict and never mutates the process environment.
+
+    Returns:
+        One sink per deliverable entry, in configuration order. Empty when
+        nothing is configured, which is the only case in which the dispatcher's
+        ``log-only`` fallback should ever fire.
+
+    Raises:
+        AlertSinkConfigError: If any entry names an unknown type, names a
+            destination environment variable that is unset or empty, targets a
+            host off the egress allowlist, or cannot deliver as configured.
+    """
+    source = os.environ if environ is None else environ
+    built = (
+        _build_one(
+            spec,
+            allowlist=allowlist,
+            http_transport=http_transport,
+            smtp_transport=smtp_transport,
+            desktop_notifier=desktop_notifier,
+            environ=source,
+        )
+        for spec in alerts.sinks
+    )
+    return tuple(sink for sink in built if sink is not None)
