@@ -597,3 +597,113 @@ def test_in_memory_budget_ledger_filters_by_type_and_preserves_record_order() ->
 
     assert ledger.events_by_type(BUDGET_FORECAST_EXCEEDED_EVENT) == (event_a, event_c)
     assert ledger.events_by_type(BUDGET_DAY_EXHAUSTED_EVENT) == (event_b,)
+
+
+# --- charge_stage: multi-stage forecasts checked in aggregate (issue #348) -----
+
+
+def test_charge_stage_checks_the_aggregate_against_the_per_forecast_ceiling() -> None:
+    """Two stages that each fit under the ceiling still breach it together.
+
+    A forecast that spends in two stages (Stage-0 triage, then the full
+    pipeline) is still *one* forecast, so SPEC S16's per-forecast ceiling
+    governs the total. Charging each stage through `charge_forecast`
+    independently would clear both checks here, leaving a guard that cannot
+    trip; the raised error and its ledgered event both name the aggregate.
+    """
+    ledger = InMemoryBudgetLedger()
+    budget = ResearchBudget(per_forecast_micros=1_000_000, ledger=ledger)
+    at = datetime(2024, 12, 10, 12, 0, tzinfo=UTC)
+
+    remainder = budget.charge_stage(600_000, market_ticker="KX-A", at=at)
+
+    with pytest.raises(PerForecastBudgetExceededError) as exc_info:
+        remainder.charge_forecast(600_000, market_ticker="KX-A", at=at)
+
+    assert exc_info.value.cost_micros == 1_200_000
+    assert exc_info.value.budget_micros == 1_000_000
+    breach_events = ledger.events_by_type(BUDGET_FORECAST_EXCEEDED_EVENT)
+    assert len(breach_events) == 1
+    assert breach_events[0].payload["cost_micros"] == 1_200_000
+    _assert_json_safe_leaves(breach_events[0].payload)
+
+
+def test_charge_stage_aggregate_exactly_at_the_ceiling_passes() -> None:
+    """A two-stage total exactly equal to the ceiling passes -- the aggregate
+    boundary is inclusive, matching `charge_forecast`'s single-charge boundary,
+    so a `>=` mutant on the raise condition is caught.
+    """
+    ledger = InMemoryBudgetLedger()
+    budget = ResearchBudget(per_forecast_micros=1_000_000, ledger=ledger)
+    at = datetime(2024, 12, 10, 12, 0, tzinfo=UTC)
+
+    remainder = budget.charge_stage(400_000, market_ticker="KX-A", at=at)
+    remainder.charge_forecast(600_000, market_ticker="KX-A", at=at)
+
+    assert ledger.events_by_type(BUDGET_FORECAST_EXCEEDED_EVENT) == ()
+
+
+def test_charge_stage_charges_each_stage_to_the_shared_day_bucket_once() -> None:
+    """Both stages land in the *same* day bucket, once each.
+
+    The remainder budget is a view onto the same forecast, not a fresh budget:
+    were its day bucket separate, the first stage's spend would vanish from the
+    day's running total and the day ceiling could be overrun indefinitely.
+    """
+    ledger = InMemoryBudgetLedger()
+    budget = ResearchBudget(
+        per_forecast_micros=1_000_000, per_day_micros=1_000_000, ledger=ledger
+    )
+    at = datetime(2024, 12, 10, 12, 0, tzinfo=UTC)
+
+    remainder = budget.charge_stage(400_000, market_ticker="KX-A", at=at)
+    remainder.charge_forecast(600_000, market_ticker="KX-A", at=at)
+
+    with pytest.raises(DailyBudgetExhaustedError) as exc_info:
+        budget.ensure_day_open(at=at)
+    assert exc_info.value.spent_micros == 1_000_000
+
+
+def test_charge_stage_does_not_leak_its_offset_into_the_next_forecast() -> None:
+    """The already-spent offset is scoped to the one forecast that spent it.
+
+    A budget outlives any single forecast, so charging a stage must not make
+    every later forecast on that budget carry the first one's cost.
+    """
+    ledger = InMemoryBudgetLedger()
+    budget = ResearchBudget(
+        per_forecast_micros=1_000_000, per_day_micros=10_000_000, ledger=ledger
+    )
+    at = datetime(2024, 12, 10, 12, 0, tzinfo=UTC)
+
+    budget.charge_stage(900_000, market_ticker="KX-A", at=at)
+    budget.charge_forecast(900_000, market_ticker="KX-B", at=at)
+
+    assert ledger.events_by_type(BUDGET_FORECAST_EXCEEDED_EVENT) == ()
+
+
+def test_charge_stage_raises_when_the_stage_alone_breaches_the_ceiling() -> None:
+    """A first stage that alone exceeds the ceiling fails closed immediately --
+    the remainder budget is never handed back, so no later stage can run on it.
+    """
+    ledger = InMemoryBudgetLedger()
+    budget = ResearchBudget(per_forecast_micros=1_000_000, ledger=ledger)
+    at = datetime(2024, 12, 10, 12, 0, tzinfo=UTC)
+
+    with pytest.raises(PerForecastBudgetExceededError) as exc_info:
+        budget.charge_stage(1_000_001, market_ticker="KX-A", at=at)
+
+    assert exc_info.value.cost_micros == 1_000_001
+    assert len(ledger.events_by_type(BUDGET_FORECAST_EXCEEDED_EVENT)) == 1
+
+
+def test_charge_stage_remainder_preserves_the_page_ceiling() -> None:
+    """The remainder view keeps the forecast's `max_pages` ceiling, so the
+    stage that follows is still bounded to the same page budget.
+    """
+    budget = ResearchBudget(max_pages=7, ledger=InMemoryBudgetLedger())
+    at = datetime(2024, 12, 10, 12, 0, tzinfo=UTC)
+
+    remainder = budget.charge_stage(1, market_ticker="KX-A", at=at)
+
+    assert remainder.max_pages == 7

@@ -18,6 +18,14 @@ dependency-injection point modeled on
 convention ``scripts/lint_no_floats.py`` enforces. All arithmetic here is
 integer-only for the same reason.
 
+Both paths spend real money -- the Stage-0 prior is a paid model call even when
+the run stops there -- so :func:`run_triaged_pipeline` takes a required,
+non-Optional :class:`windbreak.forecast.budget.ResearchBudget`. It opens the
+budget's UTC day before Stage-0, charges Stage-0 the moment it returns, and
+hands the full pipeline the remainder of the same forecast's ceiling
+(:meth:`windbreak.forecast.budget.ResearchBudget.charge_stage`), so the guard
+sees the folded total this module reports rather than either stage alone.
+
 The PROCEED path additionally threads an optional
 :class:`windbreak.forecast.pipeline.ForecastLedgerWriter` *discard* ledger into
 the full pipeline, so a triage-path run ledgers discarded model outputs
@@ -48,6 +56,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from windbreak.connector.models import NormalizedMarket
+    from windbreak.forecast.budget import ResearchBudget
     from windbreak.forecast.cassettes import LlmTransport
     from windbreak.forecast.pipeline import ForecastLedgerWriter
     from windbreak.forecast.records import BaselineQuoteSnapshot
@@ -482,6 +491,7 @@ def _run_proceed_path(
     ledger: TriageLedgerWriter,
     full_transport: LlmTransport,
     research_tools: ResearchTools,
+    budget: ResearchBudget,
     discard_ledger: ForecastLedgerWriter | None = None,
 ) -> ForecastRecord:
     """Handle the PROCEED path: run the full pipeline and fold in triage cost.
@@ -495,6 +505,11 @@ def _run_proceed_path(
         full_transport: The transport for the full pipeline's vote stage.
         research_tools: The sandboxed research tools threaded into the full
             pipeline's Stage-5 bounded web research.
+        budget: The budget governing what is left of this forecast after
+            Stage-0 was charged -- see
+            :meth:`windbreak.forecast.budget.ResearchBudget.charge_stage`. It
+            bounds the full pipeline's page fetches and charges its spend, so
+            the record's *folded* total is what the per-forecast ceiling sees.
         discard_ledger: The optional forecast-event ledger for the full
             pipeline's vote-discard events, or ``None`` to record nothing
             (mirrors ``run_pipeline``'s ``ledger`` seam). Default ``None`` is a
@@ -502,6 +517,12 @@ def _run_proceed_path(
 
     Returns:
         The full forecast record with the Stage-0 cost folded into its total.
+
+    Raises:
+        DailyBudgetExhaustedError: If Stage-0's spend exhausted the UTC day,
+            halting before the full pipeline's research.
+        PerForecastBudgetExceededError: If Stage-0 plus the full pipeline
+            exceeds the per-forecast ceiling.
     """
     full_record = run_pipeline(
         market,
@@ -510,6 +531,7 @@ def _run_proceed_path(
         created_at=created_at,
         research_tools=research_tools,
         ledger=discard_ledger,
+        budget=budget,
     )
     folded = replace(
         full_record,
@@ -532,6 +554,7 @@ def run_triaged_pipeline(
     ledger: TriageLedgerWriter,
     created_at: datetime,
     research_tools: ResearchTools,
+    budget: ResearchBudget,
     discard_ledger: ForecastLedgerWriter | None = None,
     triage_threshold_ppm: int = TRIAGE_THRESHOLD_PPM,
     operator_flagged: bool = False,
@@ -547,6 +570,15 @@ def run_triaged_pipeline(
     ``TRIAGE_PROCEED`` event is ledgered per run. Given identical inputs and
     ``created_at``, two runs produce equal records and event trails.
 
+    Every run is budgeted, and ``budget`` has no default: an unbudgeted triaged
+    run is not expressible, because an omitted ceiling would be indistinguishable
+    from a deliberate "no ceiling" on the one path whose whole purpose is to
+    reach the expensive pipeline. The day is checked *before* the Stage-0 call
+    (itself a paid model call), Stage-0's cost is charged the moment it is
+    spent -- on both paths -- and the full pipeline then runs against the
+    remainder of the same forecast's ceiling, so the per-forecast guard sees the
+    folded total rather than either stage alone.
+
     Args:
         market: The market under triage.
         baseline: The baseline quote snapshot the forecast is struck against.
@@ -557,6 +589,10 @@ def run_triaged_pipeline(
         created_at: The injected creation instant, for determinism.
         research_tools: The sandboxed research tools threaded into the full
             pipeline's Stage-5 bounded web research; untouched on the STOP path.
+        budget: The research budget guarding this run's day and per-forecast
+            spend. Required and non-Optional: SPEC S16's ceilings are the only
+            thing standing between this entry point and unbounded provider
+            spend, so there is no way to ask for a triaged run without them.
         discard_ledger: The optional forecast-event ledger for the full
             pipeline's vote-discard events, threaded through on the PROCEED path
             so a triage-path run ledgers discarded model outputs identically to
@@ -573,9 +609,20 @@ def run_triaged_pipeline(
 
     Returns:
         The produced, immutable forecast record.
+
+    Raises:
+        DailyBudgetExhaustedError: If ``budget``'s UTC day is already exhausted;
+            raised before the Stage-0 call, so no research is paid for.
+        PerForecastBudgetExceededError: If the run's total research cost --
+            Stage-0 plus, on the PROCEED path, the full pipeline -- exceeds the
+            per-forecast ceiling.
     """
+    budget.ensure_day_open(at=created_at)
     prior = run_stage0_prior(
         market, baseline, transport=triage_transport, model=triage_model
+    )
+    remaining_budget = budget.charge_stage(
+        prior.cost_micros, market_ticker=market.ticker, at=created_at
     )
     baseline_ppm = outside_view_base_rate(baseline)
     context = _TriageContext(
@@ -602,6 +649,7 @@ def run_triaged_pipeline(
             ledger=ledger,
             full_transport=full_transport,
             research_tools=research_tools,
+            budget=remaining_budget,
             discard_ledger=discard_ledger,
         )
     return _run_stop_path(
