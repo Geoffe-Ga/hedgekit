@@ -13,9 +13,10 @@ Three scenarios, per the issue's own test-writing brief:
    stub, `exchange_status_ok` / `pipeline_heartbeat_ok` failing closed on
    `build_evaluation_context`'s then-honest `None` PAPER wiring (issue #110),
    plus the then-`verification=None` reconciliation fail-closed -- all of
-   those causes have since been removed by issues #340, #342, and #353; the
-   two that remain are `daily_loss_limit` and
-   `participation_cap_compliance`, pinned exactly in
+   those causes have since been removed by issues #340, #342, #353, and #364,
+   the last of which supplied the real start-of-day equity and book depth
+   `daily_loss_limit` and `participation_cap_compliance` had been failing
+   closed without. What still vetoes is pinned exactly in
    `tests/integration/test_paper_verification.py`). This test's hard,
    unconditional assertions are the ledger *structure* (every stage event
    fires, the chain verifies, and two runs are content-identical); its
@@ -92,22 +93,23 @@ if TYPE_CHECKING:
 
     from windbreak.config.schema import WindbreakConfig
 
-#: The two veto reasons the real kernel must produce whenever it vetoes an
-#: intent this loop's selector emits, given the honest zero/`None` feeds
-#: `build_evaluation_context` still supplies: `equity_start_of_day=0` floors
-#: the daily-loss threshold at zero, and `visible_depth` is `None`.
+#: The veto reason the real kernel must produce whenever it vetoes an intent
+#: this loop's selector emits *on the tick under test*: the first tick against
+#: a fresh ledger. That tick appends its `EquitySampled` row only after the
+#: approval stage, so at approval time the current UTC day carries no sample,
+#: the start-of-day baseline is genuinely absent, and `daily_loss_limit` fails
+#: closed on it (issue #364). A second tick on the same UTC day has the
+#: baseline and clears the check.
 #:
-#: This constant previously named the `exchange_status_ok` /
-#: `pipeline_heartbeat_ok` reasons. Issue #342 made both of those checks pass
-#: on real evidence and issue #353 did the same for the three reconciliation
-#: checks, so those names had become false -- invisibly, because the assertion
-#: using them only runs when the selector emits an intent (it does not, with
-#: the stock fixtures; see the module docstring). Corrected here so that if the
+#: This constant previously also named `visible depth unknown`; issue #364
+#: supplies the real book depth, so the check now measures a genuine figure and
+#: that reason is gone. Before that it named the `exchange_status_ok` /
+#: `pipeline_heartbeat_ok` reasons, which issues #342/#353 likewise made
+#: real -- each time invisibly, because the assertion using this constant only
+#: runs when the selector emits an intent (it does not, with the stock
+#: fixtures; see the module docstring). Corrected again here so that if the
 #: branch ever does run it asserts something true.
-_REMAINING_ACCOUNT_FEED_VETO_REASONS = (
-    "daily loss limit reached",
-    "visible depth unknown",
-)
+_REMAINING_ACCOUNT_FEED_VETO_REASONS = ("daily loss limit reached",)
 
 #: The always-present per-tick stage events, regardless of whether the
 #: selector emitted a tradeable intent.
