@@ -53,6 +53,7 @@ def _model(rate_ppm: int, *, settlement_fee_ppm: int = 0) -> FeeModel:
 
 
 def test_empty_schedule_id_raises_value_error() -> None:
+    """An empty `schedule_id` raises ValueError naming the field."""
     with pytest.raises(ValueError, match="schedule_id"):
         FeeModel(schedule_id="", maker_fee_ppm=0, taker_fee_ppm=0, settlement_fee_ppm=0)
 
@@ -61,6 +62,7 @@ def test_empty_schedule_id_raises_value_error() -> None:
     "field", ["maker_fee_ppm", "taker_fee_ppm", "settlement_fee_ppm"]
 )
 def test_negative_fee_ppm_raises_value_error(field: str) -> None:
+    """A negative ppm rate on any fee field raises ValueError naming that field."""
     kwargs: dict[str, object] = {
         "schedule_id": "s",
         "maker_fee_ppm": 0,
@@ -76,6 +78,7 @@ def test_negative_fee_ppm_raises_value_error(field: str) -> None:
     "field", ["maker_fee_ppm", "taker_fee_ppm", "settlement_fee_ppm"]
 )
 def test_bool_fee_ppm_raises_type_error(field: str) -> None:
+    """A `bool` fee rate raises TypeError on any field, despite `bool` being an int."""
     kwargs: dict[str, object] = {
         "schedule_id": "s",
         "maker_fee_ppm": 0,
@@ -88,6 +91,7 @@ def test_bool_fee_ppm_raises_type_error(field: str) -> None:
 
 
 def test_fee_model_is_frozen() -> None:
+    """A `FeeModel` is frozen: assigning a field raises FrozenInstanceError."""
     model = _model(70_000)
     # Assign through a dynamic attribute name so the test exercises the frozen
     # dataclass's runtime rejection without a static type-checker suppression.
@@ -133,6 +137,7 @@ def test_max_trading_fee_micros_is_zero_at_price_boundaries(price_pips: int) -> 
 
 
 def test_max_trading_fee_micros_is_zero_for_a_zero_rate_schedule() -> None:
+    """A zero-rate schedule charges nothing, with no round-up to a whole cent."""
     model = _model(0)
 
     assert model.max_trading_fee_micros(price_pips=5_000, count_centis=10_000) == 0
@@ -157,6 +162,7 @@ def test_max_trading_fee_micros_uses_the_higher_of_maker_and_taker() -> None:
 
 @pytest.mark.parametrize("price_pips", [-1, 10_001])
 def test_max_trading_fee_micros_rejects_out_of_range_price(price_pips: int) -> None:
+    """A price outside 0..10_000 pips raises ValueError naming `price_pips`."""
     model = _model(70_000)
 
     with pytest.raises(ValueError, match="price_pips"):
@@ -164,6 +170,7 @@ def test_max_trading_fee_micros_rejects_out_of_range_price(price_pips: int) -> N
 
 
 def test_max_trading_fee_micros_rejects_bool_price() -> None:
+    """A `bool` price raises TypeError rather than being read as 0 or 1 pip."""
     model = _model(70_000)
 
     with pytest.raises(TypeError):
@@ -172,6 +179,7 @@ def test_max_trading_fee_micros_rejects_bool_price() -> None:
 
 @pytest.mark.parametrize("count_centis", [0, -1])
 def test_max_trading_fee_micros_rejects_non_positive_count(count_centis: int) -> None:
+    """A zero or negative count raises ValueError naming `count_centis`."""
     model = _model(70_000)
 
     with pytest.raises(ValueError, match="count_centis"):
@@ -179,6 +187,7 @@ def test_max_trading_fee_micros_rejects_non_positive_count(count_centis: int) ->
 
 
 def test_max_trading_fee_micros_rejects_bool_count() -> None:
+    """A `bool` count raises TypeError rather than being read as one centi."""
     model = _model(70_000)
 
     with pytest.raises(TypeError):
@@ -216,6 +225,7 @@ def test_max_trading_fee_micros_is_a_true_ceiling_over_the_exact_product(
 def test_max_trading_fee_micros_is_always_a_whole_cent(
     rate_ppm: int, count_centis: int, price_pips: int
 ) -> None:
+    """The trading-fee bound is always a whole cent: a multiple of 10_000 micros."""
     model = _model(rate_ppm)
 
     result = model.max_trading_fee_micros(
@@ -234,6 +244,7 @@ def test_max_trading_fee_micros_is_always_a_whole_cent(
 def test_max_trading_fee_micros_is_monotone_nondecreasing_in_count(
     rate_ppm: int, price_pips: int, base_count: int, delta: int
 ) -> None:
+    """Raising the contract count never lowers the trading-fee bound."""
     model = _model(rate_ppm)
 
     smaller = model.max_trading_fee_micros(
@@ -255,6 +266,7 @@ def test_max_trading_fee_micros_is_monotone_nondecreasing_in_count(
 def test_max_trading_fee_micros_is_monotone_nondecreasing_in_rate(
     count_centis: int, price_pips: int, base_rate: int, delta: int
 ) -> None:
+    """Raising the fee rate never lowers the trading-fee bound."""
     smaller = _model(base_rate).max_trading_fee_micros(
         price_pips=price_pips, count_centis=count_centis
     )
@@ -289,6 +301,7 @@ def test_max_trading_fee_micros_is_symmetric_under_price_reflection(
 
 
 def test_max_settlement_fee_micros_is_zero_for_the_standard_schedule() -> None:
+    """A schedule whose settlement rate is zero charges no settlement fee."""
     model = _model(70_000, settlement_fee_ppm=0)
 
     assert model.max_settlement_fee_micros(count_centis=10_000) == 0
@@ -304,6 +317,7 @@ def test_max_settlement_fee_micros_rounds_up_a_remainder_to_a_whole_cent() -> No
 
 
 def test_max_settlement_fee_micros_is_exact_when_evenly_divisible() -> None:
+    """An evenly divisible settlement fee is not ceiled past its exact value."""
     model = _model(0, settlement_fee_ppm=500_000)
 
     fee = model.max_settlement_fee_micros(count_centis=100)
@@ -315,6 +329,7 @@ def test_max_settlement_fee_micros_is_exact_when_evenly_divisible() -> None:
 def test_max_settlement_fee_micros_rejects_non_positive_count(
     count_centis: int,
 ) -> None:
+    """A zero or negative count raises ValueError naming `count_centis`."""
     model = _model(70_000)
 
     with pytest.raises(ValueError, match="count_centis"):
@@ -322,6 +337,7 @@ def test_max_settlement_fee_micros_rejects_non_positive_count(
 
 
 def test_max_settlement_fee_micros_rejects_bool_count() -> None:
+    """A `bool` count raises TypeError rather than being read as one centi."""
     model = _model(70_000)
 
     with pytest.raises(TypeError):
@@ -344,6 +360,7 @@ def test_max_settlement_fee_micros_is_a_true_ceiling_over_the_exact_product(
 def test_max_settlement_fee_micros_is_always_a_whole_cent(
     count_centis: int, settlement_fee_ppm: int
 ) -> None:
+    """The settlement-fee bound is always a whole cent: a multiple of 10_000 micros."""
     model = _model(0, settlement_fee_ppm=settlement_fee_ppm)
 
     result = model.max_settlement_fee_micros(count_centis=count_centis)

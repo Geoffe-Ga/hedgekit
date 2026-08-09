@@ -96,6 +96,7 @@ def test_construction_accepts_negative_int(unit_type) -> None:
 
 @pytest.mark.parametrize("unit_type", UNIT_TYPES)
 def test_addition_within_unit_returns_same_type_and_sum(unit_type) -> None:
+    """Adding two same-unit values returns that unit type holding the sum."""
     result = unit_type(7) + unit_type(5)
 
     assert type(result) is unit_type
@@ -104,6 +105,7 @@ def test_addition_within_unit_returns_same_type_and_sum(unit_type) -> None:
 
 @pytest.mark.parametrize("unit_type", UNIT_TYPES)
 def test_subtraction_within_unit_returns_same_type_and_difference(unit_type) -> None:
+    """Subtracting same-unit values returns that unit type with the difference."""
     result = unit_type(7) - unit_type(5)
 
     assert type(result) is unit_type
@@ -112,6 +114,7 @@ def test_subtraction_within_unit_returns_same_type_and_difference(unit_type) -> 
 
 @pytest.mark.parametrize("unit_type", UNIT_TYPES)
 def test_negation_within_unit_returns_same_type_and_negated_value(unit_type) -> None:
+    """Negating a unit value returns the same type with the value negated."""
     result = -unit_type(7)
 
     assert type(result) is unit_type
@@ -189,6 +192,7 @@ def test_same_unit_multiplication_raises_type_error(unit_type) -> None:
 
 @pytest.mark.parametrize("unit_type", UNIT_TYPES)
 def test_within_unit_equality_and_ordering(unit_type) -> None:
+    """Same-unit values compare by payload across <, <=, >, >=, == and !=."""
     small, big, big_copy = unit_type(3), unit_type(9), unit_type(9)
 
     assert small < big
@@ -305,6 +309,7 @@ def test_money_micros_str_positive() -> None:
 
 
 def test_money_micros_str_zero() -> None:
+    """Zero micros renders as `$0.000000`, keeping all six fraction digits."""
     assert str(MoneyMicros(0)) == "$0.000000"
 
 
@@ -324,6 +329,7 @@ def test_price_pips_str_half_cent() -> None:
 
 
 def test_price_pips_str_negative() -> None:
+    """A negative PricePips renders sign-first as `-$0.0050`."""
     assert str(PricePips(-50)) == "-$0.0050"
 
 
@@ -333,10 +339,12 @@ def test_contract_centis_str_typical() -> None:
 
 
 def test_contract_centis_str_sub_unit() -> None:
+    """A single centi renders as the sub-unit quantity `0.01`."""
     assert str(ContractCentis(1)) == "0.01"
 
 
 def test_contract_centis_str_negative() -> None:
+    """A negative ContractCentis renders sign-first as `-3.00`."""
     assert str(ContractCentis(-300)) == "-3.00"
 
 
@@ -346,10 +354,12 @@ def test_probability_ppm_str_typical() -> None:
 
 
 def test_probability_ppm_str_negative() -> None:
+    """A negative ProbabilityPpm renders sign-first as `-45.6700%`."""
     assert str(ProbabilityPpm(-456_700)) == "-45.6700%"
 
 
 def test_probability_ppm_str_zero() -> None:
+    """Zero ppm renders as `0.0000%`, keeping four fraction digits."""
     assert str(ProbabilityPpm(0)) == "0.0000%"
 
 
