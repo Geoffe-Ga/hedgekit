@@ -758,11 +758,29 @@ A halted market appends exactly one `ResearchBudgetHalted` ledger row (component
 forecast, select, and approve stages and stops walking its remaining
 candidates**, but still emits its heartbeat, equity sample, positions snapshot,
 and weekly report -- so a budget-halted loop stays observably alive and flat
-rather than dying. Its ledger differs from an unhalted tick's by the
-`ForecastCreated` and `SelectorDecisionRecorded` rows of the halting market and
-every market after it. No `ForecastCreated` row is fabricated for a market where
-the forecast engine never ran; in a hash-chained audit ledger an honest gap
-beats an invented record.
+rather than dying. No `ForecastCreated` row is fabricated for a market where the
+forecast engine never ran; in a hash-chained audit ledger an honest gap beats an
+invented record.
+
+**What a halt actually leaves on the ledger.** The halting market and the
+markets behind it leave *different* shapes, so read them separately:
+
+| Market | Rows present | Rows absent |
+| --- | --- | --- |
+| Forecast before the halt | `ScreenDecisionRecorded`, `MarketSnapshotRecorded`, `ForecastCreated`, `SelectorDecisionRecorded`, `ExchangeStatusObserved` | — |
+| **The halting market** | `ScreenDecisionRecorded`, `MarketSnapshotRecorded`, then the tick's `ResearchBudgetHalted` | `ForecastCreated`, `SelectorDecisionRecorded`, `ExchangeStatusObserved` |
+| **Every candidate after it** | `ScreenDecisionRecorded` only | `MarketSnapshotRecorded`, `ForecastCreated`, `SelectorDecisionRecorded`, `ExchangeStatusObserved` |
+
+The halting market keeps its snapshot because the tick ledgers the book before
+the forecast stage can halt. The markets behind it are never run at all, so
+they lose their snapshot too -- do **not** expect a `MarketSnapshotRecorded` for
+them. What they keep is their screen verdict, because the screen covers the
+whole candidate set before the walk begins: the ledger says such a market was
+examined and found eligible, and says nothing further about it.
+
+Both shapes are pinned as exact golden row sequences in
+`tests/integration/test_paper_universe.py`, so this table is checkable rather
+than prose that can drift.
 
 **How many forecasts one tick can buy (issue #345).** A tick no longer forecasts
 one hardcoded ticker: it screens the venue's market universe and forecasts up to

@@ -37,6 +37,8 @@ from tests.integration.conftest import (
 )
 from windbreak.config.schema import (
     CapitalConfig,
+    ForecastBudget,
+    ForecastConfig,
     RiskConfig,
     ScreenerConfig,
     WindbreakConfig,
@@ -55,21 +57,60 @@ def _fixed_clock() -> int:
     return FIXED_NOW_EPOCH_S
 
 
-def _config(*, screener: ScreenerConfig = FIXTURE_SCREENER_CONFIG) -> WindbreakConfig:
+#: The fixed research cost one forecast charges on this offline path, mirroring
+#: `test_paper_budget.py::_EXPECTED_RESEARCH_COST_MICROS`. A per-day ceiling of
+#: exactly this admits the first market's forecast and halts the second.
+_RESEARCH_COST_MICROS = 3_000_000
+
+
+def _config(
+    *,
+    screener: ScreenerConfig = FIXTURE_SCREENER_CONFIG,
+    per_day_micros: int | None = None,
+) -> WindbreakConfig:
     """Build the PAPER-ceilinged config these scenarios tick under.
 
     Args:
         screener: The screening thresholds to enforce.
+        per_day_micros: An explicit per-UTC-day research ceiling, or `None` to
+            keep the SPEC §16 default (which no scenario here exhausts).
 
     Returns:
         The assembled configuration.
     """
+    forecast = (
+        ForecastConfig()
+        if per_day_micros is None
+        else ForecastConfig(budget=ForecastBudget(per_day_micros=per_day_micros))
+    )
     return WindbreakConfig(
         mode_ceiling="paper",
         capital=CapitalConfig(floor_micros=0),
         risk=RiskConfig(),
         screener=screener,
+        forecast=forecast,
     )
+
+
+def _ledger_shape(records: list[object]) -> list[tuple[str, str]]:
+    """Project the ledger into an `(event_type, ticker)` sequence.
+
+    The ticker is whichever of `ticker` / `market_ticker` the payload carries,
+    or `""` for the rows that describe the loop rather than a market. That is
+    exactly the granularity the halt claims below are made at: *which* rows
+    exist, and *which market* each names.
+
+    Args:
+        records: The `LedgerRecord` sequence from `store.read_all()`.
+
+    Returns:
+        One `(event_type, ticker)` pair per row, in ledger order.
+    """
+    shape = []
+    for event_type, payload in read_event_type_payload_pairs(records):
+        ticker = payload.get("ticker") or payload.get("market_ticker") or ""
+        shape.append((event_type, ticker))
+    return shape
 
 
 def _build_deps(
@@ -343,6 +384,136 @@ def test_candidate_capital_depletes_across_markets_within_one_tick(
     assert second.snapshot_id == "MKT-ISO-B-positions"
     # Same account, read twice: identical until something spends it.
     assert first.above_floor_capital_micros == second.above_floor_capital_micros
+
+
+def test_a_halt_on_the_second_market_ledgers_its_snapshot_but_no_forecast(
+    two_ticker_books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """Golden row sequence for a budget halt part-way through the universe.
+
+    Pinned as an exact sequence rather than a set of membership assertions,
+    because the claim `run_single_tick`'s docstring and `docs/RUNBOOK.md` make
+    about a halted tick's ledger is a claim about *which rows exist*. Prose
+    drifts; a golden sequence does not. An earlier revision of that prose said a
+    halt costs the halting market its `ForecastCreated` and
+    `SelectorDecisionRecorded` rows *and every market after it* the same two --
+    which is wrong in both directions, and this test is what makes the corrected
+    version self-verifying.
+
+    The halting market (`MKT-ISO-B`) keeps its `MarketSnapshotRecorded`, because
+    `_run_candidate` ledgers the snapshot before `_forecast_stage` can return
+    `None`. What it loses is `ForecastCreated`, `SelectorDecisionRecorded`, and
+    the `ExchangeStatusObserved` the approval stage would have appended.
+
+    A per-day ceiling of exactly one forecast's research cost is what produces
+    this: `MKT-ISO-A` charges it, then `MKT-ISO-B`'s `ensure_day_open` sees the
+    day at its ceiling and halts before touching a tool or transport.
+    """
+    from windbreak.scheduler.loop import run_single_tick
+
+    deps = _build_deps(
+        books_dir=two_ticker_books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=_config(per_day_micros=_RESEARCH_COST_MICROS),
+        research_tools_factory=research_tools_factory,
+    )
+
+    outcome = run_single_tick(deps, beat=1)
+
+    deps.store.verify_chain()
+    assert _ledger_shape(deps.store.read_all()) == [
+        # Built by the gateway's boot recovery, before the tick runs at all.
+        ("RecoveryCompleted", ""),
+        # The screen runs first and covers both candidates, so a market the
+        # walk never reaches still has a verdict on record.
+        ("ScreenDecisionRecorded", "MKT-ISO-A"),
+        ("ScreenDecisionRecorded", "MKT-ISO-B"),
+        ("PipelineHeartbeatRecorded", ""),
+        ("VerificationPassed", ""),
+        # MKT-ISO-A: the full per-market path.
+        ("MarketSnapshotRecorded", "MKT-ISO-A"),
+        ("ForecastCreated", "MKT-ISO-A"),
+        ("SelectorDecisionRecorded", "MKT-ISO-A"),
+        ("ExchangeStatusObserved", ""),
+        # MKT-ISO-B: snapshotted, then halted before it could forecast.
+        ("MarketSnapshotRecorded", "MKT-ISO-B"),
+        ("ResearchBudgetHalted", ""),
+        # The tick-level stages still run, so a halted loop stays observably
+        # alive and flat rather than simply stopping.
+        ("ModeHeartbeat", ""),
+        ("EquitySampled", ""),
+        ("PositionsSnapshotRecorded", ""),
+    ]
+    assert outcome.candidate_tickers == _TICKERS
+    assert len(outcome.forecast_ids) == 1
+    assert outcome.research_halted is True
+
+
+def test_a_halt_on_the_first_market_leaves_the_next_one_entirely_unrun(
+    two_ticker_books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """A screened candidate the walk never reached has no snapshot row at all.
+
+    This is the half the earlier prose got wrong. `_run_universe` breaks out of
+    the walk on a halt, so `_run_candidate` is never invoked for the markets
+    after it -- they lose their `MarketSnapshotRecorded` too, not merely their
+    `ForecastCreated` and `SelectorDecisionRecorded`.
+
+    What they keep is their `ScreenDecisionRecorded`: the screen ran over the
+    whole candidate set before the walk began, so the ledger still records that
+    `MKT-ISO-B` was examined and found eligible. It simply never says anything
+    further about it, which is the honest record of a market the tick screened
+    in and then ran out of money before reaching.
+
+    A per-day ceiling of zero halts on the very first market, which is what
+    leaves a screened-but-unrun candidate behind to assert on.
+    """
+    from windbreak.scheduler.loop import run_single_tick
+
+    deps = _build_deps(
+        books_dir=two_ticker_books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=_config(per_day_micros=0),
+        research_tools_factory=research_tools_factory,
+    )
+
+    outcome = run_single_tick(deps, beat=1)
+
+    deps.store.verify_chain()
+    shape = _ledger_shape(deps.store.read_all())
+    assert shape == [
+        ("RecoveryCompleted", ""),
+        ("ScreenDecisionRecorded", "MKT-ISO-A"),
+        ("ScreenDecisionRecorded", "MKT-ISO-B"),
+        ("PipelineHeartbeatRecorded", ""),
+        ("VerificationPassed", ""),
+        # MKT-ISO-A halts: snapshotted, then nothing further.
+        ("MarketSnapshotRecorded", "MKT-ISO-A"),
+        ("ResearchBudgetHalted", ""),
+        ("ModeHeartbeat", ""),
+        ("EquitySampled", ""),
+        ("PositionsSnapshotRecorded", ""),
+    ]
+    # Stated separately from the golden above, because it is the specific claim
+    # the corrected documentation now makes: the skipped market is screened and
+    # nothing else.
+    assert ("MarketSnapshotRecorded", "MKT-ISO-B") not in shape
+    assert ("ScreenDecisionRecorded", "MKT-ISO-B") in shape
+    assert outcome.candidate_tickers == _TICKERS
+    assert outcome.forecast_ids == ()
+    assert outcome.research_halted is True
 
 
 def test_build_paper_deps_refuses_a_non_positive_candidate_bound(

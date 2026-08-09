@@ -2810,10 +2810,29 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     skips that market's forecast, select, and approve stages, and stops the
     universe walk there. The tick still emits its heartbeat, equity sample,
     positions snapshot, and weekly report -- so the loop stays observably alive
-    and flat rather than dying on an uncaught budget error. Its ledger therefore
-    differs from an unhalted tick's by the ``ForecastCreated`` and
-    ``SelectorDecisionRecorded`` rows of the halting market and every market
-    after it.
+    and flat rather than dying on an uncaught budget error.
+
+    The halting market and the markets behind it leave *different* ledger
+    shapes, and the difference is worth stating precisely, because someone
+    auditing a halt reads this paragraph to know which rows to expect:
+
+    * **The halting market** keeps its ``MarketSnapshotRecorded``.
+      :func:`_run_candidate` ledgers the snapshot before :func:`_forecast_stage`
+      can return ``None``, so the book it was about to research is on record.
+      What it loses is ``ForecastCreated``, ``SelectorDecisionRecorded``, and
+      the ``ExchangeStatusObserved`` the approval stage would have appended.
+    * **Every candidate after it** is never run at all -- :func:`_run_universe`
+      breaks before reaching them -- so they lose their
+      ``MarketSnapshotRecorded`` too, not merely the forecast and selector rows.
+      What they keep is their ``ScreenDecisionRecorded``, because the screen ran
+      over the whole candidate set before the walk began. The ledger therefore
+      says such a market was examined and found eligible, and says nothing
+      further about it: the honest record of a market the tick screened in and
+      then ran out of money before reaching.
+
+    Both shapes are pinned as exact golden row sequences in
+    ``tests/integration/test_paper_universe.py``, so this description is
+    checkable rather than prose that can drift away from the code.
 
     Args:
         deps: The fully wired dependency bundle.
