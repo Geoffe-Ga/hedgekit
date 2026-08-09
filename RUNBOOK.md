@@ -542,6 +542,57 @@ argument -- so canary drift does not yet block a live PAPER-loop tick
 end-to-end; today the battery is a standalone, operator-run detector, not (yet)
 an in-loop gate.
 
+### Prove a provider before it can back a live order (issue #305)
+
+Unlike the canary gate above, the *per-provider track-record* gate **is** wired
+into the PAPER tick: `build_paper_deps` builds one `ProviderTrackRecordGate`
+per process and `_forecast_stage` passes it into every `run_pipeline` call, so
+a provider that has not earned live eligibility cannot produce a live-eligible
+forecast in the loop. Its votes still run and still cost -- that is the only
+way a paper track record ever accrues -- but the record's `eligible_for_live`
+is forced `False`.
+
+The gate reads one strict-JSON artifact, `provider-track-records.json`, from
+the same `--report-dir` the loop writes its weekly reports to, and compares
+each provider against `config.forecast.provider_gate.min_resolved` (default
+150) and `config.forecast.provider_gate.min_brier_skill_ppm` (default 10000):
+
+```json
+{
+  "anthropic": {"resolved_count": 210, "brier_skill_ppm": 14000},
+  "openai":    {"resolved_count": 180, "brier_skill_ppm": 11500}
+}
+```
+
+Both boundary cases fail closed. **No artifact yet** is the bootstrap case:
+every provider is unproven and every full forecast is held, which is the
+correct reading of "no measured edge yet". **A malformed artifact** aborts
+startup with a `ValueError` naming the offending leaf -- a broken evaluation
+pass must not be indistinguishable from a genuinely empty one. Values are
+integers throughout: a fractional `brier_skill_ppm` is rejected, not truncated.
+
+Each hold appends exactly one `ProviderGateHeld` row (component `scheduler`)
+after that tick's `ProviderVoteRecorded` rows, carrying `forecast_id`,
+`market_ticker`, the comma-joined `unproven_providers`, their `unproven_count`,
+and the `min_resolved` / `min_brier_skill_ppm` bars actually in force. To see
+why a healthy-looking forecast was not live-eligible:
+
+```bash
+python -c "
+from pathlib import Path
+from windbreak.ledger.store import SqliteLedgerStore
+for r in SqliteLedgerStore(Path('var/ledger.db')).read_all():
+    if r.event_type == 'ProviderGateHeld':
+        print(r.sequence_number, r.payload_json)
+"
+```
+
+If a provider you expect to be proven is named there, the artifact is stale (or
+missing) rather than the provider being bad -- re-run the evaluation pass that
+writes it. Raising or lowering the bars is a config edit to
+`config.forecast.provider_gate`; there is no runtime lever, and the bars in
+force at the time of each decision are on the row itself.
+
 ### Respond to budget exhaustion
 
 `windbreak.forecast.budget.ResearchBudget` enforces SPEC S16's three research
