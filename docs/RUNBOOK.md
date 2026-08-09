@@ -107,6 +107,77 @@ windbreak run \
   verification view all hold the *same* live-book session object, so the loop
   can never reason about one venue and fill against another.
 
+### Running against live forecast providers (issue #344)
+
+By default the loop's forecast vote stage replays a **recorded LLM cassette**:
+`forecast.provider_transport.mode` is `cassette`, so a deployment that says
+nothing about providers -- and CI, which builds the default configuration --
+never acquires a network dependency. Going live is an explicit written act:
+
+```yaml
+forecast:
+  provider_transport:
+    mode: live                    # default: cassette
+    request_timeout_seconds: 30
+    anthropic_api_key_env: ANTHROPIC_API_KEY
+    openai_api_key_env: OPENAI_API_KEY
+    retry:
+      max_attempts: 3
+      total_deadline_ms: 30000
+      backoff_base_ms: 1000
+      max_cost_micros: 1000000
+    prices:
+      - {provider: openai, price_micros: 200000}
+      - {provider: anthropic, price_micros: 300000}
+      - {provider: futuresearch, price_micros: 500000}
+    unknown_provider_price_micros: 1000000
+```
+
+Then export the keys the config *names* and start the loop as usual:
+
+```bash
+export ANTHROPIC_API_KEY=replace-with-a-real-key
+export OPENAI_API_KEY=replace-with-a-real-key
+windbreak run --paper-books-dir ... --cassette-path ... --ledger-path ... \
+  --report-dir ...
+```
+
+- **Configuration names variables; it never holds keys.** Every config leaf is
+  flattened verbatim into the hash-chained `ConfigLoaded` ledger event and into
+  `config_versions.json`, neither of which can be redacted afterwards. So
+  `*_api_key_env` carries the *name* of an environment variable, and only
+  `windbreak.main` ever reads its value -- the same rule the alert sinks and the
+  FutureSearch provider already follow.
+- **A missing key refuses to start**, naming the variable and never any value.
+- **Each provider gets its own transport, credential, and single-host
+  allowlist.** One shared transport would send the first provider's key to the
+  second provider's endpoint on the very first vote.
+- **Egress is still gated twice.** Each provider endpoint is screened against
+  the deployment's own outbound allowlist *before any session exists* (SPEC
+  S15); a provider host only reaches that allowlist by being named in
+  `forecast.vote_ensemble`. The transport is then additionally pinned to that
+  one host. Redirects are refused, so an on-path responder cannot steer a dial
+  elsewhere.
+- **A half-configuration refuses to start**, in either direction -- live mode
+  with no live seam, or a live seam without live mode. Silently replaying a
+  recording for an operator who asked for novel forecasts would hand them a
+  paper tape they believed was the market. An unrecognized `mode` refuses too.
+- **Live providers and live research are independent.** Leaving
+  `forecast.research.search_endpoint_url` unconfigured means research finds
+  nothing, so the pipeline abstains on zero verified citations *before* any vote
+  (SPEC S8.8) -- fail-closed, and no reason to invent a search endpoint.
+- **Every live vote is retried and priced.** `RetryingProvider` bounds attempts,
+  the total deadline, backoff, and spend from the `retry` block above, and
+  charges each failed attempt against the `prices` table. The cassette path is
+  deliberately *not* wrapped: billing a list price for a replayed call would
+  corrupt the cost accounting the table exists to keep honest.
+- **Budget headroom.** `forecast.budget.per_forecast_micros` defaults to
+  `6000000` -- the fixed research charge plus the default three-member
+  ensemble's worst case, which `retry.max_cost_micros` bounds at `1000000` per
+  member. Raising `max_attempts`, `max_cost_micros`, or the ensemble size
+  without raising this ceiling will make ticks halt fail-closed on budget and
+  produce no forecast at all.
+
 ### What one PAPER tick actually does
 
 Each beat runs one `windbreak.scheduler.loop.run_single_tick` pass over the

@@ -89,6 +89,32 @@ provider in `config.forecast.ensemble`, `config.forecast.triage_model`, and
 `config.alerts.allowed_hosts`; an unrecognized provider contributes no host, so
 an unknown exchange or model can never silently inherit network access.
 
+### Live forecast-provider egress
+
+When `forecast.provider_transport.mode` is `live` (it defaults to `cassette`,
+which reaches nothing), `windbreak.main` builds one
+`windbreak.net.live_http.LiveHttpTransport` **per provider**. Each carries only
+that provider's credential and is pinned to a single-host allowlist of its own,
+so one vendor's key structurally cannot travel to another vendor's endpoint —
+the failure a single shared transport would produce on the very first vote.
+
+Each endpoint is screened against `allowlist_from_config` *before any session
+object exists*, and a provider host only reaches that allowlist by being named
+in `config.forecast.vote_ensemble`, so egress nobody declared refuses at
+startup. Redirects are refused (`allow_redirects=False`), so an on-path
+responder cannot steer a dial to another host, and an integer timeout bounds
+every dial.
+
+Credentials are held in send-time headers on the transport and are never placed
+on the header-free `HttpRequest` the provider adapters build — the object a
+recording cassette persists — so a key cannot be written into a cassette. As
+everywhere else in this repo, configuration carries the *name* of the
+environment variable (`*_api_key_env`) and never the value, because every config
+leaf is flattened verbatim into the hash-chained `ConfigLoaded` event and cannot
+be redacted afterwards. Research *page fetches* deliberately carry no credential
+at all: an anonymous read of a third-party page needs none, and inventing a key
+leaf for it would put a secret in the ledger for nothing.
+
 ### Alert-sink egress
 
 Every alert sink that leaves the box — `NtfySink`, `WebhookSink`, and

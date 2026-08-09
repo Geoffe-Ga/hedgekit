@@ -105,7 +105,6 @@ from windbreak.forecast.providers.track_record import (
     parse_track_records,
 )
 from windbreak.forecast.records import BaselineQuoteSnapshot
-from windbreak.forecast.sandbox import build_research_tools
 from windbreak.ledger.events import (
     EquitySampled,
     ExchangeStatusObserved,
@@ -167,6 +166,7 @@ from windbreak.scheduler.provider_wiring import (
     build_live_research_tools,
     build_provider_factory,
     is_live_mode,
+    offline_research_tools,
 )
 from windbreak.scheduler.weekly_data import weekly_report_body
 from windbreak.selector import select
@@ -267,11 +267,6 @@ _EQUITY_MICROS_KEY = "equity_micros"
 #: seconds -- the field the UTC-day bucketing reads, never the row's own
 #: ``created_at`` wall clock (which the injected clock does not control).
 _SAMPLE_EPOCH_KEY = "epoch_s"
-
-#: The research egress host allowlisted for the default offline research tools
-#: built when a caller supplies none. The offline default never actually
-#: searches, so nothing is ever fetched against it.
-_DEFAULT_RESEARCH_HOST = "research.local"
 
 #: The M6 per-provider track-record artifact the loop's live-eligibility gate
 #: reads, resolved inside the same ``report_dir`` every other evaluation
@@ -1319,42 +1314,7 @@ def _resolve_research_tools(
         return research_tools
     if provider_http is not None:
         return build_live_research_tools(config, provider_http, cache_dir)
-    transport = _OfflineResearchTransport()
-    return build_research_tools(
-        allowed_hosts=frozenset({_DEFAULT_RESEARCH_HOST}),
-        cache_dir=cache_dir,
-        search_transport=transport,
-        fetch_transport=transport,
-    )
-
-
-class _OfflineResearchTransport:
-    """A search/fetch transport that finds nothing (the offline default)."""
-
-    def search(self, query: str) -> tuple[str, ...]:
-        """Return no candidate URLs, unconditionally.
-
-        Args:
-            query: The (unused) subquestion text.
-
-        Returns:
-            An empty tuple, always.
-        """
-        del query
-        return ()
-
-    def fetch(self, url: str) -> str:
-        """Never reached (search finds nothing); raises defensively.
-
-        Args:
-            url: The (unused) URL that would have been fetched.
-
-        Raises:
-            RuntimeError: Always -- reaching this is itself a wiring bug.
-        """
-        raise RuntimeError(
-            f"offline research transport fetch unexpectedly called: {url!r}"
-        )
+    return offline_research_tools(cache_dir)
 
 
 def _build_verifier(

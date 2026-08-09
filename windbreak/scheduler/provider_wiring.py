@@ -94,6 +94,11 @@ OPENAI_PROVIDER = "openai"
 #: How many candidate URLs a live search requests per subquestion.
 _SEARCH_MAX_RESULTS = 10
 
+#: The research egress host allowlisted for the offline default research tools.
+#: The offline default never actually searches, so nothing is ever fetched
+#: against it.
+_DEFAULT_RESEARCH_HOST = "research.local"
+
 #: Builds the live LLM adapter for each supported provider over its own HTTP
 #: transport. A provider absent from this table has no live adapter and is
 #: therefore unroutable, which fails closed at
@@ -123,13 +128,72 @@ class LiveProviderHttp:
             mapping has no live route and fails closed at vote time rather than
             borrowing another provider's transport -- and therefore another
             provider's credential.
-        search: The HTTP transport live web search is issued over.
-        fetch: The HTTP transport live page fetches are issued over.
+        search: The HTTP transport live web search is issued over, or ``None``
+            when live research is not configured. ``None`` is not a degraded
+            live mode: research falls back to the offline transport that finds
+            nothing, so the pipeline abstains on zero verified citations before
+            any vote (SPEC S8.8). Live *providers* and live *research* are
+            independently configured, and a deployment that has pinned an LLM
+            but not a search endpoint must not be forced to invent one.
+        fetch: The HTTP transport live page fetches are issued over, or ``None``
+            alongside ``search``.
     """
 
     llm: Mapping[str, HttpTransport]
-    search: HttpTransport
-    fetch: HttpTransport
+    search: HttpTransport | None
+    fetch: HttpTransport | None
+
+
+class OfflineResearchTransport:
+    """A search/fetch transport that finds nothing (the offline default)."""
+
+    def search(self, query: str) -> tuple[str, ...]:
+        """Return no candidate URLs, unconditionally.
+
+        Args:
+            query: The (unused) subquestion text.
+
+        Returns:
+            An empty tuple, always.
+        """
+        del query
+        return ()
+
+    def fetch(self, url: str) -> str:
+        """Never reached (search finds nothing); raises defensively.
+
+        Args:
+            url: The (unused) URL that would have been fetched.
+
+        Raises:
+            RuntimeError: Always -- reaching this is itself a wiring bug.
+        """
+        raise RuntimeError(
+            f"offline research transport fetch unexpectedly called: {url!r}"
+        )
+
+
+def offline_research_tools(cache_dir: Path) -> ResearchTools:
+    """Build the offline, no-network research bundle.
+
+    Its transports find nothing, so the pipeline abstains on zero verified
+    citations before any fetch or vote (SPEC S8.8) -- the offline PAPER
+    contract, without a live network. Shared by the cassette path and by a live
+    deployment that has not configured a research endpoint.
+
+    Args:
+        cache_dir: The root the (never-written) fetch cache is jailed to.
+
+    Returns:
+        A capability-closed :class:`~windbreak.forecast.sandbox.ResearchTools`.
+    """
+    transport = OfflineResearchTransport()
+    return build_research_tools(
+        allowed_hosts=frozenset({_DEFAULT_RESEARCH_HOST}),
+        cache_dir=cache_dir,
+        search_transport=transport,
+        fetch_transport=transport,
+    )
 
 
 def is_live_mode(config: WindbreakConfig) -> bool:
@@ -194,9 +258,12 @@ def build_live_research_tools(
         cache_dir: The root the fetch cache is jailed to.
 
     Returns:
-        A capability-closed :class:`~windbreak.forecast.sandbox.ResearchTools`.
+        A capability-closed :class:`~windbreak.forecast.sandbox.ResearchTools`;
+        the offline no-network bundle when live research is unconfigured.
     """
     research = config.forecast.research
+    if provider_http.search is None or provider_http.fetch is None:
+        return offline_research_tools(cache_dir)
     return build_research_tools(
         allowed_hosts=research.allowed_research_hosts,
         cache_dir=cache_dir,

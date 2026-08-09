@@ -53,9 +53,12 @@ _ALLOWED_URL = f"https://{_ALLOWED_HOST}/v1/messages"
 #: A host deliberately absent from the allowlist under test.
 _DENIED_URL = "https://evil.example.com/v1/messages"
 
-#: The send-time headers under test; the value stands in for a real API key.
-_SECRET_VALUE = "sk-super-secret-key-value"
-_HEADERS = {"x-api-key": _SECRET_VALUE, "content-type": "application/json"}
+#: A distinctive marker standing in for a live credential in the send-time
+#: headers. Named for what it is -- a canary the assertions look for -- rather
+#: than as a credential, so the repo's secret scanner is never asked to tell a
+#: fixture apart from the real thing.
+_HEADER_CANARY = "live-http-header-canary-0001"
+_HEADERS = {"x-api-key": _HEADER_CANARY, "content-type": "application/json"}
 
 #: The integer dial timeout every transport below is constructed with.
 _TIMEOUT_SECONDS = 30
@@ -237,14 +240,14 @@ def test_the_api_key_is_injected_as_a_send_time_header() -> None:
 
     _transport(session).send(_request())
 
-    assert session.calls[0]["headers"]["x-api-key"] == _SECRET_VALUE
+    assert session.calls[0]["headers"]["x-api-key"] == _HEADER_CANARY
 
 
 def test_the_api_key_never_touches_the_http_request_record() -> None:
     """`HttpRequest` is header-free, so a recording cassette cannot persist it."""
     request = _request()
 
-    assert _SECRET_VALUE not in repr(request)
+    assert _HEADER_CANARY not in repr(request)
     assert not hasattr(request, "headers")
 
 

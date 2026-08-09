@@ -41,7 +41,7 @@ dressed up as a benign provider timeout.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import requests
 
@@ -111,13 +111,36 @@ class SessionLike(Protocol):
     without inheritance.
     """
 
-    def request(self, method: str, url: str, **kwargs: object) -> ResponseLike:
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        data: bytes,
+        headers: Mapping[str, str],
+        timeout: int,
+        allow_redirects: bool,
+    ) -> Any:
         """Send one HTTP request.
+
+        The keyword set is spelled out exactly as :meth:`LiveHttpTransport.send`
+        passes it, rather than as ``**kwargs``: a protocol declaring ``**kwargs``
+        would demand a session accepting *arbitrary* keywords, which the real
+        ``requests.Session.request`` -- with its fixed, named option list -- does
+        not satisfy. The return stays ``Any`` because it is narrowed immediately
+        by :func:`_to_http_response`, and pinning it to
+        :class:`ResponseLike` here would reject the genuine ``Response`` for no
+        gain.
 
         Args:
             method: The HTTP method.
             url: The target URL.
-            **kwargs: The remaining request options.
+            data: The encoded request body (keyword-only).
+            headers: The send-time headers, including any credential
+                (keyword-only).
+            timeout: The dial timeout in whole seconds (keyword-only).
+            allow_redirects: Whether redirects may be followed; always ``False``
+                here (keyword-only).
 
         Returns:
             The response object.

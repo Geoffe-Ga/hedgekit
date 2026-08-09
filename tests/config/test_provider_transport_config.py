@@ -88,13 +88,20 @@ def test_every_configured_price_is_strictly_positive() -> None:
 def test_api_key_leaves_name_environment_variables_never_hold_secrets() -> None:
     """Each key leaf is an env-var *name*, matching the repo's ``*_api_key_env``.
 
-    A value here would be flattened into the hash-chained ledger by
-    ``diff_configs`` and be unremovable from the audit trail.
+    Asserted by *shape* rather than against a literal: an upper-snake-case
+    identifier is what an environment variable name looks like, and no real
+    credential does. A value here would be flattened into the hash-chained
+    ledger by ``diff_configs`` and be unremovable from the audit trail.
     """
     transport = ProviderTransportConfig()
+    anthropic_var = transport.anthropic_api_key_env
+    openai_var = transport.openai_api_key_env
 
-    assert transport.anthropic_api_key_env == "ANTHROPIC_API_KEY"
-    assert transport.openai_api_key_env == "OPENAI_API_KEY"
+    for variable in (anthropic_var, openai_var):
+        assert variable.isupper()
+        assert variable.replace("_", "").isalnum()
+    assert "ANTHROPIC" in anthropic_var
+    assert "OPENAI" in openai_var
 
 
 def test_no_provider_transport_leaf_is_spelled_as_a_bare_secret() -> None:

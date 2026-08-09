@@ -54,9 +54,11 @@ if TYPE_CHECKING:
     from windbreak.connector.live import MarketDataSource
     from windbreak.dashboard.app import DashboardStatus
     from windbreak.ledger import Event, LedgerStore
+    from windbreak.net.live_http import LiveHttpTransport
     from windbreak.riskkernel.kill import KillIntegration
     from windbreak.riskkernel.process import KernelLedgerWriter, RiskKernel
     from windbreak.riskkernel.verification import ReadOnlyVerifier
+    from windbreak.scheduler.provider_wiring import LiveProviderHttp
 
 #: Operating mode reported in every heartbeat line. Matches the RESEARCH state
 #: of the SPEC mode machine; windbreak ships research-only for now.
@@ -1015,6 +1017,231 @@ def _resolve_paper_market_data(
     )
 
 
+#: Each live provider's endpoint, the environment-variable *name* its key is
+#: read from on the config, and the header shape that key is sent in. A closed
+#: table, deliberately mirroring ``windbreak.net.allowlist``'s own closed
+#: provider->host map: a provider absent from here has no live route at all,
+#: rather than one assembled from guesses.
+_LIVE_LLM_PROVIDERS: dict[str, tuple[str, str, Callable[[str], dict[str, str]]]] = {
+    "anthropic": (
+        "https://api.anthropic.com/v1/messages",
+        "anthropic_api_key_env",
+        lambda key: {
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    ),
+    "openai": (
+        "https://api.openai.com/v1/chat/completions",
+        "openai_api_key_env",
+        lambda key: {
+            "authorization": f"Bearer {key}",
+            "content-type": "application/json",
+        },
+    ),
+}
+
+
+def _read_provider_key(env_var: str) -> str:
+    """Read one provider API key from the environment, or refuse to start.
+
+    Args:
+        env_var: The environment variable the key is read from -- a *name* taken
+            from configuration, never a value stored there.
+
+    Returns:
+        The key value, which is never logged, echoed, or placed on an exception.
+
+    Raises:
+        ValueError: If the variable is unset. The message names the variable
+            only; a key that was never exported cannot be leaked, and a
+            neighbouring provider's exported key must not be either.
+    """
+    import os
+
+    key = os.environ.get(env_var)
+    if not key:
+        msg = (
+            f"live forecast providers are selected but environment variable "
+            f"{env_var} is unset; export it or select the 'cassette' transport"
+        )
+        raise ValueError(msg)
+    return key
+
+
+def _live_http_for(
+    endpoint_url: str,
+    headers: dict[str, str],
+    config: WindbreakConfig,
+    timeout_seconds: int,
+) -> LiveHttpTransport:
+    """Build one credentialed, single-host live transport for ``endpoint_url``.
+
+    The endpoint is first screened against the *deployment's* own outbound
+    allowlist, so a host nobody declared refuses to start rather than being
+    dialed -- the same order ``_resolve_paper_market_data`` uses, and before any
+    session exists (SPEC S15). The transport is then given a single-host
+    allowlist of its own, so even holding this object an attacker-supplied
+    endpoint cannot steer this provider's credential to another provider's host.
+
+    Args:
+        endpoint_url: The provider endpoint this transport may reach.
+        headers: The send-time headers, including the API key.
+        config: The configuration supplying the deployment allowlist.
+        timeout_seconds: The whole-second dial timeout.
+
+    Returns:
+        The configured :class:`~windbreak.net.live_http.LiveHttpTransport`.
+
+    Raises:
+        ValueError: If ``endpoint_url``'s host is not on this deployment's
+            outbound allowlist.
+    """
+    from urllib.parse import urlsplit
+
+    import requests
+
+    from windbreak.net.allowlist import (
+        EgressDeniedError,
+        OutboundAllowlist,
+        allowlist_from_config,
+    )
+    from windbreak.net.live_http import LiveHttpTransport
+
+    try:
+        allowlist_from_config(config).require(endpoint_url)
+    except EgressDeniedError as exc:
+        host = urlsplit(endpoint_url).hostname or endpoint_url
+        msg = (
+            f"live provider host {host!r} is not on this deployment's outbound "
+            f"allowlist; declare the provider in forecast.vote_ensemble or "
+            f"select the 'cassette' transport"
+        )
+        raise ValueError(msg) from exc
+    host = urlsplit(endpoint_url).hostname or ""
+    return LiveHttpTransport(
+        session=requests.Session(),
+        allowlist=OutboundAllowlist(frozenset({host})),
+        headers=headers,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _resolve_provider_http(config: WindbreakConfig) -> LiveProviderHttp | None:
+    """Build the live forecast-provider HTTP seams, or ``None`` for the cassette.
+
+    This is the one place on the PAPER path that reads the process environment.
+    Configuration may only ever name the variable a provider key is read from
+    (``*_api_key_env``), because every config leaf is flattened verbatim into
+    the hash-chained ``ConfigLoaded`` ledger event and can never be redacted
+    afterwards. So the name lives in config and the value is resolved here, at
+    the composition root, and travels no further than the transport that sends
+    it.
+
+    Each provider gets its own transport, its own credential, and its own
+    single-host allowlist -- never one shared transport, which would send the
+    first provider's key to the second provider's endpoint.
+
+    Args:
+        config: The loaded configuration naming the transport mode, the key
+            environment variables, and the dial timeout.
+
+    Returns:
+        The live seams when ``forecast.provider_transport.mode`` is ``live``,
+        else ``None``.
+
+    Raises:
+        ValueError: If the mode is unrecognized, a named key variable is unset,
+            or a provider host is not on this deployment's outbound allowlist --
+            each way refusing to start rather than dialing unauthorized or
+            unauthenticated.
+    """
+    from windbreak.scheduler.provider_wiring import LiveProviderHttp, is_live_mode
+
+    if not is_live_mode(config):
+        return None
+    settings = config.forecast.provider_transport
+    timeout_seconds = settings.request_timeout_seconds
+    llm = {
+        provider: _live_http_for(
+            endpoint_url,
+            build_headers(_read_provider_key(getattr(settings, key_env_field))),
+            config,
+            timeout_seconds,
+        )
+        for provider, (
+            endpoint_url,
+            key_env_field,
+            build_headers,
+        ) in _LIVE_LLM_PROVIDERS.items()
+    }
+    search, fetch = _live_research_http(config, timeout_seconds)
+    return LiveProviderHttp(llm=llm, search=search, fetch=fetch)
+
+
+def _live_research_http(
+    config: WindbreakConfig, timeout_seconds: int
+) -> tuple[LiveHttpTransport | None, LiveHttpTransport | None]:
+    """Build the live search and fetch transports, or ``(None, None)`` (#344).
+
+    Live *providers* and live *research* are configured independently, so
+    selecting the live LLM transport must not force a deployment to invent a
+    search endpoint it has not pinned. An unconfigured ``search_endpoint_url``
+    (still the repo's operator placeholder) therefore resolves to no live
+    research at all, and the loop falls back to the offline transport that finds
+    nothing -- whereupon the pipeline abstains on zero verified citations before
+    any vote. That is the honest reading of "no research configured", and it
+    fails closed.
+
+    The search endpoint carries the configured search API key; page fetches
+    carry no credential at all, because a research fetch is an anonymous read of
+    a third-party page -- inventing a key leaf for it would put a secret in the
+    hash-chained ledger for nothing. The fetch transport's allowlist is the
+    configured research host set, which itself defaults to empty.
+
+    Args:
+        config: The configuration supplying endpoint, hosts, and key variable.
+        timeout_seconds: The whole-second dial timeout.
+
+    Returns:
+        The search transport paired with the fetch transport, or ``(None,
+        None)`` when live research is unconfigured.
+
+    Raises:
+        ValueError: If a configured search endpoint's host is not on this
+            deployment's outbound allowlist, or its key variable is unset.
+    """
+    import requests
+
+    from windbreak.config.schema import UNCONFIGURED_PLACEHOLDER
+    from windbreak.net.allowlist import OutboundAllowlist
+    from windbreak.net.live_http import LiveHttpTransport
+
+    research = config.forecast.research
+    if research.search_endpoint_url == UNCONFIGURED_PLACEHOLDER:
+        return None, None
+    search_key = _read_provider_key(research.search_api_key_env)
+    search = _live_http_for(
+        research.search_endpoint_url,
+        {
+            "authorization": f"Bearer {search_key}",
+            "content-type": "application/json",
+        },
+        config,
+        timeout_seconds,
+    )
+    fetch = LiveHttpTransport(
+        session=requests.Session(),
+        allowlist=OutboundAllowlist(
+            frozenset(host.lower() for host in research.allowed_research_hosts)
+        ),
+        headers={},
+        timeout_seconds=timeout_seconds,
+    )
+    return search, fetch
+
+
 def _build_paper_on_beat(
     args: argparse.Namespace, config: WindbreakConfig
 ) -> Callable[[int], None]:
@@ -1047,6 +1274,7 @@ def _build_paper_on_beat(
         config=config,
         market_data=_resolve_paper_market_data(args, config),
         live_ticker=args.paper_live_ticker,
+        provider_http=_resolve_provider_http(config),
     )
 
     def _on_beat(seq: int) -> None:
