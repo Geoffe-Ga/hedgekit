@@ -916,6 +916,7 @@ def build_evaluation_context(
     pipeline_heartbeat_epoch_s: int | None,
     quote_snapshot_epoch_s: int | None,
     exchange_clock_epoch_s: int | None,
+    forecast_epoch_s: int | None,
     open_position: ContractCentis | None,
     equity_start_of_day: MoneyMicros | None,
     visible_depth: ContractCentis | None,
@@ -964,6 +965,17 @@ def build_evaluation_context(
     the local clock instead would report perfect agreement, which is the most
     reassuring answer available and the least evidenced.
 
+    The forecast epoch closes the same shape for the last time (issue #380). It
+    is the *forecast's own* ``created_at``, threaded down from
+    :func:`_forecast_stage`, never this function's ``now_epoch_s``. Fed the
+    tick's clock, ``forecast_freshness`` measured now against now and could not
+    veto a forecast of any age -- which is precisely the aging
+    :func:`_approve_stage`'s deliberate second clock read exists to expose,
+    since a slow forecast stage genuinely ages its own output between the two
+    readings. A tick that produced no forecast at all (the issue-#339 research
+    budget halt) passes ``None`` and the check keeps vetoing; the tick's clock
+    would instead claim a forecast zero seconds old where provably none exists.
+
     The open position is caller-supplied too (issue #373), from
     :func:`read_open_position_centis`. It was a hardcoded ``None``, so
     ``reduce_only_provable`` vetoed every close on every tick -- correctly, but
@@ -1011,6 +1023,11 @@ def build_evaluation_context(
             #377). Never the tick's clock: comparing the local clock with
             itself yields a skew of zero and makes ``clock_skew_limit``
             unfalsifiable.
+        forecast_epoch_s: The instant this tick's forecast was created, in
+            epoch seconds, taken from its own ``created_at``, or ``None`` when
+            the tick produced no forecast -- which fails closed (issue #380).
+            Never the tick's clock: a forecast stamped ``now`` is zero seconds
+            old by construction, so ``forecast_freshness`` could never veto.
         open_position: The signed YES-frame holding in this tick's market, in
             contract-centis, or ``None`` when the venue could not describe it
             -- which fails closed (issue #373). A venue-reported flat account is
@@ -1027,15 +1044,13 @@ def build_evaluation_context(
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
     """
-    # `forecast_epoch_s` is the last `*_epoch_s` still fed this function's own
-    # clock, and it makes `forecast_freshness` unfalsifiable exactly as the
-    # quote and the exchange clock were (issue #380). It is not fixed here
-    # because the honest stamp is the forecast's own `created_at`, which means
-    # threading the forecast itself down to the approval stage -- a different
-    # change from this one, tracked separately rather than bundled.
+    # Every `*_epoch_s` below is the caller's evidence; none is this function's
+    # own `now_epoch_s`. That sweep is complete as of issue #380 -- a field fed
+    # `now_epoch_s` makes its consumer measure now against now, which no
+    # observation can falsify.
     market_view = MarketView(
         quote_snapshot_epoch_s=quote_snapshot_epoch_s,
-        forecast_epoch_s=now_epoch_s,
+        forecast_epoch_s=forecast_epoch_s,
         visible_depth=visible_depth,
         exchange_clock_epoch_s=exchange_clock_epoch_s,
         open_position=open_position,
@@ -1892,6 +1907,7 @@ def _approve_stage(
     decision: SelectorDecision,
     heartbeat_epoch_s: int,
     order_book: OrderBookSnapshot,
+    forecast: ForecastRecord,
 ) -> int:
     """Approve each emitted intent through the seam; route any minted token.
 
@@ -1947,6 +1963,15 @@ def _approve_stage(
     vetoing -- see :func:`read_open_position_centis` for why zero would be a
     fabrication rather than a fallback.
 
+    Threads the forecast's own ``created_at`` as the forecast epoch (issue
+    #380) rather than this stage's ``now_epoch_s``, so ``forecast_freshness``
+    compares the estimate's age with the instant it is being acted on. The two
+    differ by exactly how long the forecast stage took, and that gap is the
+    whole point of the second clock read documented below: a research run slow
+    enough to outlive ``forecast_ttl_seconds`` must age its own output out.
+    Stamped with this stage's clock instead, the forecast was zero seconds old
+    however long it had taken, and the check could not veto at any age.
+
     A market the exchange cannot resolve becomes ``None`` rather than an
     exception, so an unknown ticker vetoes the tick instead of aborting it.
 
@@ -1957,6 +1982,12 @@ def _approve_stage(
             alive.
         order_book: The book snapshot this tick took, whose shallower visible
             side bounds the participation cap.
+        forecast: The very forecast ``decision`` was selected against, whose
+            ``created_at`` stamps the context. Non-optional on purpose: a tick
+            with no forecast never reaches this stage at all
+            (:func:`_decide_and_approve` short-circuits), so there is no
+            approval here to fail closed -- the fail-closed ``None`` lives one
+            seam down, on :func:`build_evaluation_context`.
 
     Returns:
         The total quantity filled this tick, in contract-centis.
@@ -1990,6 +2021,7 @@ def _approve_stage(
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
         quote_snapshot_epoch_s=int(order_book.fetched_at.timestamp()),
         exchange_clock_epoch_s=int(deps.exchange.get_exchange_time().timestamp()),
+        forecast_epoch_s=int(forecast.created_at.timestamp()),
         open_position=read_open_position_centis(deps.exchange, ticker=deps.ticker),
         equity_start_of_day=read_start_of_day_equity_micros(
             deps.store, now_epoch_s=now_epoch_s
@@ -2206,7 +2238,9 @@ def _decide_and_approve(
     """Select and approve against a forecast, or short-circuit a halted tick.
 
     Narrows the optional forecast in one place so the select and approve stages
-    keep their existing non-optional contracts.
+    keep their non-optional contracts. That narrowing is why a halted tick
+    needs no fail-closed forecast stamp of its own (issue #380): it never
+    reaches an approval at all, which is strictly stronger than vetoing one.
 
     Args:
         deps: The tick's dependency bundle.
@@ -2223,7 +2257,7 @@ def _decide_and_approve(
     if forecast is None:
         return "", 0, 0
     decision = _select_stage(deps, order_book, forecast, created_at)
-    filled = _approve_stage(deps, decision, heartbeat_epoch_s, order_book)
+    filled = _approve_stage(deps, decision, heartbeat_epoch_s, order_book, forecast)
     return forecast.forecast_id, len(decision.intents), filled
 
 
