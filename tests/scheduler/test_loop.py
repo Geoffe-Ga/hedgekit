@@ -225,6 +225,8 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        equity_start_of_day=None,
+        visible_depth=None,
     )
 
     assert context.limits.floor == MoneyMicros(42_000_000)
@@ -250,6 +252,8 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        equity_start_of_day=None,
+        visible_depth=None,
     )
 
     assert context.limits.quote_ttl_seconds == 17
@@ -276,6 +280,8 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        equity_start_of_day=None,
+        visible_depth=None,
     )
 
     assert context.verification is None
@@ -306,6 +312,8 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        equity_start_of_day=None,
+        visible_depth=None,
     )
 
     assert context.market.exchange_status is None
@@ -327,6 +335,8 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         exchange_status=None,
         exchange_status_epoch_s=None,
         pipeline_heartbeat_epoch_s=None,
+        equity_start_of_day=None,
+        visible_depth=None,
     )
 
     assert context.now_epoch_s == 1_234_567
@@ -593,6 +603,8 @@ def _context_with(*, status, status_epoch_s: int | None, heartbeat_epoch_s: int 
         exchange_status=status,
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
+        equity_start_of_day=None,
+        visible_depth=None,
     )
 
 
@@ -680,3 +692,302 @@ def test_absent_status_vetoes_as_stale_or_missing_not_as_closed() -> None:
 
     assert result.vetoed is True
     assert result.reason == "exchange status stale or missing"
+
+
+# --- Issue #364: real start-of-day equity and real visible depth -------------
+
+
+#: One whole UTC day, in seconds -- used to place a ledgered equity sample on
+#: the calendar day *before* the one under test.
+_ONE_DAY_SECONDS = 86_400
+
+#: The fixture book's shallower visible side, in contract-centis: 300 resting
+#: on the single bid level against 1200 across the two ask levels.
+_SHALLOW_SIDE_CENTIS = 300
+
+#: The largest order the SPEC S16 default `max_participation_ppm` (250000 ppm =
+#: 25%) admits against `_SHALLOW_SIDE_CENTIS` of visible depth: 75 centis.
+_CAP_AT_SHALLOW_SIDE_CENTIS = 75
+
+
+def _book_with(*, bid_centis: int | None, ask_centis: int | None):
+    """Build a one-level-per-side book carrying the given visible quantities.
+
+    Args:
+        bid_centis: Resting quantity on the single YES bid level, or `None`
+            for a book with no bids at all.
+        ask_centis: Resting quantity on the single YES ask level, or `None`
+            for a book with no asks at all.
+
+    Returns:
+        The composed `OrderBookSnapshot`.
+    """
+    from windbreak.connector.models import OrderBookLevel, OrderBookSnapshot
+    from windbreak.numeric import ContractCentis, PricePips
+
+    bids = (
+        ()
+        if bid_centis is None
+        else (OrderBookLevel(PricePips(4500), ContractCentis(bid_centis)),)
+    )
+    asks = (
+        ()
+        if ask_centis is None
+        else (OrderBookLevel(PricePips(4600), ContractCentis(ask_centis)),)
+    )
+    return OrderBookSnapshot(
+        ticker=DEFAULT_MARKET_TICKER,
+        yes_bids=bids,
+        yes_asks=asks,
+        fetched_at=datetime.fromtimestamp(DEFAULT_NOW_EPOCH_S, UTC),
+    )
+
+
+def _ledger_with_equity_samples(path: Path, samples: tuple[tuple[int, int], ...]):
+    """Append `(epoch_s, equity_micros)` samples to a fresh ledger, in order.
+
+    Uses a real `SqliteLedgerStore` and the real `EquitySampled` event rather
+    than a hand-rolled record double, so the fold under test reads the very
+    envelope shape `windbreak.scheduler.loop._equity_and_positions_stage`
+    writes.
+
+    Args:
+        path: Where the ledger database is created.
+        samples: The `(epoch_s, equity_micros)` pairs to append, in order.
+
+    Returns:
+        The opened `SqliteLedgerStore`.
+    """
+    from windbreak.ledger.events import EquitySampled
+    from windbreak.ledger.store import SqliteLedgerStore
+
+    store = SqliteLedgerStore(path)
+    for epoch_s, equity_micros in samples:
+        store.append(
+            EquitySampled(
+                component="scheduler",
+                equity_micros=equity_micros,
+                floor_micros=0,
+                epoch_s=epoch_s,
+            )
+        )
+    return store
+
+
+def test_start_of_day_equity_micros_reads_the_utc_days_first_sample(
+    tmp_path: Path,
+) -> None:
+    """The baseline is the *earliest* sample of the current UTC day, not the last.
+
+    A later, larger sample must not become the baseline: `daily_loss_limit`
+    measures today's loss against where the day *started*, so reading the most
+    recent sample would silently raise the loss threshold every time equity
+    grew intraday.
+    """
+    from windbreak.numeric import MoneyMicros
+    from windbreak.scheduler.loop import start_of_day_equity_micros
+
+    store = _ledger_with_equity_samples(
+        tmp_path / "ledger.db",
+        (
+            (DEFAULT_NOW_EPOCH_S - 3_600, 90_000_000),
+            (DEFAULT_NOW_EPOCH_S, 140_000_000),
+        ),
+    )
+
+    baseline = start_of_day_equity_micros(
+        store.read_all(), now_epoch_s=DEFAULT_NOW_EPOCH_S
+    )
+
+    assert baseline == MoneyMicros(90_000_000)
+
+
+def test_start_of_day_equity_micros_ignores_a_previous_utc_days_samples(
+    tmp_path: Path,
+) -> None:
+    """Yesterday's samples are not today's baseline -- the day boundary is real.
+
+    Yesterday's equity is a genuine figure, but it is the wrong one: carrying it
+    forward would let a day that has not yet sampled anything trade against a
+    stale baseline instead of failing closed.
+    """
+    from windbreak.scheduler.loop import start_of_day_equity_micros
+
+    store = _ledger_with_equity_samples(
+        tmp_path / "ledger.db",
+        ((DEFAULT_NOW_EPOCH_S - _ONE_DAY_SECONDS, 90_000_000),),
+    )
+
+    baseline = start_of_day_equity_micros(
+        store.read_all(), now_epoch_s=DEFAULT_NOW_EPOCH_S
+    )
+
+    assert baseline is None
+
+
+def test_start_of_day_equity_micros_is_none_on_an_empty_ledger(
+    tmp_path: Path,
+) -> None:
+    """No sample at all means no baseline -- never a permissive zero-by-default."""
+    from windbreak.scheduler.loop import start_of_day_equity_micros
+
+    store = _ledger_with_equity_samples(tmp_path / "ledger.db", ())
+
+    baseline = start_of_day_equity_micros(
+        store.read_all(), now_epoch_s=DEFAULT_NOW_EPOCH_S
+    )
+
+    assert baseline is None
+
+
+def test_visible_depth_centis_takes_the_shallower_visible_side() -> None:
+    """Depth is the shallower of the two sides, summed across every level.
+
+    The context is composed once per tick, before any intent's side is known,
+    so the bound has to hold for either side: taking the deeper side would
+    admit an order larger than the other side could absorb.
+    """
+    from windbreak.numeric import ContractCentis
+    from windbreak.scheduler.loop import visible_depth_centis
+
+    depth = visible_depth_centis(_book_with(bid_centis=300, ask_centis=1200))
+
+    assert depth == ContractCentis(300)
+
+
+def test_visible_depth_centis_is_zero_for_a_one_sided_book() -> None:
+    """An empty side is an observed zero, which vetoes -- never an unknown.
+
+    Zero depth admits no positive-size order at all (`participation cap
+    exceeded`), so a one-sided book fails closed on the cap rather than on
+    absent evidence.
+    """
+    from windbreak.numeric import ContractCentis
+    from windbreak.scheduler.loop import visible_depth_centis
+
+    depth = visible_depth_centis(_book_with(bid_centis=None, ask_centis=1200))
+
+    assert depth == ContractCentis(0)
+
+
+def _exposure_context(*, equity_start_of_day, visible_depth):
+    """Build a PAPER context carrying the given exposure evidence.
+
+    Every other feed is the loop's own production wiring; only the two figures
+    issue #364 supplies vary, so each assertion below isolates them.
+
+    Args:
+        equity_start_of_day: The `MoneyMicros` start-of-day baseline, or `None`
+            when no sample exists for the current UTC day.
+        visible_depth: The `ContractCentis` visible book depth, or `None` when
+            the book could not be read.
+
+    Returns:
+        The composed `EvaluationContext`.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+    from windbreak.scheduler.loop import build_evaluation_context
+
+    return build_evaluation_context(
+        WindbreakConfig(),
+        now_epoch_s=DEFAULT_NOW_EPOCH_S,
+        verification=None,
+        instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=ExchangeTradingStatus.OPEN,
+        exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+        equity_start_of_day=equity_start_of_day,
+        visible_depth=visible_depth,
+    )
+
+
+def test_absent_equity_baseline_and_depth_still_veto_both_exposure_checks() -> None:
+    """With neither figure available, both checks keep failing closed.
+
+    This is the half of issue #364 that must never regress: an absent baseline
+    or an unreadable book loosens nothing, because a fabricated value for
+    either would raise the daily-loss threshold and the participation ceiling
+    on invented evidence.
+    """
+    context = _exposure_context(equity_start_of_day=None, visible_depth=None)
+    intent = make_intent()
+
+    loss = _check_named("daily_loss_limit")(intent, context)
+    participation = _check_named("participation_cap_compliance")(intent, context)
+
+    assert loss.vetoed is True
+    assert loss.reason == "daily loss limit reached"
+    assert participation.vetoed is True
+    assert participation.reason == "visible depth unknown"
+
+
+def test_a_genuinely_zero_equity_baseline_still_vetoes() -> None:
+    """A real zero baseline vetoes exactly as an absent one does.
+
+    `AccountState.equity_start_of_day` has no `None`, so absence is carried as
+    zero -- and zero floors the daily-loss threshold at zero, which today's
+    zero realized loss already reaches. Pinned so the mapping of absence onto
+    zero can never be mistaken for a permissive default.
+    """
+    from windbreak.numeric import MoneyMicros
+
+    context = _exposure_context(equity_start_of_day=MoneyMicros(0), visible_depth=None)
+
+    result = _check_named("daily_loss_limit")(make_intent(), context)
+
+    assert result.vetoed is True
+    assert result.reason == "daily loss limit reached"
+
+
+def test_a_real_equity_baseline_clears_the_daily_loss_veto() -> None:
+    """A genuine start-of-day baseline lets today's zero loss pass the limit.
+
+    The positive half of issue #364: before it, no value a caller could supply
+    would let this check pass, because the loop hardcoded a zero baseline.
+    """
+    from windbreak.numeric import ContractCentis, MoneyMicros
+
+    context = _exposure_context(
+        equity_start_of_day=MoneyMicros(100_000_000),
+        visible_depth=ContractCentis(_SHALLOW_SIDE_CENTIS),
+    )
+
+    result = _check_named("daily_loss_limit")(make_intent(), context)
+
+    assert result.vetoed is False
+
+
+@pytest.mark.parametrize(
+    ("size_centis", "expected_vetoed"),
+    [
+        (_CAP_AT_SHALLOW_SIDE_CENTIS, False),
+        (_CAP_AT_SHALLOW_SIDE_CENTIS + 1, True),
+    ],
+    ids=["at-cap", "one-over-cap"],
+)
+def test_participation_cap_vetoes_exactly_past_its_share_of_real_depth(
+    size_centis: int, expected_vetoed: bool
+) -> None:
+    """The cap binds at 25% of the real depth, and one centi past it vetoes.
+
+    Pinned against the SPEC S16 default `max_participation_ppm`, not a
+    hand-tuned fixture: the `at-cap` case is the one carrying signal, since the
+    over-cap case vetoed vacuously while depth was `None`.
+
+    Args:
+        size_centis: The intent size, in contract-centis.
+        expected_vetoed: Whether `participation_cap_compliance` must veto.
+    """
+    from windbreak.numeric import ContractCentis
+
+    context = _exposure_context(
+        equity_start_of_day=None,
+        visible_depth=ContractCentis(_SHALLOW_SIDE_CENTIS),
+    )
+    intent = make_intent(size=ContractCentis(size_centis))
+
+    result = _check_named("participation_cap_compliance")(intent, context)
+
+    assert result.vetoed is expected_vetoed

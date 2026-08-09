@@ -21,22 +21,29 @@ runs a real read-only verification cycle each tick and threads that snapshot
 into the approval context, so the three SPEC S10.3 reconciliation checks
 evaluate real evidence and pass on a clean cycle.
 
-Two honest zero/``None`` feeds still veto every PAPER intent, and neither is a
-verification concern -- both live in the account/market view this module
-composes, not in the kernel:
+Issue #364 closed the last two unconditional vetoes the same way -- by
+supplying evidence the loop already holds, never a convenient number:
 
-* ``daily_loss_limit`` vetoes because :func:`_account_from_verification` leaves
-  ``equity_start_of_day`` at zero, which floors the loss threshold at zero and
-  makes ``realized_loss_today >= threshold`` true for a flat account.
-* ``participation_cap_compliance`` vetoes because
-  :func:`build_evaluation_context` supplies ``visible_depth=None``.
+* ``daily_loss_limit`` now measures against the current UTC day's *first*
+  ledgered ``EquitySampled`` row (:func:`start_of_day_equity_micros`), which is
+  a genuine start-of-day baseline. Until the day has a sample -- including the
+  day's first approval, since a tick samples equity only after approving -- the
+  baseline is absent, lands on the account as zero, and the check keeps
+  vetoing.
+* ``participation_cap_compliance`` now measures against the shallower visible
+  side of the book the tick snapshotted (:func:`visible_depth_centis`). A book
+  that cannot be read at all stays ``None`` and the check keeps vetoing.
 
-They are left as they are on purpose: fabricating a start-of-day equity or a
-depth figure to unblock a fill would loosen two real exposure limits on
-invented evidence, which is the exact failure mode issues #340/#342/#353 each
-removed by supplying *genuine* evidence instead. Until those two feeds are
-real, ``filled_centis`` stays ``0``; the fill leg is proven separately by
-driving the gateway with a genuinely minted token through a doubled seam.
+Both figures loosen a real exposure limit when they are wrong -- a larger
+baseline raises the loss threshold, a deeper book raises the participation
+ceiling -- so absence is never rounded to a permissive default here. That is
+the same discipline issues #340/#342/#353 applied: supply *genuine* evidence,
+or keep failing closed.
+
+What still vetoes a given intent is therefore a question about that intent and
+the market it targets, not about missing feeds; the stock fixtures' surviving
+reasons are measured, reason by reason, in
+``tests/integration/test_paper_verification.py``.
 
 Verification is also the loop's one HALT path. The baseline the cycle
 reconciles against is frozen at startup from the venue's own opening state
@@ -54,6 +61,7 @@ Money and equity fields are scaled integers (micros/centis/pips), never floats
 
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from dataclasses import dataclass
@@ -137,7 +145,8 @@ from windbreak.selector.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
+    from datetime import date
     from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
@@ -147,6 +156,7 @@ if TYPE_CHECKING:
     from windbreak.forecast.records import ForecastRecord
     from windbreak.forecast.sandbox import ResearchTools
     from windbreak.ledger.events import Event
+    from windbreak.ledger.store import LedgerRecord
     from windbreak.riskkernel.checks import Decision, OrderIntent
     from windbreak.riskkernel.verification import VerificationSnapshot
     from windbreak.selector.types import SelectorDecision
@@ -203,6 +213,24 @@ _RECONCILE_MAX_CYCLES = 5
 #: paper exchange models fills (not balances), so positions are folded from the
 #: full fill history each tick.
 _EPOCH_START = datetime(1, 1, 1, tzinfo=UTC)
+
+#: The ledger event type carrying one PAPER-loop equity sample. The tick
+#: appends one every beat, and :func:`start_of_day_equity_micros` reads the
+#: day's first one back as the ``daily_loss_limit`` baseline (issue #364).
+_EQUITY_SAMPLED_EVENT_TYPE = "EquitySampled"
+
+#: Envelope key under which a ledgered event's typed payload is nested (mirrors
+#: :data:`windbreak.scheduler.weekly_data._PAYLOAD_DATA_KEY` and
+#: :func:`windbreak.ledger.rebuild._gateway_projection`'s own ``["data"]``).
+_PAYLOAD_DATA_KEY = "data"
+
+#: The ``EquitySampled`` payload key carrying the sampled equity, in micros.
+_EQUITY_MICROS_KEY = "equity_micros"
+
+#: The ``EquitySampled`` payload key carrying the sample instant, in epoch
+#: seconds -- the field the UTC-day bucketing reads, never the row's own
+#: ``created_at`` wall clock (which the injected clock does not control).
+_SAMPLE_EPOCH_KEY = "epoch_s"
 
 #: The research egress host allowlisted for the default offline research tools
 #: built when a caller supplies none. The offline default never actually
@@ -462,6 +490,103 @@ def market_snapshot_event_to_record(
     )
 
 
+def _utc_day(epoch_s: int) -> date:
+    """Return the UTC calendar day an epoch second falls on.
+
+    Args:
+        epoch_s: The instant to bucket, in whole epoch seconds.
+
+    Returns:
+        The UTC date containing ``epoch_s``.
+    """
+    return datetime.fromtimestamp(epoch_s, UTC).date()
+
+
+def start_of_day_equity_micros(
+    records: Iterable[LedgerRecord], *, now_epoch_s: int
+) -> MoneyMicros | None:
+    """Return the current UTC day's *first* ledgered equity sample, or ``None``.
+
+    ``daily_loss_limit`` measures today's realized loss against where the day
+    started, so the baseline has to be the earliest sample of the day and not
+    the latest: reading the most recent one would quietly raise the loss
+    threshold every time equity grew intraday, which is precisely the loosening
+    a fabricated baseline would have caused (issue #364).
+
+    Samples are matched by their own ``epoch_s`` payload field rather than by
+    the row's ``created_at`` wall clock, because only the payload is stamped
+    from the loop's injected clock; and the earliest is chosen by comparing
+    those stamps rather than by taking the first matching row, so a clock that
+    steps backwards mid-day cannot promote a later sample to the baseline.
+
+    An absent answer is deliberately ``None`` and never a zero: the caller maps
+    it onto the fail-closed account (see :func:`_account_from_verification`),
+    and a numeric default here would be indistinguishable from a genuine
+    reading. Before the day's first tick has ledgered its sample -- including
+    the very first tick against a fresh ledger, since the sample is appended
+    *after* the approval stage -- there simply is no baseline, and the check
+    must keep vetoing.
+
+    The whole record sequence is scanned rather than stopped at the first
+    same-day hit, for the clock reason above: append order is not proof of
+    chronological order. That is the same whole-ledger fold the tick's weekly
+    report already performs, so it adds no new order of cost.
+
+    Args:
+        records: The ledger read (``SqliteLedgerStore.read_all()``), in append
+            order. Non-``EquitySampled`` rows are ignored.
+        now_epoch_s: The instant whose UTC day is the "current" one.
+
+    Returns:
+        The day's earliest sampled equity, in micros, or ``None`` when the day
+        carries no sample at all.
+
+    Raises:
+        KeyError: If an ``EquitySampled`` payload is missing either field this
+            reads -- a loud shape drift, never a silently zeroed baseline.
+    """
+    today = _utc_day(now_epoch_s)
+    earliest: tuple[int, int] | None = None
+    for record in records:
+        if record.event_type != _EQUITY_SAMPLED_EVENT_TYPE:
+            continue
+        data = json.loads(record.payload_json)[_PAYLOAD_DATA_KEY]
+        epoch_s = int(data[_SAMPLE_EPOCH_KEY])
+        if _utc_day(epoch_s) != today:
+            continue
+        if earliest is None or epoch_s < earliest[0]:
+            earliest = (epoch_s, int(data[_EQUITY_MICROS_KEY]))
+    return MoneyMicros(earliest[1]) if earliest is not None else None
+
+
+def visible_depth_centis(order_book: OrderBookSnapshot) -> ContractCentis:
+    """Return the visible depth ``participation_cap_compliance`` may bound against.
+
+    The evaluation context is composed once per tick, before any intent's side
+    is known, so the figure has to hold for either side of the book: it is the
+    *shallower* of the two visible sides, summed across every level. Bounding a
+    sale against the (possibly much deeper) ask side would admit an order
+    larger than the bid side could absorb, which is the loosening issue #364
+    exists to avoid.
+
+    An empty side is a genuine observation of zero depth, not an unknown one,
+    so it yields ``0`` -- which admits no positive-size order at all. Only a
+    caller with no book to read passes ``None`` on to
+    :func:`build_evaluation_context`, and that is the case the check answers
+    with ``visible depth unknown``.
+
+    Args:
+        order_book: The book snapshot this tick took.
+
+    Returns:
+        The shallower visible side's total resting quantity, in
+        contract-centis.
+    """
+    bid_depth = sum(level.quantity.value for level in order_book.yes_bids)
+    ask_depth = sum(level.quantity.value for level in order_book.yes_asks)
+    return ContractCentis(min(bid_depth, ask_depth))
+
+
 def _human_ack_micros(config: WindbreakConfig) -> MoneyMicros | None:
     """Return the configured human-ack notional threshold, or ``None``.
 
@@ -521,10 +646,11 @@ def _build_limits(
 
 def _account_from_verification(
     verification: VerificationSnapshot | None,
+    equity_start_of_day: MoneyMicros | None,
 ) -> AccountState:
-    """Return the account snapshot the tick's verification evidence supports.
+    """Return the account snapshot the tick's ledgered evidence supports.
 
-    Only the two terms a verification cycle actually observes are populated:
+    Two of the three populated terms come from the verification cycle:
     the venue-reported available cash and the observed drift (as the
     reconciliation-uncertainty buffer). That mirrors
     ``RiskKernel._stamp_verification`` exactly, and mirroring it is
@@ -537,15 +663,26 @@ def _account_from_verification(
     zeros the caller supplied -- a token that can never mint, for a reason
     invisible in the kernel's ledgered verdict.
 
+    The third is the caller's ``equity_start_of_day``, folded out of the
+    loop's own ledgered ``EquitySampled`` history by
+    :func:`start_of_day_equity_micros` (issue #364). ``AccountState`` has no
+    ``None`` for it, so an absent baseline is carried as zero -- and zero is
+    the fail-closed reading, not a permissive one: it floors
+    ``daily_loss_limit``'s threshold at zero, which today's zero realized loss
+    already reaches, so the check keeps vetoing exactly as it did before any
+    baseline existed.
+
     Every other term stays zero: they are the ones the ledger cannot yet
-    justify (start-of-day equity, high-water mark, exposures, velocity), and a
-    fabricated figure there would loosen a limit rather than tighten it. With
-    ``verification=None`` the whole account is zero, exactly as before, so the
-    fail-closed path is unchanged.
+    justify (high-water mark, exposures, velocity), and a fabricated figure
+    there would loosen a limit rather than tighten it. With
+    ``verification=None`` and no baseline the whole account is zero, exactly as
+    before, so the fail-closed path is unchanged.
 
     Args:
         verification: The tick's verification snapshot, or ``None`` when no
             cycle has produced one (the fail-closed reading).
+        equity_start_of_day: The current UTC day's first ledgered equity
+            sample, or ``None`` when the day has none yet (also fail-closed).
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.AccountState`.
@@ -557,13 +694,14 @@ def _account_from_verification(
         else zero
     )
     drift = verification.cash_drift if verification is not None else zero
+    baseline = equity_start_of_day if equity_start_of_day is not None else zero
     return AccountState(
         exchange_verified_available_cash=verified_cash,
         guaranteed_terminal_value_of_positions=zero,
         pending_kernel_reservations=zero,
         unresolved_fee_upper_bounds=zero,
         reconciliation_uncertainty_buffer=drift,
-        equity_start_of_day=zero,
+        equity_start_of_day=baseline,
         equity_high_water_mark=zero,
         realized_loss_today=zero,
         market_exposure=zero,
@@ -585,6 +723,8 @@ def build_evaluation_context(
     exchange_status: ExchangeTradingStatus | None,
     exchange_status_epoch_s: int | None,
     pipeline_heartbeat_epoch_s: int | None,
+    equity_start_of_day: MoneyMicros | None,
+    visible_depth: ContractCentis | None,
 ) -> EvaluationContext:
     """Compose the evaluation context a PAPER-mode approval reads.
 
@@ -608,6 +748,15 @@ def build_evaluation_context(
     stale, which would make its check unfalsifiable and strictly worse than the
     ``None`` it replaced.
 
+    The start-of-day equity and the visible depth are caller-supplied for the
+    same reason (issue #364), and both loosen a real exposure limit when they
+    are wrong: a larger baseline raises ``daily_loss_limit``'s threshold and a
+    deeper book raises ``participation_cap_compliance``'s ceiling. So neither
+    may be defaulted here. A caller that cannot prove either figure passes
+    ``None`` and both checks keep failing closed -- ``daily loss limit
+    reached`` on the zero baseline an absent sample maps to, and ``visible
+    depth unknown`` on the absent book.
+
     Args:
         config: The configuration whose capital/risk sections map to the limits.
         now_epoch_s: The kernel's current wall clock, in epoch seconds.
@@ -627,6 +776,13 @@ def build_evaluation_context(
             alive, or ``None``. Stamped by an earlier stage, never by this
             function -- a heartbeat equal to ``now`` could never go stale and
             would make its check unfalsifiable.
+        equity_start_of_day: The current UTC day's first ledgered equity
+            sample, or ``None`` when the day has none yet -- which fails closed
+            (issue #364).
+        visible_depth: The visible book depth, in contract-centis, or ``None``
+            when no book could be read -- which fails closed (issue #364). A
+            genuinely empty book is ``0``, not ``None``: an observed absence of
+            liquidity is evidence, and it admits no order at all.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
@@ -634,7 +790,7 @@ def build_evaluation_context(
     market_view = MarketView(
         quote_snapshot_epoch_s=now_epoch_s,
         forecast_epoch_s=now_epoch_s,
-        visible_depth=None,
+        visible_depth=visible_depth,
         exchange_clock_epoch_s=now_epoch_s,
         open_position=None,
         exchange_status=exchange_status,
@@ -650,7 +806,7 @@ def build_evaluation_context(
     return EvaluationContext(
         mode=Mode.PAPER,
         limits=_build_limits(config, instrument_whitelist),
-        account=_account_from_verification(verification),
+        account=_account_from_verification(verification, equity_start_of_day),
         market=market_view,
         fees=fees,
         now_epoch_s=now_epoch_s,
@@ -1342,7 +1498,10 @@ def _route_intent(
 
 
 def _approve_stage(
-    deps: PaperTickDeps, decision: SelectorDecision, heartbeat_epoch_s: int
+    deps: PaperTickDeps,
+    decision: SelectorDecision,
+    heartbeat_epoch_s: int,
+    order_book: OrderBookSnapshot,
 ) -> int:
     """Approve each emitted intent through the seam; route any minted token.
 
@@ -1362,6 +1521,16 @@ def _approve_stage(
     observation. Before the first cycle it is ``None`` and everything still
     fails closed.
 
+    Threads the two exposure figures issue #364 supplies, both out of evidence
+    this tick itself produced: the start-of-day equity is folded from the
+    ``EquitySampled`` rows already on the ledger, and the visible depth from
+    the book the snapshot stage just read. Both are read at the same clock
+    reading the context is stamped with, so the UTC day the baseline is bucketed
+    into is the day the evaluation happens on. On the day's first tick the
+    ledger carries no sample yet -- the tick appends its own only after this
+    stage -- so the baseline is genuinely ``None`` and ``daily_loss_limit``
+    keeps vetoing rather than trading against an invented one.
+
     A market the exchange cannot resolve becomes ``None`` rather than an
     exception, so an unknown ticker vetoes the tick instead of aborting it.
 
@@ -1370,6 +1539,8 @@ def _approve_stage(
         decision: The selector's decision carrying any emitted intents.
         heartbeat_epoch_s: The instant an earlier stage observed the pipeline
             alive.
+        order_book: The book snapshot this tick took, whose shallower visible
+            side bounds the participation cap.
 
     Returns:
         The total quantity filled this tick, in contract-centis.
@@ -1391,15 +1562,20 @@ def _approve_stage(
     # freshness must be judged at evaluation time, so a slow forecast stage can
     # legitimately age the heartbeat out rather than being masked by a reading
     # taken before it ran.
+    now_epoch_s = deps.clock()
     context = build_evaluation_context(
         deps.config,
-        now_epoch_s=deps.clock(),
+        now_epoch_s=now_epoch_s,
         verification=deps.kernel.latest_verification,
         instrument_whitelist=frozenset({deps.ticker}),
         market=market,
         exchange_status=project_exchange_status(observed.status),
         exchange_status_epoch_s=status_epoch_s,
         pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
+        equity_start_of_day=start_of_day_equity_micros(
+            deps.store.read_all(), now_epoch_s=now_epoch_s
+        ),
+        visible_depth=visible_depth_centis(order_book),
     )
     filled = 0
     for intent in decision.intents:
@@ -1570,7 +1746,7 @@ def _decide_and_approve(
     if forecast is None:
         return "", 0, 0
     decision = _select_stage(deps, order_book, forecast, created_at)
-    filled = _approve_stage(deps, decision, heartbeat_epoch_s)
+    filled = _approve_stage(deps, decision, heartbeat_epoch_s, order_book)
     return forecast.forecast_id, len(decision.intents), filled
 
 
@@ -1589,10 +1765,17 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     Since issue #353 the tick also runs one read-only verification cycle
     (:func:`_verification_stage`) before deciding anything, and threads its
     snapshot into the approval context, so the three reconciliation checks now
-    evaluate real evidence rather than failing closed on ``None``. Two other
-    honest zero/``None`` feeds still veto every intent (see the module
-    docstring), so ``filled_centis`` is still ``0`` -- but no longer for any
-    verification reason.
+    evaluate real evidence rather than failing closed on ``None``. Issue #364
+    did the same for the two exposure feeds (see the module docstring), so no
+    SPEC S10.3 check now vetoes for want of a datum the loop holds -- with one
+    honest exception: the day's *first* tick approves before it has sampled the
+    day's equity, so ``daily_loss_limit`` still fails closed on that one tick.
+
+    Stage order is load-bearing for that reason. The equity sample is taken
+    after the approval stage on purpose -- it reflects the tick's own fills --
+    so moving it earlier to hand the day's first approval a baseline would make
+    "start of day" mean "a moment ago", which is not the figure
+    ``daily_loss_limit`` is defined against.
 
     A cycle that grades a ``BREACH`` halts the kernel instead (issue #32); the
     tick still completes and still ledgers its heartbeat, equity sample, and

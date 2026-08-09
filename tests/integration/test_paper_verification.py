@@ -28,10 +28,15 @@ remainder from being misread as a fill:
    exchange straight to the verifier hands over the write surface.
 4. `test_loop_production_context_vetoes_carry_no_verification_reason` -- under
    the context `windbreak.scheduler.loop._approve_stage` actually composes, the
-   surviving veto reasons are exactly `concentration limit exceeded`,
-   `daily loss limit reached`, and `visible depth unknown`. #353 removes
+   surviving veto reasons are exactly `_SURVIVING_VETO_REASONS`. #353 removes
    verification as a blocker; it does not make a PAPER tick fill, and this
    test is the guard against that overclaim quietly becoming true-by-assertion.
+5. `test_loop_supplies_its_own_ledgered_equity_baseline_and_book_depth` (issue
+   #364, RED -- today `build_evaluation_context` takes neither figure) -- the
+   start-of-day equity must be read back from the `EquitySampled` row the tick
+   itself ledgered, and the visible depth from the book the tick itself
+   snapshotted, with `None` (and therefore a veto) before the UTC day has a
+   sample at all.
 """
 
 from __future__ import annotations
@@ -60,6 +65,76 @@ _RECONCILIATION_VETO_REASONS = frozenset(
         "open-order verification stale or missing",
     }
 )
+
+#: The `deep_walk` fixture book's shallower visible side, in contract-centis:
+#: 300 resting on its single bid level, against 1200 across its two ask levels.
+#: That is the depth `visible_depth_centis` bounds participation against, since
+#: the context is composed before any intent's side is known.
+_SHALLOW_SIDE_CENTIS = 300
+
+#: What still vetoes `tests.riskkernel.conftest.make_intent` under the loop's
+#: own composed context, reason by reason, in SPEC S10.3 check order:
+#:
+#: * `concentration limit exceeded` -- the intent's 5_000_000-micro cost is over
+#:   the 2% (`max_pos_market_pct_ppm`) share of the fixture's 100_000_000-micro
+#:   verified cash. Real evidence, real limit; unchanged by issue #364.
+#: * `participation cap exceeded` -- the intent's 1000 centis is over the 25%
+#:   (`max_participation_ppm`) share of the fixture book's 300-centi shallower
+#:   side. This *replaces* `visible depth unknown`: the check now measures a
+#:   real book instead of failing closed on absent evidence, and this
+#:   particular test intent is simply too big for that book.
+#:
+#: `daily loss limit reached` is gone: issue #364 supplies the genuine
+#: start-of-day equity the loop ledgers every tick, and today's zero realized
+#: loss is below its 2% threshold.
+#:
+#: Compared with exact equality on purpose, mirroring
+#: `tests/scheduler/test_loop.py::_EXPECTED_VETO_REASONS`. Never soften it to a
+#: membership check: it is the repo's designated measurement of what actually
+#: gates a PAPER fill, and a membership assertion would silently tolerate a new
+#: veto -- or a silently loosened check.
+_SURVIVING_VETO_REASONS = (
+    "concentration limit exceeded",
+    "participation cap exceeded",
+)
+
+
+def _production_context(deps):
+    """Rebuild the exact `EvaluationContext` `_approve_stage` composes.
+
+    Every argument mirrors that stage's own call, so what this test pins is the
+    loop's production wiring rather than a permissive test fixture.
+
+    Args:
+        deps: The wired `PaperTickDeps` whose ledger, exchange, and kernel the
+            context is composed from.
+
+    Returns:
+        The composed `EvaluationContext`.
+    """
+    from windbreak.scheduler.eligibility import project_exchange_status
+    from windbreak.scheduler.loop import (
+        build_evaluation_context,
+        start_of_day_equity_micros,
+        visible_depth_centis,
+    )
+
+    return build_evaluation_context(
+        deps.config,
+        now_epoch_s=DEFAULT_NOW_EPOCH_S,
+        verification=deps.kernel.latest_verification,
+        instrument_whitelist=frozenset({deps.ticker}),
+        market=deps.exchange.get_market(deps.ticker),
+        exchange_status=project_exchange_status(
+            deps.exchange.get_exchange_status().status
+        ),
+        exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+        equity_start_of_day=start_of_day_equity_micros(
+            deps.store.read_all(), now_epoch_s=DEFAULT_NOW_EPOCH_S
+        ),
+        visible_depth=visible_depth_centis(deps.exchange.get_order_book(deps.ticker)),
+    )
 
 
 def _fixed_clock() -> int:
@@ -185,10 +260,10 @@ def test_loop_production_context_vetoes_carry_no_verification_reason(
     The test above proves the reconciliation checks pass on a permissive
     context. This one refuses to let that stand in for the production wiring:
     it rebuilds the exact context `_approve_stage` composes and pins the exact
-    remaining veto reasons. Both survivors are honest zero/`None` feeds in this
-    module's own account/market view -- `equity_start_of_day=0` floors the
-    daily-loss threshold at zero, and `visible_depth` is `None` -- and neither
-    is a verification concern.
+    remaining veto reasons (see `_SURVIVING_VETO_REASONS` for why each one
+    survives). Since issue #364 every survivor is a real limit measured against
+    real evidence -- an oversized test intent against genuine equity and a
+    genuine book -- rather than a check failing closed on an absent datum.
 
     The tuple is compared with exact equality on purpose, mirroring
     `tests/scheduler/test_loop.py::_EXPECTED_VETO_REASONS`: a membership check
@@ -202,8 +277,7 @@ def test_loop_production_context_vetoes_carry_no_verification_reason(
         research_tools_factory: Builds the offline research tools double.
         tmp_path: The pytest scratch directory.
     """
-    from windbreak.scheduler.eligibility import project_exchange_status
-    from windbreak.scheduler.loop import build_evaluation_context, run_single_tick
+    from windbreak.scheduler.loop import run_single_tick
 
     deps = _build_deps(
         books_dir=books_dir,
@@ -215,27 +289,72 @@ def test_loop_production_context_vetoes_carry_no_verification_reason(
     )
     run_single_tick(deps, beat=1)
 
-    context = build_evaluation_context(
-        deps.config,
-        now_epoch_s=DEFAULT_NOW_EPOCH_S,
-        verification=deps.kernel.latest_verification,
-        instrument_whitelist=frozenset({deps.ticker}),
-        market=deps.exchange.get_market(deps.ticker),
-        exchange_status=project_exchange_status(
-            deps.exchange.get_exchange_status().status
-        ),
-        exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
-        pipeline_heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
-    )
+    context = _production_context(deps)
     outcome = deps.approval.decide(make_intent(market_ticker=deps.ticker), context)
 
-    assert outcome.decision.reasons == (
-        "concentration limit exceeded",
-        "daily loss limit reached",
-        "visible depth unknown",
-    )
+    assert outcome.decision.reasons == _SURVIVING_VETO_REASONS
     assert _RECONCILIATION_VETO_REASONS.isdisjoint(outcome.decision.reasons)
     assert context.account.exchange_verified_available_cash.value == 100_000_000
+
+
+def test_loop_supplies_its_own_ledgered_equity_baseline_and_book_depth(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """Both issue-#364 figures come from evidence this loop itself produced.
+
+    The baseline is not merely *a* number: it must equal the `equity_micros` of
+    the very `EquitySampled` row this tick ledgered, and the depth must equal
+    the shallower side of the book this tick snapshotted. Before the tick runs
+    there is no sample for the UTC day at all, and the honest answer is `None`
+    -- proven here rather than assumed, because a baseline that quietly
+    defaulted to a number would raise the daily-loss threshold on nothing.
+
+    Args:
+        books_dir: The shared books-fixture directory.
+        cassette_path: The empty recorded-cassette path.
+        report_dir: Where weekly-report stubs would be written.
+        paper_config: The PAPER-ceilinged configuration.
+        research_tools_factory: Builds the offline research tools double.
+        tmp_path: The pytest scratch directory.
+    """
+    from windbreak.numeric import ContractCentis
+    from windbreak.scheduler.loop import (
+        run_single_tick,
+        start_of_day_equity_micros,
+        visible_depth_centis,
+    )
+
+    deps = _build_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools_factory=research_tools_factory,
+    )
+
+    before = start_of_day_equity_micros(
+        deps.store.read_all(), now_epoch_s=DEFAULT_NOW_EPOCH_S
+    )
+    outcome = run_single_tick(deps, beat=1)
+    after = start_of_day_equity_micros(
+        deps.store.read_all(), now_epoch_s=DEFAULT_NOW_EPOCH_S
+    )
+
+    assert before is None
+    assert after is not None
+    assert after.value == outcome.equity_micros
+    context = _production_context(deps)
+    assert context.account.equity_start_of_day == after
+    assert context.market.visible_depth == ContractCentis(_SHALLOW_SIDE_CENTIS)
+    assert context.market.visible_depth == visible_depth_centis(
+        deps.exchange.get_order_book(deps.ticker)
+    )
 
 
 def test_paper_verification_mismatch_halts_the_kernel_and_ledgers_the_breach(
