@@ -60,11 +60,20 @@ TriageModel injection choice (issue #192)
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import TYPE_CHECKING
 
 import pytest
 
+from windbreak.forecast.budget import (
+    BUDGET_DAY_EXHAUSTED_EVENT,
+    BUDGET_FORECAST_EXCEEDED_EVENT,
+    DailyBudgetExhaustedError,
+    InMemoryBudgetLedger,
+    PerForecastBudgetExceededError,
+    ResearchBudget,
+)
 from windbreak.forecast.cassettes import (
     CassetteMissError,
     ForbiddenLiveTransport,
@@ -111,6 +120,21 @@ if TYPE_CHECKING:
 #: `_baseline_probability_ppm`) -- named here so every gating assertion below
 #: reads against the same, single source of truth.
 _BASELINE_PPM = 450_000
+
+#: The fixed Stage-0 prior cost, in micros (2% of `PER_FORECAST_BUDGET_MICROS`),
+#: restated as a literal so a mutant to the module's divisor is caught rather
+#: than mirrored.
+_STAGE0_COST_MICROS = 60_000
+
+#: The research cost a full `run_pipeline` run charges with this package's
+#: fixture provider (whose own `cost_micros` is zero), in micros -- the same
+#: figure `tests/forecast/test_budget.py` pins as the per-forecast boundary.
+_FULL_RUN_RESEARCH_COST_MICROS = 3_000_000
+
+#: What one PROCEED-path triaged run truly costs: the full pipeline plus the
+#: Stage-0 prior folded into it. Deliberately *greater* than the SPEC S16
+#: per-forecast default, which is why the budget must see the total.
+_TRIAGED_RUN_TOTAL_COST_MICROS = _FULL_RUN_RESEARCH_COST_MICROS + _STAGE0_COST_MICROS
 
 
 class _CountingTransport:
@@ -379,6 +403,7 @@ def test_run_triaged_pipeline_threads_triage_model_into_the_stage0_request(
     baseline: BaselineQuoteSnapshot,
     created_at: datetime,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """`run_triaged_pipeline`'s `triage_model=` reaches Stage-0's sent request,
     on both the STOP and PROCEED paths.
@@ -395,6 +420,7 @@ def test_run_triaged_pipeline_threads_triage_model_into_the_stage0_request(
         created_at=created_at,
         research_tools=research_tools,
         triage_model=custom_model,
+        budget=research_budget,
     )
 
     assert transport.calls[0].provider == "anthropic"
@@ -407,6 +433,7 @@ def test_stop_event_payload_carries_the_default_triage_model_provenance(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """With `triage_model=` omitted, a STOP event's payload names the pinned
     default model's provider and version.
@@ -421,6 +448,7 @@ def test_stop_event_payload_carries_the_default_triage_model_provenance(
         ledger=ledger,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     payload = ledger.events_by_type(TRIAGE_STOP_EVENT)[0].payload
@@ -436,6 +464,7 @@ def test_stop_event_payload_carries_an_injected_triage_model_provenance(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """An injected `triage_model=` is reflected in the STOP event's payload."""
     ledger = InMemoryTriageLedger()
@@ -450,6 +479,7 @@ def test_stop_event_payload_carries_an_injected_triage_model_provenance(
         created_at=created_at,
         research_tools=research_tools,
         triage_model=custom_model,
+        budget=research_budget,
     )
 
     payload = ledger.events_by_type(TRIAGE_STOP_EVENT)[0].payload
@@ -463,6 +493,7 @@ def test_proceed_event_payload_carries_an_injected_triage_model_provenance(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """An injected `triage_model=` is also reflected in the PROCEED event's
     payload.
@@ -479,6 +510,7 @@ def test_proceed_event_payload_carries_an_injected_triage_model_provenance(
         created_at=created_at,
         research_tools=research_tools,
         triage_model=custom_model,
+        budget=research_budget,
     )
 
     payload = ledger.events_by_type(TRIAGE_PROCEED_EVENT)[0].payload
@@ -597,6 +629,7 @@ def test_stop_path_never_runs_full_pipeline_and_records_triage_only(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """A within-band prior stops before the full pipeline and ledgers a STOP.
 
@@ -614,6 +647,7 @@ def test_stop_path_never_runs_full_pipeline_and_records_triage_only(
         ledger=ledger,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record.triage_stage == "triage_only"
@@ -649,6 +683,7 @@ def test_proceed_path_runs_full_pipeline_and_accumulates_both_costs(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """A far-from-baseline prior proceeds to the full pipeline and ledgers a PROCEED."""
     ledger = InMemoryTriageLedger()
@@ -661,6 +696,7 @@ def test_proceed_path_runs_full_pipeline_and_accumulates_both_costs(
         ledger=ledger,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record.triage_stage == "full"
@@ -688,6 +724,7 @@ def test_operator_flagged_forces_full_pipeline_despite_below_threshold_prior(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """`operator_flagged=True` forces the full pipeline inside the triage band."""
     ledger = InMemoryTriageLedger()
@@ -701,6 +738,7 @@ def test_operator_flagged_forces_full_pipeline_despite_below_threshold_prior(
         created_at=created_at,
         operator_flagged=True,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record.triage_stage == "full"
@@ -715,6 +753,7 @@ def test_refresh_triggered_forces_full_pipeline_despite_below_threshold_prior(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """`refresh_triggered=True` forces the full pipeline inside the triage band."""
     ledger = InMemoryTriageLedger()
@@ -728,6 +767,7 @@ def test_refresh_triggered_forces_full_pipeline_despite_below_threshold_prior(
         created_at=created_at,
         refresh_triggered=True,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record.triage_stage == "full"
@@ -745,6 +785,7 @@ def test_run_triaged_pipeline_is_byte_deterministic_for_identical_inputs(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """Two proceed-path runs with fresh fakes/ledgers produce identical output."""
     ledger_a = InMemoryTriageLedger()
@@ -758,6 +799,7 @@ def test_run_triaged_pipeline_is_byte_deterministic_for_identical_inputs(
         ledger=ledger_a,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
     record_b = run_triaged_pipeline(
         market,
@@ -767,6 +809,7 @@ def test_run_triaged_pipeline_is_byte_deterministic_for_identical_inputs(
         ledger=ledger_b,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record_a == record_b
@@ -786,6 +829,7 @@ def test_run_triaged_pipeline_stop_path_is_byte_deterministic_for_identical_inpu
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """Two stop-path runs with fresh fakes/ledgers produce identical output.
 
@@ -805,6 +849,7 @@ def test_run_triaged_pipeline_stop_path_is_byte_deterministic_for_identical_inpu
         ledger=ledger_a,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
     record_b = run_triaged_pipeline(
         market,
@@ -814,6 +859,7 @@ def test_run_triaged_pipeline_stop_path_is_byte_deterministic_for_identical_inpu
         ledger=ledger_b,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record_a == record_b
@@ -835,6 +881,7 @@ def test_proceed_path_cassette_replay_matches_recording(
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
     tmp_path: Path,
+    research_budget: ResearchBudget,
 ) -> None:
     """Recording `full_transport`, then replaying it, reproduces the same record.
 
@@ -853,6 +900,7 @@ def test_proceed_path_cassette_replay_matches_recording(
         ledger=InMemoryTriageLedger(),
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     replay = ReplayCassette.from_path(cassette_path)
@@ -864,6 +912,7 @@ def test_proceed_path_cassette_replay_matches_recording(
         ledger=InMemoryTriageLedger(),
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert replayed == recorded
@@ -878,6 +927,7 @@ def test_stop_path_never_touches_discard_ledger(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """A within-band prior stops before the full pipeline, so the wired
     `discard_ledger` -- a seam that only the full pipeline's vote-discard
@@ -897,6 +947,7 @@ def test_stop_path_never_touches_discard_ledger(
         discard_ledger=discard_ledger,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record.triage_stage == "triage_only"
@@ -909,6 +960,7 @@ def test_proceed_path_with_clean_votes_records_no_discard_events(
     created_at: datetime,
     make_fake_vote_transport: FakeVoteTransportFactory,
     research_tools: ResearchTools,
+    research_budget: ResearchBudget,
 ) -> None:
     """A far-from-baseline prior proceeds to the full pipeline; with every
     full-pipeline vote clean, the wired `discard_ledger` records zero
@@ -928,8 +980,178 @@ def test_proceed_path_with_clean_votes_records_no_discard_events(
         discard_ledger=discard_ledger,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record.triage_stage == "full"
     assert record.eligible_for_live is True
     assert discard_ledger.events_by_type(FORECAST_OUTPUT_DISCARDED_EVENT) == ()
+
+
+# --- Budget enforcement (issue #348): an unbudgeted triaged run is unrepresentable
+
+
+def test_run_triaged_pipeline_budget_parameter_is_required_and_non_optional() -> None:
+    """`budget=` is keyword-only, has no default, and is not `... | None`.
+
+    Issue #339 made `ResearchBudget` non-Optional on `PaperTickDeps` so an
+    unwired loop could not be *expressed* rather than merely discouraged;
+    `run_triaged_pipeline` is the second entry point onto the same spend, so it
+    carries the same discipline. A defaulted or Optional `budget` would restore
+    the fail-open shape where an omitted ceiling is indistinguishable from a
+    deliberate "no ceiling", which is precisely the defect this pins shut.
+    """
+    parameter = inspect.signature(run_triaged_pipeline).parameters["budget"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.annotation == "ResearchBudget"
+
+
+def test_exhausted_day_halts_the_triaged_run_before_the_stage0_call(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    make_fake_vote_transport: FakeVoteTransportFactory,
+    research_tools: ResearchTools,
+) -> None:
+    """An exhausted UTC day halts the run before Stage-0 spends anything.
+
+    The Stage-0 prior is itself a paid model call, so the day check has to come
+    before it, not after: `call_count == 0` is the fail-closed proof no money
+    moved, and the empty triage ledger proves no decision was recorded either.
+    """
+    budget_ledger = InMemoryBudgetLedger()
+    budget = ResearchBudget(per_day_micros=_STAGE0_COST_MICROS, ledger=budget_ledger)
+    budget.charge_forecast(
+        _STAGE0_COST_MICROS, market_ticker=market.ticker, at=created_at
+    )
+    triage_transport = _CountingTransport(make_fake_vote_transport(("460000",)))
+    triage_ledger = InMemoryTriageLedger()
+
+    with pytest.raises(DailyBudgetExhaustedError):
+        run_triaged_pipeline(
+            market,
+            baseline,
+            triage_transport=triage_transport,
+            full_transport=ForbiddenLiveTransport(),
+            ledger=triage_ledger,
+            created_at=created_at,
+            research_tools=research_tools,
+            budget=budget,
+        )
+
+    assert triage_transport.call_count == 0
+    assert triage_ledger.events_by_type(TRIAGE_STOP_EVENT) == ()
+    assert triage_ledger.events_by_type(TRIAGE_PROCEED_EVENT) == ()
+    assert len(budget_ledger.events_by_type(BUDGET_DAY_EXHAUSTED_EVENT)) == 1
+
+
+def test_stop_path_charges_the_stage0_cost_against_the_budget(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    make_fake_vote_transport: FakeVoteTransportFactory,
+    research_tools: ResearchTools,
+) -> None:
+    """A STOP run's Stage-0 spend lands in the day bucket, exhausting a day
+    sized to exactly one Stage-0 prior. Without the charge the next run would
+    proceed, so triage could burn the day's budget one cheap prior at a time.
+    """
+    budget = ResearchBudget(
+        per_day_micros=_STAGE0_COST_MICROS, ledger=InMemoryBudgetLedger()
+    )
+
+    record = run_triaged_pipeline(
+        market,
+        baseline,
+        triage_transport=make_fake_vote_transport(("460000",)),
+        full_transport=ForbiddenLiveTransport(),
+        ledger=InMemoryTriageLedger(),
+        created_at=created_at,
+        research_tools=research_tools,
+        budget=budget,
+    )
+
+    assert record.research_cost_micros == _STAGE0_COST_MICROS
+    with pytest.raises(DailyBudgetExhaustedError) as exc_info:
+        budget.ensure_day_open(at=created_at)
+    assert exc_info.value.spent_micros == _STAGE0_COST_MICROS
+
+
+def test_proceed_path_folded_total_breaches_the_per_forecast_ceiling(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    make_fake_vote_transport: FakeVoteTransportFactory,
+    research_tools: ResearchTools,
+) -> None:
+    """Stage-0's cost is not exempt from the per-forecast ceiling.
+
+    A ceiling equal to the full run's cost is one the pipeline alone fits under
+    exactly (`test_per_forecast_exact_budget_succeeds_with_zero_breach_events`
+    in `test_budget.py` pins that boundary). Reached through triage, the same
+    run also owes the Stage-0 prior, so the *folded* total breaches -- and the
+    raised error and its ledgered event both name the total, not either stage.
+    Charging each stage independently would let this run pass both checks and
+    still spend more than one forecast is allowed.
+    """
+    budget_ledger = InMemoryBudgetLedger()
+    budget = ResearchBudget(
+        per_forecast_micros=_FULL_RUN_RESEARCH_COST_MICROS, ledger=budget_ledger
+    )
+
+    with pytest.raises(PerForecastBudgetExceededError) as exc_info:
+        run_triaged_pipeline(
+            market,
+            baseline,
+            triage_transport=make_fake_vote_transport(("600000",)),
+            full_transport=make_fake_vote_transport(),
+            ledger=InMemoryTriageLedger(),
+            created_at=created_at,
+            research_tools=research_tools,
+            budget=budget,
+        )
+
+    assert exc_info.value.cost_micros == _TRIAGED_RUN_TOTAL_COST_MICROS
+    assert exc_info.value.budget_micros == _FULL_RUN_RESEARCH_COST_MICROS
+    breach_events = budget_ledger.events_by_type(BUDGET_FORECAST_EXCEEDED_EVENT)
+    assert len(breach_events) == 1
+    assert breach_events[0].payload["cost_micros"] == _TRIAGED_RUN_TOTAL_COST_MICROS
+
+
+def test_proceed_path_charges_both_stages_to_the_day_bucket_exactly_once(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    make_fake_vote_transport: FakeVoteTransportFactory,
+    research_tools: ResearchTools,
+) -> None:
+    """A PROCEED run charges Stage-0 plus the full pipeline, once each.
+
+    The per-forecast ceiling is set to the folded total, so the run passes on
+    the inclusive boundary; the day is sized to the same figure, so the day
+    bucket's post-run spend is pinned exactly. Double-charging either stage
+    would overshoot it, and skipping either would undershoot.
+    """
+    budget = ResearchBudget(
+        per_forecast_micros=_TRIAGED_RUN_TOTAL_COST_MICROS,
+        per_day_micros=_TRIAGED_RUN_TOTAL_COST_MICROS,
+        ledger=InMemoryBudgetLedger(),
+    )
+
+    record = run_triaged_pipeline(
+        market,
+        baseline,
+        triage_transport=make_fake_vote_transport(("600000",)),
+        full_transport=make_fake_vote_transport(),
+        ledger=InMemoryTriageLedger(),
+        created_at=created_at,
+        research_tools=research_tools,
+        budget=budget,
+    )
+
+    assert record.research_cost_micros == _TRIAGED_RUN_TOTAL_COST_MICROS
+    with pytest.raises(DailyBudgetExhaustedError) as exc_info:
+        budget.ensure_day_open(at=created_at)
+    assert exc_info.value.spent_micros == _TRIAGED_RUN_TOTAL_COST_MICROS

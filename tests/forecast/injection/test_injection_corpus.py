@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from windbreak.connector.models import NormalizedMarket
+    from windbreak.forecast.budget import ResearchBudget
     from windbreak.forecast.records import BaselineQuoteSnapshot, ForecastRecord
     from windbreak.forecast.sandbox import ResearchTools
 
@@ -897,6 +898,7 @@ def test_run_triaged_pipeline_proceed_path_all_malicious_votes_ledgers_discards(
     research_tools: ResearchTools,
     make_fake_vote_transport: FakeVoteTransportFactory,
     make_malicious_vote_transport: MaliciousVoteTransportFactory,
+    research_budget: ResearchBudget,
 ) -> None:
     """The triaged PROCEED path threads its own `discard_ledger` into the full
     pipeline's vote-discard bookkeeping (issue #98): with a within-band-prior
@@ -920,6 +922,7 @@ def test_run_triaged_pipeline_proceed_path_all_malicious_votes_ledgers_discards(
         discard_ledger=discard_ledger,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     assert record.abstention_reason == ABSTENTION_ALL_VOTES_DISCARDED
@@ -940,6 +943,7 @@ def test_run_triaged_pipeline_discard_ledger_matches_direct_run_pipeline(
     research_tools: ResearchTools,
     make_fake_vote_transport: FakeVoteTransportFactory,
     make_malicious_vote_transport: MaliciousVoteTransportFactory,
+    research_budget: ResearchBudget,
 ) -> None:
     """The triaged PROCEED path's `discard_ledger` records byte-identical
     `FORECAST_OUTPUT_DISCARDED` events to calling `run_pipeline` directly with
@@ -970,6 +974,7 @@ def test_run_triaged_pipeline_discard_ledger_matches_direct_run_pipeline(
         discard_ledger=triaged_ledger,
         created_at=created_at,
         research_tools=research_tools,
+        budget=research_budget,
     )
 
     direct_events = direct_ledger.events_by_type(FORECAST_OUTPUT_DISCARDED_EVENT)

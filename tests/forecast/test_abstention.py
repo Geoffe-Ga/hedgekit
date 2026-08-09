@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from windbreak.connector.models import NormalizedMarket
+    from windbreak.forecast.budget import ResearchBudget
     from windbreak.forecast.records import BaselineQuoteSnapshot
     from windbreak.forecast.sandbox import ResearchTools
 
@@ -509,6 +510,7 @@ def test_triaged_pipeline_abstained_record_is_ledgered_as_proceed(
     make_raising_fetch_transport: RaisingFetchTransportFactory,
     make_fake_vote_transport: FakeVoteTransportFactory,
     tmp_path: Path,
+    research_budget: ResearchBudget,
 ) -> None:
     """`operator_flagged=True` forces the PROCEED path regardless of the
     Stage-0 prior; when the full pipeline it proceeds into abstains (every
@@ -530,6 +532,7 @@ def test_triaged_pipeline_abstained_record_is_ledgered_as_proceed(
         created_at=created_at,
         research_tools=tools,
         operator_flagged=True,
+        budget=research_budget,
     )
 
     assert record.abstention_reason == ABSTENTION_NO_VERIFIED_CITATIONS
