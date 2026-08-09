@@ -14,15 +14,15 @@ appending one audit event to the ledger at every stage, plus a per-tick
 
 The approval seam is the load-bearing safety boundary: :class:`KernelApproval`
 composes the *real* ``RiskKernel.evaluate_intent`` with the *real*
-``ApprovalPipeline.approve``. Today that can never mint a token -- the
-``jurisdiction_product_eligibility`` SPEC S10.3 check is still an
-unconditional-veto stub, the now-real ``exchange_status_ok`` /
-``pipeline_heartbeat_ok`` checks (issue #110) fail closed on the ``None`` exchange
-status and pipeline heartbeat this loop honestly supplies, and the three
-reconciliation checks fail closed on the ``verification=None`` this loop honestly
-supplies (no live exchange verification cycle runs in PAPER yet) -- so the real
-tick never fills. The fill leg is proven separately by driving the gateway with a
-genuinely minted token through a doubled seam.
+``ApprovalPipeline.approve``. Every SPEC S10.3 check is now real (issue
+#340 promoted the last one), but the PAPER tick still never fills, for
+three honest reasons rather than a stub: the now-real ``exchange_status_ok`` /
+``pipeline_heartbeat_ok`` checks (issue #110) fail closed on the ``None``
+exchange status and pipeline heartbeat this loop honestly supplies, and the
+three reconciliation checks fail closed on the ``verification=None`` it likewise
+supplies (no live exchange verification cycle runs in PAPER yet). The fill leg
+is proven separately by driving the gateway with a genuinely minted token
+through a doubled seam.
 
 Money and equity fields are scaled integers (micros/centis/pips), never floats
 (SPEC S6.1); this package is on ``scripts/lint_no_floats.py``'s denylist.
@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from windbreak.config import config_hash
 from windbreak.connector.freshness import is_fresh
+from windbreak.connector.interface import UnknownMarketError
 from windbreak.connector.paper import PaperExchange
 from windbreak.forecast.budget import (
     BUDGET_DAY_EXHAUSTED_EVENT,
@@ -86,6 +87,7 @@ from windbreak.riskkernel.reservations import (
     ReservationLedger,
 )
 from windbreak.riskkernel.tokens import TokenIssuer
+from windbreak.scheduler.eligibility import project_jurisdiction, project_product_type
 from windbreak.scheduler.weekly_data import weekly_report_body
 from windbreak.selector import select
 from windbreak.selector.types import (
@@ -101,7 +103,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
-    from windbreak.connector.models import OrderBookSnapshot
+    from windbreak.connector.models import NormalizedMarket, OrderBookSnapshot
     from windbreak.forecast.budget import BudgetEvent
     from windbreak.forecast.cassettes import LlmTransport
     from windbreak.forecast.records import ForecastRecord
@@ -514,6 +516,7 @@ def build_evaluation_context(
     now_epoch_s: int,
     verification: VerificationSnapshot | None,
     instrument_whitelist: frozenset[str],
+    market: NormalizedMarket | None,
 ) -> EvaluationContext:
     """Compose the evaluation context a PAPER-mode approval reads.
 
@@ -536,11 +539,16 @@ def build_evaluation_context(
         now_epoch_s: The kernel's current wall clock, in epoch seconds.
         verification: The latest verification snapshot, or ``None`` (fail-closed).
         instrument_whitelist: The tradable-ticker set for this tick.
+        market: The market being evaluated, or ``None`` when it could not be
+            resolved -- which fails closed exactly like ``verification=None``.
+            Its connector eligibility metadata is projected onto the kernel's
+            own enums here, so the connector's ``"unknown"`` becomes ``None``
+            and can never masquerade as eligible (issue #340).
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
     """
-    market = MarketView(
+    market_view = MarketView(
         quote_snapshot_epoch_s=now_epoch_s,
         forecast_epoch_s=now_epoch_s,
         visible_depth=None,
@@ -548,13 +556,19 @@ def build_evaluation_context(
         open_position=None,
         exchange_status=None,
         exchange_status_epoch_s=None,
+        jurisdiction_status=project_jurisdiction(
+            market.jurisdiction_status if market is not None else None
+        ),
+        product_type=project_product_type(
+            market.market_type if market is not None else None
+        ),
     )
     fees = FeeBounds(max_trading_fee=MoneyMicros(0), max_settlement_fee=MoneyMicros(0))
     return EvaluationContext(
         mode=Mode.PAPER,
         limits=_build_limits(config, instrument_whitelist),
         account=_zero_account(),
-        market=market,
+        market=market_view,
         fees=fees,
         now_epoch_s=now_epoch_s,
         used_intent_ids=frozenset(),
@@ -1122,13 +1136,15 @@ def _route_intent(
 def _approve_stage(deps: PaperTickDeps, decision: SelectorDecision) -> int:
     """Approve each emitted intent through the seam; route any minted token.
 
-    With the real kernel the approval always vetoes (no token minted), so no
-    order ever routes; the routing path exists for the doubled-seam fill-leg
-    proof. Issue #110's ``exchange_status_ok`` / ``pipeline_heartbeat_ok`` are
-    now real, but PAPER fills stay gated: the ``jurisdiction_product_eligibility``
-    stub still vetoes, and the honest ``verification=None`` plus the ``None``
-    exchange status / pipeline heartbeat this loop supplies make those two
-    now-real checks veto too.
+    Every SPEC S10.3 check is now real, including
+    ``jurisdiction_product_eligibility`` (issue #340), which reads the market's
+    projected eligibility metadata. PAPER fills nonetheless stay gated by the
+    honest ``None`` values this loop supplies: ``verification=None`` fails the
+    three reconciliation checks, and the absent exchange-status feed and
+    pipeline heartbeat fail ``exchange_status_ok`` / ``pipeline_heartbeat_ok``.
+
+    A market the exchange cannot resolve becomes ``None`` rather than an
+    exception, so an unknown ticker vetoes the tick instead of aborting it.
 
     Args:
         deps: The tick's dependency bundle.
@@ -1137,11 +1153,16 @@ def _approve_stage(deps: PaperTickDeps, decision: SelectorDecision) -> int:
     Returns:
         The total quantity filled this tick, in contract-centis.
     """
+    try:
+        market: NormalizedMarket | None = deps.exchange.get_market(deps.ticker)
+    except UnknownMarketError:
+        market = None
     context = build_evaluation_context(
         deps.config,
         now_epoch_s=deps.clock(),
         verification=None,
         instrument_whitelist=frozenset({deps.ticker}),
+        market=market,
     )
     filled = 0
     for intent in decision.intents:
@@ -1274,7 +1295,9 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     carries genuine evaluation and cost-meter data (issue #188), built lazily so
     the fold is paid for only on the genuine per-week write. Every stage appends
     an audit event to the shared hash-chained ledger. With the real kernel the
-    approval always vetoes, so no order ever routes and ``filled_centis`` is ``0``.
+    approval still vetoes every intent -- on the honest ``None`` verification,
+    exchange status, and pipeline heartbeat this loop supplies, not on a stub --
+    so no order routes and ``filled_centis`` is ``0``.
 
     A tick whose per-forecast or per-UTC-day research budget is exhausted halts
     fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row, skips

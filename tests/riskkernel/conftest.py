@@ -55,8 +55,7 @@ import, not pytest fixture injection, so it works unchanged inside
 
 `make_context`'s defaults are deliberately tuned so that, paired with
 `make_intent()`'s defaults (action "buy", price 5000 pips, size 1000
-centis), **every one of the 17 real SPEC S10.3 checks passes** (issues #30
-and #31 together): each
+centis), **every one of the 24 real SPEC S10.3 checks passes**: each
 per-check test in `test_checks.py` therefore only needs to override the one
 or two fields that check actually reads, proving the override -- not a
 coincidence of some other field -- is what flips the verdict.
@@ -90,7 +89,9 @@ from windbreak.riskkernel.context import (
     EvaluationContext,
     ExchangeTradingStatus,
     FeeBounds,
+    JurisdictionStatus,
     MarketView,
+    ProductType,
     RiskLimits,
 )
 from windbreak.riskkernel.modes import Mode
@@ -233,7 +234,9 @@ _DEFAULT_ACCOUNT = AccountState(
 #: freshness/skew/participation checks pass by default. `exchange_status`
 #: defaults to `ExchangeTradingStatus.OPEN` with a fresh
 #: `exchange_status_epoch_s` (issue #110), so `exchange_status_ok` passes by
-#: default too.
+#: default too. `jurisdiction_status`/`product_type` default to the one
+#: eligible/tradable pair (issue #340), so `jurisdiction_product_eligibility`
+#: passes by default as well.
 _DEFAULT_MARKET = MarketView(
     quote_snapshot_epoch_s=DEFAULT_NOW_EPOCH_S,
     forecast_epoch_s=DEFAULT_NOW_EPOCH_S,
@@ -242,6 +245,8 @@ _DEFAULT_MARKET = MarketView(
     open_position=None,
     exchange_status=ExchangeTradingStatus.OPEN,
     exchange_status_epoch_s=DEFAULT_NOW_EPOCH_S,
+    jurisdiction_status=JurisdictionStatus.ELIGIBLE,
+    product_type=ProductType.FULLY_COLLATERALIZED_BINARY,
 )
 
 #: The permissive default `FeeBounds`: both bounds present (zero), so

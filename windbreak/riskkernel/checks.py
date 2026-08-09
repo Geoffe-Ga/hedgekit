@@ -1,15 +1,15 @@
 """Pre-trade veto checks for the Risk Kernel (SPEC S10.3).
 
 This module ships the 24 SPEC S10.3 pre-trade checks. Issues #30, #31, #32,
-#34, and #110 give 23 of them real logic -- instrument whitelist, mode/ceiling,
+#34, #110, and #340 give all 24 real logic -- instrument whitelist, mode/ceiling,
 the floor invariant, balance/position/open-order reconciliation (#32), fee-bound
 presence, concentration, daily loss, trailing drawdown, velocity, quote/forecast
 freshness, price band, participation cap, human-ack satisfaction (#34),
 approval-token and idempotency-key uniqueness (#31), clock skew, exchange-status
-and pipeline-heartbeat liveness (#110), and reduce-only provability -- each
-reading a full :class:`EvaluationContext`. The remaining 1 is a deliberate stub
-that still vetoes, naming the metadata it awaits (:data:`_STUB_REASONS`), so an
-operator sees *why* a check is not yet live rather than a bare "not implemented".
+and pipeline-heartbeat liveness (#110), reduce-only provability, and
+jurisdiction/product eligibility (#340) -- each reading a full
+:class:`EvaluationContext`. No check is a stub: every one of the 24 can both
+approve and veto on evidence.
 
 Every check is a small, pure callable taking ``(intent, context)`` and
 returning a :class:`CheckResult`; :func:`evaluate_intent` runs the whole
@@ -26,7 +26,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from windbreak.numeric import RoundingDirection, divide
-from windbreak.riskkernel.context import ExchangeTradingStatus
+from windbreak.riskkernel.context import (
+    ExchangeTradingStatus,
+    JurisdictionStatus,
+    ProductType,
+)
 from windbreak.riskkernel.floor import worst_case_cost, worst_case_equity
 from windbreak.riskkernel.modes import Mode
 
@@ -74,6 +78,15 @@ HUMAN_ACK_REQUIRED_REASON = "human acknowledgement required"
 #: an unknown ``None``) all fail closed via ``exchange_status_ok`` (issue #110).
 _TRADABLE_EXCHANGE_STATUSES: frozenset[ExchangeTradingStatus] = frozenset(
     {ExchangeTradingStatus.OPEN}
+)
+
+#: The product types this system may ever trade. Fully collateralized binaries
+#: only -- SPEC S1.1 invariant 2 and LEGAL_AND_COMPLIANCE.md make this a hard,
+#: non-configurable constraint, so it lives here rather than in ``RiskLimits``:
+#: no operator config edit can widen it. An unrecognized or absent product is
+#: ``None`` on :class:`MarketView` and fails closed (issue #340).
+_TRADABLE_PRODUCT_TYPES: frozenset[ProductType] = frozenset(
+    {ProductType.FULLY_COLLATERALIZED_BINARY}
 )
 
 
@@ -171,7 +184,7 @@ class Check(Protocol):
     """A pre-trade check: a named callable returning a :class:`CheckResult`.
 
     ``name`` is a read-only property so both a frozen-dataclass field (like
-    :class:`_ExplicitVetoStub`) and a plain class attribute satisfy the
+    :class:`_ReconciliationCheck`) and a plain class attribute satisfy the
     protocol; a bare ``name: str`` would demand a *settable* attribute that a
     frozen check cannot provide.
     """
@@ -367,7 +380,7 @@ def _is_stale(timestamp: int | None, now: int, ttl_seconds: int) -> bool:
     return now - timestamp > ttl_seconds
 
 
-# --- The 23 real checks (SPEC S10.3) ---------------------------------------------
+# --- The 24 real checks (SPEC S10.3) ---------------------------------------------
 
 
 class _InstrumentWhitelist:
@@ -388,6 +401,48 @@ class _InstrumentWhitelist:
         if intent.market_ticker in context.limits.instrument_whitelist:
             return _approve()
         return _veto(f"ticker {intent.market_ticker} not on whitelist")
+
+
+class _JurisdictionProductEligibility:
+    """Veto unless the market is provably jurisdiction- and product-eligible (#340)."""
+
+    name = "jurisdiction_product_eligibility"
+
+    def __call__(self, intent: OrderIntent, context: EvaluationContext) -> CheckResult:
+        """Approve iff the market is proven eligible and a tradable product.
+
+        Absence is checked *first*: an unknown, missing, or unrecognized
+        jurisdiction arrives as ``None`` and can never be read as eligible, so an
+        exchange that publishes no eligibility signal fails closed exactly like a
+        missing quote (SPEC S1.1 invariant 1). Only once eligibility is proven is
+        the product consulted, and only a fully collateralized binary
+        (:data:`_TRADABLE_PRODUCT_TYPES`) approves -- SPEC S6.2 forbids a live
+        order on a non-eligible market, and SPEC S1.1 invariant 2 forbids any
+        other product shape.
+
+        This check deliberately does not *alert* on an unknown jurisdiction.
+        Checks are pure ``(intent, context) -> CheckResult`` callables with no
+        emitter, and the SPEC S6.2 alert duty is already discharged upstream at
+        the preflight and verification layers; raising it here would break
+        :func:`evaluate_intent`'s purity for all 24 checks and triple-alert.
+
+        Args:
+            intent: The order intent (unused -- eligibility is a property of the
+                market, not of the order).
+            context: The evaluation context supplying the market view.
+
+        Returns:
+            A veto naming which datum was unprovable or disqualifying, else an
+            approval.
+        """
+        del intent
+        if context.market.jurisdiction_status is None:
+            return _veto("jurisdiction eligibility unknown or missing")
+        if context.market.jurisdiction_status is not JurisdictionStatus.ELIGIBLE:
+            return _veto("market not jurisdiction-eligible")
+        if context.market.product_type not in _TRADABLE_PRODUCT_TYPES:
+            return _veto("product not provably a fully collateralized binary")
+        return _approve()
 
 
 class _ModePermissionCeiling:
@@ -1089,55 +1144,6 @@ _RECONCILIATION_CHECKS: tuple[_ReconciliationCheck, ...] = (
 )
 
 
-# --- The 1 deliberate stub (blocked on awaited metadata) --------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class _ExplicitVetoStub:
-    """A stub check that vetoes with a fixed reason naming its blocking issue.
-
-    Attributes:
-        name: The SPEC S10.3 check name this stub stands in for.
-        reason: The veto reason, naming the issue that will replace the stub.
-    """
-
-    name: str
-    reason: str
-
-    def __call__(self, intent: OrderIntent, context: EvaluationContext) -> CheckResult:
-        """Veto unconditionally with this stub's blocking-issue reason.
-
-        Args:
-            intent: The order intent (unused by the stub).
-            context: The evaluation context (unused by the stub).
-
-        Returns:
-            A vetoing :class:`CheckResult` carrying :attr:`reason`.
-        """
-        del intent, context  # No real logic yet; the veto is constant.
-        return _veto(self.reason)
-
-
-#: The stub checks paired with their blocking-issue veto reasons, naming the
-#: issue that will replace each one. Only ``jurisdiction_product_eligibility``
-#: remains a stub; it has no tracking issue yet and instead names the metadata
-#: it awaits. (Issue #31 promoted ``approval_token_uniqueness`` /
-#: ``idempotency_key_uniqueness`` out of this table into real checks; issue #32
-#: promoted ``balance_reconciliation`` / ``position_reconciliation`` /
-#: ``open_order_reconciliation`` out too; issue #110 promoted
-#: ``exchange_status_ok`` / ``pipeline_heartbeat_ok`` out as well.) Held as a
-#: tuple of pairs (not a dict literal) so a future ``token``/``key``-named entry
-#: could never sit as a string-valued literal dict key -- a shape bandit's B105
-#: heuristic misreads as a hardcoded credential; the runtime lookup dict is
-#: built below.
-_STUB_REASON_ITEMS: tuple[tuple[str, str], ...] = (
-    ("jurisdiction_product_eligibility", "awaiting NormalizedMarket metadata"),
-)
-
-#: Each stub check's name mapped to its blocking-issue veto reason.
-_STUB_REASONS: dict[str, str] = dict(_STUB_REASON_ITEMS)
-
-
 # --- Assembly: the pinned SPEC S10.3 sequence ------------------------------------
 
 
@@ -1169,9 +1175,10 @@ _SPEC_10_3_CHECK_NAMES: tuple[str, ...] = (
     "reduce_only_provable",
 )
 
-#: The 23 real checks, keyed by SPEC S10.3 name for order-independent assembly.
+#: The 24 real checks, keyed by SPEC S10.3 name for order-independent assembly.
 _REAL_CHECKS: tuple[Check, ...] = (
     _InstrumentWhitelist(),
+    _JurisdictionProductEligibility(),
     _ModePermissionCeiling(),
     _FloorInvariant(),
     *_RECONCILIATION_CHECKS,
@@ -1194,16 +1201,10 @@ _REAL_CHECKS: tuple[Check, ...] = (
     _ReduceOnlyProvable(),
 )
 
-#: The 1 stub check, keyed by SPEC S10.3 name, vetoing with its reason.
-_STUB_CHECKS: tuple[Check, ...] = tuple(
-    _ExplicitVetoStub(name, reason) for name, reason in _STUB_REASONS.items()
-)
 
-#: Name-to-check lookup spanning all 24 checks (23 real, 1 stub); the pinned
+#: Name-to-check lookup spanning all 24 checks; the pinned
 #: :data:`_SPEC_10_3_CHECK_NAMES` sequence selects and orders them.
-_CHECK_BY_NAME: dict[str, Check] = {
-    check.name: check for check in (*_REAL_CHECKS, *_STUB_CHECKS)
-}
+_CHECK_BY_NAME: dict[str, Check] = {check.name: check for check in _REAL_CHECKS}
 
 #: The default pre-trade check sequence, in exact SPEC S10.3 order.
 DEFAULT_CHECKS: tuple[Check, ...] = tuple(

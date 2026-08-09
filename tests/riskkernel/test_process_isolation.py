@@ -453,9 +453,8 @@ def test_risk_kernel_evaluate_intent_records_one_intent_vetoed_event() -> None:
     (component "riskkernel", schema version 1, payload carrying the intent id
     and reasons) and returns a `Decision` marked both vetoed and ledgered.
 
-    A fully-permissive context (see `tests/riskkernel/conftest.py`) still
-    vetoes overall: 1 of the 24 SPEC S10.3 checks remains a deliberate stub
-    (`jurisdiction_product_eligibility`, awaiting its metadata source).
+    The veto is sourced from a real dimension -- an unknown jurisdiction --
+    because since issue #340 a fully-permissive context approves outright.
     """
     kernel = RiskKernel.for_testing()
     intent = _make_intent()
@@ -484,13 +483,11 @@ def test_risk_kernel_evaluate_intent_records_intent_approved_when_not_vetoed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the check pipeline approves an intent (no veto), the kernel ledgers
-    exactly one `IntentApproved` event and never a mislabeled `IntentVetoed`.
+        exactly one `IntentApproved` event and never a mislabeled `IntentVetoed`.
 
-    1 of the 24 SPEC S10.3 checks remains a deliberate stub
-    (`jurisdiction_product_eligibility`), so no real context ever
-    produces a fully-approving decision yet; the approving pipeline is
-    stubbed here so the audit trail's correctness is pinned before that
-    remaining logic lands, not rediscovered as a ledger bug after.
+    Since issue #340 promoted the last SPEC S10.3 check, a permissive
+        context genuinely reaches this branch, so the approving path is exercised
+        end-to-end rather than through a stubbed pipeline.
     """
     from windbreak.riskkernel import checks as checks_module
 

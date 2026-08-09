@@ -56,16 +56,19 @@ from windbreak.riskkernel.modes import Mode
 if TYPE_CHECKING:
     from pathlib import Path
 
-#: The four veto reasons a PAPER-mode evaluation with `verification=None` must
-#: produce today, in the exact SPEC S10.3 check order
-#: (`windbreak/riskkernel/checks.py::_SPEC_10_3_CHECK_NAMES`): the
-#: `jurisdiction_product_eligibility` stub (position 2) fires before the three
-#: reconciliation checks (positions 5-7, each failing closed on the missing
-#: verification snapshot). `exchange_status_ok` / `pipeline_heartbeat_ok`
-#: (positions 21-22, issue #110) are real checks now and pass here, since
-#: `tests.riskkernel.conftest.make_context`'s defaults are permissive for both.
+#: The three veto reasons a PAPER-mode evaluation with `verification=None` must
+#: produce, in the exact SPEC S10.3 check order
+#: (`windbreak/riskkernel/checks.py::_SPEC_10_3_CHECK_NAMES`): the three
+#: reconciliation checks (positions 5-7), each failing closed on the missing
+#: verification snapshot. Issue #340 removed a fourth reason -- the
+#: `jurisdiction_product_eligibility` stub at position 2 -- by making that check
+#: real; it passes here because `tests.riskkernel.conftest.make_context`'s
+#: defaults supply an eligible jurisdiction and a tradable product.
+#:
+#: This tuple is compared with exact equality on purpose. Never soften it to a
+#: membership check: it is the repo's designated proof of which reasons gate a
+#: PAPER fill, and a membership assertion would silently tolerate a new veto.
 _EXPECTED_VETO_REASONS = (
-    "awaiting NormalizedMarket metadata",
     "balance verification stale or missing",
     "position verification stale or missing",
     "open-order verification stale or missing",
@@ -80,9 +83,9 @@ def test_kernel_approval_vetoes_before_minting_any_token() -> None:
 
     Composes the real `RiskKernel.evaluate_intent` (for the ledgered audit
     event) with the real `ApprovalPipeline.approve` (for the reserve-and-issue
-    path), over an otherwise fully-permissive context (every one of the 23
+    path), over an otherwise fully-permissive context (every one of the 24
     real SPEC S10.3 checks passes -- `tests.riskkernel.conftest.make_context`'s
-    documented guarantee) except `verification=None`. Exactly the four known
+    documented guarantee) except `verification=None`. Exactly the three known
     reasons veto; the pipeline's `approve` is never reached far enough to
     reserve capital or issue a token.
     """
@@ -210,6 +213,7 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         now_epoch_s=DEFAULT_NOW_EPOCH_S,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
     )
 
     assert context.limits.floor == MoneyMicros(42_000_000)
@@ -231,6 +235,7 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         now_epoch_s=DEFAULT_NOW_EPOCH_S,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
     )
 
     assert context.limits.quote_ttl_seconds == 17
@@ -253,6 +258,7 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         now_epoch_s=DEFAULT_NOW_EPOCH_S,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
     )
 
     assert context.verification is None
@@ -277,6 +283,7 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         now_epoch_s=DEFAULT_NOW_EPOCH_S,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
     )
 
     assert context.market.exchange_status is None
@@ -294,6 +301,7 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         now_epoch_s=1_234_567,
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
     )
 
     assert context.now_epoch_s == 1_234_567

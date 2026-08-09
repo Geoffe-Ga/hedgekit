@@ -31,9 +31,9 @@ mirroring the `verification` fail-loud precedent): `exchange_status_ok` fails
 closed (staleness-first) on a missing or stale status via the existing
 `_is_stale` pattern, then vetoes a fresh but non-`OPEN` status (`PAUSED` /
 `CLOSED`); `pipeline_heartbeat_ok` fails closed on a missing or stale
-heartbeat the same way -- so 23 of the 24 SPEC S10.3 checks are now real; the
-remaining 1 (`jurisdiction_product_eligibility`) stays a deliberate stub that
-still vetoes, naming the metadata it awaits.
+heartbeat the same way. Issue #340 promoted the last one,
+`jurisdiction_product_eligibility`, so all 24 SPEC S10.3 checks are now real and
+none is an unconditional veto.
 
 `windbreak/riskkernel/context.py` does not yet declare `used_intent_ids` /
 `used_idempotency_keys` / `verification` / `acknowledged_intent_ids` /
@@ -81,12 +81,17 @@ from windbreak.numeric.types import (
     PricePips,
     ProbabilityPpm,
 )
+from windbreak.riskkernel import checks as checks_module
 from windbreak.riskkernel.checks import (
     DEFAULT_CHECKS,
     CheckResult,
     evaluate_intent,
 )
-from windbreak.riskkernel.context import ExchangeTradingStatus
+from windbreak.riskkernel.context import (
+    ExchangeTradingStatus,
+    JurisdictionStatus,
+    ProductType,
+)
 from windbreak.riskkernel.modes import Mode
 
 if TYPE_CHECKING:
@@ -123,15 +128,14 @@ EXPECTED_CHECK_NAMES: tuple[str, ...] = (
 
 _EXPECTED_CHECK_COUNT = 24
 
-#: The 23 checks now real after issues #30, #31, #32, #34, and #110, in SPEC
-#: S10.3 order. `approval_token_uniqueness` / `idempotency_key_uniqueness` are
-#: the two issue #31 promotes from stub to real logic; `balance_reconciliation`
-#: / `position_reconciliation` / `open_order_reconciliation` are the three
-#: issue #32 promotes; `human_ack_satisfied` is the one issue #34 promotes;
-#: `exchange_status_ok` / `pipeline_heartbeat_ok` are the final two issue #110
-#: promotes.
+#: All 24 checks, now real, in SPEC S10.3 order. Issue #340 promoted the last
+#: one -- `jurisdiction_product_eligibility` -- so this tuple is now identical
+#: to `EXPECTED_CHECK_NAMES`; the two are kept separate deliberately, because
+#: `EXPECTED_CHECK_NAMES` is the guardrail pinning the *order* while this one
+#: names what is backed by real logic.
 REAL_CHECK_NAMES: tuple[str, ...] = (
     "instrument_whitelist",
+    "jurisdiction_product_eligibility",
     "mode_permission_ceiling",
     "floor_invariant",
     "balance_reconciliation",
@@ -155,15 +159,6 @@ REAL_CHECK_NAMES: tuple[str, ...] = (
     "pipeline_heartbeat_ok",
     "reduce_only_provable",
 )
-
-#: The 1 check that remains a deliberate stub after issue #110 --
-#: `jurisdiction_product_eligibility` has no tracking issue yet (a follow-up
-#: to file, not invented here).
-_STUB_ISSUE_NUMBERS: dict[str, int | None] = {
-    "jurisdiction_product_eligibility": None,
-}
-
-STUB_CHECK_NAMES: tuple[str, ...] = tuple(_STUB_ISSUE_NUMBERS)
 
 #: Every check callable, keyed by its own `.name` -- built from each check's
 #: self-reported name (not by zipping against `EXPECTED_CHECK_NAMES`), so a
@@ -221,22 +216,109 @@ class _PassingCheck:
         return CheckResult(vetoed=False, reason="approved")
 
 
+class _VetoingCheck:
+    """A check double that always vetoes, for pipeline-level aggregation tests."""
+
+    name = "vetoing_check"
+
+    def __call__(self, intent: object, context: object) -> CheckResult:
+        """Veto unconditionally.
+
+        Args:
+            intent: Unused; accepted only to match the check-callable shape.
+            context: Unused; accepted only to match the check-callable shape.
+
+        Returns:
+            A vetoing :class:`CheckResult`.
+        """
+        del intent, context
+        return CheckResult(vetoed=True, reason="vetoed")
+
+
+# --- jurisdiction_product_eligibility (issue #340) ---------------------------
+
+
+def test_jurisdiction_product_eligibility_approves_an_eligible_binary() -> None:
+    """An eligible jurisdiction on a fully collateralized binary approves."""
+    result = _real_check("jurisdiction_product_eligibility")(
+        make_intent(),
+        make_context(
+            jurisdiction_status=JurisdictionStatus.ELIGIBLE,
+            product_type=ProductType.FULLY_COLLATERALIZED_BINARY,
+        ),
+    )
+
+    assert result.vetoed is False
+
+
+def test_jurisdiction_product_eligibility_vetoes_an_ineligible_jurisdiction() -> None:
+    """A market proven ineligible is vetoed, with a reason naming why."""
+    result = _real_check("jurisdiction_product_eligibility")(
+        make_intent(), make_context(jurisdiction_status=JurisdictionStatus.INELIGIBLE)
+    )
+
+    assert result.vetoed is True
+    assert result.reason == "market not jurisdiction-eligible"
+
+
+def test_jurisdiction_product_eligibility_fails_closed_on_unknown_jurisdiction() -> (
+    None
+):
+    """An unknown or absent jurisdiction vetoes rather than being read as eligible.
+
+    This is the fail-closed arm (SPEC S1.1 invariant 1) and the one that matters
+    in production: a live Kalshi market carries no eligibility signal at all, so
+    it arrives here as `None`.
+    """
+    result = _real_check("jurisdiction_product_eligibility")(
+        make_intent(), make_context(jurisdiction_status=None)
+    )
+
+    assert result.vetoed is True
+    assert result.reason == "jurisdiction eligibility unknown or missing"
+
+
+def test_jurisdiction_product_eligibility_fails_closed_on_unprovable_product() -> None:
+    """An absent product type vetoes even when the jurisdiction is eligible.
+
+    Ordering matters: the jurisdiction arm is satisfied here, so this can only
+    pass if the product arm is genuinely evaluated (SPEC S1.1 invariant 2).
+    """
+    result = _real_check("jurisdiction_product_eligibility")(
+        make_intent(),
+        make_context(
+            jurisdiction_status=JurisdictionStatus.ELIGIBLE, product_type=None
+        ),
+    )
+
+    assert result.vetoed is True
+    assert result.reason == "product not provably a fully collateralized binary"
+
+
 # --- Sanity on the fixtures themselves -------------------------------------------
 
 
-def test_real_and_stub_name_sets_partition_the_24_spec_names_exactly() -> None:
-    """`REAL_CHECK_NAMES` and `STUB_CHECK_NAMES` are disjoint and together
-    equal the full 24-name SPEC S10.3 set -- protects the taxonomy this whole
-    file's pipeline-level tests assume.
+def test_every_pinned_check_name_is_backed_by_a_real_check() -> None:
+    """No check in the pinned SPEC S10.3 sequence is an unconditional veto.
+
+    Issue #340 promoted the last stub, so the real-name set is now exactly the
+    pinned set. The `hasattr` guards are deliberately attribute-based: they fail
+    if the stub machinery is left behind as an emptied table rather than
+    deleted, which would otherwise pass every other assertion here.
     """
-    assert len(REAL_CHECK_NAMES) == 23
-    assert len(STUB_CHECK_NAMES) == 1
-    assert set(REAL_CHECK_NAMES).isdisjoint(STUB_CHECK_NAMES)
-    assert set(REAL_CHECK_NAMES) | set(STUB_CHECK_NAMES) == set(EXPECTED_CHECK_NAMES)
+    assert REAL_CHECK_NAMES == EXPECTED_CHECK_NAMES
+    assert len(REAL_CHECK_NAMES) == _EXPECTED_CHECK_COUNT
+    for dead in (
+        "_ExplicitVetoStub",
+        "_STUB_REASON_ITEMS",
+        "_STUB_REASONS",
+        "_STUB_CHECKS",
+    ):
+        assert not hasattr(checks_module, dead), f"{dead} survived the stub deletion"
 
 
 def test_make_context_defaults_make_every_real_check_pass() -> None:
-    """`make_context()` paired with `make_intent()` passes all 23 real
+    """`make_context()` paired with `make_intent()` passes all 24 real
     checks -- the load-bearing fixture assumption every per-check boundary
     test below relies on to isolate its one overridden field.
     """
@@ -1884,37 +1966,21 @@ def test_default_checks_names_match_spec_10_3_exactly_in_order() -> None:
     assert tuple(check.name for check in DEFAULT_CHECKS) == EXPECTED_CHECK_NAMES
 
 
-def test_default_checks_over_permissive_context_leaves_only_stubs_vetoing() -> None:
-    """Given `make_intent()`/`make_context()` (tuned so every real check
-    passes), `evaluate_intent` is still vetoed -- but with exactly the 1 stub
-    reason, naming the metadata it awaits. This is the test that proves which
-    23 checks are now real.
+def test_default_checks_over_a_permissive_context_approves() -> None:
+    """A fully permissive context now clears all 24 checks with no veto.
+
+    This is the direct negation of the pre-#340 state: while
+    `jurisdiction_product_eligibility` vetoed unconditionally, no context of any
+    kind could produce an approving decision, so the Risk Kernel could never
+    approve an intent in any mode.
     """
     intent = make_intent()
     context = make_context()
 
     decision = evaluate_intent(intent, context)
 
-    assert decision.vetoed is True
-    stub_positions = [name for name in EXPECTED_CHECK_NAMES if name in STUB_CHECK_NAMES]
-    assert len(stub_positions) == 1
-    assert len(decision.reasons) == 1
-    for reason, name in zip(decision.reasons, stub_positions, strict=True):
-        issue_number = _STUB_ISSUE_NUMBERS[name]
-        if issue_number is None:
-            assert reason
-        else:
-            assert f"#{issue_number}" in reason, f"{name}: {reason!r}"
-
-
-@pytest.mark.parametrize("name", STUB_CHECK_NAMES)
-def test_each_stub_check_still_vetoes_a_valid_intent(name: str) -> None:
-    """Called directly, every stub check still vetoes over a fully
-    permissive context -- issues #30/#31/#32/#34/#110 together promote 23 of
-    the 24 checks to real logic."""
-    result = _real_check(name)(make_intent(), make_context())
-
-    assert result.vetoed is True
+    assert decision.vetoed is False
+    assert decision.reasons == ()
 
 
 def test_evaluate_intent_fail_closed_converts_a_raised_exception_to_a_veto() -> None:
@@ -1936,11 +2002,7 @@ def test_evaluate_intent_omits_reasons_for_checks_that_pass() -> None:
     """A non-vetoing check contributes no reason; only vetoing checks do."""
     intent = make_intent()
     context = make_context()
-    checks = (
-        _PassingCheck(),
-        _real_check("jurisdiction_product_eligibility"),
-        _PassingCheck(),
-    )
+    checks = (_PassingCheck(), _VetoingCheck(), _PassingCheck())
 
     decision = evaluate_intent(intent, context, checks=checks)
 

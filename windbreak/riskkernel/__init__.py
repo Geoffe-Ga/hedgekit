@@ -32,7 +32,9 @@ from windbreak.riskkernel.context import (
     EvaluationContext,
     ExchangeTradingStatus,
     FeeBounds,
+    JurisdictionStatus,
     MarketView,
+    ProductType,
     RiskLimits,
 )
 from windbreak.riskkernel.demotion import (
@@ -157,6 +159,7 @@ __all__ = [
     "HumanAckQueue",
     "IllegalModeTransitionError",
     "InMemoryKernelLedgerWriter",
+    "JurisdictionStatus",
     "KernelLedgerWriter",
     "KillFileWatcher",
     "KillIntegration",
@@ -175,6 +178,7 @@ __all__ = [
     "OverrideAcknowledgementError",
     "PendingFloorLower",
     "PendingHumanAck",
+    "ProductType",
     "PromotionDecision",
     "PromotionGate",
     "ReconciliationMismatchMonitor",
