@@ -157,6 +157,10 @@ from windbreak.scheduler.eligibility import (
     project_jurisdiction,
     project_product_type,
 )
+from windbreak.scheduler.fill_accounting import (
+    LedgerFillAccountingFeed,
+    LedgerFillBookkeeper,
+)
 from windbreak.scheduler.weekly_data import weekly_report_body
 from windbreak.selector import select
 from windbreak.selector.types import (
@@ -1149,6 +1153,11 @@ class PaperTickDeps:
             the verification path structurally cannot trade (SPEC S1.1
             invariant 3), even though it watches the very exchange this loop
             fills against.
+        fill_bookkeeper: Books each of the exchange's executions into the ledger
+            exactly once, so the verification cycle's expectation can advance
+            from ledgered evidence instead of freezing at process start and
+            halting on the first fill (issue #365). Paired by component label
+            with the feed :func:`_build_verifier` wires.
         gateway: The recovered Order Gateway submissions route through.
         reconciler: The bounded reconciler run to fixpoint after a fill.
         approval: The approval seam intents are decided through.
@@ -1189,6 +1198,7 @@ class PaperTickDeps:
     store: SqliteLedgerStore
     exchange: PaperExchange
     verification_view: ReadOnlyVenueView
+    fill_bookkeeper: LedgerFillBookkeeper
     gateway: OrderGateway
     reconciler: Reconciler
     approval: ApprovalSeam
@@ -1291,14 +1301,41 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
     later cycle compares a live, moving observation against that fixed
     baseline -- a comparison that can, and on any real fill does, fail.
 
-    The consequence is deliberate and load-bearing: once a PAPER order fills,
-    the venue has moved away from the only baseline the ledger can justify
-    (fills are not ledgered with amounts, so no ledgered fact can update it),
-    the next cycle grades a ``BREACH``, and the kernel HALTs per issue #32.
-    That is the fail-closed answer to "our books cannot explain the venue", not
-    an accident of wiring -- and it is strictly better than the alternative of
-    re-reading the expectation off the same connector every cycle, which would
-    make all three dimensions structurally incapable of failing.
+    That baseline no longer stays frozen for the life of the process. Until
+    issue #365 it did, and the consequence was that the first PAPER fill moved
+    the venue away from the only baseline the ledger could justify -- fills were
+    not ledgered with amounts, so no ledgered fact could update it -- the next
+    cycle graded ``BREACH``, the kernel HALTed per issue #32, and only a restart
+    cleared it. An always-on PAPER deployment could not survive its own first
+    fill.
+
+    A :class:`~windbreak.scheduler.fill_accounting.LedgerFillAccountingFeed`
+    now advances it from *ledgered evidence*. The paired
+    :class:`~windbreak.scheduler.fill_accounting.LedgerFillBookkeeper` books
+    each execution once, durably, into this same hash chain, and the feed hands
+    those entries to the expectation. Two composition-time decisions live here,
+    both deliberate:
+
+    * **Which component is trusted.** The feed accepts only bookings stamped
+      ``_COMPONENT`` -- this loop's own. In the PAPER deployment the scheduler
+      *is* the account's bookkeeper, so declaring it here is the honest form of
+      that trust; the alternative, letting the kernel fold whatever
+      ``FillAccounted`` rows a shared ``ledger`` volume happens to carry, is
+      exactly the cross-process contamination
+      ``_own_component_events`` was written to stop.
+    * **Where the cursor starts.** At the chain head *as of this call*, which is
+      the ledger position the baseline above was captured over. Entries booked
+      by an earlier process are already reflected in that baseline -- a fresh
+      ``PaperExchange`` opens flat -- so folding them again would advance the
+      expectation past cash the venue never moved.
+
+    This is not the issue #352 tautology returning. A booked entry is frozen at
+    execution and describes one discrete movement; the observation is the
+    venue's live *aggregate*. A venue that moves by anything the books cannot
+    explain -- an unbooked fill, a settlement, a retired resting order -- still
+    diverges and still halts. Only the explained part is absorbed. Re-reading
+    the expectation off the same connector each cycle, by contrast, would make
+    all three dimensions structurally incapable of failing.
 
     The tolerances come from ``config.risk`` (both default to ``0``: exact
     match). The dispatcher fans mismatch and unknown-jurisdiction alerts out
@@ -1317,9 +1354,15 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
         The composed :class:`~windbreak.riskkernel.verification.ReadOnlyVerifier`.
     """
     history = events_from_records(store.read_all())
+    head = store.head()
+    feed = LedgerFillAccountingFeed(
+        store,
+        component=_COMPONENT,
+        after_sequence=0 if head is None else head.sequence_number,
+    )
     return ReadOnlyVerifier(
         connector=view,
-        expectation_source=LedgerExpectationSource(history, view),
+        expectation_source=LedgerExpectationSource(history, view, fill_accounting=feed),
         tolerances=VerificationTolerances(
             balance_tolerance=MoneyMicros(
                 config.risk.verification_balance_tolerance_micros
@@ -1676,6 +1719,11 @@ def build_paper_deps(
     # exposes `place_order`/`cancel_order` alongside its reads, and the
     # read-only cycle must not be able to reach them (SPEC S1.1 invariant 3).
     verification_view = ReadOnlyConnectorView(exchange)
+    # Books each execution into the ledger exactly once, under this loop's own
+    # component -- the label `_build_verifier`'s feed is told to trust. The
+    # bookkeeper is built before the verifier so no execution can slip between
+    # the baseline capture and the first booking (issue #365).
+    fill_bookkeeper = LedgerFillBookkeeper(store, exchange, component=_COMPONENT)
     approval, kernel = _build_approval(
         store, config, key, verification_view, resolved_clock
     )
@@ -1692,6 +1740,7 @@ def build_paper_deps(
         store=store,
         exchange=exchange,
         verification_view=verification_view,
+        fill_bookkeeper=fill_bookkeeper,
         gateway=gateway,
         reconciler=reconciler,
         approval=approval,
@@ -2362,9 +2411,24 @@ def _verification_stage(deps: PaperTickDeps) -> None:
     holding -- is graded a forced breach there rather than escaping as an
     exception, so an unobservable venue halts instead of killing the tick.
 
+    Every execution the venue has reported is booked into the ledger first
+    (issue #365), so the expectation the cycle diffs against has already
+    absorbed the fills the ledger can explain. Booking here rather than beside
+    the routing call catches fills from *every* source -- a taker walk on a
+    placed order and a resting order filled by ``PaperExchange.advance`` alike
+    -- and does it at the one moment the answer is needed. Booking is
+    idempotent on the venue's fill id, so re-entering this stage never advances
+    the expectation past cash the venue moved once.
+
+    The booking reads the venue's *execution reports*; the cycle reads the
+    venue's *aggregate* balances and positions. Those are different questions,
+    which is why the comparison can still fail -- see
+    :class:`~windbreak.riskkernel.verification.LedgerExpectationSource`.
+
     Args:
         deps: The tick's dependency bundle.
     """
+    deps.fill_bookkeeper.book_new()
     deps.kernel.run_verification_cycle()
 
 

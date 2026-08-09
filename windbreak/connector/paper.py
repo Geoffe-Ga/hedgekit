@@ -934,6 +934,34 @@ class PaperExchange:
             for fill in self._fills
         )
 
+    def fill_cash_micros(self, fill: Fill) -> MoneyMicros:
+        """Return the cash ``fill`` moved out of the account, in micros.
+
+        The per-fill half of the exact arithmetic :meth:`_cash_spent_micros`
+        folds across the whole fill log, exposed rather than left for a caller
+        to re-derive. Ledgered fill accounting (issue #365) books this figure at
+        execution so the Risk Kernel's reconciliation expectation can advance
+        from ledgered evidence; a bookkeeper reimplementing book-cost-plus-fee
+        would drift from this class the first time either rounding rule moved,
+        and a bookkeeping drift is indistinguishable from the real venue
+        divergence verification exists to catch.
+
+        The figure is a positive magnitude, not a signed movement: every paper
+        fill is an acquisition (a close of a YES holding is a *buy* on the NO
+        side), so the direction is a property of the account convention the
+        booking layer owns, not of the venue.
+
+        Args:
+            fill: The executed fill to price.
+
+        Returns:
+            The fill's book cost plus the venue's worst-case trading fee, in
+            micros.
+        """
+        return MoneyMicros(
+            self._order_cash_micros(fill.ticker, fill.price, fill.quantity)
+        )
+
     def _reserved_micros(self) -> int:
         """Return the cash this exchange's resting orders have pledged, in micros.
 
