@@ -50,13 +50,24 @@
 
 | Metric | Threshold | Tool |
 |--------|-----------|------|
-| **Code Coverage** | ≥90% | pytest-cov |
-| **Branch Coverage** | ≥85% | pytest-cov |
+| **Code Coverage** | ≥90%, over line **and** branch outcomes combined | pytest-cov |
+| **Branch Coverage** | measured (`branch = true`) and folded into the ≥90% figure above — there is no second floor | pytest-cov |
 | **Docstring Coverage** | 100% of public symbols (ruff `D1`) | ruff |
 | **Mutation Score** | ≥80% (manual pre-v1.0.0 gate, not automated) | mutmut |
-| **Cyclomatic Complexity** | ≤10 per function | radon |
-| **Pylint Score** | ≥9.0 | pylint |
+| **Cyclomatic Complexity** | ≤10 per function (xenon `--max-absolute B`) | xenon |
 | **Security Vulnerabilities** | 0 critical/high | bandit, pip-audit |
+
+Every row above is verified by `tests/toolchain/test_quality_standards_table.py`,
+which reads this table and fails if a row names a tool the repo does not pin or a
+threshold it does not configure. A row that cannot fail is worse than no row: it
+is believed. Issue #411 removed one such row after it had been quoted as a hard
+constraint in agent briefs.
+
+**Linting is ruff's remit alone.** No second linter is installed, pinned, or run;
+`pyproject.toml` records which rule families are selected, which are deliberately
+not, and why. Beyond the table, code quality is enforced by ruff (lint + format,
+ADR-0002), mypy strict, import-linter, vulture, and the whole pre-commit hook set
+via `scripts/precommit.sh` (issue #401).
 
 ---
 

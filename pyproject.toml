@@ -172,6 +172,58 @@ ignore = []
 # reflowing 1,667 docstrings would bury this change. Tracked as a follow-up
 # (see the PR for issue #351) rather than silenced: nothing here suppresses a
 # finding the documented gate asks for.
+# WHY THERE IS NO SECOND LINTER, AND WHY `PL` IS NOT SELECTED (issue #411)
+#
+# CLAUDE.md's Quality Standards table used to assert `Pylint Score >= 9.0`.
+# Pylint was in no pin, no requirements file, no pre-commit hook and no gate
+# script; it was not importable and had no pinned version anywhere. The row was
+# decoration -- the fourth instance of that defect class found in the gate
+# machinery itself, after #359, #401 and #351 -- and the worst-behaved, because
+# ">=9.0 pylint" was quoted as a hard constraint in agent briefs written from
+# the table. The row is gone. Two reasons it was not wired instead:
+#
+# 1. THE SCORE IS NOT A QUALITY PROPERTY. Pylint's 10-point score is a weighted
+#    aggregate over its own message counts, normalised by statement count. No
+#    other tool computes it, so the number is unreproducible except by adopting
+#    pylint wholesale. Worse, unlike every other row in that table -- each a
+#    floor or a per-item obligation -- a score threshold is a TOLERANCE: a
+#    codebase can sit at 9.2 with any individual defect present indefinitely,
+#    and can lose the gate by growing rather than by regressing. That is the
+#    opposite of how this repo gates, which is per-rule and absolute.
+#
+# 2. RUFF ALREADY IMPLEMENTS PYLINT'S RULES. They ship natively as the `PL`
+#    family (PLC/PLE/PLR/PLW). So the choice was never "pylint or no pylint
+#    checks"; it was "select PL, or not" -- and installing pylint would add a
+#    second, separately-versioned opinion on rules the pinned linter already
+#    has. This is the same call PR #409 made in declining pydocstyle and
+#    interrogate when ruff already implemented the `D` family, and the same
+#    instinct as ADR-0002's single formatter authority.
+#
+# WHAT SELECTING `PL` WOULD COST, MEASURED, NOT GUESSED
+#
+# `ruff check --select PL` over windbreak/, scripts/ and tests/ reports 1,919
+# findings. The distribution is the argument:
+#
+#   886  PLR2004  magic-value-comparison      (overwhelmingly test assertions)
+#   840  PLC0415  import-outside-top-level    (deliberate: deferred imports)
+#   173  PLR0913  too-many-arguments
+#     9  PLC0414  useless-import-alias
+#     4  PLR0402  manual-from-import
+#     2  PLR0911  too-many-return-statements
+#     2  PLW0108  unnecessary-lambda
+#     1  each     PLC0207, PLR0915, PLR1714
+#
+# The `PLE` tier -- pylint's ERROR class, the findings that indicate a genuine
+# defect rather than a style preference -- is EMPTY. What remains is either a
+# style question (PLR2004 against test literals, PLC0415 against imports this
+# codebase defers on purpose) or a complexity opinion that overlaps the xenon
+# ceiling already enforced by scripts/complexity.sh (PLR0913/PLR0911/PLR0915).
+#
+# So there is no pylint-only correctness gap here, and the ~30 non-duplicated
+# nits (PLC0414, PLR0402, PLW0108, PLC0207, PLR1714) are worth a follow-up on
+# their own merits -- not worth carrying a phantom score threshold for. They
+# are tracked as a follow-up rather than silenced: nothing here suppresses a
+# finding any documented gate asks for.
 [tool.ruff.lint.pydocstyle]
 # CLAUDE.md's "Docstring Style (Google Format)" section is the house standard,
 # so the convention is declared even though no D1xx rule is convention-

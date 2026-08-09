@@ -8,14 +8,28 @@
 
 All code must meet these standards before merging to main:
 
+> Every threshold in this section is one a tool in the pinned toolchain
+> actually computes. `tests/toolchain/test_quality_standards_table.py` holds
+> the summary table in [CLAUDE.md](../../CLAUDE.md) to that rule and fails if a
+> row names an unpinned tool or an unconfigured number. Do not add a
+> requirement here that nothing measures — issue #411 removed one after it had
+> been quoted as a hard constraint in fifteen agent briefs.
+
 ### Test Coverage
-- **Code Coverage**: 90% minimum (branch coverage)
-- **Docstring Coverage**: 95% minimum (pydocstyle / ruff D rules)
+- **Code Coverage**: 90% minimum, computed over line *and* branch outcomes
+  combined (`branch = true` plus `--cov-fail-under=90`). Branch coverage has no
+  separate floor: it is folded into this single figure, which makes the 90%
+  stricter than a line-only 90% because uncovered branches drag it down.
+- **Docstring Coverage**: 100% of public symbols, enforced per symbol by ruff
+  `D1` (issue #351). Not a percentage — there is no fraction of symbols
+  permitted to lose their docstrings.
 - **Mutation Score**: 80% minimum (mutmut) — **manual pre-v1.0.0 release gate,
   NOT an automated check**. Run on demand via `./scripts/mutation.sh` or the
   `mutation-gate.yml` workflow; enforced before shipping v1.0.0 (owner
   directive, issue #107), never on push/PR/pre-commit.
-- **Test Types**: Unit, Integration, and E2E coverage required
+- **Test Types**: unit suites per package, plus `tests/integration/`,
+  Hypothesis property tests where behaviour is law-like, and
+  `tests/toolchain/` for the gates themselves
 
 ### Type Checking
 - **MyPy**: Strict mode, no `# type: ignore` without justification
@@ -23,19 +37,31 @@ All code must meet these standards before merging to main:
 - **Generic Types**: Use for collections (List, Dict, etc.)
 
 ### Code Complexity
-- **Cyclomatic Complexity**: Max 10 per function
-- **Maintainability Index**: Minimum 20 (radon)
+
+**Gated** — `scripts/complexity.sh`, dispatched by Gate 1:
+- **Cyclomatic Complexity**: max 10 per function, enforced by xenon
+  `--max-absolute B` (radon's B grade is CC 6–10). xenon is the enforcing half
+  of that script; the `radon cc` / `radon mi` calls above it run with `|| true`
+  and only report.
+
+**Guidance, not gated** — write to these, but no tool fails a build over them.
+Listing them as requirements while nothing measured them is what issue #411
+was filed about, so they are labelled rather than deleted:
+- **Maintainability Index**: aim ≥20; `radon mi` reports it, nothing enforces it
 - **Max Arguments**: 5 per function
 - **Max Branches**: 12 per function
 - **Max Lines per Function**: 50 lines
 
 ### Linting and Formatting
-- **Ruff**: ALL rules enabled (no exceptions unless documented)
-- **Black**: Line length 88 characters
-- **isort**: Import sorting per configuration
-- **Pylint**: Score of 9.0+ required
-- **Bandit**: Security scanning with zero exceptions
-- **Safety**: Dependency vulnerability checking
+- **Ruff**: the single lint *and* format authority (ADR-0002). A curated
+  `select` list, not "all rules" — `pyproject.toml` records which families are
+  enabled, which are deliberately not, and why. No second linter is installed,
+  pinned, or run; ruff already reimplements the rule sets the alternatives
+  offer.
+- **Mypy**: strict mode across `windbreak/` and `scripts/`
+- **Bandit**: security scanning with zero exceptions
+- **Pip-audit**: dependency vulnerability scanning, run as a module of the
+  pinned interpreter
 
 ### Documentation Standards
 - **Google-style Docstrings**: All public APIs
