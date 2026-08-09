@@ -1,29 +1,40 @@
-"""Project venue fills into ledgered accounting entries (issue #365).
+"""Project venue executions into ledgered accounting entries (issues #365, #390).
 
 The Risk Kernel never imports connector types (SPEC S5 Process-B trust
-boundary), so it cannot read a :class:`~windbreak.connector.models.Fill`. The
-scheduler is the composition layer permitted to see both sides -- the same role
+boundary), so it cannot read a :class:`~windbreak.connector.models.Fill` or an
+:class:`~windbreak.connector.models.OpenOrder`. The scheduler is the composition
+layer permitted to see both sides -- the same role
 :mod:`windbreak.scheduler.eligibility` plays for market metadata -- and this
-module is the one-way translation it performs for executions: a venue ``Fill``
-in, a hash-chained :class:`~windbreak.ledger.events.FillAccounted` entry out,
-and from there only ``int``/``str`` payload leaves reach
+module is the one-way translation it performs for order activity: a venue
+``Fill`` or a venue order arrival in, a hash-chained
+:class:`~windbreak.ledger.events.FillAccounted` or
+:class:`~windbreak.ledger.events.RestingOrderAccounted` entry out, and from there
+only ``int``/``str`` payload leaves reach
 :class:`~windbreak.riskkernel.verification.LedgerExpectationSource`.
 
 Why book at all. The kernel's reconciliation baseline is frozen at process
 start, which is what keeps the comparison falsifiable rather than the issue #352
 tautology of grading the venue against itself. Frozen forever, though, the first
 real fill moved the venue off that baseline permanently and the kernel HALTed
-until a restart. Booking each execution once, durably, gives the expectation
-something to advance *from* that is not the connector: the entry is written at
-execution and never rewritten, while the observation stays the venue's live
-aggregate. A venue that moves by anything other than what was booked still
-diverges and still halts.
+until a restart; and the first order left resting did the same to the open-order
+dimension. Booking each execution and each arrival once, durably, gives the
+expectation something to advance *from* that is not the connector: the entry is
+written at the moment it happens and never rewritten, while the observation
+stays the venue's live aggregate. A venue that moves by anything other than what
+was booked still diverges and still halts.
+
+What is booked is always a *discrete report* -- an execution, or an order's
+arrival on the resting book -- never the account's aggregate state. That is the
+whole safety property. Booking ``get_open_orders`` instead of arrivals would
+mirror the very view the cycle then compares against, and the open-order check
+could never fail.
 
 Two halves:
 
 * :class:`LedgerFillBookkeeper` -- the write side. Books each fill exactly once,
-  keyed on the venue's own fill id, so a re-polled execution report can never be
-  double-booked into cash the venue only moved once.
+  keyed on the venue's own fill id, and each order arrival exactly once, keyed
+  on the venue's own order id, so a re-polled report can never be double-booked
+  into cash the venue only moved once or an order it only rested once.
 * :class:`LedgerFillAccountingFeed` -- the read side, and where the trust
   decision lives. The kernel is handed only entries stamped by the component the
   composition root names as this account's bookkeeper, starting after the chain
@@ -42,13 +53,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
-from windbreak.ledger.events import FillAccounted
+from windbreak.ledger.events import FillAccounted, RestingOrderAccounted
 from windbreak.ledger.store import events_from_records
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from windbreak.connector.models import Fill
+    from windbreak.connector.models import Fill, OpenOrder
     from windbreak.ledger.events import Event
     from windbreak.ledger.store import LedgerRecord
     from windbreak.numeric.types import MoneyMicros
@@ -56,6 +67,17 @@ if TYPE_CHECKING:
 #: The ledger ``event_type`` booked entries carry, matched verbatim by the
 #: kernel's fold. It is the class name, as for every typed event.
 _FILL_ACCOUNTED_EVENT_TYPE = "FillAccounted"
+
+#: The ledger ``event_type`` booked order arrivals carry (issue #390).
+_RESTING_ORDER_ACCOUNTED_EVENT_TYPE = "RestingOrderAccounted"
+
+#: Every entry kind the feed hands the kernel, and therefore every kind the
+#: kernel's fold must know how to apply. Anything else on the seam is a gap in
+#: the books, never a row to skip.
+_ACCOUNTING_EVENT_TYPES: tuple[str, ...] = (
+    _RESTING_ORDER_ACCOUNTED_EVENT_TYPE,
+    _FILL_ACCOUNTED_EVENT_TYPE,
+)
 
 #: An instant no real fill can precede, used as the ``get_fills`` lower bound.
 #: The bookkeeper deliberately re-reads the venue's whole fill log every call
@@ -68,13 +90,15 @@ _EPOCH_FLOOR = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class FillSource(Protocol):
-    """The venue seam the bookkeeper reads executions and their cost through.
+    """The venue seam the bookkeeper reads order activity through.
 
-    Both methods describe *executions*, never the account's aggregate state:
-    :meth:`get_fills` is the venue's execution report and
-    :meth:`fill_cash_micros` is what that one execution cost, fee included. The
-    account's balances and positions are read by the verification cycle,
-    separately and later, which is what keeps the two sides independent.
+    Every method describes a *discrete report*, never the account's aggregate
+    state: :meth:`get_fills` is the venue's execution report,
+    :meth:`fill_cash_micros` is what one execution cost fee included, and
+    :meth:`get_rested_orders` is the log of orders that came to rest. The
+    account's balances, positions, and live resting book are read by the
+    verification cycle, separately and later, which is what keeps the two sides
+    independent.
     """
 
     def get_fills(self, since: datetime) -> tuple[Fill, ...]:
@@ -97,6 +121,20 @@ class FillSource(Protocol):
         Returns:
             The positive magnitude of the cash the fill consumed, book cost plus
             the fee charged on it.
+        """
+        ...
+
+    def get_rested_orders(self) -> tuple[OpenOrder, ...]:
+        """Return the append-only log of orders that came to rest.
+
+        An *arrival report*, not the account's live resting book: an order that
+        later fills or is cancelled leaves ``get_open_orders`` but never leaves
+        this log. Booking arrivals rather than mirroring the live book is what
+        keeps the open-order dimension falsifiable (issue #390); see
+        :meth:`~windbreak.connector.paper.PaperExchange.get_rested_orders`.
+
+        Returns:
+            The orders that came to rest, in arrival order.
         """
         ...
 
@@ -154,12 +192,12 @@ def _position_delta_centis(fill: Fill) -> int:
 
 
 class LedgerFillBookkeeper:
-    """Books each of an account's venue fills into the ledger exactly once.
+    """Books an account's fills and order arrivals into the ledger, once each.
 
-    The de-duplication set is per-process and per-instance, which is the correct
-    scope: the feed's cursor starts at the chain head the expectation's baseline
-    was captured over, so entries booked by an earlier process are already
-    reflected in that baseline and are never folded again.
+    The de-duplication sets are per-process and per-instance, which is the
+    correct scope: the feed's cursor starts at the chain head the expectation's
+    baseline was captured over, so entries booked by an earlier process are
+    already reflected in that baseline and are never folded again.
     """
 
     def __init__(
@@ -179,12 +217,56 @@ class LedgerFillBookkeeper:
         self._venue = venue
         self._component = component
         self._booked: set[str] = set()
+        self._booked_orders: set[str] = set()
 
     def book_new(self) -> int:
+        """Book every arrival and execution not yet booked, and count them.
+
+        Arrivals are booked *before* executions, and that order is load-bearing:
+        the kernel's fold draws a named resting order down by the fill that
+        consumed it, so an arrival landing after its own fill would present as a
+        fill naming an order the expectation has never held -- an unexplained
+        gap that latches the advance off. Within one call the venue's arrival
+        log is always at least as complete as its fill log, because an order
+        must rest before anything can fill against it.
+
+        Returns:
+            The number of entries appended; ``0`` when nothing new happened.
+        """
+        return self._book_arrivals() + self._book_fills()
+
+    def _book_arrivals(self) -> int:
+        """Book every order that has come to rest since the last call.
+
+        The whole arrival log is re-read and de-duplicated on the venue's order
+        id, exactly as :meth:`_book_fills` de-duplicates on the fill id: the log
+        is small, and an id key cannot silently drop entries the way a timestamp
+        cursor can.
+
+        Returns:
+            The number of arrival entries appended.
+        """
+        booked = 0
+        for order in self._venue.get_rested_orders():
+            if order.id in self._booked_orders:
+                continue
+            self._writer.append(
+                RestingOrderAccounted(
+                    component=self._component,
+                    venue_order_id=order.id,
+                    ticker=order.ticker,
+                    resting_quantity_centis=order.quantity.value,
+                )
+            )
+            self._booked_orders.add(order.id)
+            booked += 1
+        return booked
+
+    def _book_fills(self) -> int:
         """Book every execution not yet booked, and return how many were.
 
         Returns:
-            The number of entries appended; ``0`` when nothing new executed.
+            The number of fill entries appended.
         """
         booked = 0
         for fill in self._venue.get_fills(_EPOCH_FLOOR):
@@ -197,6 +279,7 @@ class LedgerFillBookkeeper:
                     ticker=fill.ticker,
                     cash_delta_micros=-self._venue.fill_cash_micros(fill).value,
                     position_delta_centis=_position_delta_centis(fill),
+                    venue_order_id=fill.order_id or "",
                 )
             )
             self._booked.add(fill.id)
@@ -236,21 +319,45 @@ class LedgerFillAccountingFeed:
     def drain(self) -> tuple[Event, ...]:
         """Return the entries booked since the last call, oldest first.
 
+        Both booked entry kinds come back through this one seam, interleaved in
+        chain order. The ledger's reverse-by-type scan takes one literal type at
+        a time (so the package's SQL stays statically auditable), so each kind is
+        walked separately and the two bounded results are merged on
+        ``sequence_number``. Chain order is not cosmetic: the kernel draws a
+        resting order down by the fill that consumed it, so an arrival must be
+        folded before its own fill.
+
         Returns:
-            The newly booked ``FillAccounted`` events; empty when nothing has
-            been booked since the last call.
+            The newly booked ``RestingOrderAccounted`` and ``FillAccounted``
+            events; empty when nothing has been booked since the last call.
         """
         fresh: list[LedgerRecord] = []
-        for record in self._scan.iter_records_of_type_reversed(
-            _FILL_ACCOUNTED_EVENT_TYPE
-        ):
-            if record.sequence_number <= self._cursor:
-                break
-            fresh.append(record)
+        for event_type in _ACCOUNTING_EVENT_TYPES:
+            fresh.extend(self._fresh_of_type(event_type))
         if not fresh:
             return ()
-        self._cursor = fresh[0].sequence_number
-        fresh.reverse()
+        fresh.sort(key=lambda record: record.sequence_number)
+        self._cursor = fresh[-1].sequence_number
         return events_from_records(
             record for record in fresh if record.component == self._component
         )
+
+    def _fresh_of_type(self, event_type: str) -> list[LedgerRecord]:
+        """Return this type's records booked after the cursor, newest first.
+
+        The walk stops the moment it reaches the cursor, so an always-on loop
+        pays for the entries booked since the last cycle rather than for the
+        whole chain.
+
+        Args:
+            event_type: The single event type to walk.
+
+        Returns:
+            The matching records above the cursor, in descending sequence order.
+        """
+        fresh: list[LedgerRecord] = []
+        for record in self._scan.iter_records_of_type_reversed(event_type):
+            if record.sequence_number <= self._cursor:
+                break
+            fresh.append(record)
+        return fresh

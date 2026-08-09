@@ -1768,6 +1768,15 @@ def _build_verifier(
     ``dispatcher`` and ``writer`` with the kill switch so its alerts and events
     reach the same sinks and hash-chained ledger.
 
+    No ``fill_accounting`` feed is wired here, and that omission is load-bearing
+    rather than an oversight (issues #365, #390). The feed advances the baseline
+    from booked fill and order-arrival entries; nothing on this LIVE path books
+    either. A feed here would therefore advance the expectation on evidence no
+    process records, quietly drifting it away from the venue -- a fail-*open*
+    regression in the one check that exists to catch unexplained venue movement.
+    The baseline stays frozen for the life of the process until something on
+    this path actually books the evidence.
+
     Args:
         config: The loaded configuration supplying the balance/position drift
             tolerances.
