@@ -277,6 +277,8 @@ A first-class adapter that replays recorded real order books and simulates fills
 
 ### 7.5.1 Replay cursor semantics (normative)
 
+This section is the canonical statement of *why* the replay cursor is what it is. Code docstrings state the contract they need locally and cite S7.5.1 for the reasoning rather than re-deriving it, so the argument below has exactly one copy to keep true.
+
 A recorded session is a *sequence* of steps, and the PAPER loop reads exactly one of them. The replay cursor is **stationary**: `run_single_tick` never advances the replay cursor, so a tick prices, fills, and allocates against the single recorded step the cursor stands on, for the life of the process. `PaperExchange.advance()` is harness API — the §17.4 fill-model suites drive a recorded tape through it — and has no production caller.
 
 The alternative reading, one step per tick, is **rejected**, for three reasons that compound:

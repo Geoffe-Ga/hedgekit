@@ -69,14 +69,13 @@ Cursor semantics (issue #387, SPEC S7.5.1) settle which of those two triggers
 production can actually reach. The PAPER loop's replay cursor is **stationary**:
 :meth:`PaperExchange.advance` has no production caller, so a run prices and
 fills against the one recorded step it opened on, and only an empty recording
-can exhaust the cursor. That is a decision, not an oversight -- a cursor stepped
-once per tick would move the anchored book stamp at the *recording's* cadence
-while the clock moved at the *loop's*, future-dating the very quote a tick is
-priced against and reducing ``quote_freshness`` to a measure of the gap between
-two unrelated cadences. Its consequences are accepted deliberately and stated in
-S7.5.1: a resting remainder never fills in production, and the recording's later
-steps are read for their instants (the substantiated span above) rather than for
-their books.
+can exhaust the cursor. That is a decision, not an oversight, and it is
+load-bearing here: a resting remainder never fills in production, recorded depth
+is not consumed by a fill, and the recording's later steps are read for their
+instants (the substantiated span above) rather than for their books. SPEC S7.5.1
+is the canonical account of why the alternative reading -- one step per tick --
+was rejected, and of the consequences this one accepts; it is deliberately not
+restated here.
 
 Consistency guard (issues #18, #362): the constructor rejects any fixture whose
 :class:`~windbreak.connector.semantics.BalanceSemantics` claims a behavior this
@@ -1109,14 +1108,9 @@ class PaperExchange:
         connector rather than a double, and because that is the honest name for
         what it does; it is *not* a step the scheduler is expected to take.
         ``tests/connector/test_paper_replay_semantics.py`` fails if a caller
-        appears under ``windbreak/``.
-
-        Advancing per tick was considered and rejected: it moves the anchored
-        book stamp at the recording's cadence while the clock moves at the
-        loop's, which future-dates the quote a tick is priced against and turns
-        ``quote_freshness`` into a measure of that cadence gap. See SPEC S7.5.1
-        for the full reasoning and for the consequences the stationary reading
-        accepts.
+        appears under ``windbreak/``. Advancing per tick was considered and
+        rejected; SPEC S7.5.1 records why, and the consequences the stationary
+        reading accepts.
 
         Returns:
             True if any session still has an unconsumed step after advancing;

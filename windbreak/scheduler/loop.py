@@ -3104,9 +3104,9 @@ def _verification_stage(deps: PaperTickDeps) -> None:
     recorded trade-through fill is a third source in principle, but only for a
     harness that steps the replay itself: the loop's cursor is stationary (SPEC
     S7.5.1, issue #387), so no ``PaperExchange.advance`` fill arises in a run.
-    Booking is idempotent on the
-    venue's fill id and order id, so re-entering this stage never advances the
-    expectation past cash the venue moved once or an order it rested once.
+    Booking is idempotent on the venue's fill id and order id, so re-entering
+    this stage never advances the expectation past cash the venue moved once or
+    an order it rested once.
 
     The booking reads the venue's *discrete reports* -- executions, and orders
     arriving on the resting book; the cycle reads the venue's *aggregate*
@@ -3261,15 +3261,11 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     than an omission (issue #387, SPEC S7.5.1). A fixture run therefore prices,
     fills, and allocates against the one recorded step it opened on for the life
     of the process; ``PaperExchange.advance`` is harness API with no caller
-    here. Stepping it once per tick would move the anchored book stamp at the
-    *recording's* cadence while this function's clock moved at the *loop's* --
-    a tape sampled in minutes replayed by a loop beating in seconds hands the
-    second tick a book dated after the instant it is being priced at, which
-    ``quote_freshness`` refuses for every ttl -- so the check would be measuring
-    the gap between two cadences instead of the age of a price, and simulated
-    P&L would become a function of run length. The always-on path whose market
-    data genuinely advances is ``LiveBookPaperExchange``, which reads the
-    venue's real books. S7.5.1 states the consequences this accepts;
+    here, and the always-on path whose market data genuinely advances is
+    ``LiveBookPaperExchange``, which reads the venue's real books. Stepping the
+    cursor per tick was considered and rejected -- S7.5.1 is the canonical
+    account of why, and of the consequences the stationary reading accepts, so
+    the argument is not restated here. Instead,
     ``tests/integration/test_paper_replay_cursor.py`` fails if the answer
     changes here.
 
