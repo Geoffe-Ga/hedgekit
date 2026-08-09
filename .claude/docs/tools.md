@@ -155,10 +155,36 @@ worktree must import its **own** checkout's `windbreak/` package, so per-lane
 test isolation is preserved even though the toolchain venv is shared.
 
 `check-all.sh` auto-detects the shared `.venv` when present, runs a drift
-check against it, and PATH-prepends it so every sub-check (ruff, pylint,
-mypy, bandit, pip-audit, pytest, ...) uses the pinned versions; if the venv is
-absent it falls back to ambient tools with a note. The `.venv` directory is
-gitignored.
+check against it, and PATH-prepends it so any subprocess a tool spawns also
+sees the pinned toolchain. The `.venv` directory is gitignored.
+
+**`./scripts/toolchain-env.sh`** - Resolve a gate tool from the pinned toolchain
+
+**Purpose**: make a gate's verdict a property of this repository rather than of
+the shell it was launched from (issue #366). Each gate sub-script resolves its
+tools through this helper by absolute path instead of by bare name, so
+`./scripts/security.sh` run directly reaches the same verdict it reaches through
+Gate 1. It **fails closed**: with the shared `.venv` present a tool comes from it
+and only from it, and a tool missing there vetoes rather than silently falling
+back to an alien binary. With no `.venv` (how CI runs) it falls back to `PATH`
+but names the absolute path it chose, so a verdict is always attributable.
+
+```bash
+# Which pip-audit would Gate 1 actually run?
+bash scripts/toolchain-env.sh --print-tool pip-audit
+
+# Which environment does the dependency audit inspect?
+bash scripts/toolchain-env.sh --print-python
+
+# The resolved shared .venv (empty when absent)
+bash scripts/toolchain-env.sh --print-venv
+```
+
+One documented exception: `architecture.sh` → `plans/architecture/run-check.sh`
+still resolves `lint-imports` from `PATH`, because
+`tests/architecture/test_import_linter_gate.py` pins a
+fail-loud-when-unreachable-on-PATH contract that anchoring would defeat. The
+reason is recorded in `scripts/toolchain-env.sh`'s header.
 
 ### Complete Workflow Example
 

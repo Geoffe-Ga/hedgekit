@@ -82,6 +82,12 @@ done
 
 cd "$PROJECT_ROOT"
 
+# Resolve pytest from the PINNED toolchain, not the caller's PATH (issue #366):
+# an ambient pytest runs against an ambient site-packages, so the suite would be
+# exercising a different dependency set than the one this repo pins.
+TOOLCHAIN_ENV="$SCRIPT_DIR/toolchain-env.sh"
+PYTEST="$(bash "$TOOLCHAIN_ENV" --print-tool pytest)"
+
 # Set verbosity
 if $VERBOSE; then
     set -x
@@ -126,19 +132,18 @@ if $VERBOSE; then
     echo "Running pytest with args: ${PYTEST_ARGS[*]}"
 fi
 
-pytest "${PYTEST_ARGS[@]}" tests/ || { echo "✗ Tests failed" >&2; exit 1; }
+"$PYTEST" "${PYTEST_ARGS[@]}" tests/ || { echo "✗ Tests failed" >&2; exit 1; }
 
 echo "✓ Tests passed"
 
 # Run mutation tests if requested
 if $MUTATION; then
     echo "=== Running Mutation Tests ==="
-    if command -v mutmut &> /dev/null; then
-        mutmut run || { echo "✗ Mutation tests failed" >&2; exit 1; }
-        echo "✓ Mutation tests passed"
-    else
-        echo "Warning: mutmut not installed, skipping mutation tests" >&2
-    fi
+    # Resolved (not `command -v`-guarded) so an absent mutmut vetoes instead of
+    # reporting a mutation run that never happened.
+    MUTMUT="$(bash "$TOOLCHAIN_ENV" --print-tool mutmut)"
+    "$MUTMUT" run || { echo "✗ Mutation tests failed" >&2; exit 1; }
+    echo "✓ Mutation tests passed"
 fi
 
 exit 0
