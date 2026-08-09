@@ -414,7 +414,7 @@ check "review agent's --allowed-tools are all read-only (no write verbs)" \
 # posting step breaks silently, and if someone raises it without the allowlist
 # above the guard is the only thing left.
 pr_write_hits=$(grep -cE -- '^[[:space:]]*pull-requests:[[:space:]]*write' "$CODE_REVIEW_YML" 2>/dev/null) || true
-if [[ "$pr_write_hits" -ge 1 ]]; then pr_write_status=write; else pr_write_status=not-write; fi
+if [[ "$pr_write_hits" -ge 1 ]]; then pr_write_status="write"; else pr_write_status="not-write"; fi
 check "code-review.yml grants pull-requests: write for the deterministic poster" \
   "write" "$pr_write_status"
 
@@ -425,6 +425,7 @@ check "code-review.yml grants pull-requests: write for the deterministic poster"
 # (post gate) both parse. A format drift here is the #135 silent-stall class:
 # a verdict the poster considers valid but the merger never sees.
 # shellcheck source=scripts/ralph/verdict-regex.sh
+# shellcheck disable=SC1091  # sourced at runtime; not followed without -x
 source "$RALPH_DIR/verdict-regex.sh"
 printf_fmt=$(grep -oE -- "printf '[^']*## Verdict: %s[^']*'" "$CODE_REVIEW_YML" 2>/dev/null | head -1) || true
 if [[ -z "$printf_fmt" ]]; then
