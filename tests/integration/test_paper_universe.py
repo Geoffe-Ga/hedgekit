@@ -37,6 +37,7 @@ from tests.integration.conftest import (
 )
 from windbreak.config.schema import (
     CapitalConfig,
+    CorrelationConfig,
     ForecastBudget,
     ForecastConfig,
     RiskConfig,
@@ -94,6 +95,7 @@ def _config(
     *,
     screener: ScreenerConfig = FIXTURE_SCREENER_CONFIG,
     per_day_micros: int | None = None,
+    correlation: CorrelationConfig | None = None,
 ) -> WindbreakConfig:
     """Build the PAPER-ceilinged config these scenarios tick under.
 
@@ -101,6 +103,11 @@ def _config(
         screener: The screening thresholds to enforce.
         per_day_micros: An explicit per-UTC-day research ceiling, or `None` to
             keep the SPEC §16 default (which no scenario here exhausts).
+        correlation: The operator's declared bucket assignments, or `None` for
+            the empty default. Empty is not permissive (issue #407): a market
+            with no declared bucket has unprovable bucket exposure, so the
+            selector declines it rather than sizing against an empty bucket.
+            Only the scenario that asserts on bucket exposure declares any.
 
     Returns:
         The assembled configuration.
@@ -116,6 +123,7 @@ def _config(
         risk=RiskConfig(),
         screener=screener,
         forecast=forecast,
+        correlation=correlation if correlation is not None else CorrelationConfig(),
     )
 
 
@@ -413,6 +421,7 @@ def test_a_fill_on_the_first_market_debits_what_the_second_can_deploy(
       50 * 4_400 = 220_000 micros, plus a 10_000-micro fee.
     * Remaining: 100_000_000 - 230_000 = 99_770_000 micros.
     """
+    from tests.scheduler.conftest import proven_flat_exposure
     from windbreak.connector.paper import PaperOrderIntent
     from windbreak.numeric.types import ContractCentis, PricePips
     from windbreak.scheduler.loop import _position_input
@@ -426,7 +435,7 @@ def test_a_fill_on_the_first_market_debits_what_the_second_can_deploy(
         research_tools_factory=research_tools_factory,
     )
 
-    before = _position_input(deps, "MKT-ISO-A")
+    before = _position_input(deps, "MKT-ISO-A", proven_flat_exposure("MKT-ISO-A"))
     assert before.snapshot_id == "MKT-ISO-A-positions"
     assert before.above_floor_capital_micros.value == _OPENING_CAPITAL_MICROS
 
@@ -444,7 +453,7 @@ def test_a_fill_on_the_first_market_debits_what_the_second_can_deploy(
     assert fill.price.value == _RESTING_ASK_PIPS
     assert fill.quantity.value == _FILL_SIZE_CENTIS
 
-    after = _position_input(deps, "MKT-ISO-B")
+    after = _position_input(deps, "MKT-ISO-B", proven_flat_exposure("MKT-ISO-B"))
 
     assert after.snapshot_id == "MKT-ISO-B-positions"
     # The load-bearing assertion: strictly less, by exactly the fill's cost.
@@ -456,6 +465,101 @@ def test_a_fill_on_the_first_market_debits_what_the_second_can_deploy(
     # The deploy cap tracks it too, so the second market cannot size against
     # capital the first one already spent.
     assert after.total_deploy_cap_micros.value == _CAPITAL_AFTER_FILL_MICROS
+
+
+def test_a_fill_on_the_first_market_binds_the_seconds_correlation_bucket(
+    two_ticker_books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """The second market's bucket exposure already carries the first's fill.
+
+    This is issue #345's open acceptance criterion, closed by issue #407: a
+    single tick over two markets sharing a correlation bucket has the second
+    market's sizing bound by the first market's *exposure*, not merely by the
+    cash it spent.
+
+    The sibling test above pins the capital half, which was the only
+    cross-market bound in force before #407. This pins the exposure half. They
+    are genuinely different bounds: capital falls by what a fill *cost*
+    (notional plus fee), while bucket exposure rises by what the resulting
+    position is *worth* -- and a cap on one cannot substitute for a cap on the
+    other.
+
+    `read_candidate_exposure` is read per candidate off the venue's live
+    positions, so `MKT-ISO-A`'s fill is a holding the venue reports by the time
+    `MKT-ISO-B` is projected. Both markets are declared into the weather bucket,
+    which is what lets A's exposure reach B at all: without the declaration
+    `effective_buckets` would be empty and the projection would refuse outright.
+
+    Every figure is pinned exactly:
+
+    * The fill: 50 contract-centis at 4_400 pips, exactly as the sibling test.
+    * The resulting position is worth `quantity * average_price` == 50 * 4_400
+      == 220_000 micros, which is the notional and excludes the 10_000-micro
+      fee -- a position's mark value is not its acquisition cost.
+    * `MKT-ISO-B` holds nothing itself, so its `market_exposure` stays 0 while
+      its `bucket_exposure` is 220_000. That gap is the whole mechanism: a
+      per-market cap alone would still read this account as flat in B.
+    """
+    from tests.scheduler.conftest import weather_bucket_correlation
+    from windbreak.connector.paper import PaperOrderIntent
+    from windbreak.numeric.types import ContractCentis, PricePips
+    from windbreak.scheduler.loop import read_candidate_exposure
+    from windbreak.scheduler.screening import MarketCandidate
+
+    deps = _build_deps(
+        books_dir=two_ticker_books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=_config(
+            correlation=weather_bucket_correlation("MKT-ISO-A", "MKT-ISO-B")
+        ),
+        research_tools_factory=research_tools_factory,
+    )
+
+    def _candidate_for(ticker: str) -> MarketCandidate:
+        """Build the screened candidate for one fixture market.
+
+        Args:
+            ticker: The market to build a candidate for.
+
+        Returns:
+            The assembled candidate, carrying the venue's own book.
+        """
+        return MarketCandidate(
+            market=deps.exchange.get_market(ticker),
+            order_book=deps.exchange.get_order_book(ticker),
+        )
+
+    before = read_candidate_exposure(deps, _candidate_for("MKT-ISO-B"))
+    assert before is not None
+    assert before.bucket_exposure.value == 0
+
+    placement = deps.exchange.place_order(
+        PaperOrderIntent(
+            ticker="MKT-ISO-A",
+            side="yes",
+            price=PricePips(_CROSSING_LIMIT_PIPS),
+            quantity=ContractCentis(_FILL_SIZE_CENTIS),
+        ),
+        None,
+    )
+    assert placement.resting_order is None, "no remainder may rest"
+
+    after = read_candidate_exposure(deps, _candidate_for("MKT-ISO-B"))
+    assert after is not None
+    # The load-bearing assertion: A's fill is exposure B is now bound by.
+    assert after.bucket_exposure.value == _FILL_NOTIONAL_MICROS
+    # B holds nothing of its own, so a per-market cap would still see it flat.
+    assert after.market_exposure.value == 0
+    assert after.total_exposure.value == _FILL_NOTIONAL_MICROS
+    # And the peer that carries it is A, not B.
+    (peer,) = after.bucket_peers
+    assert peer.market_ticker == "MKT-ISO-A"
 
 
 def test_a_halt_on_the_second_market_ledgers_its_snapshot_but_no_forecast(
