@@ -99,7 +99,7 @@ through `OutboundAllowlist.require_host`). `DesktopSink` and `LogOnlySink` are
 exempt: neither leaves the machine.
 
 The hosts an alert may reach come from `alerts.allowed_hosts` **only** — never
-from the sink entries' own `base_url`/`url`/`smtp.host` fields. Deriving the
+from the sink entries' own destinations. Deriving the
 allowlist from the URLs it screens would make the check unfalsifiable: every
 configured sink would admit itself and the veto could never fire. Requiring the
 host in two independent fields means a single mistyped or tampered destination
@@ -113,8 +113,47 @@ healthy-looking log-only dispatch. A sink the operator simply has not filled in
 yet is skipped with a WARNING naming its *type only*, and the alert still
 surfaces through the dispatcher's log-only fallback.
 
-Alert destinations are treated as secrets: an ntfy topic is a bearer capability
-and a webhook URL can embed a token, so no log line or error message emitted by
+### Alert destinations never live in configuration
+
+An ntfy topic is a bearer capability and a webhook URL can embed a token in its
+userinfo, path, or query. Neither may be a configuration leaf, because every
+config leaf is flattened by `diff_configs`, persisted **verbatim — old value and
+new value** into the hash-chained `ConfigLoaded` ledger event on every
+`windbreak run --config … --ledger-path …`, and folded again into the plaintext
+`config_versions.json` read model by `windbreak.ledger.rebuild`. All three are
+append-only: a secret that reaches them cannot be redacted afterwards.
+
+So `AlertSink` stores only the **name of an environment variable** —
+`topic_env`, `base_url_env`, `url_env` — exactly as
+`FutureSearchProviderSettings.api_key_env` and
+`ResearchSettings.search_api_key_env` already do, and
+`windbreak.alerts.factory.build_sinks` resolves it against `os.environ` at
+composition time. A named variable that is unset or empty raises
+`AlertSinkConfigError` and stops the process, naming the *variable* and the
+config field — never a value, of which there is none. Skipping it instead would
+leave a deployment whose configuration advertises an alert channel and whose
+alerts go nowhere.
+
+The `smtp` block is deliberately **not** indirected, and its leaves do reach the
+ledger diff. None of them can carry a credential:
+
+- `smtp.host` must also be declared in `alerts.allowed_hosts` for the sink to
+  build at all, so the relay hostname is unavoidably in plaintext configuration
+  already; hiding it in one field while publishing it in the other would be
+  theatre. The same is true of every alert host — host-level information is
+  non-secret by construction in this design.
+- `smtp.sender`/`smtp.recipients` are mailbox addresses, not bearer
+  capabilities: holding one grants no ability to send or read a windbreak alert.
+  `SmtpSinkConfig` has no username/password field — the relay authenticates this
+  process by network position, never by these values — and `recipients` is a
+  list, which environment-variable indirection cannot carry without inventing a
+  delimiter convention that would itself be a parsing hazard.
+
+This knowingly deviates from SPEC §16's literal `topic:` key
+(`plans/SPEC_v3.md` §16); the placeholder is carried as `topic_env` instead.
+
+Alert destinations are treated as secrets once resolved, too: no log line or
+error message emitted by
 `windbreak.alerts.factory` ever contains more of a destination than its
 hostname. Where a hostname cannot be *proven* — a URL whose netloc will not
 parse (`https:///host/path?token=…`, a plausible one-slash-too-many typo), or a
@@ -123,7 +162,11 @@ the message names the sink type and the configuration field to correct and
 withholds the destination entirely, rather than falling back to echoing it. The
 decision is driven by proving every character of a value is hostname-legal, not
 by stripping the URL separators a leak might use, so an unanticipated malformed
-destination fails closed onto disclosing nothing.
+destination fails closed onto disclosing nothing. One consequence worth knowing
+before you meet it: an IPv6 literal relay host contains `:`, which is not
+hostname-legal, so an off-allowlist IPv6 `smtp.host` gets the fully-redacted
+"malformed destination" message rather than being named. That is the fail-safe
+working as designed, not a parsing bug.
 
 ## Supply chain
 

@@ -503,15 +503,22 @@ def test_allowlist_from_config_derives_declared_alert_hosts() -> None:
 def test_allowlist_from_config_ignores_the_sink_destination_fields() -> None:
     """A sink destination alone never admits its own host.
 
-    This is what keeps the egress check able to *veto* a configured sink: if
-    `base_url` fed the allowlist, no configured sink could ever be denied and
-    the check would be decorative.
+    This is what keeps the egress check able to *veto* a configured sink: if the
+    sink's own destination fed the allowlist, no configured sink could ever be
+    denied and the check would be decorative. The sink's destination is not even
+    in configuration -- `base_url_env` names the environment variable holding it
+    -- so the allowlist could not derive it without reading the environment,
+    which it deliberately never does.
     """
     config = dataclasses.replace(
         WindbreakConfig(),
         alerts=AlertsConfig(
             sinks=(
-                AlertSink(type="ntfy", topic="ops", base_url="https://ntfy.example"),
+                AlertSink(
+                    type="ntfy",
+                    topic_env="WINDBREAK_NTFY_TOPIC",
+                    base_url_env="WINDBREAK_NTFY_BASE_URL",
+                ),
             ),
         ),
     )

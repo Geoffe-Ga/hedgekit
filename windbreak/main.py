@@ -642,7 +642,10 @@ def _build_alert_dispatcher(config: WindbreakConfig) -> AlertDispatcher:
     The single place the CLI turns ``alerts.sinks`` into live delivery channels,
     screened against the deployment's own egress allowlist. Every process shares
     it so no composition site can quietly regress to the log-only fallback the
-    way all three did before this existed.
+    way all three did before this existed. It is also the only place the real
+    :data:`os.environ` is read for alert destinations: configuration names the
+    variables, this seam resolves them, so no destination is ever a config leaf
+    the ledger would persist in plaintext.
 
     Args:
         config: The loaded configuration whose alerts section supplies the
@@ -654,13 +657,19 @@ def _build_alert_dispatcher(config: WindbreakConfig) -> AlertDispatcher:
         fallback carries the alert.
 
     Raises:
-        AlertSinkConfigError: If a sink names an unknown type, targets a host
-            outside ``alerts.allowed_hosts``, or cannot deliver as configured.
+        AlertSinkConfigError: If a sink names an unknown type, names a
+            destination environment variable that is unset or empty, targets a
+            host outside ``alerts.allowed_hosts``, or cannot deliver as
+            configured.
     """
     from windbreak.net.allowlist import allowlist_from_config
 
     return AlertDispatcher(
-        sinks=build_sinks(config.alerts, allowlist=allowlist_from_config(config)),
+        sinks=build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ=os.environ,
+        ),
         ledger_writer=LoggingLedgerWriter(),
     )
 

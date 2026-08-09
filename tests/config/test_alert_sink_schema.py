@@ -37,9 +37,9 @@ def test_default_alert_sink_destinations_are_all_placeholders() -> None:
     sink = WindbreakConfig().alerts.sinks[0]
 
     assert sink.type == "ntfy"
-    assert sink.topic == UNCONFIGURED_PLACEHOLDER
-    assert sink.base_url == UNCONFIGURED_PLACEHOLDER
-    assert sink.url == UNCONFIGURED_PLACEHOLDER
+    assert sink.topic_env == UNCONFIGURED_PLACEHOLDER
+    assert sink.base_url_env == UNCONFIGURED_PLACEHOLDER
+    assert sink.url_env == UNCONFIGURED_PLACEHOLDER
     assert sink.smtp == SmtpSinkSettings()
 
 
@@ -70,10 +70,10 @@ def test_alerts_section_round_trips_every_sink_shape(
                 "sinks": [
                     {
                         "type": "ntfy",
-                        "topic": "windbreak-ops",
-                        "base_url": "https://ntfy.example.com",
+                        "topic_env": "WINDBREAK_NTFY_TOPIC",
+                        "base_url_env": "WINDBREAK_NTFY_BASE_URL",
                     },
-                    {"type": "webhook", "url": "https://hooks.example.com/incoming"},
+                    {"type": "webhook", "url_env": "WINDBREAK_WEBHOOK_URL"},
                     {
                         "type": "smtp",
                         "smtp": {
@@ -92,9 +92,11 @@ def test_alerts_section_round_trips_every_sink_shape(
 
     assert alerts.allowed_hosts == ("ntfy.example.com", "hooks.example.com")
     assert alerts.sinks[0] == AlertSink(
-        type="ntfy", topic="windbreak-ops", base_url="https://ntfy.example.com"
+        type="ntfy",
+        topic_env="WINDBREAK_NTFY_TOPIC",
+        base_url_env="WINDBREAK_NTFY_BASE_URL",
     )
-    assert alerts.sinks[1].url == "https://hooks.example.com/incoming"
+    assert alerts.sinks[1].url_env == "WINDBREAK_WEBHOOK_URL"
     assert alerts.sinks[2].smtp == SmtpSinkSettings(
         host="smtp.example.com",
         port=587,
@@ -147,4 +149,4 @@ def test_sink_type_has_no_default() -> None:
 
     assert fields_by_name["type"].default is dataclasses.MISSING
     assert fields_by_name["type"].default_factory is dataclasses.MISSING
-    assert fields_by_name["topic"].default == UNCONFIGURED_PLACEHOLDER
+    assert fields_by_name["topic_env"].default == UNCONFIGURED_PLACEHOLDER

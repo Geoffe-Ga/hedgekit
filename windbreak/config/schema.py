@@ -62,6 +62,23 @@ class SmtpSinkSettings:
     safe real-world default, so they ship as :data:`UNCONFIGURED_PLACEHOLDER`
     and an untouched section builds no SMTP sink at all.
 
+    Unlike :class:`AlertSink`'s ``*_env`` destination fields, every leaf here is
+    held in configuration directly, and therefore reaches the ``ConfigLoaded``
+    ledger event and ``config_versions.json``. That is deliberate: none of them
+    can carry a credential.
+
+    - ``host`` must *also* be declared in ``alerts.allowed_hosts`` for the sink
+      to build at all, so the relay hostname is unavoidably in plaintext
+      configuration already; hiding it in one field while publishing it in the
+      other would be theatre, not protection.
+    - ``sender``/``recipients`` are mailbox addresses, not bearer capabilities:
+      holding one grants no ability to send or read a windbreak alert.
+      :class:`~windbreak.alerts.sinks.SmtpSinkConfig` has no username/password
+      field at all -- the relay authenticates this process by network position,
+      never by these values -- and ``recipients`` is a list, which
+      environment-variable indirection cannot carry without inventing a
+      delimiter convention that would itself be a parsing hazard.
+
     Attributes:
         host: The SMTP relay hostname. Screened against the outbound allowlist
             before a sink is built, exactly like an ntfy/webhook host.
@@ -89,27 +106,50 @@ class AlertSink:
     separate schema class per sink type -- cannot be expressed in a single
     homogeneous ``tuple[AlertSink, ...]`` the loader can build, so the union is
     carried here and :func:`windbreak.alerts.factory.build_sinks` reads only the
-    fields belonging to ``type``. Every destination field defaults to
+    fields belonging to ``type``. Every field defaults to
     :data:`UNCONFIGURED_PLACEHOLDER`, so an entry the operator has not finished
     filling in builds no sink instead of dialing a made-up endpoint.
 
+    **No credential-bearing destination is stored here.** Every field below
+    names an *environment variable*, exactly as
+    :attr:`FutureSearchProviderSettings.api_key_env` and
+    :attr:`ResearchSettings.search_api_key_env` do, and
+    :func:`windbreak.alerts.factory.build_sinks` resolves it against the process
+    environment at composition time. The indirection is structural, not
+    cosmetic: a configuration leaf is flattened by
+    :func:`windbreak.config.versioning.diff_configs` and persisted verbatim --
+    old value *and* new value -- into the hash-chained ``ConfigLoaded`` ledger
+    event and then into the plaintext ``config_versions.json`` read model, all
+    of which are append-only and cannot be redacted after the fact. An ntfy
+    topic is a bearer capability and a webhook URL can embed a token in its
+    userinfo, path, or query, so none of them may ever be a config leaf. This
+    deviates knowingly from SPEC S16's literal ``topic:`` key
+    (``plans/SPEC_v3.md``); the SPEC example's placeholder is preserved as
+    ``topic_env``.
+
     Attributes:
         type: The sink transport: ``ntfy``, ``webhook``, ``smtp``, or
-            ``desktop``. Anything else is fatal at sink-construction time.
-        topic: The ntfy topic to publish to. Unused by the other types. Treat it
-            as a credential -- an ntfy topic is a bearer capability -- so it is
-            never logged.
-        base_url: The ``https://`` ntfy server base URL. Unused by other types.
-        url: The ``https://`` endpoint a ``webhook`` sink POSTs to. Unused by
-            other types, and treated as secret-bearing (it may embed a token),
-            so only its host is ever named in a log line or error.
-        smtp: The relay settings an ``smtp`` sink connects with.
+            ``desktop``. Anything else is fatal at sink-construction time. Not a
+            secret: it names a code path, not a destination.
+        topic_env: The environment variable holding the ntfy topic to publish
+            to; never the topic itself, which is a bearer capability. Unused by
+            the other types.
+        base_url_env: The environment variable holding the ``https://`` ntfy
+            server base URL. Held out of configuration because it is a URL, and
+            a URL can embed credentials in its userinfo. Unused by other types.
+        url_env: The environment variable holding the ``https://`` endpoint a
+            ``webhook`` sink POSTs to -- typically the highest-value alert
+            secret, since providers routinely encode the whole capability in the
+            path. Unused by other types.
+        smtp: The relay settings an ``smtp`` sink connects with. Held in
+            configuration directly; see :class:`SmtpSinkSettings` for why none
+            of its leaves can carry a credential.
     """
 
     type: str
-    topic: str = UNCONFIGURED_PLACEHOLDER
-    base_url: str = UNCONFIGURED_PLACEHOLDER
-    url: str = UNCONFIGURED_PLACEHOLDER
+    topic_env: str = UNCONFIGURED_PLACEHOLDER
+    base_url_env: str = UNCONFIGURED_PLACEHOLDER
+    url_env: str = UNCONFIGURED_PLACEHOLDER
     smtp: SmtpSinkSettings = field(default_factory=SmtpSinkSettings)
 
 
@@ -448,7 +488,8 @@ class AlertsConfig:
     Attributes:
         sinks: The destinations each alert fans out to. The SPEC §16 default is
             one placeholder ntfy sink, which builds nothing until an operator
-            fills in its ``base_url``/``topic``.
+            fills in its ``base_url_env``/``topic_env`` and exports the
+            variables they name.
         allowed_hosts: The alert-destination hosts this deployment may dial,
             unioned into :func:`windbreak.net.allowlist.allowlist_from_config`'s
             egress allowlist. Deliberately *separate* from the per-sink

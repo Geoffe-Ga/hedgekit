@@ -61,6 +61,37 @@ _HOSTLESS_URL_TOKEN = "abc123"
 #: destination rather than falling back to echoing it.
 _HOSTLESS_WEBHOOK_URL = f"https:///{_WEBHOOK_HOST}/incoming?token={_HOSTLESS_URL_TOKEN}"
 
+#: Alert destinations are never configuration leaves -- a config leaf is
+#: flattened by `diff_configs` and persisted verbatim into the hash-chained
+#: `ConfigLoaded` ledger event -- so every sink below names the environment
+#: variable its destination is read from, and each test injects the mapping.
+_TOPIC_VAR = "WINDBREAK_TEST_NTFY_TOPIC"
+
+#: The variable an ntfy sink's server base URL is read from.
+_BASE_URL_VAR = "WINDBREAK_TEST_NTFY_BASE_URL"
+
+#: The variable a webhook sink's endpoint is read from.
+_URL_VAR = "WINDBREAK_TEST_WEBHOOK_URL"
+
+
+def _environ(
+    *, topic: str | None = None, base_url: str | None = None, url: str | None = None
+) -> dict[str, str]:
+    """Return an injected environment holding the named destinations.
+
+    Args:
+        topic: The ntfy topic to export under :data:`_TOPIC_VAR`, if any.
+        base_url: The ntfy base URL to export under :data:`_BASE_URL_VAR`.
+        url: The webhook endpoint to export under :data:`_URL_VAR`.
+
+    Returns:
+        The mapping `build_sinks` resolves each sink's ``*_env`` field against.
+        Omitted destinations are absent, not empty, so a test can drive the
+        never-exported case exactly as a real process would meet it.
+    """
+    pairs = ((_TOPIC_VAR, topic), (_BASE_URL_VAR, base_url), (_URL_VAR, url))
+    return {name: value for name, value in pairs if value is not None}
+
 
 class _RecordingHttpTransport:
     """An :data:`~windbreak.alerts.sinks.HttpTransport` double.
@@ -128,12 +159,17 @@ def _ntfy_config() -> WindbreakConfig:
         AlertsConfig(
             sinks=(
                 AlertSink(
-                    type="ntfy", topic="windbreak-ops", base_url=f"https://{_NTFY_HOST}"
+                    type="ntfy", topic_env=_TOPIC_VAR, base_url_env=_BASE_URL_VAR
                 ),
             ),
             allowed_hosts=(_NTFY_HOST,),
         )
     )
+
+
+def _ntfy_environ() -> dict[str, str]:
+    """Return the environment :func:`_ntfy_config`'s sink resolves against."""
+    return _environ(topic="windbreak-ops", base_url=f"https://{_NTFY_HOST}")
 
 
 # --- 1. The configured sink actually receives the alert -----------------------
@@ -152,6 +188,7 @@ def test_configured_ntfy_sink_receives_dispatched_alert() -> None:
         config.alerts,
         allowlist=allowlist_from_config(config),
         http_transport=transport,
+        environ=_ntfy_environ(),
     )
     dispatcher = AlertDispatcher(sinks, ledger_writer=LoggingLedgerWriter())
     event = dispatcher.dispatch(AlertType.MODE_CHANGE, "switched to PAPER")
@@ -173,6 +210,7 @@ def test_configured_sink_suppresses_the_log_only_fallback() -> None:
         config.alerts,
         allowlist=allowlist_from_config(config),
         http_transport=_RecordingHttpTransport(),
+        environ=_ntfy_environ(),
     )
     event = AlertDispatcher(sinks, ledger_writer=LoggingLedgerWriter()).dispatch(
         AlertType.VETO, "vetoed"
@@ -185,7 +223,9 @@ def test_log_only_fallback_fires_when_no_sink_is_configured() -> None:
     """The shipped placeholder config builds no sink, so the fallback fires."""
     config = WindbreakConfig()
 
-    sinks = build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+    sinks = build_sinks(
+        config.alerts, allowlist=allowlist_from_config(config), environ={}
+    )
     event = AlertDispatcher(sinks, ledger_writer=LoggingLedgerWriter()).dispatch(
         AlertType.VETO, "vetoed"
     )
@@ -201,14 +241,19 @@ def test_unconfigured_sink_is_skipped_with_a_warning_naming_only_its_type(
 
     Absent evidence must not read as healthy evidence: skipping is visible in
     the log. The topic is an ntfy capability token, so the warning names the
-    sink *type* only.
+    sink *type* only -- never the resolved topic, and never the variable's
+    value.
     """
     config = _config_with(
-        AlertsConfig(sinks=(AlertSink(type="ntfy", topic="s3cr3t-topic"),))
+        AlertsConfig(sinks=(AlertSink(type="ntfy", topic_env=_TOPIC_VAR),))
     )
 
     with caplog.at_level(logging.WARNING, logger="windbreak.alerts"):
-        sinks = build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        sinks = build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ=_environ(topic="s3cr3t-topic"),
+        )
 
     assert sinks == ()
     assert any(
@@ -218,6 +263,77 @@ def test_unconfigured_sink_is_skipped_with_a_warning_naming_only_its_type(
     assert "s3cr3t-topic" not in caplog.text
 
 
+def test_sink_naming_an_unexported_variable_is_rejected_at_build_time() -> None:
+    """A named-but-unset destination variable is fatal, not a silent skip.
+
+    An operator who wires `url_env` and forgets to export the variable has a
+    broken alerting path, not an unconfigured one. Skipping it would leave a
+    process whose configuration advertises a webhook sink and whose alerts go
+    nowhere but the log-only fallback.
+    """
+    config = _config_with(
+        AlertsConfig(
+            sinks=(AlertSink(type="webhook", url_env=_URL_VAR),),
+            allowed_hosts=(_WEBHOOK_HOST,),
+        )
+    )
+
+    with pytest.raises(AlertSinkConfigError) as exc_info:
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config), environ={})
+
+    message = str(exc_info.value)
+    assert _URL_VAR in message
+    assert "url_env" in message
+    assert "webhook" in message
+
+
+def test_sink_naming_an_empty_variable_is_rejected_at_build_time() -> None:
+    """An exported-but-empty variable fails closed exactly like an unset one.
+
+    `os.environ` cannot distinguish "exported as empty" from a typo in the
+    export, and an empty destination can never be dialed, so both refuse.
+    """
+    config = _config_with(
+        AlertsConfig(
+            sinks=(AlertSink(type="webhook", url_env=_URL_VAR),),
+            allowed_hosts=(_WEBHOOK_HOST,),
+        )
+    )
+
+    with pytest.raises(AlertSinkConfigError) as exc_info:
+        build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ=_environ(url=""),
+        )
+
+    assert _URL_VAR in str(exc_info.value)
+
+
+def test_unexported_destination_error_never_echoes_another_variable() -> None:
+    """The refusal names the one variable it needs, not the environment.
+
+    The message is logged verbatim as `FATAL:` on stderr by `main.py`, so it
+    must never widen into a dump of the injected mapping -- which in production
+    is the real `os.environ`, holding every secret this process was given.
+    """
+    config = _config_with(
+        AlertsConfig(
+            sinks=(AlertSink(type="webhook", url_env=_URL_VAR),),
+            allowed_hosts=(_WEBHOOK_HOST,),
+        )
+    )
+
+    with pytest.raises(AlertSinkConfigError) as exc_info:
+        build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ={"WINDBREAK_UNRELATED_ENTRY": "s3cr3t-neighbour"},
+        )
+
+    assert "s3cr3t-neighbour" not in str(exc_info.value)
+
+
 # --- 2. Webhook: same allowlist as ntfy, and its rejection path ---------------
 
 
@@ -225,12 +341,7 @@ def test_configured_webhook_sink_delivers_a_json_payload() -> None:
     """An allowlisted webhook receives the JSON `{type, severity, message}`."""
     config = _config_with(
         AlertsConfig(
-            sinks=(
-                AlertSink(
-                    type="webhook",
-                    url=f"https://{_WEBHOOK_HOST}{_WEBHOOK_SECRET_PATH}",
-                ),
-            ),
+            sinks=(AlertSink(type="webhook", url_env=_URL_VAR),),
             allowed_hosts=(_WEBHOOK_HOST,),
         )
     )
@@ -240,6 +351,7 @@ def test_configured_webhook_sink_delivers_a_json_payload() -> None:
         config.alerts,
         allowlist=allowlist_from_config(config),
         http_transport=transport,
+        environ=_environ(url=f"https://{_WEBHOOK_HOST}{_WEBHOOK_SECRET_PATH}"),
     )
     AlertDispatcher(sinks, ledger_writer=LoggingLedgerWriter()).dispatch(
         AlertType.DISK_HALT, "disk full"
@@ -264,13 +376,17 @@ def test_webhook_url_off_the_allowlist_is_rejected_at_build_time() -> None:
     """
     config = _config_with(
         AlertsConfig(
-            sinks=(AlertSink(type="webhook", url="https://169.254.169.254/latest"),),
+            sinks=(AlertSink(type="webhook", url_env=_URL_VAR),),
             allowed_hosts=(_WEBHOOK_HOST,),
         )
     )
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ=_environ(url="https://169.254.169.254/latest"),
+        )
 
     assert "169.254.169.254" in str(exc_info.value)
 
@@ -278,18 +394,15 @@ def test_webhook_url_off_the_allowlist_is_rejected_at_build_time() -> None:
 def test_webhook_rejection_message_never_echoes_the_url_past_its_host() -> None:
     """A denial names the host but never the secret-bearing path or query."""
     config = _config_with(
-        AlertsConfig(
-            sinks=(
-                AlertSink(
-                    type="webhook",
-                    url=f"https://internal.example.org{_WEBHOOK_SECRET_PATH}",
-                ),
-            ),
-        )
+        AlertsConfig(sinks=(AlertSink(type="webhook", url_env=_URL_VAR),))
     )
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ=_environ(url=f"https://internal.example.org{_WEBHOOK_SECRET_PATH}"),
+        )
 
     assert "s3cr3t-token" not in str(exc_info.value)
     assert "internal.example.org" in str(exc_info.value)
@@ -306,20 +419,24 @@ def test_webhook_rejection_message_never_echoes_an_unparseable_url() -> None:
     """
     config = _config_with(
         AlertsConfig(
-            sinks=(AlertSink(type="webhook", url=_HOSTLESS_WEBHOOK_URL),),
+            sinks=(AlertSink(type="webhook", url_env=_URL_VAR),),
             allowed_hosts=(_WEBHOOK_HOST,),
         )
     )
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ=_environ(url=_HOSTLESS_WEBHOOK_URL),
+        )
 
     message = str(exc_info.value)
     assert _HOSTLESS_URL_TOKEN not in message
     assert _HOSTLESS_WEBHOOK_URL not in message
     assert "/incoming" not in message
     assert "webhook" in message
-    assert "url" in message
+    assert "url_env" in message
 
 
 def test_ntfy_rejection_message_never_echoes_an_unparseable_base_url() -> None:
@@ -332,9 +449,7 @@ def test_ntfy_rejection_message_never_echoes_an_unparseable_base_url() -> None:
         AlertsConfig(
             sinks=(
                 AlertSink(
-                    type="ntfy",
-                    base_url=_HOSTLESS_WEBHOOK_URL,
-                    topic="secret-topic",
+                    type="ntfy", base_url_env=_BASE_URL_VAR, topic_env=_TOPIC_VAR
                 ),
             ),
             allowed_hosts=(_NTFY_HOST,),
@@ -342,13 +457,18 @@ def test_ntfy_rejection_message_never_echoes_an_unparseable_base_url() -> None:
     )
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ=_environ(base_url=_HOSTLESS_WEBHOOK_URL, topic="secret-topic"),
+        )
 
     message = str(exc_info.value)
     assert _HOSTLESS_URL_TOKEN not in message
     assert _HOSTLESS_WEBHOOK_URL not in message
+    assert "secret-topic" not in message
     assert "ntfy" in message
-    assert "base_url" in message
+    assert "base_url_env" in message
 
 
 def test_smtp_rejection_message_redacts_a_host_that_is_not_a_bare_host() -> None:
@@ -376,7 +496,7 @@ def test_smtp_rejection_message_redacts_a_host_that_is_not_a_bare_host() -> None
     )
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config), environ={})
 
     message = str(exc_info.value)
     assert _HOSTLESS_URL_TOKEN not in message
@@ -407,7 +527,7 @@ def test_smtp_rejection_message_still_names_a_genuine_bare_host() -> None:
     )
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config), environ={})
 
     message = str(exc_info.value)
     assert "relay.internal.example" in message
@@ -441,6 +561,7 @@ def test_configured_smtp_sink_delivers_an_email() -> None:
         config.alerts,
         allowlist=allowlist_from_config(config),
         smtp_transport=transport,
+        environ={},
     )
     AlertDispatcher(sinks, ledger_writer=LoggingLedgerWriter()).dispatch(
         AlertType.BACKUP_FAILURE, "backup failed"
@@ -471,7 +592,7 @@ def test_smtp_host_off_the_allowlist_is_rejected_at_build_time() -> None:
     )
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config), environ={})
 
     assert "relay.internal" in str(exc_info.value)
 
@@ -485,6 +606,7 @@ def test_configured_desktop_sink_delivers_through_the_injected_notifier() -> Non
         config.alerts,
         allowlist=allowlist_from_config(config),
         desktop_notifier=lambda title, body: notified.append((title, body)),
+        environ={},
     )
     AlertDispatcher(sinks, ledger_writer=LoggingLedgerWriter()).dispatch(
         AlertType.VETO, "vetoed"
@@ -503,7 +625,7 @@ def test_desktop_sink_without_a_notifier_is_rejected_at_build_time() -> None:
     config = _config_with(AlertsConfig(sinks=(AlertSink(type="desktop"),)))
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config), environ={})
 
     assert "desktop" in str(exc_info.value)
 
@@ -516,7 +638,7 @@ def test_unknown_sink_type_is_rejected() -> None:
     config = _config_with(AlertsConfig(sinks=(AlertSink(type="carrier-pigeon"),)))
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(config.alerts, allowlist=allowlist_from_config(config), environ={})
 
     assert "carrier-pigeon" in str(exc_info.value)
 
@@ -527,7 +649,7 @@ def test_ntfy_host_off_the_allowlist_is_rejected_at_build_time() -> None:
         AlertsConfig(
             sinks=(
                 AlertSink(
-                    type="ntfy", topic="ops", base_url="https://evil.example.net"
+                    type="ntfy", topic_env=_TOPIC_VAR, base_url_env=_BASE_URL_VAR
                 ),
             ),
             allowed_hosts=(_NTFY_HOST,),
@@ -535,7 +657,11 @@ def test_ntfy_host_off_the_allowlist_is_rejected_at_build_time() -> None:
     )
 
     with pytest.raises(AlertSinkConfigError) as exc_info:
-        build_sinks(config.alerts, allowlist=allowlist_from_config(config))
+        build_sinks(
+            config.alerts,
+            allowlist=allowlist_from_config(config),
+            environ=_environ(topic="ops", base_url="https://evil.example.net"),
+        )
 
     assert "evil.example.net" in str(exc_info.value)
 
@@ -545,8 +671,10 @@ def test_every_configured_sink_is_built_in_order() -> None:
     config = _config_with(
         AlertsConfig(
             sinks=(
-                AlertSink(type="ntfy", topic="ops", base_url=f"https://{_NTFY_HOST}"),
-                AlertSink(type="webhook", url=f"https://{_WEBHOOK_HOST}/hook"),
+                AlertSink(
+                    type="ntfy", topic_env=_TOPIC_VAR, base_url_env=_BASE_URL_VAR
+                ),
+                AlertSink(type="webhook", url_env=_URL_VAR),
             ),
             allowed_hosts=(_NTFY_HOST, _WEBHOOK_HOST),
         )
@@ -556,6 +684,11 @@ def test_every_configured_sink_is_built_in_order() -> None:
         config.alerts,
         allowlist=allowlist_from_config(config),
         http_transport=_RecordingHttpTransport(),
+        environ=_environ(
+            topic="ops",
+            base_url=f"https://{_NTFY_HOST}",
+            url=f"https://{_WEBHOOK_HOST}/hook",
+        ),
     )
 
     assert [sink.name for sink in sinks] == ["ntfy", "webhook"]
@@ -581,4 +714,4 @@ def test_allowlist_from_config_admits_no_alert_host_by_default() -> None:
 
 def test_placeholder_constant_is_the_shipped_alert_sink_default() -> None:
     """The skip rule keys off the same placeholder the schema ships."""
-    assert WindbreakConfig().alerts.sinks[0].base_url == UNCONFIGURED_PLACEHOLDER
+    assert WindbreakConfig().alerts.sinks[0].base_url_env == UNCONFIGURED_PLACEHOLDER

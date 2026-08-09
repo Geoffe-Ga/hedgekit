@@ -223,6 +223,16 @@ def test_alert_test_subcommand_message_can_be_overridden() -> None:
 
 
 # --- issue #274: `alert-test` dispatches through the *configured* sinks -------
+#
+# Alert destinations are never config leaves (they would land verbatim in the
+# hash-chained `ConfigLoaded` ledger event), so each sink below names the
+# environment variable its destination is read from.
+
+#: The variable the webhook CLI tests point at their endpoint.
+_WEBHOOK_URL_VAR = "WINDBREAK_TEST_CLI_WEBHOOK_URL"
+
+#: The variable the ntfy CLI test points at its bearer-capability topic.
+_NTFY_TOPIC_VAR = "WINDBREAK_TEST_CLI_NTFY_TOPIC"
 
 
 def test_alert_test_subcommand_accepts_a_config_path() -> None:
@@ -248,7 +258,9 @@ def test_alert_test_subcommand_fails_closed_on_an_unreadable_config(
 
 
 def test_alert_test_subcommand_fails_closed_on_an_off_allowlist_sink(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A webhook aimed off the declared allowlist stops the command (issue #274).
 
@@ -256,13 +268,14 @@ def test_alert_test_subcommand_fails_closed_on_an_off_allowlist_sink(
     may not dial must never degrade to a healthy-looking log-only dispatch. No
     network is touched -- the URL is refused at composition, before any POST.
     """
+    monkeypatch.setenv(_WEBHOOK_URL_VAR, "https://169.254.169.254/latest/meta-data")
     config_path = tmp_path / "windbreak.yaml"
     config_path.write_text(
         "alerts:\n"
         "  allowed_hosts: [hooks.example.com]\n"
         "  sinks:\n"
         "    - type: webhook\n"
-        "      url: https://169.254.169.254/latest/meta-data\n",
+        f"      url_env: {_WEBHOOK_URL_VAR}\n",
         encoding="utf-8",
     )
 
@@ -274,17 +287,53 @@ def test_alert_test_subcommand_fails_closed_on_an_off_allowlist_sink(
     assert "169.254.169.254" in captured.err
 
 
+def test_alert_test_subcommand_fails_closed_on_an_unexported_destination_variable(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sink naming an unset variable stops the command, naming the variable.
+
+    Naming a variable and never exporting it is an operator mistake, not absent
+    configuration: silently skipping it would leave a process that reports a
+    configured alert channel and delivers nothing. The FATAL line reaches stderr
+    verbatim, so it names only the variable -- there is no value to disclose.
+    """
+    monkeypatch.delenv(_WEBHOOK_URL_VAR, raising=False)
+    config_path = tmp_path / "windbreak.yaml"
+    config_path.write_text(
+        "alerts:\n"
+        "  allowed_hosts: [hooks.example.com]\n"
+        "  sinks:\n"
+        "    - type: webhook\n"
+        f"      url_env: {_WEBHOOK_URL_VAR}\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["alert-test", "veto", "--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "FATAL" in captured.err
+    assert _WEBHOOK_URL_VAR in captured.err
+    assert "url_env" in captured.err
+
+
 def test_alert_test_subcommand_never_logs_a_configured_ntfy_topic(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unconfigured sink is skipped loudly without leaking its topic.
 
     An ntfy topic is a bearer capability: anyone holding it can publish to (and
-    subscribe to) the operator's alert channel, so it must never reach a log.
+    subscribe to) the operator's alert channel, so it must never reach a log --
+    not the configuration file it is deliberately kept out of, and not stderr.
     """
+    monkeypatch.setenv(_NTFY_TOPIC_VAR, "s3cr3t-capability")
     config_path = tmp_path / "windbreak.yaml"
     config_path.write_text(
-        "alerts:\n  sinks:\n    - type: ntfy\n      topic: s3cr3t-capability\n",
+        f"alerts:\n  sinks:\n    - type: ntfy\n      topic_env: {_NTFY_TOPIC_VAR}\n",
         encoding="utf-8",
     )
 

@@ -20,8 +20,9 @@ network access.
 
 Alert-sink hosts *are* derived here (issue #274), from
 :attr:`~windbreak.config.schema.AlertsConfig.allowed_hosts` -- and from that
-field **only**, never from the per-sink ``base_url``/``url``/``smtp.host``
-destinations the same section carries. Deriving the allowlist from the very URLs
+field **only**, never from the destinations the same section carries (which for
+``ntfy``/``webhook`` are not even in configuration -- ``base_url_env``/
+``url_env`` name environment variables). Deriving the allowlist from the very URLs
 it screens would make the check unfalsifiable: every configured sink would admit
 itself and the veto could never fire. Keeping the declaration separate means an
 operator must state the host twice, in two independent fields, so a single

@@ -314,25 +314,32 @@ pass.
 Alerts reach you only through the sinks `config.alerts` declares. Until you
 declare one, every alert falls back to the log-only sink: it appears on stderr
 as a JSON `AlertEmitted` line and **nowhere else**. That is the shipped default
-(`alerts.sinks` holds one `configured-by-operator` ntfy placeholder), so treat
-configuring a real sink as a prerequisite for any unattended run.
+(`alerts.sinks` holds one ntfy entry whose `topic_env` is still the
+`configured-by-operator` placeholder), so treat configuring a real sink as a
+prerequisite for any unattended run.
 
 ### Configure a sink
 
 Each entry needs `type` plus the fields that type uses, and every destination
 host must **also** be declared in `alerts.allowed_hosts` — the outbound egress
 allowlist is deliberately separate from the destination, so a mistyped URL
-cannot open egress by itself:
+cannot open egress by itself.
+
+**An ntfy topic and a webhook URL never go in the config file.** They are bearer
+capabilities, and every config value is written verbatim into the append-only
+ledger and into `config_versions.json`. Instead the config names the environment
+variable each one is read from — `topic_env`, `base_url_env`, `url_env` — the
+same indirection `research.search_api_key_env` already uses:
 
 ```yaml
 alerts:
   allowed_hosts: [ntfy.sh, hooks.example.com, smtp.example.com]
   sinks:
     - type: ntfy
-      base_url: https://ntfy.sh
-      topic: your-private-topic     # a bearer capability: keep it secret
+      base_url_env: WINDBREAK_NTFY_BASE_URL
+      topic_env: WINDBREAK_NTFY_TOPIC
     - type: webhook
-      url: https://hooks.example.com/services/TOKEN
+      url_env: WINDBREAK_WEBHOOK_URL
     - type: smtp
       smtp:
         host: smtp.example.com
@@ -340,6 +347,20 @@ alerts:
         sender: windbreak@example.com
         recipients: [ops@example.com]
 ```
+
+```bash
+export WINDBREAK_NTFY_BASE_URL=https://ntfy.sh
+export WINDBREAK_NTFY_TOPIC=your-private-topic     # a bearer capability
+export WINDBREAK_WEBHOOK_URL=https://hooks.example.com/services/TOKEN
+```
+
+Naming a variable you never export is **fatal**, not a skip: startup exits 1
+with a `FATAL:` line naming the variable (never a value). A sink you have not
+wired at all — the field left at `configured-by-operator` — is the skip case.
+
+The `smtp` block stays in the config file on purpose: `host` has to be repeated
+in `allowed_hosts` anyway, and `sender`/`recipients` are mailbox addresses, not
+credentials. See SECURITY.md, "Alert destinations never live in configuration".
 
 `desktop` is also a valid type, but only for a process that supplies a desktop
 notifier; the CLI does not, so a `desktop` entry makes it exit 1 rather than
@@ -354,8 +375,9 @@ windbreak alert-test mode-change --config /path/to/windbreak.yaml
 Read the `AlertEmitted` line's per-sink outcomes on stderr. `"ntfy=ok:True"`
 means it was delivered; a `log-only` outcome means no sink was built or every
 sink failed. Startup **fails closed** (exit 1, `FATAL:` on stderr) when a sink
-names an unknown type, targets a host missing from `allowed_hosts`, or cannot
-deliver as configured — a half-wired alerting path is never silently downgraded.
+names an unknown type, names a destination environment variable that is unset or
+empty, targets a host missing from `allowed_hosts`, or cannot deliver as
+configured — a half-wired alerting path is never silently downgraded.
 A sink you have not finished filling in is skipped with a WARNING naming its
 type only; no topic or webhook URL is ever logged.
 

@@ -10,8 +10,11 @@ dispatcher to the crosscheck's ``(severity, message) -> None`` alert seam.
 :func:`~windbreak.alerts.factory.build_sinks` is the config-driven composition
 seam: it turns the ``alerts.sinks`` section of a
 :class:`~windbreak.config.schema.WindbreakConfig` into the concrete ``*Sink``
-instances a dispatcher fans out to, screening every network destination against
-the deployment's egress allowlist (issue #274). It is deliberately *not*
+instances a dispatcher fans out to, resolving each destination from the
+environment variable configuration names for it (destinations are never config
+leaves: a leaf is persisted verbatim into the hash-chained ``ConfigLoaded``
+ledger event) and screening every one against the deployment's egress allowlist
+(issue #274). It is deliberately *not*
 re-exported from this package: importing it pulls :mod:`windbreak.config` and
 :mod:`windbreak.net` in behind it, and the alert primitives below must stay
 usable without either.

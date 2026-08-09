@@ -69,4 +69,4 @@ ops:
   cancel_open_orders_on_shutdown: true
 
 alerts:
-  sinks: [{type: ntfy, topic: "configured-by-operator"}]
+  sinks: [{type: ntfy, topic_env: "configured-by-operator"}]
