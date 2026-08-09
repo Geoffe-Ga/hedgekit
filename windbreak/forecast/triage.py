@@ -39,7 +39,6 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, replace
-from datetime import UTC
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol
 
 from windbreak.forecast.cassettes import LlmRequest
@@ -50,6 +49,7 @@ from windbreak.forecast.pipeline import (
     run_pipeline,
 )
 from windbreak.forecast.records import ForecastRecord
+from windbreak.timekeeping import iso_z
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -195,21 +195,6 @@ class InMemoryTriageLedger:
             The matching events.
         """
         return tuple(event for event in self._events if event.event_type == event_type)
-
-
-def _iso_z(moment: datetime) -> str:
-    """Render a datetime as ISO-8601 UTC with a trailing ``Z``.
-
-    Follows the local-``_iso_z`` precedent in ``pipeline.py`` and ``records.py``
-    (each module defines its own) rather than reaching across for a shared one.
-
-    Args:
-        moment: The (timezone-aware) datetime to render; normalized to UTC.
-
-    Returns:
-        A string like ``2024-12-10T12:00:00.000000Z``.
-    """
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def _stage0_prompt(market: NormalizedMarket, baseline: BaselineQuoteSnapshot) -> str:
@@ -394,7 +379,7 @@ def _triage_forecast_id(
         A sha256 hex digest over the canonical JSON of the provenance tuple.
     """
     canonical = json.dumps(
-        [question_hash, snapshot_id, _iso_z(created_at), _TRIAGE_ONLY_STAGE],
+        [question_hash, snapshot_id, iso_z(created_at), _TRIAGE_ONLY_STAGE],
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -477,7 +462,7 @@ def _run_stop_path(
         market=market, baseline=baseline, prior=context.prior, created_at=created_at
     )
     ledger.record(
-        TriageEvent(TRIAGE_STOP_EVENT, _base_payload(context), _iso_z(created_at))
+        TriageEvent(TRIAGE_STOP_EVENT, _base_payload(context), iso_z(created_at))
     )
     return record
 
@@ -541,7 +526,7 @@ def _run_proceed_path(
     payload = _base_payload(context)
     payload["full_cost_micros"] = full_record.research_cost_micros
     payload["total_research_cost_micros"] = folded.research_cost_micros
-    ledger.record(TriageEvent(TRIAGE_PROCEED_EVENT, payload, _iso_z(created_at)))
+    ledger.record(TriageEvent(TRIAGE_PROCEED_EVENT, payload, iso_z(created_at)))
     return folded
 
 

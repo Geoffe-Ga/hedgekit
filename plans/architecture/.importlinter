@@ -76,6 +76,7 @@ source_modules =
     windbreak.scheduler
     windbreak.screener
     windbreak.selector
+    windbreak.timekeeping
     windbreak.tokens
     windbreak.__main__
     windbreak.main
@@ -133,6 +134,7 @@ source_modules =
     windbreak.riskkernel
     windbreak.screener
     windbreak.selector
+    windbreak.timekeeping
     windbreak.tokens
     windbreak.__main__
     windbreak.main

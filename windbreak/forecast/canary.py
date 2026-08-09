@@ -22,11 +22,11 @@ arithmetic here is integer-only for the same reason.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol
 
 from windbreak.alerts import AlertType
 from windbreak.forecast.cassettes import LlmRequest
+from windbreak.timekeeping import iso_z, require_aware
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -192,21 +192,6 @@ class CanaryAlertEmitter(Protocol):
             An opaque result; callers never inspect this seam's return value.
         """
         ...
-
-
-def _iso_z(moment: datetime) -> str:
-    """Render a datetime as ISO-8601 UTC with a trailing ``Z``.
-
-    Follows the local-``_iso_z`` precedent in ``triage.py``/``pipeline.py``/
-    ``records.py`` (each module defines its own) rather than sharing one.
-
-    Args:
-        moment: The (timezone-aware) datetime to render; normalized to UTC.
-
-    Returns:
-        A string like ``2024-12-10T12:00:00.000000Z``.
-    """
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def _canary_prompt(question: CanaryQuestion) -> str:
@@ -547,7 +532,15 @@ class CanaryGate:
 
         Returns:
             ``True`` if the run breached tolerance, else ``False``.
+
+        Raises:
+            ValueError: If ``checked_at`` carries no UTC offset (issue #397).
+                It is stored as the drift instant and later compared against
+                other instants, so a naive value would either raise ``TypeError``
+                deep in the gate on a naive/aware mix or compare bare host-local
+                wall clocks on a naive/naive one.
         """
+        require_aware(checked_at, "checked_at")
         if result.drift_score_ppm > self._drift_tolerance_ppm:
             alerts.dispatch(
                 AlertType.CANARY_DRIFT,
@@ -557,13 +550,13 @@ class CanaryGate:
                 CanaryEvent(
                     CANARY_DRIFT_EVENT,
                     self._answer_breach_payload(result, provider),
-                    _iso_z(checked_at),
+                    iso_z(checked_at),
                 )
             )
             self._window(provider).register_breach(checked_at)
             return True
         ledger.record(
-            CanaryEvent(CANARY_OK_EVENT, self._ok_payload(result), _iso_z(checked_at))
+            CanaryEvent(CANARY_OK_EVENT, self._ok_payload(result), iso_z(checked_at))
         )
         return False
 
@@ -596,7 +589,11 @@ class CanaryGate:
 
         Returns:
             ``True`` if the version drifted off the pinned set, else ``False``.
+
+        Raises:
+            ValueError: If ``checked_at`` carries no UTC offset (issue #397).
         """
+        require_aware(checked_at, "checked_at")
         if reported_version in pinned_versions:
             return False
         message = (
@@ -611,7 +608,7 @@ class CanaryGate:
             "reported_version": reported_version,
             "pinned_versions": list(pinned_versions),
         }
-        ledger.record(CanaryEvent(CANARY_DRIFT_EVENT, payload, _iso_z(checked_at)))
+        ledger.record(CanaryEvent(CANARY_DRIFT_EVENT, payload, iso_z(checked_at)))
         self._window(provider).register_breach(checked_at)
         return True
 
@@ -638,20 +635,22 @@ class CanaryGate:
                 the global dimension (keyword-only).
 
         Raises:
-            ValueError: If the named dimension has no active drift.
+            ValueError: If ``acked_at`` carries no UTC offset (issue #397), or
+                if the named dimension has no active drift.
         """
+        require_aware(acked_at, "acked_at")
         window = self._windows.get(provider)
         if window is None or window.drifted_at is None:
             msg = "cannot acknowledge: no active canary drift"
             raise ValueError(msg)
         window.acked_at = acked_at
         payload: dict[str, object] = {
-            "drifted_at": _iso_z(window.drifted_at),
-            "acked_at": _iso_z(acked_at),
+            "drifted_at": iso_z(window.drifted_at),
+            "acked_at": iso_z(acked_at),
         }
         if provider is not None:
             payload["provider"] = provider
-        ledger.record(CanaryEvent(CANARY_ACK_EVENT, payload, _iso_z(acked_at)))
+        ledger.record(CanaryEvent(CANARY_ACK_EVENT, payload, iso_z(acked_at)))
 
     def _is_dimension_blocked(self, key: str | None, created_at: datetime) -> bool:
         """Return whether a single drift dimension blocks ``created_at``.
@@ -682,7 +681,13 @@ class CanaryGate:
 
         Returns:
             ``True`` if the record is blocked from live eligibility.
+
+        Raises:
+            ValueError: If ``created_at`` carries no UTC offset (issue #397).
+                This is the live-eligibility decision, so a host-dependent
+                ordering here decides whether a record may back a real order.
         """
+        require_aware(created_at, "created_at")
         if self._is_dimension_blocked(None, created_at):
             return True
         return provider is not None and self._is_dimension_blocked(provider, created_at)
