@@ -99,7 +99,11 @@ from windbreak.connector.interface import MarketConnector, UnknownMarketError
 from windbreak.connector.kalshi.adapter import KALSHI_BALANCE_SEMANTICS, KalshiConnector
 from windbreak.connector.kalshi.client import KalshiApiError, KalshiClient
 from windbreak.connector.kalshi.normalize import MARKET_MALFORMED_EVENT
-from windbreak.connector.paper import PaperExchange
+from windbreak.connector.paper import (
+    PaperExchange,
+    PaperOrderIntent,
+    TwoSidedPositionError,
+)
 from windbreak.connector.resilience import ResiliencePolicy, ResilientCaller
 from windbreak.connector.semantics import PartialFillRepresentation
 from windbreak.connector.snapshot import InMemoryEventLedgerWriter
@@ -1142,6 +1146,9 @@ def _paper_get_balance_semantics_happy() -> None:
 
 
 def _paper_get_balances_happy() -> None:
+    # A fresh exchange has filled nothing, so the opening fixture balance is
+    # still intact; `tests/connector/test_paper_exchange.py` pins the debits a
+    # fill applies to it (issue #352).
     exchange = _paper_exchange()
 
     balances = exchange.get_balances()
@@ -1151,9 +1158,39 @@ def _paper_get_balances_happy() -> None:
 
 
 def _paper_get_positions_happy() -> None:
+    # Positions are folded from the exchange's own fills (issue #352), so the
+    # happy path is exercised by actually trading: the `deep_walk` walk consumes
+    # (4600, 200) then (4700, 100) -- 300 centis at a 1_390_000 // 300 mean.
     exchange = _paper_exchange()
+    exchange.place_order(
+        PaperOrderIntent("MKT-DEEP", "yes", PricePips(4700), ContractCentis(1000)),
+        approval_token=object(),
+    )
 
-    assert exchange.get_positions() == ()
+    positions = exchange.get_positions()
+
+    assert len(positions) == 1
+    assert positions[0].ticker == "MKT-DEEP"
+    assert positions[0].quantity == ContractCentis(300)
+    assert positions[0].average_price == PricePips(4633)
+
+
+def _paper_get_positions_error() -> None:
+    # A ticker filled on both sides has no honest single-row `Position`, and
+    # netting the legs would report a flat account while both are still open;
+    # the simulator refuses rather than fabricating that healthy zero.
+    exchange = _paper_exchange()
+    exchange.place_order(
+        PaperOrderIntent("MKT-DEEP", "yes", PricePips(4700), ContractCentis(100)),
+        approval_token=object(),
+    )
+    exchange.place_order(
+        PaperOrderIntent("MKT-DEEP", "no", PricePips(5500), ContractCentis(100)),
+        approval_token=object(),
+    )
+
+    with pytest.raises(TwoSidedPositionError, match="MKT-DEEP"):
+        exchange.get_positions()
 
 
 def _paper_get_open_orders_happy() -> None:
@@ -1295,6 +1332,7 @@ _MATRIX: dict[tuple[str, str, str], Callable[[], None] | NotApplicable] = {
     ("paper", "get_open_orders", "happy"): _paper_get_open_orders_happy,
     ("paper", "get_fills", "happy"): _paper_get_fills_happy,
     ("paper", "get_fee_model", "happy"): _paper_get_fee_model_happy,
+    ("paper", "get_positions", "error"): _paper_get_positions_error,
     ("paper", "get_market", "error"): _paper_get_market_error,
     ("paper", "get_order_book", "error"): _paper_get_order_book_error,
     ("paper", "list_markets", "malformed"): _paper_list_markets_malformed,
@@ -1324,8 +1362,9 @@ for _scenario in _NON_HAPPY_SCENARIOS:
         "transport is dialed, so this scenario cannot occur."
     )
 
-#: Reasons for the 9 paper endpoints with no defined "error" contract (only
-#: `get_market` / `get_order_book` can fail on an unknown ticker).
+#: Reasons for the 8 paper endpoints with no defined "error" contract
+#: (`get_market` / `get_order_book` fail on an unknown ticker, and
+#: `get_positions` fails closed on a ticker held on both sides).
 _PAPER_ERROR_NA_REASONS: Final[dict[str, str]] = {
     "list_markets": (
         "list_markets takes no argument and always returns the loaded "
@@ -1336,8 +1375,11 @@ _PAPER_ERROR_NA_REASONS: Final[dict[str, str]] = {
     "get_balance_semantics": (
         "returns the static fixture semantics; no failure path exists."
     ),
-    "get_balances": "returns the static fixture balances; no failure path exists.",
-    "get_positions": "always returns an empty tuple; no failure path exists.",
+    "get_balances": (
+        "folds the opening fixture balance and the exchange's own fills into a "
+        "snapshot; both inputs are already validated at construction, so no "
+        "failure path exists."
+    ),
     "get_open_orders": (
         "returns the current resting-order list; a fresh exchange has no "
         "failure path here."
@@ -1430,7 +1472,7 @@ def test_matrix_accounts_for_every_endpoint_scenario_cell() -> None:
 
 
 def test_matrix_reports_the_runnable_versus_not_applicable_split() -> None:
-    """Sanity guard on the matrix's shape: 50 runnable cells, 60 N/A cells."""
+    """Sanity guard on the matrix's shape: 51 runnable cells, 59 N/A cells."""
     runnable = sum(
         1 for entry in _MATRIX.values() if not isinstance(entry, NotApplicable)
     )
@@ -1438,8 +1480,8 @@ def test_matrix_reports_the_runnable_versus_not_applicable_split() -> None:
         1 for entry in _MATRIX.values() if isinstance(entry, NotApplicable)
     )
 
-    assert runnable == 50
-    assert not_applicable == 60
+    assert runnable == 51
+    assert not_applicable == 59
     assert runnable + not_applicable == 110
 
 

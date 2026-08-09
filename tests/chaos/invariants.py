@@ -81,8 +81,9 @@ class GatewaySnapshot:
         wal_records: Every durable write-ahead record, in append order.
         open_orders: The venue's currently resting orders.
         positions: The currently held positions, as reported by a wired
-            reduce-only position source; empty when enforcement is off (the
-            venue itself models no position state, see
+            reduce-only position source; empty when enforcement is off, and
+            empty on an untraded venue (the paper exchange folds its holdings
+            out of its own fill log, see
             :meth:`~windbreak.connector.paper.PaperExchange.get_positions`).
     """
 

@@ -10,8 +10,20 @@ rests, and resting orders fill on later steps only when the recorded market
 
 The connector reuses :mod:`windbreak.connector.fake`'s JSON loader helpers for
 the static market/balance/fee fixtures (DRY) and adds a ``sessions.json`` reader
-for the book-and-print replay. Balances are static: this simulator models fills
-and resting orders, *not* balance debits (out of scope for issue #19).
+for the book-and-print replay. The fixture balance is the account's *opening*
+balance only: :meth:`PaperExchange.get_positions` and
+:meth:`PaperExchange.get_balances` are both folded from this exchange's own
+fill log, so what the exchange reports holding and what it reports owning are
+consequences of what it actually traded (issue #352).
+
+That independence is the point. ``LedgerExpectationSource`` seeds each
+verification dimension from ``component == "riskkernel"`` events, and the PAPER
+loop stamps ``"scheduler"`` on everything it writes, so every dimension falls
+back to this connector. Had positions stayed a hardcoded ``()`` and balances a
+frozen fixture, the ledger-derived *expectation* and the exchange-reported
+*observation* would be the same constant and a reconciliation between them
+could not fail for any reason -- checks that structurally cannot fail are worse
+than no checks at all.
 
 Consistency guard (issue #18): a taker walk can span multiple book levels, each
 needing its own :class:`~windbreak.connector.models.Fill` price, so the
@@ -50,9 +62,22 @@ from windbreak.connector.fills import (
     walk_taker_fill,
 )
 from windbreak.connector.interface import UnknownMarketError
-from windbreak.connector.models import Fill, OpenOrder, OrderBookLevel
+from windbreak.connector.models import (
+    BalanceSnapshot,
+    Fill,
+    OpenOrder,
+    OrderBookLevel,
+    Position,
+)
 from windbreak.connector.semantics import PartialFillRepresentation
-from windbreak.numeric import ContractCentis, PricePips
+from windbreak.numeric import (
+    ContractCentis,
+    MoneyMicros,
+    PricePips,
+    RoundingDirection,
+    divide,
+    money_from_price_and_count,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -61,14 +86,17 @@ if TYPE_CHECKING:
     from windbreak.connector.fees import FeeModel
     from windbreak.connector.models import (
         BalanceSemantics,
-        BalanceSnapshot,
         ExchangeStatus,
         NormalizedMarket,
         OrderBookSnapshot,
-        Position,
     )
 
-__all__ = ["PAPER_FILL_MODEL_VERSION", "PaperExchange", "PaperOrderIntent"]
+__all__ = [
+    "PAPER_FILL_MODEL_VERSION",
+    "PaperExchange",
+    "PaperOrderIntent",
+    "TwoSidedPositionError",
+]
 
 #: Fee-schedule key used when a market has no ticker-specific schedule (mirrors
 #: :data:`windbreak.connector.fake._DEFAULT_FEE_KEY`).
@@ -76,6 +104,109 @@ _DEFAULT_FEE_KEY: Final[str] = "default"
 
 #: Pips in a full ``$1`` payout: a NO price is the complement ``10_000 - yes``.
 _COMPLEMENT_PIPS: Final[int] = 10_000
+
+#: Cash leaving the account always rounds *up*: an overstated debit is the safe
+#: error, mirroring :mod:`windbreak.connector.fills`'s money rounding. Every
+#: notional here is an exact ``price * quantity`` product, so this is inert in
+#: practice -- it is stated at the call site because the money path requires the
+#: direction to be visible (``scripts/lint_no_floats.py`` forbids bare ``//``).
+_MONEY_ROUNDING: Final[RoundingDirection] = RoundingDirection.OVERSTATE_COST
+
+#: An average entry price rounds *down*, so a reported holding is never marked
+#: at more than it cost. Matches the PAPER loop's own ``notional // quantity``
+#: position projection (``windbreak/scheduler/loop.py``).
+_PRICE_ROUNDING: Final[RoundingDirection] = RoundingDirection.UNDERSTATE_EQUITY
+
+
+class TwoSidedPositionError(RuntimeError):
+    """Raised when one ticker's fill log carries both a YES and a NO leg.
+
+    :class:`~windbreak.connector.models.Position` carries a single signed
+    quantity per ticker, and
+    :class:`~windbreak.riskkernel.verification.LedgerExpectationSource` keys its
+    expectation by ticker, so a two-sided holding can only be reported by
+    netting the legs -- and a netted one-YES-plus-one-NO reports as *flat* while
+    both legs and their collateral are still live. That is precisely the
+    fabricated "healthy zero" a reconciliation must never be handed, so the
+    simulator refuses to report at all rather than report a state it cannot
+    represent.
+
+    Refusing is safe for the kernel's own cycle:
+    :meth:`~windbreak.riskkernel.verification.ReadOnlyVerifier.run_cycle` grades
+    a connector that raises as a ``BREACH`` and records it before alerting, so
+    this error halts the kernel through the audited path instead of escaping the
+    heartbeat loop.
+
+    Attributes:
+        ticker: The market held on both sides.
+    """
+
+    def __init__(self, ticker: str) -> None:
+        """Build the error for a two-sided ``ticker``.
+
+        Args:
+            ticker: The market whose fill log carries both a YES and a NO leg.
+        """
+        self.ticker = ticker
+        super().__init__(
+            f"{ticker} is held on both the YES and the NO side; a single-row "
+            "Position cannot represent that, and netting the legs would report "
+            "a flat account while both legs are still open"
+        )
+
+
+@dataclass(slots=True)
+class _SideTotals:
+    """Running totals for one ``(ticker, side)`` slice of the fill log.
+
+    Attributes:
+        quantity_centis: The side's total filled size, in contract-centis.
+        notional_micros: The side's total filled notional, in micros.
+    """
+
+    quantity_centis: int = 0
+    notional_micros: int = 0
+
+
+def _position_row(
+    ticker: str, side: Literal["yes", "no"], totals: _SideTotals
+) -> Position:
+    """Project one side's fill totals into a YES-frame :class:`Position` row.
+
+    Positions are reported in the YES frame -- positive is long YES, negative is
+    long NO -- because a ticker gets exactly one row and a consumer reading only
+    ``quantity`` must not mistake a NO holding for a YES one. A long NO is
+    economically a short YES, so ``N`` NO contracts bought at ``p`` report as
+    ``-N`` at the complement price ``10_000 - p``.
+
+    :data:`_PRICE_ROUNDING` stays conservative through that complement:
+    subtracting a *floored* NO average from ``10_000`` yields a *ceiling* on the
+    reported YES-frame price, and marking a short position at the higher end of
+    its price band is the direction that understates equity -- the same
+    conservatism the YES row gets from flooring directly.
+
+    Args:
+        ticker: The market the holding is in.
+        side: The side every folded fill was on.
+        totals: That side's filled size and notional.
+
+    Returns:
+        The YES-frame position row.
+    """
+    average = divide(
+        totals.notional_micros, totals.quantity_centis, rounding=_PRICE_ROUNDING
+    )
+    if side == "yes":
+        return Position(
+            ticker=ticker,
+            quantity=ContractCentis(totals.quantity_centis),
+            average_price=PricePips(average),
+        )
+    return Position(
+        ticker=ticker,
+        quantity=ContractCentis(-totals.quantity_centis),
+        average_price=PricePips(_COMPLEMENT_PIPS - average),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,15 +294,17 @@ class PaperExchange:
 
     The connector replays a per-ticker session of recorded books and trade
     prints. Crossing orders fill immediately via the pessimistic taker walk;
-    remainders rest and fill only on a later step's trade-through. Balances are
-    static (no debit modeling -- out of scope for issue #19).
+    remainders rest and fill only on a later step's trade-through. Positions and
+    balances are both folded from the resulting fill log (issue #352), so they
+    move only when the simulator actually trades.
 
     Attributes:
         markets: Ticker-keyed normalized markets.
         sessions: Ticker-keyed replay steps.
         exchange_status: The exchange's trading status.
         exchange_time: The exchange's server time.
-        balances: The account's (static) balances.
+        balances: The account's *opening* balances, before any fill is debited;
+            :meth:`get_balances` reports the current ones.
         balance_semantics: The venue's balance-interpretation semantics.
         fee_models: Fee schedules keyed by ticker (plus a ``default``).
         haircut_ppm: The slippage haircut applied to modeled fees, in ppm.
@@ -202,7 +335,7 @@ class PaperExchange:
             exchange_time: The exchange's server time.
             clock: Observation clock stamped onto each
                 :meth:`get_exchange_status` reading (issue #342).
-            balances: The account's static balances.
+            balances: The account's opening balances, which every fill debits.
             balance_semantics: The venue's balance-interpretation semantics.
             fee_models: Fee schedules keyed by ticker (plus a ``default``).
             haircut_ppm: The slippage haircut on modeled fees, in ppm.
@@ -249,8 +382,10 @@ class PaperExchange:
         """Build a :class:`PaperExchange` from a fixture directory.
 
         Loads the :class:`~windbreak.connector.fake.FakeExchange`-shaped static
-        fixtures plus a ``sessions.json`` replay. Positions and fills start
-        empty (the simulator produces its own fills as it runs).
+        fixtures plus a ``sessions.json`` replay. The fill log starts empty, so
+        the account starts flat at the fixture's opening balance; the simulator
+        produces its own fills -- and therefore its own positions and debits --
+        as it runs.
 
         Args:
             path: The directory holding the JSON fixtures and ``sessions.json``.
@@ -338,12 +473,103 @@ class PaperExchange:
         return self.balance_semantics
 
     def get_balances(self) -> BalanceSnapshot:
-        """Return the fixture balances (static; no debit modeling)."""
-        return self.balances
+        """Return the opening balance less everything this exchange has spent.
+
+        Every fill debits its book cost plus the fee schedule's charge on that
+        fill, from both ``total`` and ``available``: buying a fully
+        collateralized binary converts cash into contracts, and the contracts
+        are reported separately by :meth:`get_positions`. The slippage haircut
+        (:data:`~windbreak.connector.fills.DEFAULT_FEE_HAIRCUT_PPM`) is
+        deliberately *not* debited -- it is a pessimism allowance the sizing
+        path reasons with, not money the venue takes.
+
+        The debit is never floored at zero. A paper account that spent more than
+        it opened with reports a negative balance, because clamping would hide
+        exactly the simulator-fidelity bug the number exists to expose.
+
+        Known gap (deliberately out of issue #352's scope): resting-order
+        collateral is not withheld from ``available``, even though the fixture
+        :meth:`get_balance_semantics` advertises
+        ``DEDUCTED_FROM_AVAILABLE``. Only *filled* cash movements are modeled,
+        so ``available`` overstates free cash while an order rests.
+
+        Returns:
+            The current balances, stamped at the observation instant.
+        """
+        spent = self._cash_spent_micros()
+        return BalanceSnapshot(
+            total=MoneyMicros(self.balances.total.value - spent),
+            available=MoneyMicros(self.balances.available.value - spent),
+            fetched_at=self._clock(),
+        )
+
+    def _cash_spent_micros(self) -> int:
+        """Return the cash this exchange's own fills have spent, in micros.
+
+        The fee is re-derived per fill from the same
+        :meth:`~windbreak.connector.fees.FeeModel.max_trading_fee_micros` call
+        the taker walk charged per consumed level -- and a taker walk emits
+        exactly one :class:`~windbreak.connector.models.Fill` per consumed level
+        (the ``PER_FILL_RECORDS`` invariant the constructor enforces) -- so this
+        reconstruction reproduces the walk's fee exactly rather than
+        approximating it. A resting trade-through fill is charged on the same
+        schedule.
+
+        Returns:
+            The total book cost plus fees across every simulated fill, in
+            micros.
+        """
+        spent = 0
+        for fill in self._fills:
+            spent += money_from_price_and_count(
+                fill.price, fill.quantity, rounding=_MONEY_ROUNDING
+            ).value
+            spent += self.get_fee_model(fill.ticker).max_trading_fee_micros(
+                fill.price.value, fill.quantity.value
+            )
+        return spent
 
     def get_positions(self) -> tuple[Position, ...]:
-        """Return the account's positions (always empty in the paper sim)."""
-        return ()
+        """Return the holdings this exchange's own fills have accumulated.
+
+        One row per ticker that has filled, ordered by ticker for determinism,
+        in the YES frame (see :func:`_position_row`). A ticker with no fills has
+        no row: the account is genuinely flat there.
+
+        Returns:
+            The per-ticker positions, in ticker order.
+
+        Raises:
+            TwoSidedPositionError: If any one ticker has filled on both the YES
+                and the NO side. See that class for why netting is refused.
+        """
+        positions: list[Position] = []
+        seen: set[str] = set()
+        for (ticker, side), totals in sorted(
+            self._fill_totals().items(), key=lambda item: item[0]
+        ):
+            if ticker in seen:
+                raise TwoSidedPositionError(ticker)
+            seen.add(ticker)
+            positions.append(_position_row(ticker, side, totals))
+        return tuple(positions)
+
+    def _fill_totals(self) -> dict[tuple[str, Literal["yes", "no"]], _SideTotals]:
+        """Fold this exchange's fill log into per-``(ticker, side)`` totals.
+
+        Returns:
+            The filled size and notional for every ``(ticker, side)`` slice that
+            has traded; a slice only exists once a fill landed on it, and every
+            emitted fill carries a positive quantity, so no entry is ever empty.
+        """
+        totals: dict[tuple[str, Literal["yes", "no"]], _SideTotals] = {}
+        for fill in self._fills:
+            entry = totals.setdefault((fill.ticker, fill.side), _SideTotals())
+            entry.quantity_centis += fill.quantity.value
+            entry.notional_micros += money_from_price_and_count(
+                fill.price, fill.quantity, rounding=_MONEY_ROUNDING
+            ).value
+        return totals
 
     def get_open_orders(self) -> tuple[OpenOrder, ...]:
         """Return the account's currently resting orders."""
