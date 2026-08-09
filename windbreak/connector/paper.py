@@ -131,6 +131,12 @@ class TwoSidedPositionError(RuntimeError):
     simulator refuses to report at all rather than report a state it cannot
     represent.
 
+    Refusing is safe for the kernel's own cycle:
+    :meth:`~windbreak.riskkernel.verification.ReadOnlyVerifier.run_cycle` grades
+    a connector that raises as a ``BREACH`` and records it before alerting, so
+    this error halts the kernel through the audited path instead of escaping the
+    heartbeat loop.
+
     Attributes:
         ticker: The market held on both sides.
     """
@@ -172,6 +178,12 @@ def _position_row(
     ``quantity`` must not mistake a NO holding for a YES one. A long NO is
     economically a short YES, so ``N`` NO contracts bought at ``p`` report as
     ``-N`` at the complement price ``10_000 - p``.
+
+    :data:`_PRICE_ROUNDING` stays conservative through that complement:
+    subtracting a *floored* NO average from ``10_000`` yields a *ceiling* on the
+    reported YES-frame price, and marking a short position at the higher end of
+    its price band is the direction that understates equity -- the same
+    conservatism the YES row gets from flooring directly.
 
     Args:
         ticker: The market the holding is in.

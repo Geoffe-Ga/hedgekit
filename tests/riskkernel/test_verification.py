@@ -1724,7 +1724,7 @@ _BOOKS_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "books"
 
 def _paper_verifier(
     exchange: PaperExchange,
-) -> tuple[ReadOnlyVerifier, InMemoryKernelLedgerWriter]:
+) -> tuple[ReadOnlyVerifier, InMemoryKernelLedgerWriter, _RecordingSink]:
     """Build a zero-tolerance verifier reconciling ``exchange`` against itself.
 
     The expectation source is constructed *now*, freezing the exchange's
@@ -1735,9 +1735,10 @@ def _paper_verifier(
             construction) and every later observation.
 
     Returns:
-        The `(verifier, kernel_ledger_writer)` pair.
+        The `(verifier, kernel_ledger_writer, alert_sink)` triple.
     """
     ledger_writer = InMemoryKernelLedgerWriter()
+    sink = _RecordingSink()
     verifier = ReadOnlyVerifier(
         connector=exchange,
         expectation_source=LedgerExpectationSource([], exchange),
@@ -1745,18 +1746,42 @@ def _paper_verifier(
             balance_tolerance=_ZERO_TOLERANCE_MICROS,
             position_tolerance=_ZERO_TOLERANCE_CENTIS,
         ),
-        dispatcher=AlertDispatcher(
-            [_RecordingSink()], ledger_writer=LoggingLedgerWriter()
-        ),
+        dispatcher=AlertDispatcher([sink], ledger_writer=LoggingLedgerWriter()),
         ledger_writer=ledger_writer,
     )
-    return verifier, ledger_writer
+    return verifier, ledger_writer, sink
+
+
+def _two_sided_paper_exchange() -> tuple[
+    PaperExchange, ReadOnlyVerifier, InMemoryKernelLedgerWriter, _RecordingSink
+]:
+    """Build a paper exchange whose `get_positions` raises, plus its verifier.
+
+    The verifier (and with it the frozen expectation) is built *before* the two
+    opposing orders land, so construction still sees a representable flat
+    account and only the later per-cycle observation is unreadable -- the exact
+    ordering a running kernel would meet.
+
+    Returns:
+        The `(exchange, verifier, kernel_ledger_writer, alert_sink)` tuple.
+    """
+    exchange = PaperExchange.from_fixture_dir(_BOOKS_DIR / "deep_walk")
+    verifier, ledger_writer, sink = _paper_verifier(exchange)
+    exchange.place_order(
+        PaperOrderIntent("MKT-DEEP", "yes", PricePips(4700), ContractCentis(100)),
+        approval_token=object(),
+    )
+    exchange.place_order(
+        PaperOrderIntent("MKT-DEEP", "no", PricePips(5500), ContractCentis(100)),
+        approval_token=object(),
+    )
+    return exchange, verifier, ledger_writer, sink
 
 
 def test_paper_verification_passes_while_the_exchange_has_not_traded() -> None:
     """An untraded paper exchange still matches the baseline frozen off it."""
     exchange = PaperExchange.from_fixture_dir(_BOOKS_DIR / "deep_walk")
-    verifier, _ = _paper_verifier(exchange)
+    verifier, _, _ = _paper_verifier(exchange)
 
     snapshot = verifier.run_cycle(now_epoch_s=DEFAULT_NOW_EPOCH_S)
 
@@ -1779,7 +1804,7 @@ def test_paper_verification_breaches_once_the_exchange_actually_trades() -> None
     """
     exchange = PaperExchange.from_fixture_dir(_BOOKS_DIR / "deep_walk")
     exchange.advance()
-    verifier, _ = _paper_verifier(exchange)
+    verifier, _, _ = _paper_verifier(exchange)
 
     exchange.place_order(
         PaperOrderIntent("MKT-DEEP", "yes", PricePips(4750), ContractCentis(100)),
@@ -1792,3 +1817,65 @@ def test_paper_verification_breaches_once_the_exchange_actually_trades() -> None
     assert snapshot.position_ok is False
     assert snapshot.outcome is VerificationOutcome.BREACH
     assert snapshot.cash_drift == MoneyMicros(495_000)
+
+
+# --- An unreadable venue is a ledgered breach, never an escaping exception -------
+#
+# `run_cycle` reads the connector *before* `_record(snapshot)`, and that ordering
+# is deliberate everywhere else in the module: recording first is what guarantees
+# a raise later in the cycle can never lose the verification event nor the HALT
+# it drives. `PaperExchange.get_positions` can now raise `TwoSidedPositionError`,
+# so an unhandled raise there would escape `RiskKernel.run_verification_cycle`
+# and the heartbeat loop above it -- crashing the kernel with no ledgered breach
+# and no HALT, i.e. the exact opposite of failing closed. The two tests below
+# pin the fail-closed contract: an unreadable venue lands as a recorded BREACH.
+
+
+def test_unreadable_venue_records_a_breach_instead_of_raising() -> None:
+    """A connector that raises mid-observation yields a recorded BREACH.
+
+    Every dimension is reported not-ok (an unobservable venue has verified
+    nothing), the observed cash floors to zero and the whole expected balance
+    becomes drift, so the snapshot can only tighten the equity floor, never
+    loosen it. Exactly one `VerificationMismatch` event is recorded and the
+    reconciliation-mismatch alert carries the underlying failure.
+    """
+    _, verifier, writer, sink = _two_sided_paper_exchange()
+
+    snapshot = verifier.run_cycle(now_epoch_s=DEFAULT_NOW_EPOCH_S)
+
+    assert snapshot.outcome is VerificationOutcome.BREACH
+    assert snapshot.balance_ok is False
+    assert snapshot.position_ok is False
+    assert snapshot.open_order_ok is False
+    assert snapshot.semantics_fully_known is False
+    assert snapshot.exchange_verified_available_cash == MoneyMicros(0)
+    assert snapshot.verified_at_epoch_s == DEFAULT_NOW_EPOCH_S
+    assert len(_events_of_type(writer, "VerificationMismatch")) == 1
+    mismatch_calls = [
+        call for call in sink.calls if call[0] is AlertType.RECONCILIATION_MISMATCH
+    ]
+    assert len(mismatch_calls) == 1
+    assert "MKT-DEEP" in mismatch_calls[0][2]
+
+
+def test_unreadable_venue_halts_the_kernel_through_the_heartbeat_path() -> None:
+    """The breach reaches HALT through `RiskKernel.run_verification_cycle`.
+
+    The raise must not escape the heartbeat loop: the kernel transitions to
+    `Mode.HALT` and records its `VerificationMismatchHalt` alongside the
+    verifier's own `VerificationMismatch`.
+    """
+    _, verifier, writer, _ = _two_sided_paper_exchange()
+    kernel = RiskKernel(
+        writer,
+        mode_machine=ModeStateMachine(mode_ceiling=Mode.LIVE, mode=Mode.LIVE),
+        verifier=verifier,
+        clock=lambda: DEFAULT_NOW_EPOCH_S,
+    )
+
+    kernel.run_verification_cycle()
+
+    assert kernel.mode is Mode.HALT
+    assert len(_events_of_type(writer, "VerificationMismatch")) == 1
+    assert len(_events_of_type(writer, "VerificationMismatchHalt")) == 1
