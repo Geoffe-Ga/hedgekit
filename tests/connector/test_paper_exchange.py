@@ -80,9 +80,11 @@ class TestModuleConstants:
     """Pins the fills module's default ppm constants and model-version hash."""
 
     def test_default_haircut_ppm_is_25_percent(self) -> None:
+        """The default fee haircut is 250_000 ppm: +25% on top of modeled fees."""
         assert fills.DEFAULT_FEE_HAIRCUT_PPM == 250_000
 
     def test_default_max_participation_ppm_is_25_percent(self) -> None:
+        """The default participation cap is 250_000 ppm: 25% of visible depth."""
         assert fills.DEFAULT_MAX_PARTICIPATION_PPM == 250_000
 
     def test_paper_fill_model_version_is_a_sha256_hex_digest(self) -> None:
@@ -103,6 +105,7 @@ class TestParticipationCap:
     """Pins `participation_cap`: floor-rounded, always against the trader."""
 
     def test_exact_quarter_of_an_even_depth(self) -> None:
+        """A depth of 1000 at 25% participation caps the fill at exactly 250."""
         cap = fills.participation_cap(
             ContractCentis(1000), max_participation_ppm=250_000
         )
@@ -124,6 +127,7 @@ class TestParticipationCap:
         assert cap == ContractCentis(0)
 
     def test_full_participation_returns_the_full_depth(self) -> None:
+        """Full participation (1_000_000 ppm) leaves the 300-centi depth intact."""
         cap = fills.participation_cap(
             ContractCentis(300), max_participation_ppm=1_000_000
         )
@@ -131,11 +135,13 @@ class TestParticipationCap:
         assert cap == ContractCentis(300)
 
     def test_zero_participation_always_yields_zero(self) -> None:
+        """Zero participation caps the fill at 0 despite 1000 centis of depth."""
         cap = fills.participation_cap(ContractCentis(1000), max_participation_ppm=0)
 
         assert cap == ContractCentis(0)
 
     def test_returns_a_contract_centis(self) -> None:
+        """The cap comes back as a ContractCentis, not a bare int."""
         cap = fills.participation_cap(
             ContractCentis(1000), max_participation_ppm=250_000
         )
@@ -301,6 +307,7 @@ class TestWalkTakerFill:
         assert result.total_cost == MoneyMicros(13_335)
 
     def test_zero_haircut_ppm_leaves_total_cost_as_book_cost_plus_fee(self) -> None:
+        """A zero haircut_ppm adds nothing: total_cost is book_cost plus fee."""
         levels = (OrderBookLevel(PricePips(4600), ContractCentis(1000)),)
 
         result = fills.walk_taker_fill(
@@ -350,6 +357,7 @@ class TestWalkTakerFillNoSide:
     """
 
     def test_no_buy_walks_the_complemented_yes_bids(self) -> None:
+        """A NO buy at 4050 takes 125 centis from the complemented 4000 level."""
         # yes_bids, best-first (highest price first): 6000/500, then 5900/1000.
         yes_bids = (
             OrderBookLevel(PricePips(6000), ContractCentis(500)),
@@ -397,6 +405,7 @@ class TestRestingFillQuantity:
     """
 
     def test_touch_is_not_a_fill(self) -> None:
+        """A print at exactly the resting limit is a touch and fills nothing."""
         prints = (fills.TradePrint(PricePips(4200), ContractCentis(1000), _TS),)
 
         fill = fills.resting_fill_quantity(
@@ -410,6 +419,7 @@ class TestRestingFillQuantity:
         assert fill == ContractCentis(0)
 
     def test_prints_above_the_limit_are_irrelevant_to_a_resting_buy(self) -> None:
+        """A 4250 print never fills a resting 4200 bid, whatever its volume."""
         prints = (fills.TradePrint(PricePips(4250), ContractCentis(5000), _TS),)
 
         fill = fills.resting_fill_quantity(
@@ -438,6 +448,7 @@ class TestRestingFillQuantity:
         assert fill == ContractCentis(125)
 
     def test_trade_through_volume_binds_when_smaller_than_the_cap(self) -> None:
+        """Only 100 centis printed through, so 100 fills despite a 2500 cap."""
         prints = (fills.TradePrint(PricePips(4150), ContractCentis(100), _TS),)
 
         fill = fills.resting_fill_quantity(
@@ -451,6 +462,7 @@ class TestRestingFillQuantity:
         assert fill == ContractCentis(100)
 
     def test_remaining_order_size_binds_when_it_is_the_smallest_bound(self) -> None:
+        """A 50-centi remainder fills fully and no more, despite 10_000 printed."""
         prints = (fills.TradePrint(PricePips(4100), ContractCentis(10_000), _TS),)
 
         fill = fills.resting_fill_quantity(
@@ -464,6 +476,7 @@ class TestRestingFillQuantity:
         assert fill == ContractCentis(50)
 
     def test_multiple_trade_through_prints_sum_their_volume(self) -> None:
+        """Two through-prints of 50 and 30 centis combine into an 80-centi fill."""
         prints = (
             fills.TradePrint(PricePips(4100), ContractCentis(50), _TS),
             fills.TradePrint(PricePips(4150), ContractCentis(30), _TS),
@@ -482,6 +495,7 @@ class TestRestingFillQuantity:
     def test_a_touch_print_mixed_with_a_through_print_counts_only_the_through_volume(
         self,
     ) -> None:
+        """The 999-centi touch print is dropped; only the 40 through-centis fill."""
         prints = (
             fills.TradePrint(PricePips(4200), ContractCentis(999), _TS),  # touch
             fills.TradePrint(PricePips(4150), ContractCentis(40), _TS),  # through
@@ -498,6 +512,7 @@ class TestRestingFillQuantity:
         assert fill == ContractCentis(40)
 
     def test_returns_a_contract_centis(self) -> None:
+        """The realized resting fill is a ContractCentis, not a bare int."""
         prints = (fills.TradePrint(PricePips(4150), ContractCentis(10), _TS),)
 
         fill = fills.resting_fill_quantity(
@@ -516,6 +531,7 @@ class TestTradeThroughFillTs:
     that trades through the limit, and a touch print never counts."""
 
     def test_returns_the_latest_trade_through_prints_timestamp(self) -> None:
+        """The fill time is the later of two trade-through prints, not the first."""
         early = datetime(2025, 1, 1, 0, 1, tzinfo=UTC)
         late = datetime(2025, 1, 1, 0, 2, tzinfo=UTC)
         prints = (
@@ -526,6 +542,7 @@ class TestTradeThroughFillTs:
         assert fills.trade_through_fill_ts(PricePips(4200), prints) == late
 
     def test_a_touch_print_is_ignored_when_choosing_the_timestamp(self) -> None:
+        """A later touch print is ignored; the earlier through-print's time wins."""
         through = datetime(2025, 1, 1, 0, 1, tzinfo=UTC)
         touch_later = datetime(2025, 1, 1, 0, 5, tzinfo=UTC)
         prints = (
@@ -536,6 +553,7 @@ class TestTradeThroughFillTs:
         assert fills.trade_through_fill_ts(PricePips(4200), prints) == through
 
     def test_no_trade_through_print_raises_value_error(self) -> None:
+        """A prints tuple that only touches the limit raises ValueError."""
         prints = (fills.TradePrint(PricePips(4200), ContractCentis(99), _TS),)  # touch
 
         with pytest.raises(ValueError, match="no trade-through print"):
@@ -551,6 +569,7 @@ class TestWalkTakerFillSkipsZeroQuantityLevels:
     """
 
     def test_a_zero_quantity_eligible_level_is_skipped_not_crashed(self) -> None:
+        """A stale zero-size 4300 level is walked past; 4350 fills all 1000."""
         levels = (
             OrderBookLevel(PricePips(4300), ContractCentis(0)),  # stale, zero size
             OrderBookLevel(PricePips(4350), ContractCentis(1000)),
@@ -579,6 +598,7 @@ class TestAllocateRestingFills:
     """
 
     def test_a_single_request_matches_resting_fill_quantity(self) -> None:
+        """One request allocates exactly what resting_fill_quantity would return."""
         prints = (fills.TradePrint(PricePips(4150), ContractCentis(2000), _TS),)
         request = fills.RestingFillRequest(
             PricePips(4200), ContractCentis(1000), ContractCentis(500)
@@ -694,11 +714,13 @@ class TestPaperExchangeProtocolConformance:
     def test_satisfies_the_market_connector_protocol(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """A PaperExchange passes an isinstance check against MarketConnector."""
         assert isinstance(paper_exchange, MarketConnector)
 
     def test_defaults_match_the_fills_module_constants(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """An unconfigured exchange adopts the fills module's default ppm values."""
         assert paper_exchange.haircut_ppm == fills.DEFAULT_FEE_HAIRCUT_PPM
         assert (
             paper_exchange.max_participation_ppm == fills.DEFAULT_MAX_PARTICIPATION_PPM
@@ -707,6 +729,7 @@ class TestPaperExchangeProtocolConformance:
     def test_from_fixture_dir_accepts_ppm_overrides(
         self, books_fixture_dir: Path
     ) -> None:
+        """The from_fixture_dir factory keeps the ppm overrides it is given."""
         overridden = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "deep_walk",
             haircut_ppm=0,
@@ -763,6 +786,7 @@ class TestPaperExchangeConstructorRejectsInconsistentSemantics:
     def test_rejects_a_fixture_whose_partial_fill_representation_is_aggregated(
         self, books_fixture_dir: Path, tmp_path: Path
     ) -> None:
+        """A fixture claiming AGGREGATED partial fills is refused at construction."""
         broken_dir = _fixture_dir_with_semantics_override(
             books_fixture_dir, tmp_path, "partial_fill_representation", "AGGREGATED"
         )
@@ -802,6 +826,7 @@ class TestPaperExchangeOrderBookCursor:
     def test_get_order_book_starts_at_the_first_step(
         self, books_fixture_dir: Path
     ) -> None:
+        """A freshly loaded exchange serves step 0's book: asks at 4600 and 4700."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
 
         book = exchange.get_order_book("MKT-DEEP")
@@ -811,6 +836,7 @@ class TestPaperExchangeOrderBookCursor:
     def test_advance_moves_the_cursor_to_the_next_book_and_returns_true(
         self, books_fixture_dir: Path
     ) -> None:
+        """Calling advance() returns True and swaps in step 1's 4750 ask book."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
 
         advanced = exchange.advance()
@@ -822,6 +848,7 @@ class TestPaperExchangeOrderBookCursor:
     def test_advance_returns_false_once_the_session_is_exhausted(
         self, books_fixture_dir: Path
     ) -> None:
+        """The second advance() consumes the last step and reports False."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
         exchange.advance()  # consumes step 0's book -> now positioned at step 1
 
@@ -830,6 +857,7 @@ class TestPaperExchangeOrderBookCursor:
     def test_get_order_book_unknown_ticker_raises_unknown_market_error(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """An unrecorded ticker raises UnknownMarketError, not an empty book."""
         with pytest.raises(UnknownMarketError):
             paper_exchange.get_order_book("NOT-A-REAL-TICKER")
 
@@ -840,6 +868,7 @@ class TestPaperExchangeCrossingOrders:
     def test_crossing_buy_emits_one_fill_record_per_consumed_level(
         self, books_fixture_dir: Path
     ) -> None:
+        """A two-level walk records separate 4600x200 and 4700x100 yes fills."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
 
         exchange.place_order(
@@ -881,6 +910,7 @@ class TestPaperExchangeCrossingOrders:
     def test_crossing_buy_rests_the_unfilled_remainder_at_its_own_limit(
         self, books_fixture_dir: Path
     ) -> None:
+        """The 700 centis left unfilled rest at the order's own 4700 limit."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
 
         exchange.place_order(
@@ -898,6 +928,7 @@ class TestPaperExchangeCrossingOrders:
     def test_a_fully_absorbed_crossing_order_leaves_no_resting_remainder(
         self, books_fixture_dir: Path
     ) -> None:
+        """A 100-centi buy fully absorbed at 4750 leaves no open order behind."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
         exchange.advance()  # step 1's book: single ask level 4750/500
 
@@ -917,6 +948,7 @@ class TestPaperExchangeCrossingOrders:
     def test_non_crossing_buy_rests_without_any_immediate_fill(
         self, books_fixture_dir: Path
     ) -> None:
+        """A 4000 buy below the ask records no fill and rests all 100 centis."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
 
         exchange.place_order(
@@ -948,12 +980,14 @@ class TestPaperExchangeCrossingOrders:
     def test_place_order_rejects_a_malformed_intent(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """A non-PaperOrderIntent argument raises TypeError rather than filling."""
         with pytest.raises(TypeError):
             paper_exchange.place_order(object(), approval_token=object())
 
     def test_place_order_unknown_ticker_raises_unknown_market_error(
         self, books_fixture_dir: Path
     ) -> None:
+        """Ordering on a ticker the fixture never recorded raises UnknownMarketError."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
 
         with pytest.raises(UnknownMarketError):
@@ -967,6 +1001,7 @@ class TestPaperExchangeCrossingOrders:
     def test_cancel_order_removes_a_resting_order(
         self, books_fixture_dir: Path
     ) -> None:
+        """Cancelling a resting order by id leaves no open orders behind."""
         exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
         exchange.place_order(
             paper.PaperOrderIntent(
@@ -986,6 +1021,7 @@ class TestPaperExchangeRestingOrderTouchIsNotAFill:
     order, even though the print's price exactly equals the resting limit."""
 
     def test_touch_is_not_a_fill(self, books_fixture_dir: Path) -> None:
+        """Advancing past a touch-only print leaves all 1000 centis resting."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "touch_not_fill"
         )
@@ -1013,6 +1049,7 @@ class TestPaperExchangeRestingOrderTradeThrough:
     def test_trade_through_fills_at_the_orders_own_limit_price(
         self, books_fixture_dir: Path
     ) -> None:
+        """A through-print fills 125 centis at the resting 4200 limit, not better."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "trade_through"
         )
@@ -1038,6 +1075,7 @@ class TestPaperExchangeRestingOrderTradeThrough:
     def test_trade_through_leaves_the_correct_remaining_resting_quantity(
         self, books_fixture_dir: Path
     ) -> None:
+        """After a 125-centi trade-through fill, 875 centis remain resting."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "trade_through"
         )
@@ -1113,6 +1151,7 @@ class TestPaperExchangeConcurrentRestingOrders:
     def test_a_single_trade_never_fills_two_orders_beyond_its_own_volume(
         self, books_fixture_dir: Path
     ) -> None:
+        """Two resting buys split one 100-centi print, filling 100 centis in all."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "concurrent_resting"
         )
@@ -1140,6 +1179,7 @@ class TestPaperExchangeConcurrentRestingOrders:
     def test_the_more_aggressive_limit_claims_the_shared_volume_first(
         self, books_fixture_dir: Path
     ) -> None:
+        """The 4200 order takes all 100 printed centis; the 4100 order keeps 1000."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "concurrent_resting"
         )
@@ -1177,6 +1217,7 @@ class TestPaperExchangeReadOnlySurface:
     def test_list_markets_returns_the_fixture_market(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """Listing markets reports exactly the fixture's one MKT-DEEP market."""
         tickers = {market.ticker for market in paper_exchange.list_markets()}
 
         assert tickers == {"MKT-DEEP"}
@@ -1184,6 +1225,7 @@ class TestPaperExchangeReadOnlySurface:
     def test_get_market_unknown_ticker_raises_unknown_market_error(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """Fetching a market the fixture lacks raises UnknownMarketError."""
         with pytest.raises(UnknownMarketError):
             paper_exchange.get_market("NOT-A-REAL-TICKER")
 
@@ -1199,11 +1241,13 @@ class TestPaperExchangeReadOnlySurface:
         assert balances.available == MoneyMicros(100_000_000)
 
     def test_get_exchange_status_is_open(self, paper_exchange: PaperExchange) -> None:
+        """The fixture exchange reports an 'open' trading status."""
         assert paper_exchange.get_exchange_status().status == "open"
 
     def test_get_fee_model_falls_back_to_the_default_schedule(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """A market with no own schedule gets the default 70_000 ppm taker fee."""
         fee_model = paper_exchange.get_fee_model("MKT-DEEP")
 
         assert fee_model.taker_fee_ppm == 70_000
@@ -1216,16 +1260,19 @@ class TestPaperExchangeReadOnlySurface:
         assert paper_exchange.get_positions() == ()
 
     def test_get_open_orders_starts_empty(self, paper_exchange: PaperExchange) -> None:
+        """A newly loaded exchange has no open orders yet."""
         assert paper_exchange.get_open_orders() == ()
 
     def test_get_exchange_time_returns_the_fixture_exchange_time(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """The exchange time replays the fixture's own recorded timestamp."""
         assert paper_exchange.get_exchange_time() == _TS
 
     def test_get_balance_semantics_returns_the_fixture_semantics(
         self, paper_exchange: PaperExchange
     ) -> None:
+        """Every BalanceSemantics field is replayed verbatim from the fixture."""
         expected = BalanceSemantics(
             open_order_collateral_in_total=OrderCollateralInTotal.INCLUDED,
             open_order_collateral_in_available=(
@@ -1279,6 +1326,7 @@ class TestPaperExchangeNoSideTaker:
     def test_no_order_walks_the_complemented_yes_bids_and_rests_the_remainder(
         self, books_fixture_dir: Path
     ) -> None:
+        """A NO buy fills 125 at complemented 4000 and rests 875 at its own 4050."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "no_side_taker"
         )
@@ -1319,6 +1367,7 @@ class TestPaperExchangeNoSideRestingFill:
     def test_resting_no_order_fills_at_its_own_limit_from_complemented_depth(
         self, books_fixture_dir: Path
     ) -> None:
+        """A resting NO bid fills 125 centis at 4200, leaving 875 centis resting."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "no_side_resting"
         )
@@ -1350,6 +1399,7 @@ class TestPaperExchangeRestingOrderFullyConsumed:
     def test_a_fill_covering_the_full_remainder_removes_the_resting_order(
         self, books_fixture_dir: Path
     ) -> None:
+        """A fill covering all 100 remaining centis drops the order from the book."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "resting_full_consume"
         )
@@ -1383,6 +1433,7 @@ class TestPaperExchangeMultiTickerRestingIsolation:
     def test_advancing_one_ticker_leaves_the_others_resting_order_untouched(
         self, books_fixture_dir: Path
     ) -> None:
+        """One advance() fills ticker A's order and leaves B's 200 centis intact."""
         exchange = paper.PaperExchange.from_fixture_dir(
             books_fixture_dir / "two_ticker_isolation"
         )
