@@ -20,8 +20,16 @@ from __future__ import annotations
 
 import pytest
 
-from windbreak.riskkernel.context import JurisdictionStatus, ProductType
-from windbreak.scheduler.eligibility import project_jurisdiction, project_product_type
+from windbreak.riskkernel.context import (
+    ExchangeTradingStatus,
+    JurisdictionStatus,
+    ProductType,
+)
+from windbreak.scheduler.eligibility import (
+    project_exchange_status,
+    project_jurisdiction,
+    project_product_type,
+)
 
 #: Raw values the connector's `jurisdiction_status` Literal can actually hold,
 #: paired with the kernel value each must project onto. `"unknown"` is the
@@ -112,3 +120,42 @@ def test_a_normalized_kalshi_market_never_projects_to_an_eligible_jurisdiction()
     from windbreak.connector.kalshi.normalize import _JURISDICTION_UNKNOWN
 
     assert project_jurisdiction(_JURISDICTION_UNKNOWN) is None
+
+
+#: The raw `ExchangeStatus.status` literals and the kernel value each projects
+#: onto. All three are legal connector values; only OPEN is tradable, and the
+#: non-tradable two must survive as real members so the check can distinguish
+#: "closed" from "no evidence" (issue #342).
+_EXCHANGE_STATUS_CASES = (
+    ("open", ExchangeTradingStatus.OPEN),
+    ("paused", ExchangeTradingStatus.PAUSED),
+    ("closed", ExchangeTradingStatus.CLOSED),
+    (None, None),
+)
+
+#: Values outside the connector's closed set. Each must fail closed to `None`,
+#: which `exchange_status_ok` reads as "stale or missing" rather than tradable.
+_ADVERSARIAL_EXCHANGE_STATUSES = ("OPEN", "Open", "open ", "", "halted", "unknown")
+
+
+@pytest.mark.parametrize(("raw", "expected"), _EXCHANGE_STATUS_CASES)
+def test_project_exchange_status_maps_the_closed_set(
+    raw: str | None, expected: ExchangeTradingStatus | None
+) -> None:
+    """Each connector status literal projects onto its kernel counterpart.
+
+    Args:
+        raw: The connector's raw `ExchangeStatus.status` value.
+        expected: The kernel value it must project onto.
+    """
+    assert project_exchange_status(raw) is expected
+
+
+@pytest.mark.parametrize("raw", _ADVERSARIAL_EXCHANGE_STATUSES)
+def test_project_exchange_status_returns_none_for_untaught_value(raw: str) -> None:
+    """An unrecognized status projects to `None`, never to a tradable member.
+
+    Args:
+        raw: A value outside the connector's closed set.
+    """
+    assert project_exchange_status(raw) is None

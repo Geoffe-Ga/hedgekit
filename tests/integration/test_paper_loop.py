@@ -513,3 +513,54 @@ def test_tracer_invariant_research_ceiling_ledgers_only_config_loaded(
         "PAPER loop must never wire under RESEARCH: zero PAPER events "
         "may appear alongside the ledgered ConfigLoaded"
     )
+
+
+# --- Issue #342: liveness evidence is ledgered, and still no fill ------------
+
+
+def test_tick_ledgers_status_and_heartbeat_evidence(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """A tick ledgers both liveness observations, stamped at the tick's clock.
+
+    Asserting the payload epochs -- not merely that rows exist -- is what makes
+    this evidence rather than decoration: it proves the value the checks
+    consumed is the same value an auditor can read back.
+
+    Args:
+        books_dir: The shared books-fixture directory.
+        cassette_path: The empty recorded-cassette path.
+        report_dir: Where weekly-report stubs would be written.
+        paper_config: The PAPER-ceilinged configuration.
+        research_tools_factory: Builds the offline research tools double.
+        tmp_path: The pytest scratch directory.
+    """
+    from windbreak.scheduler.loop import run_single_tick
+
+    deps = _build_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools_factory=research_tools_factory,
+    )
+
+    outcome = run_single_tick(deps, beat=1)
+
+    pairs = read_event_type_payload_pairs(deps.store.read_all())
+    by_type = dict(pairs)
+    assert (
+        by_type["PipelineHeartbeatRecorded"]["heartbeat_epoch_s"] == FIXED_NOW_EPOCH_S
+    )
+    assert by_type["ExchangeStatusObserved"]["status"] == "open"
+    assert by_type["ExchangeStatusObserved"]["observed_at_epoch_s"] == FIXED_NOW_EPOCH_S
+    # The three reconciliation checks still veto on verification=None, so this
+    # change must not have moved the loop any closer to filling.
+    assert outcome.filled_centis == 0
+    deps.store.verify_chain()

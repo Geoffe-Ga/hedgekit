@@ -214,6 +214,9 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
         market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.limits.floor == MoneyMicros(42_000_000)
@@ -236,6 +239,9 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
         market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.limits.quote_ttl_seconds == 17
@@ -259,6 +265,9 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
         market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.verification is None
@@ -267,13 +276,15 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
 def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat() -> (
     None
 ):
-    """`build_evaluation_context` wires `market.exchange_status`,
-    `market.exchange_status_epoch_s`, and `pipeline_heartbeat_epoch_s` all
-    `None` (issue #110): the PAPER loop honestly has no live exchange-status
-    feed or pipeline-heartbeat source yet, so it must fail closed through
-    `exchange_status_ok` / `pipeline_heartbeat_ok` rather than fabricate a
-    permissive reading -- mirroring `verification=None`'s own fail-closed
-    contract above.
+    """Absent status/heartbeat evidence lands as `None` and fails closed.
+
+    Issue #342 made these three values caller-supplied rather than hardcoded
+    `None`, so the loop can pass real evidence. This test keeps the original
+    fail-closed intent: when the caller genuinely has nothing to supply, the
+    values must land on the context as `None` and be vetoed by
+    `exchange_status_ok` / `pipeline_heartbeat_ok` -- never quietly defaulted
+    to something permissive. It is the negative half of the pair; the positive
+    half lives in the checks-pass tests below.
     """
     from windbreak.config.schema import WindbreakConfig
     from windbreak.scheduler.loop import build_evaluation_context
@@ -284,6 +295,9 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
         market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.market.exchange_status is None
@@ -302,6 +316,9 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         verification=None,
         instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
         market=None,
+        exchange_status=None,
+        exchange_status_epoch_s=None,
+        pipeline_heartbeat_epoch_s=None,
     )
 
     assert context.now_epoch_s == 1_234_567
@@ -526,3 +543,132 @@ def test_sqlite_budget_ledger_writer_rejects_an_unhandled_budget_event_type(
         writer.record(BudgetEvent(COST_REPORT_EVENT, {}, "2024-12-24T00:00:00.000000Z"))
 
     assert store.read_all() == []
+
+
+# --- Issue #342: real status and heartbeat evidence -------------------------
+
+
+def _check_named(name: str):
+    """Return the real SPEC S10.3 check registered under `name`.
+
+    Args:
+        name: The pinned check name.
+
+    Returns:
+        The check callable from the production `DEFAULT_CHECKS` sequence.
+    """
+    from windbreak.riskkernel.checks import DEFAULT_CHECKS
+
+    return next(check for check in DEFAULT_CHECKS if check.name == name)
+
+
+def _context_with(*, status, status_epoch_s: int | None, heartbeat_epoch_s: int | None):
+    """Build a PAPER context carrying the given liveness evidence.
+
+    Args:
+        status: The projected `ExchangeTradingStatus`, or `None`.
+        status_epoch_s: Epoch second the status was observed, or `None`.
+        heartbeat_epoch_s: Epoch second the pipeline was seen alive, or `None`.
+
+    Returns:
+        The composed `EvaluationContext`.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.scheduler.loop import build_evaluation_context
+
+    return build_evaluation_context(
+        WindbreakConfig(),
+        now_epoch_s=DEFAULT_NOW_EPOCH_S,
+        verification=None,
+        instrument_whitelist=frozenset({DEFAULT_MARKET_TICKER}),
+        market=None,
+        exchange_status=status,
+        exchange_status_epoch_s=status_epoch_s,
+        pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
+    )
+
+
+def test_real_status_and_heartbeat_evidence_clears_both_liveness_checks() -> None:
+    """Healthy, fresh evidence makes both liveness checks approve.
+
+    This is the positive half of issue #342: before it, no value a caller could
+    supply would let these two checks pass, because the loop hardcoded `None`.
+    """
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+
+    context = _context_with(
+        status=ExchangeTradingStatus.OPEN,
+        status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+    )
+    intent = make_intent()
+
+    assert _check_named("exchange_status_ok")(intent, context).vetoed is False
+    assert _check_named("pipeline_heartbeat_ok")(intent, context).vetoed is False
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected_vetoed"),
+    [(60, False), (61, True)],
+    ids=["fresh", "stale"],
+)
+def test_pipeline_heartbeat_vetoes_exactly_past_its_ttl(
+    age_seconds: int, expected_vetoed: bool
+) -> None:
+    """The heartbeat is fresh at exactly its ttl and stale one second later.
+
+    Pinned against the production ttl (60s), not a permissive test fixture. The
+    `fresh` case is the one that carries real signal: the `stale` case would
+    pass vacuously before issue #342, since `None` also vetoed.
+
+    Args:
+        age_seconds: How old the heartbeat is at evaluation time.
+        expected_vetoed: Whether `pipeline_heartbeat_ok` must veto.
+    """
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+
+    context = _context_with(
+        status=ExchangeTradingStatus.OPEN,
+        status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S - age_seconds,
+    )
+
+    result = _check_named("pipeline_heartbeat_ok")(make_intent(), context)
+
+    assert result.vetoed is expected_vetoed
+
+
+@pytest.mark.parametrize("status_name", ["PAUSED", "CLOSED"], ids=["paused", "closed"])
+def test_a_non_open_exchange_status_vetoes_for_not_open(status_name: str) -> None:
+    """A genuinely observed non-open status vetoes, distinguishably from absence.
+
+    The reason must be `not open for trading`, not `stale or missing`: an
+    operator has to be able to tell "the exchange is shut" from "we have no
+    idea". That distinction is why the projection keeps PAUSED and CLOSED as
+    real members instead of collapsing them to `None`.
+
+    Args:
+        status_name: The non-tradable `ExchangeTradingStatus` member name.
+    """
+    from windbreak.riskkernel.context import ExchangeTradingStatus
+
+    context = _context_with(
+        status=getattr(ExchangeTradingStatus, status_name),
+        status_epoch_s=DEFAULT_NOW_EPOCH_S,
+        heartbeat_epoch_s=DEFAULT_NOW_EPOCH_S,
+    )
+
+    result = _check_named("exchange_status_ok")(make_intent(), context)
+
+    assert result.vetoed is True
+    assert result.reason == "exchange not open for trading"
+
+
+def test_absent_status_vetoes_as_stale_or_missing_not_as_closed() -> None:
+    """Absent evidence vetoes with the missing-evidence reason, not a verdict."""
+    context = _context_with(status=None, status_epoch_s=None, heartbeat_epoch_s=None)
+
+    result = _check_named("exchange_status_ok")(make_intent(), context)
+
+    assert result.vetoed is True
+    assert result.reason == "exchange status stale or missing"

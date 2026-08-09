@@ -25,6 +25,7 @@ division, no ``float`` literal, cast, or annotation appears here.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -54,8 +55,7 @@ from windbreak.connector.semantics import PartialFillRepresentation
 from windbreak.numeric import ContractCentis, PricePips
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
-    from datetime import datetime
+    from collections.abc import Callable, Mapping, Sequence
     from typing import Any, Literal
 
     from windbreak.connector.fees import FeeModel
@@ -93,6 +93,15 @@ class PaperOrderIntent:
     side: Literal["yes", "no"]
     price: PricePips
     quantity: ContractCentis
+
+
+def _utc_now() -> datetime:
+    """Return the current instant as a timezone-aware UTC datetime.
+
+    Returns:
+        The current UTC instant.
+    """
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +185,7 @@ class PaperExchange:
         sessions: Mapping[str, tuple[_SessionStep, ...]],
         exchange_status: ExchangeStatus,
         exchange_time: datetime,
+        clock: Callable[[], datetime] = _utc_now,
         balances: BalanceSnapshot,
         balance_semantics: BalanceSemantics,
         fee_models: Mapping[str, FeeModel],
@@ -187,8 +197,11 @@ class PaperExchange:
         Args:
             markets: Ticker-keyed normalized markets.
             sessions: Ticker-keyed replay steps.
-            exchange_status: The exchange's trading status.
+            exchange_status: The exchange's trading status. Only its ``status``
+                value is used; its ``fetched_at`` is restamped per observation.
             exchange_time: The exchange's server time.
+            clock: Observation clock stamped onto each
+                :meth:`get_exchange_status` reading (issue #342).
             balances: The account's static balances.
             balance_semantics: The venue's balance-interpretation semantics.
             fee_models: Fee schedules keyed by ticker (plus a ``default``).
@@ -213,6 +226,7 @@ class PaperExchange:
         self.sessions = sessions
         self.exchange_status = exchange_status
         self.exchange_time = exchange_time
+        self._clock = clock
         self.balances = balances
         self.balance_semantics = balance_semantics
         self.fee_models = fee_models
@@ -225,7 +239,13 @@ class PaperExchange:
         self._fill_seq = 0
 
     @classmethod
-    def from_fixture_dir(cls, path: str | Path, **overrides: int) -> PaperExchange:
+    def from_fixture_dir(
+        cls,
+        path: str | Path,
+        *,
+        clock: Callable[[], datetime] = _utc_now,
+        **overrides: int,
+    ) -> PaperExchange:
         """Build a :class:`PaperExchange` from a fixture directory.
 
         Loads the :class:`~windbreak.connector.fake.FakeExchange`-shaped static
@@ -234,6 +254,7 @@ class PaperExchange:
 
         Args:
             path: The directory holding the JSON fixtures and ``sessions.json``.
+            clock: Observation clock forwarded to the constructor (issue #342).
             **overrides: Optional ``haircut_ppm`` / ``max_participation_ppm``
                 keyword overrides forwarded to the constructor.
 
@@ -247,6 +268,7 @@ class PaperExchange:
             sessions=_load_sessions(directory),
             exchange_status=status,
             exchange_time=exchange_time,
+            clock=clock,
             balances=_load_balances(directory),
             balance_semantics=_load_balance_semantics(directory),
             fee_models=_load_fee_models(directory),
@@ -292,8 +314,20 @@ class PaperExchange:
         return self._current_step(ticker).book
 
     def get_exchange_status(self) -> ExchangeStatus:
-        """Return the fixture exchange status."""
-        return self.exchange_status
+        """Return the fixture status, stamped with the observation instant.
+
+        The ``status`` value comes verbatim from the fixture and is never
+        synthesized, so a ``paused``/``closed`` fixture still reports as such.
+        Only ``fetched_at`` is replaced: the committed fixtures carry a frozen
+        literal far outside any freshness ttl, and this exchange answers
+        synchronously in-process, so the observation genuinely happened now.
+        Mirrors :meth:`KalshiConnector.get_exchange_status`, which likewise
+        stamps its own clock rather than trusting the venue's timestamp.
+
+        Returns:
+            The fixture status observed at the injected clock's instant.
+        """
+        return replace(self.exchange_status, fetched_at=self._clock())
 
     def get_exchange_time(self) -> datetime:
         """Return the fixture exchange time."""

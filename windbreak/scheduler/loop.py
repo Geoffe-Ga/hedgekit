@@ -15,14 +15,14 @@ appending one audit event to the ledger at every stage, plus a per-tick
 The approval seam is the load-bearing safety boundary: :class:`KernelApproval`
 composes the *real* ``RiskKernel.evaluate_intent`` with the *real*
 ``ApprovalPipeline.approve``. Every SPEC S10.3 check is now real (issue
-#340 promoted the last one), but the PAPER tick still never fills, for
-three honest reasons rather than a stub: the now-real ``exchange_status_ok`` /
-``pipeline_heartbeat_ok`` checks (issue #110) fail closed on the ``None``
-exchange status and pipeline heartbeat this loop honestly supplies, and the
-three reconciliation checks fail closed on the ``verification=None`` it likewise
-supplies (no live exchange verification cycle runs in PAPER yet). The fill leg
-is proven separately by driving the gateway with a genuinely minted token
-through a doubled seam.
+#340 promoted the last one) and the loop now observes real exchange status
+and stamps a real pipeline heartbeat each tick (issue #342), so
+``exchange_status_ok`` and ``pipeline_heartbeat_ok`` evaluate genuine evidence
+and can pass. The PAPER tick still never fills, for one remaining honest
+reason: the three reconciliation checks fail closed on the ``verification=None``
+this loop supplies, because no read-only verification cycle runs in PAPER
+yet. The fill leg is proven separately by driving the gateway with a genuinely
+minted token through a doubled seam.
 
 Money and equity fields are scaled integers (micros/centis/pips), never floats
 (SPEC S6.1); this package is on ``scripts/lint_no_floats.py``'s denylist.
@@ -57,9 +57,11 @@ from windbreak.forecast.records import BaselineQuoteSnapshot
 from windbreak.forecast.sandbox import build_research_tools
 from windbreak.ledger.events import (
     EquitySampled,
+    ExchangeStatusObserved,
     ForecastCreated,
     MarketSnapshotRecorded,
     ModeHeartbeat,
+    PipelineHeartbeatRecorded,
     PositionsSnapshotRecorded,
     ProviderVoteRecorded,
     ResearchBudgetHalted,
@@ -75,6 +77,7 @@ from windbreak.reports.weekly import maybe_write_weekly
 from windbreak.riskkernel.context import (
     AccountState,
     EvaluationContext,
+    ExchangeTradingStatus,
     FeeBounds,
     MarketView,
     RiskLimits,
@@ -87,7 +90,11 @@ from windbreak.riskkernel.reservations import (
     ReservationLedger,
 )
 from windbreak.riskkernel.tokens import TokenIssuer
-from windbreak.scheduler.eligibility import project_jurisdiction, project_product_type
+from windbreak.scheduler.eligibility import (
+    project_exchange_status,
+    project_jurisdiction,
+    project_product_type,
+)
 from windbreak.scheduler.weekly_data import weekly_report_body
 from windbreak.selector import select
 from windbreak.selector.types import (
@@ -140,13 +147,13 @@ _DEFAULT_FORECAST_TTL_SECONDS = 3600
 _DEFAULT_VERIFICATION_TTL_SECONDS = 3600
 
 #: Default max admissible exchange-status age, in seconds (SPEC S7.3
-#: approval/submission snapshot TTL range). The PAPER loop supplies
-#: ``exchange_status=None`` data, so this only bounds a future live cycle.
+#: approval/submission snapshot TTL range). The PAPER loop observes a real
+#: status every tick (issue #342), so this genuinely bounds that evidence.
 _DEFAULT_EXCHANGE_STATUS_TTL_SECONDS = 30
 
 #: Default max admissible pipeline-heartbeat age, in seconds. The PAPER loop
-#: supplies ``pipeline_heartbeat_epoch_s=None`` data, so this only bounds a
-#: future live cycle.
+#: stamps a real heartbeat every tick (issue #342), so this genuinely bounds
+#: how long a stalled pipeline may go unnoticed.
 _DEFAULT_PIPELINE_HEARTBEAT_TTL_SECONDS = 60
 
 #: The slippage-model id stamped on the selector's per-contract buffer input.
@@ -517,6 +524,9 @@ def build_evaluation_context(
     verification: VerificationSnapshot | None,
     instrument_whitelist: frozenset[str],
     market: NormalizedMarket | None,
+    exchange_status: ExchangeTradingStatus | None,
+    exchange_status_epoch_s: int | None,
+    pipeline_heartbeat_epoch_s: int | None,
 ) -> EvaluationContext:
     """Compose the evaluation context a PAPER-mode approval reads.
 
@@ -527,12 +537,14 @@ def build_evaluation_context(
     the reconciliation checks rather than open (mirroring
     :class:`~windbreak.riskkernel.context.EvaluationContext`'s own contract).
 
-    For the same fail-closed reason the PAPER loop honestly supplies
-    ``exchange_status=None`` / ``exchange_status_epoch_s=None`` and
-    ``pipeline_heartbeat_epoch_s=None``: it has no live exchange-status feed or
-    pipeline heartbeat, so ``exchange_status_ok`` and ``pipeline_heartbeat_ok``
-    veto on the honest ``None`` rather than being fed a fabricated liveness
-    reading (mirroring ``verification=None``).
+    The exchange status and pipeline heartbeat are caller-supplied rather than
+    hardcoded (issue #342), so the loop can pass genuine observations. They are
+    still ``| None``, and a caller with nothing to report must pass ``None``
+    rather than a placeholder: both checks fail closed on it. In particular the
+    heartbeat must be stamped by an earlier stage and never set to this
+    function's own ``now_epoch_s`` -- a heartbeat equal to ``now`` can never go
+    stale, which would make its check unfalsifiable and strictly worse than the
+    ``None`` it replaced.
 
     Args:
         config: The configuration whose capital/risk sections map to the limits.
@@ -544,6 +556,15 @@ def build_evaluation_context(
             Its connector eligibility metadata is projected onto the kernel's
             own enums here, so the connector's ``"unknown"`` becomes ``None``
             and can never masquerade as eligible (issue #340).
+        exchange_status: The observed exchange trading status, or ``None`` when
+            none could be observed -- which fails closed (issue #342).
+        exchange_status_epoch_s: Epoch second the status was observed, or
+            ``None``. Freshness is measured against this, never against the
+            tick's own clock, so a failed read cannot read as fresh.
+        pipeline_heartbeat_epoch_s: Epoch second the pipeline was last observed
+            alive, or ``None``. Stamped by an earlier stage, never by this
+            function -- a heartbeat equal to ``now`` could never go stale and
+            would make its check unfalsifiable.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
@@ -554,8 +575,8 @@ def build_evaluation_context(
         visible_depth=None,
         exchange_clock_epoch_s=now_epoch_s,
         open_position=None,
-        exchange_status=None,
-        exchange_status_epoch_s=None,
+        exchange_status=exchange_status,
+        exchange_status_epoch_s=exchange_status_epoch_s,
         jurisdiction_status=project_jurisdiction(
             market.jurisdiction_status if market is not None else None
         ),
@@ -575,7 +596,7 @@ def build_evaluation_context(
         used_idempotency_keys=frozenset(),
         verification=verification,
         acknowledged_intent_ids=frozenset(),
-        pipeline_heartbeat_epoch_s=None,
+        pipeline_heartbeat_epoch_s=pipeline_heartbeat_epoch_s,
     )
 
 
@@ -770,6 +791,7 @@ def _build_gateway(
         wal=WriteAheadLog(wal_path),
         ledger_reader=store,
         reconciliation_source=exchange,
+        status_source=exchange,
     )
     gateway.recover()
     return gateway
@@ -838,7 +860,13 @@ def build_paper_deps(
         A fully wired :class:`PaperTickDeps`.
     """
     resolved_clock = clock if clock is not None else _default_clock
-    exchange = PaperExchange.from_fixture_dir(books_dir)
+    # The exchange must observe on the same clock the tick reads, or its status
+    # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
+    # freshness against two unrelated timelines (issue #342).
+    exchange = PaperExchange.from_fixture_dir(
+        books_dir,
+        clock=lambda: datetime.fromtimestamp(resolved_clock(), UTC),
+    )
     ticker = next(iter(exchange.markets))
     store = SqliteLedgerStore(ledger_path)
     key = secrets.token_bytes(_SIGNING_KEY_BYTES)
@@ -1133,15 +1161,18 @@ def _route_intent(
     return result.ack.filled.value if result.ack is not None else 0
 
 
-def _approve_stage(deps: PaperTickDeps, decision: SelectorDecision) -> int:
+def _approve_stage(
+    deps: PaperTickDeps, decision: SelectorDecision, heartbeat_epoch_s: int
+) -> int:
     """Approve each emitted intent through the seam; route any minted token.
 
-    Every SPEC S10.3 check is now real, including
-    ``jurisdiction_product_eligibility`` (issue #340), which reads the market's
-    projected eligibility metadata. PAPER fills nonetheless stay gated by the
-    honest ``None`` values this loop supplies: ``verification=None`` fails the
-    three reconciliation checks, and the absent exchange-status feed and
-    pipeline heartbeat fail ``exchange_status_ok`` / ``pipeline_heartbeat_ok``.
+    Reads the exchange status once, here at decision time rather than at
+    composition time, so its freshness is measured from a genuine observation
+    (issue #342). The status *value* comes from the connector and is never
+    synthesized, so a paused or closed exchange still vetoes.
+
+    PAPER fills nonetheless stay gated: ``verification=None`` still fails the
+    three reconciliation checks, so ``filled_centis`` remains ``0``.
 
     A market the exchange cannot resolve becomes ``None`` rather than an
     exception, so an unknown ticker vetoes the tick instead of aborting it.
@@ -1149,6 +1180,8 @@ def _approve_stage(deps: PaperTickDeps, decision: SelectorDecision) -> int:
     Args:
         deps: The tick's dependency bundle.
         decision: The selector's decision carrying any emitted intents.
+        heartbeat_epoch_s: The instant an earlier stage observed the pipeline
+            alive.
 
     Returns:
         The total quantity filled this tick, in contract-centis.
@@ -1157,12 +1190,28 @@ def _approve_stage(deps: PaperTickDeps, decision: SelectorDecision) -> int:
         market: NormalizedMarket | None = deps.exchange.get_market(deps.ticker)
     except UnknownMarketError:
         market = None
+    observed = deps.exchange.get_exchange_status()
+    status_epoch_s = int(observed.fetched_at.timestamp())
+    deps.store.append(
+        ExchangeStatusObserved(
+            component=_COMPONENT,
+            status=observed.status,
+            observed_at_epoch_s=status_epoch_s,
+        )
+    )
+    # A second clock read, deliberately not the tick-start `now_epoch_s`:
+    # freshness must be judged at evaluation time, so a slow forecast stage can
+    # legitimately age the heartbeat out rather than being masked by a reading
+    # taken before it ran.
     context = build_evaluation_context(
         deps.config,
         now_epoch_s=deps.clock(),
         verification=None,
         instrument_whitelist=frozenset({deps.ticker}),
         market=market,
+        exchange_status=project_exchange_status(observed.status),
+        exchange_status_epoch_s=status_epoch_s,
+        pipeline_heartbeat_epoch_s=heartbeat_epoch_s,
     )
     filled = 0
     for intent in decision.intents:
@@ -1257,11 +1306,35 @@ def _equity_and_positions_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
     return equity.value
 
 
+def _heartbeat_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
+    """Ledger a pipeline heartbeat and return the instant it attests to.
+
+    Called after the snapshot stage, so the heartbeat is stamped only once the
+    tick has proven the pipeline genuinely running -- an attestation rather than
+    a constant. It is deliberately NOT stamped inside the approval context: a
+    heartbeat equal to the approval's own ``now`` could never be stale, which
+    would make ``pipeline_heartbeat_ok`` unfalsifiable and therefore worse than
+    the ``None`` it replaces.
+
+    Args:
+        deps: The tick's dependency bundle.
+        now_epoch_s: The tick's clock reading.
+
+    Returns:
+        The epoch second the pipeline was observed alive.
+    """
+    deps.store.append(
+        PipelineHeartbeatRecorded(component=_COMPONENT, heartbeat_epoch_s=now_epoch_s)
+    )
+    return now_epoch_s
+
+
 def _decide_and_approve(
     deps: PaperTickDeps,
     order_book: OrderBookSnapshot,
     forecast: ForecastRecord | None,
     created_at: datetime,
+    heartbeat_epoch_s: int,
 ) -> tuple[str, int, int]:
     """Select and approve against a forecast, or short-circuit a halted tick.
 
@@ -1273,6 +1346,8 @@ def _decide_and_approve(
         order_book: The current book snapshot the selector reads.
         forecast: The tick's forecast, or ``None`` when research halted.
         created_at: The injected creation instant, for determinism.
+        heartbeat_epoch_s: The instant an earlier stage observed the pipeline
+            alive, threaded through to the approval context.
 
     Returns:
         A ``(forecast_id, intent_count, filled_centis)`` triple -- ``("", 0, 0)``
@@ -1281,7 +1356,8 @@ def _decide_and_approve(
     if forecast is None:
         return "", 0, 0
     decision = _select_stage(deps, order_book, forecast, created_at)
-    return forecast.forecast_id, len(decision.intents), _approve_stage(deps, decision)
+    filled = _approve_stage(deps, decision, heartbeat_epoch_s)
+    return forecast.forecast_id, len(decision.intents), filled
 
 
 def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
@@ -1317,9 +1393,10 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     now_epoch_s = deps.clock()
     created_at = datetime.fromtimestamp(now_epoch_s, UTC)
     order_book = _snapshot_stage(deps)
+    heartbeat_epoch_s = _heartbeat_stage(deps, now_epoch_s)
     forecast = _forecast_stage(deps, order_book, created_at)
     forecast_id, intent_count, filled = _decide_and_approve(
-        deps, order_book, forecast, created_at
+        deps, order_book, forecast, created_at, heartbeat_epoch_s
     )
     deps.store.append(
         ModeHeartbeat(component=_COMPONENT, mode=Mode.PAPER.name, beat=beat)

@@ -122,6 +122,7 @@ from windbreak.ledger.events import (
     DrillCompleted,
     EquitySampled,
     Event,
+    ExchangeStatusObserved,
     ForecastCreated,
     GateComputationMismatch,
     GatePlanChanged,
@@ -132,6 +133,7 @@ from windbreak.ledger.events import (
     MarketSnapshotRecorded,
     ModeHeartbeat,
     OrderTransitionLedgered,
+    PipelineHeartbeatRecorded,
     PositionsSnapshotRecorded,
     PromotionBlocked,
     PromotionEvaluated,
@@ -377,6 +379,8 @@ def test_event_types_registry_maps_type_name_to_class() -> None:
         "PromotionBlocked": PromotionBlocked,
         "ProviderVoteRecorded": ProviderVoteRecorded,
         "ResearchBudgetHalted": ResearchBudgetHalted,
+        "ExchangeStatusObserved": ExchangeStatusObserved,
+        "PipelineHeartbeatRecorded": PipelineHeartbeatRecorded,
     } == EVENT_TYPES
 
 
@@ -1197,3 +1201,31 @@ def test_research_budget_halted_is_reexported_from_windbreak_ledger() -> None:
         "ResearchBudgetHalted not re-exported from windbreak.ledger"
     )
     assert ledger_package.ResearchBudgetHalted is ResearchBudgetHalted
+
+
+# --- Issue #342: the two liveness-evidence events ---------------------------
+
+
+def test_exchange_status_observed_round_trips_through_the_registry() -> None:
+    """A persisted status observation reconstructs to an equal event."""
+    event = ExchangeStatusObserved(
+        component="scheduler", status="open", observed_at_epoch_s=1_735_000_000
+    )
+
+    assert event.event_type == "ExchangeStatusObserved"
+    assert event.payload == {"status": "open", "observed_at_epoch_s": 1_735_000_000}
+    assert all(isinstance(leaf, int | str) for leaf in event.payload.values())
+    rebuilt = EVENT_TYPES[event.event_type](component=event.component, **event.payload)
+    assert rebuilt == event
+
+
+def test_pipeline_heartbeat_recorded_round_trips_through_the_registry() -> None:
+    """A persisted heartbeat reconstructs to an equal event."""
+    event = PipelineHeartbeatRecorded(
+        component="scheduler", heartbeat_epoch_s=1_735_000_000
+    )
+
+    assert event.event_type == "PipelineHeartbeatRecorded"
+    assert event.payload == {"heartbeat_epoch_s": 1_735_000_000}
+    rebuilt = EVENT_TYPES[event.event_type](component=event.component, **event.payload)
+    assert rebuilt == event
