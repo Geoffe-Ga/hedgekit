@@ -1,6 +1,6 @@
 """Read-only exchange verification for the Risk Kernel (SPEC S5.2 / S10.3).
 
-Each cycle the kernel cross-checks a read-only :class:`MarketConnector`'s
+Each cycle the kernel cross-checks a :class:`ReadOnlyVenueView`'s
 exchange-verified balances, positions, and open orders against
 ledger-derived :class:`LedgerExpectations`, classifies the result as
 :class:`VerificationOutcome` ``CLEAN`` / ``DRIFT_WITHIN_TOLERANCE`` / ``BREACH``,
@@ -13,12 +13,27 @@ verified-cash and reconciliation-buffer terms).
 
 Balance and position drift are tolerance-graded: a nonzero diff within tolerance
 is drift (still ``ok``), a diff beyond tolerance is a breach. Open orders are
-discrete, so any set difference at all is a breach. Every value on this path is
+discrete, so any set difference at all is a breach. A connector that raises
+while being observed is itself graded a breach and recorded on the same audited
+path (:meth:`ReadOnlyVerifier._unobservable_venue_breach`), never allowed to
+escape the cycle -- an escaping exception would skip the record *and* the HALT
+that snapshot drives. Every value on this path is
 a :mod:`windbreak.numeric` scaled integer -- never a float (SPEC S6.1, enforced
 by ``scripts/lint_no_floats.py``) -- and every recorded payload leaf is an
 ``int``, ``str``, or ``bool``.
 
-:class:`KernelLedgerWriter` and :class:`MarketConnector` are imported under
+The venue seam is typed as
+:class:`~windbreak.connector.readonly.ReadOnlyVenueView`, not as the full
+:class:`~windbreak.connector.interface.MarketConnector`, so SPEC S1.1
+invariant 3 -- the verification path never holds trade-scope credentials -- is
+enforced by the type rather than by convention: the five methods this module
+calls are the only ones the seam exposes, and ``place_order``/``cancel_order``
+are simply not reachable from here. Any ``MarketConnector`` still satisfies the
+narrower protocol structurally, so a caller may pass one; a caller that wants
+the guarantee passes a
+:class:`~windbreak.connector.readonly.ReadOnlyConnectorView` instead.
+
+:class:`KernelLedgerWriter` and :class:`ReadOnlyVenueView` are imported under
 ``TYPE_CHECKING`` only: both are structural protocols, so importing them for
 typing alone keeps this module free of a runtime ``verification`` <-> ``process``
 import cycle.
@@ -38,8 +53,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
 
     from windbreak.alerts.dispatch import AlertDispatcher
-    from windbreak.connector.interface import MarketConnector
     from windbreak.connector.models import OpenOrder, Position
+    from windbreak.connector.readonly import ReadOnlyVenueView
     from windbreak.riskkernel.process import KernelLedgerWriter
 
 #: Component label stamped on every verification event this module records --
@@ -58,6 +73,11 @@ _UNKNOWN_JURISDICTION = "unknown"
 
 #: The reconciliation-mismatch alert body dispatched on a breach.
 _MISMATCH_MESSAGE = "exchange verification mismatch beyond tolerance"
+
+#: The reconciliation-mismatch alert body dispatched when the venue could not be
+#: observed at all. The raising call's message is appended, so the operator sees
+#: *why* (e.g. a two-sided holding the connector refuses to net into one row).
+_UNREADABLE_MESSAGE = "exchange verification could not observe the venue"
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +254,7 @@ def _is_scaled_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _seed_cash(events: tuple[Event, ...], connector: MarketConnector) -> MoneyMicros:
+def _seed_cash(events: tuple[Event, ...], connector: ReadOnlyVenueView) -> MoneyMicros:
     """Return the cash baseline seeded from history, else from the connector.
 
     Scans only the events *this component recorded*
@@ -270,7 +290,7 @@ def _seed_cash(events: tuple[Event, ...], connector: MarketConnector) -> MoneyMi
 
 
 def _seed_positions(
-    events: tuple[Event, ...], connector: MarketConnector
+    events: tuple[Event, ...], connector: ReadOnlyVenueView
 ) -> dict[str, ContractCentis]:
     """Return the position baseline seeded from history, else from the connector.
 
@@ -358,7 +378,7 @@ def _rows_to_positions(rows: object) -> dict[str, ContractCentis]:
 
 
 def _seed_open_order_ids(
-    events: tuple[Event, ...], connector: MarketConnector
+    events: tuple[Event, ...], connector: ReadOnlyVenueView
 ) -> frozenset[str]:
     """Return the open-order-id baseline seeded from history, else the connector.
 
@@ -405,7 +425,8 @@ class LedgerExpectationSource:
     """An :class:`ExpectationSource` projecting a *scoped* startup baseline.
 
     Built once at kernel startup from the replayed ledger ``history`` and the
-    read-only :class:`MarketConnector`, this source folds that history exactly
+    :class:`~windbreak.connector.readonly.ReadOnlyVenueView`, this source folds
+    that history exactly
     once, at construction, into one frozen :class:`LedgerExpectations` stored on
     ``self._expectations``; every :meth:`get_expectations` call returns that same
     object, so a connector mutated after construction never changes the result
@@ -465,12 +486,12 @@ class LedgerExpectationSource:
     restart, since any move beyond tolerance is a breach and a breach event is
     never allowed to seed the baseline.
 
-    :class:`MarketConnector` is annotation-only (:data:`TYPE_CHECKING`), as
-    everywhere in this module, so this class adds no runtime ``verification`` <->
-    ``process`` import cycle.
+    :class:`~windbreak.connector.readonly.ReadOnlyVenueView` is annotation-only
+    (:data:`TYPE_CHECKING`), as everywhere in this module, so this class adds no
+    runtime ``verification`` <-> ``process`` import cycle.
     """
 
-    def __init__(self, history: Iterable[Event], connector: MarketConnector) -> None:
+    def __init__(self, history: Iterable[Event], connector: ReadOnlyVenueView) -> None:
         """Project ``history`` and ``connector`` into one frozen expectation.
 
         The history is materialized once (so a one-shot iterable is safe) and
@@ -532,7 +553,7 @@ class ReadOnlyVerifier:
 
     def __init__(
         self,
-        connector: MarketConnector,
+        connector: ReadOnlyVenueView,
         expectation_source: ExpectationSource,
         tolerances: VerificationTolerances,
         dispatcher: AlertDispatcher,
@@ -541,8 +562,11 @@ class ReadOnlyVerifier:
         """Initialize the verifier.
 
         Args:
-            connector: The read-only market connector to observe the venue
-                through.
+            connector: The read-only venue view to observe the venue through.
+                Narrower than a
+                :class:`~windbreak.connector.interface.MarketConnector` on
+                purpose: it carries no order-placing method, so this cycle
+                structurally cannot trade (SPEC S1.1 invariant 3).
             expectation_source: The seam supplying ledger-derived expectations.
             tolerances: The per-dimension drift tolerances.
             dispatcher: The alert dispatcher jurisdiction and mismatch alerts
@@ -565,17 +589,26 @@ class ReadOnlyVerifier:
         jurisdiction is unknown and a reconciliation-mismatch alert on a breach;
         and records exactly one bare event.
 
+        A connector that *raises* while being observed is graded a breach rather
+        than allowed to propagate: see :meth:`_unobservable_venue_breach` for why
+        an escaping exception here would defeat the very halt this cycle exists
+        to drive.
+
         Args:
             now_epoch_s: The epoch second to stamp the snapshot at.
 
         Returns:
-            The :class:`VerificationSnapshot` describing the cycle.
+            The :class:`VerificationSnapshot` describing the cycle -- a forced
+            ``BREACH`` snapshot when the venue could not be observed at all.
         """
         expectations = self._expectation_source.get_expectations()
-        positions = self._connector.get_positions()
-        open_orders = self._connector.get_open_orders()
-        observed_cash = self._connector.get_balances().available
-        semantics_known = self._connector.get_balance_semantics().is_fully_known()
+        try:
+            positions = self._connector.get_positions()
+            open_orders = self._connector.get_open_orders()
+            observed_cash = self._connector.get_balances().available
+            semantics_known = self._connector.get_balance_semantics().is_fully_known()
+        except Exception as exc:  # Fail-closed: an unobservable venue is a breach.
+            return self._unobservable_venue_breach(now_epoch_s, expectations, exc)
 
         cash_drift = self._cash_drift(observed_cash, expectations)
         position_drift = self._position_drift(positions, expectations)
@@ -605,6 +638,64 @@ class ReadOnlyVerifier:
         # event (nor, at the process level, the HALT this snapshot drives).
         self._record(snapshot)
         self._dispatch_alerts(positions, open_orders, outcome)
+        return snapshot
+
+    def _unobservable_venue_breach(
+        self,
+        now_epoch_s: int,
+        expectations: LedgerExpectations,
+        exc: Exception,
+        /,
+    ) -> VerificationSnapshot:
+        """Record a forced ``BREACH`` for a venue that could not be observed.
+
+        A connector read can raise -- ``PaperExchange.get_positions`` refuses to
+        net a two-sided holding into one row, and a live adapter can fail its
+        transport -- and those reads happen *before* :meth:`_record`. Letting
+        such a raise propagate would take it straight out through
+        ``RiskKernel.run_verification_cycle`` and the kernel's heartbeat loop,
+        which hold no handler: the process would die with no ledgered
+        verification event, no reconciliation alert, and -- worst -- no
+        ``HALT``, since the halt is driven by the very snapshot that never got
+        returned. A connector refusing to describe the account is the strongest
+        possible reason to stop trading, so it is graded a breach here and
+        recorded on the same audited path a drift-beyond-tolerance breach takes.
+
+        Every dimension is reported not-ok because an unobservable venue has
+        verified none of them, and the outcome is forced rather than derived:
+        against an all-flat expectation the ordinary grading would score
+        "observed nothing" as ``CLEAN``, which is exactly the fabricated healthy
+        state fail-closed exists to prevent. The observed cash is reported as
+        zero and the whole expected balance therefore becomes drift (via the
+        same :meth:`_cash_drift` every cycle uses), so the snapshot can only
+        tighten the equity floor it feeds, never loosen it.
+
+        Args:
+            now_epoch_s: The epoch second to stamp the snapshot at.
+            expectations: The expectations the unobserved venue would have been
+                diffed against; supplies the cash the drift is measured from.
+            exc: The exception the connector raised, reported to the operator in
+                the alert body.
+
+        Returns:
+            The forced ``BREACH`` snapshot, already recorded.
+        """
+        snapshot = VerificationSnapshot(
+            outcome=VerificationOutcome.BREACH,
+            balance_ok=False,
+            position_ok=False,
+            open_order_ok=False,
+            verified_at_epoch_s=now_epoch_s,
+            exchange_verified_available_cash=MoneyMicros(0),
+            cash_drift=self._cash_drift(MoneyMicros(0), expectations),
+            semantics_fully_known=False,
+        )
+        # Same ordering guarantee as the ordinary path: the audit event lands
+        # before any alerting, so a raising dispatcher cannot lose the breach.
+        self._record(snapshot)
+        self._dispatcher.dispatch(
+            AlertType.RECONCILIATION_MISMATCH, f"{_UNREADABLE_MESSAGE}: {exc}"
+        )
         return snapshot
 
     def _cash_drift(

@@ -11,8 +11,12 @@ Three scenarios, per the issue's own test-writing brief:
    the full per-stage event sequence and never mints a token when the
    selector emits an intent (the `jurisdiction_product_eligibility` hard-veto
    stub, `exchange_status_ok` / `pipeline_heartbeat_ok` failing closed on
-   `build_evaluation_context`'s honest `None` PAPER wiring (issue #110), plus
-   the `verification=None` reconciliation fail-closed). This test's hard,
+   `build_evaluation_context`'s then-honest `None` PAPER wiring (issue #110),
+   plus the then-`verification=None` reconciliation fail-closed -- all of
+   those causes have since been removed by issues #340, #342, and #353; the
+   two that remain are `daily_loss_limit` and
+   `participation_cap_compliance`, pinned exactly in
+   `tests/integration/test_paper_verification.py`). This test's hard,
    unconditional assertions are the ledger *structure* (every stage event
    fires, the chain verifies, and two runs are content-identical); its
    `IntentVetoed`-carries-the-known-reasons assertion is *conditional* on the
@@ -88,14 +92,21 @@ if TYPE_CHECKING:
 
     from windbreak.config.schema import WindbreakConfig
 
-#: The two real veto reasons `exchange_status_ok` / `pipeline_heartbeat_ok`
-#: (issue #110) must produce whenever the real kernel vetoes an intent this
-#: loop's selector emits, given `build_evaluation_context`'s honest `None`
-#: PAPER wiring for both fields (see the module docstring's "Load-bearing
-#: constraint" discussion).
-_EXCHANGE_STATUS_AND_HEARTBEAT_REASONS = (
-    "exchange status stale or missing",
-    "pipeline heartbeat stale or missing",
+#: The two veto reasons the real kernel must produce whenever it vetoes an
+#: intent this loop's selector emits, given the honest zero/`None` feeds
+#: `build_evaluation_context` still supplies: `equity_start_of_day=0` floors
+#: the daily-loss threshold at zero, and `visible_depth` is `None`.
+#:
+#: This constant previously named the `exchange_status_ok` /
+#: `pipeline_heartbeat_ok` reasons. Issue #342 made both of those checks pass
+#: on real evidence and issue #353 did the same for the three reconciliation
+#: checks, so those names had become false -- invisibly, because the assertion
+#: using them only runs when the selector emits an intent (it does not, with
+#: the stock fixtures; see the module docstring). Corrected here so that if the
+#: branch ever does run it asserts something true.
+_REMAINING_ACCOUNT_FEED_VETO_REASONS = (
+    "daily loss limit reached",
+    "visible depth unknown",
 )
 
 #: The always-present per-tick stage events, regardless of whether the
@@ -197,7 +208,7 @@ def test_real_kernel_tick_ledgers_full_stage_sequence(
             record for record in records if record.event_type == "IntentVetoed"
         )
         reasons = json.loads(vetoed_record.payload_json)["data"]["reasons"]
-        for expected_reason in _EXCHANGE_STATUS_AND_HEARTBEAT_REASONS:
+        for expected_reason in _REMAINING_ACCOUNT_FEED_VETO_REASONS:
             assert expected_reason in reasons
 
 
@@ -560,7 +571,9 @@ def test_tick_ledgers_status_and_heartbeat_evidence(
     )
     assert by_type["ExchangeStatusObserved"]["status"] == "open"
     assert by_type["ExchangeStatusObserved"]["observed_at_epoch_s"] == FIXED_NOW_EPOCH_S
-    # The three reconciliation checks still veto on verification=None, so this
-    # change must not have moved the loop any closer to filling.
+    # The loop still fills nothing -- but since issue #353 that is down to
+    # `daily_loss_limit` and `participation_cap_compliance`, not to
+    # verification, which now runs for real every tick. The exact surviving
+    # reasons are pinned in tests/integration/test_paper_verification.py.
     assert outcome.filled_centis == 0
     deps.store.verify_chain()

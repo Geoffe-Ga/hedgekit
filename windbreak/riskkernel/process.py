@@ -696,6 +696,23 @@ class RiskKernel:
         )
         self._override_applied = True
 
+    @property
+    def latest_verification(self) -> VerificationSnapshot | None:
+        """Return the snapshot the last verification cycle produced, if any.
+
+        ``None`` until :meth:`run_verification_cycle` has run at least one cycle
+        with a verifier wired -- the fail-closed reading every reconciliation
+        check vetoes on. Exposed so a composition root can thread the *same*
+        snapshot the kernel stamps internally onto the context it hands to
+        :meth:`~windbreak.riskkernel.reservations.ApprovalPipeline.approve`,
+        which re-evaluates the checks over the caller's context and would
+        otherwise veto on a missing snapshot even after the kernel passed.
+
+        Returns:
+            The latest :class:`VerificationSnapshot`, or ``None``.
+        """
+        return self._latest_verification
+
     def run_verification_cycle(self) -> None:
         """Run one verification cycle, halting the kernel on a breach.
 

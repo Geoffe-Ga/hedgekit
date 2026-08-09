@@ -17,16 +17,21 @@ invention for the per-stage seams, kept small on purpose).
 The single most load-bearing fact this module proves (issue #48's own
 "Load-bearing constraint"): composing the *real*, unmodified
 `RiskKernel.evaluate_intent` with the *real* `ApprovalPipeline.approve` via
-`KernelApproval` can never mint a token today, because the
-`jurisdiction_product_eligibility` SPEC S10.3 check is still an
-unconditional-veto stub (`windbreak/riskkernel/checks.py`) and the three
-reconciliation checks fail closed on a `None` verification snapshot.
-`test_kernel_approval_vetoes_before_minting_any_token` pins the *exact* four
-veto reasons this yields, mirroring
+`KernelApproval` cannot mint a token on a context carrying no verification
+evidence -- the three reconciliation checks fail closed on a `None` snapshot.
+`test_kernel_approval_vetoes_before_minting_any_token` pins the *exact* veto
+reasons this yields, mirroring
 `tests/riskkernel/test_checks.py::test_default_checks_over_permissive_context_leaves_only_stubs_vetoing`
-but with `verification=None` (the honest PAPER-loop wiring: no live exchange
-verification cycle runs yet) instead of that test's permissive CLEAN
-snapshot, so the three reconciliation checks join the one remaining stub.
+but with `verification=None` instead of that test's permissive CLEAN snapshot.
+
+Note what `verification=None` means here since issue #353: it is no longer
+"the honest PAPER-loop wiring". The loop now runs a real read-only
+verification cycle every tick and threads its snapshot into the context
+(`windbreak/scheduler/loop.py::_verification_stage`), so `None` is now the
+*absent-evidence* case this suite deliberately constructs, not the loop's
+steady state. What still gates a real PAPER fill is pinned end to end in
+`tests/integration/test_paper_verification.py`; keep this module's assertions
+about the fail-closed contract, and read that one for the live answer.
 Issue #110 promoted `exchange_status_ok` / `pipeline_heartbeat_ok` from stub
 to real logic; both pass here because `tests.riskkernel.conftest.make_context`'s
 defaults (a fresh, `OPEN` `exchange_status` and a fresh
@@ -66,8 +71,11 @@ if TYPE_CHECKING:
 #: defaults supply an eligible jurisdiction and a tradable product.
 #:
 #: This tuple is compared with exact equality on purpose. Never soften it to a
-#: membership check: it is the repo's designated proof of which reasons gate a
-#: PAPER fill, and a membership assertion would silently tolerate a new veto.
+#: membership check: it is the repo's designated proof of what an *absent*
+#: verification snapshot costs, and a membership assertion would silently
+#: tolerate a new veto. Since issue #353 it is no longer the list of reasons
+#: gating a real PAPER fill -- the loop supplies a real snapshot now; see
+#: `tests/integration/test_paper_verification.py` for that list.
 _EXPECTED_VETO_REASONS = (
     "balance verification stale or missing",
     "position verification stale or missing",

@@ -9,6 +9,8 @@ market snapshot and screening decision per market through an
 surface: caller-scoped freshness checks (:mod:`windbreak.connector.freshness`),
 schema-drift validation (:mod:`windbreak.connector.validation`), and rate
 limiting / retry / circuit breaking (:mod:`windbreak.connector.resilience`).
+:mod:`windbreak.connector.readonly` narrows the surface further still, to the
+five account/market reads a verification cycle may hold (SPEC S1.1 invariant 3).
 Everything on the price/money path uses :mod:`windbreak.numeric` scaled-integer
 types -- never floats (enforced by ``scripts/lint_no_floats.py``).
 """
@@ -39,6 +41,7 @@ from windbreak.connector.models import (
     market_to_payload,
 )
 from windbreak.connector.paper import PaperExchange, PaperOrderIntent
+from windbreak.connector.readonly import ReadOnlyConnectorView, ReadOnlyVenueView
 from windbreak.connector.resilience import (
     CONNECTOR_HALT_EVENT,
     DEFAULT_RESILIENCE_POLICY,
@@ -119,6 +122,8 @@ __all__ = [
     "PaperOrderIntent",
     "PartialFillRepresentation",
     "Position",
+    "ReadOnlyConnectorView",
+    "ReadOnlyVenueView",
     "ResiliencePolicy",
     "ResilientCaller",
     "ResponseSchema",
