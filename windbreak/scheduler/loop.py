@@ -79,6 +79,7 @@ from windbreak.connector.freshness import is_fresh
 from windbreak.connector.interface import UnknownMarketError
 from windbreak.connector.paper import (
     COMPLEMENT_PIPS,
+    LiveBookPaperExchange,
     PaperExchange,
     ReplayExhaustedError,
     TwoSidedPositionError,
@@ -172,6 +173,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
+    from windbreak.connector.live import MarketDataSource
     from windbreak.connector.models import (
         NormalizedMarket,
         OrderBookSnapshot,
@@ -1510,6 +1512,85 @@ def _build_provider_gate(
     )
 
 
+def _build_paper_exchange(
+    books_dir: Path,
+    clock: Callable[[], int],
+    *,
+    market_data: MarketDataSource | None,
+    live_ticker: str | None,
+) -> PaperExchange:
+    """Build the tick's exchange: replayed fixture books, or the venue's live ones.
+
+    Both modes produce a :class:`~windbreak.connector.paper.PaperExchange`, so
+    every consumer :func:`build_paper_deps` wires downstream -- gateway,
+    reconciler, verification view -- takes the one object this returns and
+    needs no knowledge of which mode it is in. That is what makes the live wire
+    *total*: there is no second exchange for a consumer to be left holding.
+
+    The two modes differ in exactly one further respect, and it is a
+    fail-closed one. The fixture path anchors the recording to this run's clock
+    (issue #369): a committed book's frozen literals sit permanently outside
+    every ttl -- or, for a recording dated after the run's clock, permanently
+    in the future -- so without an anchor ``quote_freshness`` could only ever
+    veto. The anchor shifts every book and print by one offset, so the
+    recording's internal timing survives intact and a book genuinely ages as
+    the replay runs.
+
+    A live book has no such problem: it already carries the instant the venue
+    was actually observed, and shifting that would fabricate freshness the
+    venue never claimed. Live mode therefore passes **no** ``replay_anchor``,
+    and the venue's ``fetched_at`` reaches the freshness check untouched --
+    which is what leaves that check able to genuinely veto a stale book.
+
+    Args:
+        books_dir: The fixture directory. In fixture mode it supplies books,
+            markets, and fees; in live mode only its *account* fixtures
+            (opening balances and balance semantics) are read, because the
+            whole point of live mode is that the market data is the venue's.
+        clock: The injected epoch-second clock, read for the exchange's own
+            observation timeline.
+        market_data: The read-only venue surface, or ``None`` for fixtures.
+        live_ticker: The single market a live session trades, or ``None`` for
+            fixtures. The market universe is a separate concern (issue #345).
+
+    Returns:
+        The wired exchange -- a
+        :class:`~windbreak.connector.paper.LiveBookPaperExchange` in live mode.
+
+    Raises:
+        ValueError: If exactly one of ``market_data`` / ``live_ticker`` is
+            supplied. Half a live configuration must not degrade to fixtures:
+            an operator who named a live market and silently got recorded books
+            would be reading a paper tape while believing it was the venue.
+    """
+
+    def observed_at() -> datetime:
+        """Return this run's clock reading as a timezone-aware UTC instant.
+
+        Returns:
+            The injected clock's current reading, in UTC.
+        """
+        return datetime.fromtimestamp(clock(), UTC)
+
+    if market_data is None:
+        if live_ticker is not None:
+            raise ValueError(
+                f"live_ticker={live_ticker!r} was named without a `market_data` "
+                "source to read it from; supply both or neither"
+            )
+        return PaperExchange.from_fixture_dir(
+            books_dir, clock=observed_at, replay_anchor=observed_at()
+        )
+    if live_ticker is None:
+        raise ValueError(
+            "`market_data` was supplied without a `live_ticker` naming the market "
+            "to trade; supply both or neither"
+        )
+    return LiveBookPaperExchange.from_account_dir(
+        books_dir, market_data=market_data, ticker=live_ticker, clock=observed_at
+    )
+
+
 def build_paper_deps(
     *,
     books_dir: Path,
@@ -1519,6 +1600,8 @@ def build_paper_deps(
     config: WindbreakConfig,
     research_tools: ResearchTools | None = None,
     clock: Callable[[], int] | None = None,
+    market_data: MarketDataSource | None = None,
+    live_ticker: str | None = None,
 ) -> PaperTickDeps:
     """Assemble every real component one PAPER tick runs against.
 
@@ -1527,13 +1610,23 @@ def build_paper_deps(
     signing key shared by the kernel and gateway (SPEC S10.6), and wires the real
     approval seam, gateway (boot-recovered), and reconciler over them.
 
-    The exchange is given ``clock`` twice, for two distinct jobs: as its
-    observation clock, so its status attestation is stamped on the same
-    timeline the tick judges freshness on (issue #342), and as its
-    ``replay_anchor``, so the recording is re-enacted from this run's start
-    rather than replayed at its recorded literals (issue #369). Both readings
-    come from the one injected clock, so the books, the status, and the
-    evaluation can never be judged against three unrelated timelines.
+    Supplying ``market_data`` with ``live_ticker`` swaps the fixture books for a
+    venue's live ones -- real prices in, paper money out (issue #343). The swap
+    is *total* by construction: :func:`_build_paper_exchange` returns the single
+    exchange object that the gateway's submitter, its status and reconciliation
+    sources, the :class:`~windbreak.order_gateway.reconciler.Reconciler`, the
+    read-only verification view, and :attr:`PaperTickDeps.exchange` are all
+    built from, so no consumer can be left reading a different venue from the
+    one the loop trades against. Omitting both leaves every existing caller
+    byte-identical.
+
+    The exchange is given ``clock`` as its observation clock, so its status
+    attestation is stamped on the same timeline the tick judges freshness on
+    (issue #342) -- and, in fixture mode only, as its ``replay_anchor`` (issue
+    #369; see :func:`_build_paper_exchange` for why a live book must never be
+    re-dated). Both readings come from the one injected clock, so the books, the
+    status, and the evaluation can never be judged against three unrelated
+    timelines.
 
     It also builds the process's one per-provider track-record gate from
     ``report_dir``'s M6 artifact and ``config.forecast.provider_gate`` (see
@@ -1552,31 +1645,30 @@ def build_paper_deps(
         research_tools: The sandboxed research tools, or ``None`` for an offline
             no-network default.
         clock: The injected epoch-second clock, or ``None`` for the wall clock.
+        market_data: The read-only live venue surface, or ``None`` (the default)
+            to read the fixture directory's recorded books.
+        live_ticker: The single market a live session trades. Required with
+            ``market_data`` and meaningless without it.
 
     Returns:
         A fully wired :class:`PaperTickDeps`.
 
     Raises:
-        ValueError: If a configured ceiling is negative, or the track-record
+        ValueError: If exactly one of ``market_data``/``live_ticker`` is given,
+            if a configured ceiling is negative, or if the track-record
             artifact exists but cannot be read as a strict integer document --
-            either way refusing to start rather than running unguarded.
+            each way refusing to start rather than running unguarded.
     """
     resolved_clock = clock if clock is not None else _default_clock
     # The exchange must observe on the same clock the tick reads, or its status
     # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
     # freshness against two unrelated timelines (issue #342).
-    # The replay is anchored to that same clock's reading at wiring time
-    # (issue #369), so the recording's frozen literals become dates measurable
-    # against this run. Without it the committed books sit permanently outside
-    # every ttl -- or, for a recording dated after the run's clock, permanently
-    # in the future -- and `quote_freshness` could only ever veto. The anchor
-    # shifts every book and print by one offset, so the recording's internal
-    # timing survives intact and a book genuinely ages as the replay runs.
-    exchange = PaperExchange.from_fixture_dir(
-        books_dir,
-        clock=lambda: datetime.fromtimestamp(resolved_clock(), UTC),
-        replay_anchor=datetime.fromtimestamp(resolved_clock(), UTC),
+    exchange = _build_paper_exchange(
+        books_dir, resolved_clock, market_data=market_data, live_ticker=live_ticker
     )
+    # In live mode `markets` is the single bound ticker, so this one line
+    # answers both modes: the fixture directory's first market, or the market
+    # the operator named.
     ticker = next(iter(exchange.markets))
     store = SqliteLedgerStore(ledger_path)
     key = secrets.token_bytes(_SIGNING_KEY_BYTES)

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
     from windbreak.config import ConfigLoadEvent, ScreenerConfig, WindbreakConfig
     from windbreak.connector.interface import MarketConnector
+    from windbreak.connector.live import MarketDataSource
     from windbreak.dashboard.app import DashboardStatus
     from windbreak.ledger import Event, LedgerStore
     from windbreak.riskkernel.kill import KillIntegration
@@ -235,11 +236,13 @@ def _add_run_arguments(run_parser: argparse.ArgumentParser) -> None:
 
 
 def _add_paper_loop_arguments(run_parser: argparse.ArgumentParser) -> None:
-    """Register the four always-on PAPER-loop composition flags (issue #48).
+    """Register the always-on PAPER-loop composition flags (issues #48, #343).
 
-    PAPER activates only when the mode ceiling permits PAPER *and* all four flags
-    are supplied; each defaults to ``None`` so omitting any one leaves the loop in
-    its byte-identical RESEARCH-only behavior.
+    PAPER activates only when the mode ceiling permits PAPER *and* all four
+    composition flags are supplied; each defaults to ``None`` so omitting any one
+    leaves the loop in its byte-identical RESEARCH-only behavior.
+    ``--paper-live-ticker`` is a fifth, optional flag selecting live venue books
+    for an already-activated loop.
 
     Args:
         run_parser: The ``run`` subparser to populate with the PAPER flags.
@@ -248,7 +251,21 @@ def _add_paper_loop_arguments(run_parser: argparse.ArgumentParser) -> None:
         "--paper-books-dir",
         type=Path,
         default=None,
-        help="Paper-exchange fixture directory (default: PAPER loop off).",
+        help=(
+            "Paper-exchange fixture directory (default: PAPER loop off). With "
+            "--paper-live-ticker only its account fixtures (opening balances "
+            "and balance semantics) are read; the market data is the venue's."
+        ),
+    )
+    run_parser.add_argument(
+        "--paper-live-ticker",
+        default=None,
+        help=(
+            "Trade this market off the exchange's LIVE order books, with fills "
+            "still simulated (default: replay the fixture directory's recorded "
+            "books). One market only; read-only market data, no credentials, "
+            "and no order ever leaves the process."
+        ),
     )
     run_parser.add_argument(
         "--cassette-path",
@@ -948,6 +965,56 @@ def _paper_activated(config: WindbreakConfig, args: argparse.Namespace) -> bool:
     return Mode.from_config(config.mode_ceiling) is not Mode.RESEARCH
 
 
+def _resolve_paper_market_data(
+    args: argparse.Namespace, config: WindbreakConfig
+) -> MarketDataSource | None:
+    """Resolve the PAPER loop's live venue surface, or ``None`` for fixtures.
+
+    ``--paper-live-ticker`` is a single flag rather than a mode switch plus a
+    market name, so the mode and the market cannot disagree: naming a market
+    *is* selecting live books, and there is no combination that half-selects
+    one. The loop then either gets both halves or neither (issue #343).
+
+    Nothing here holds a credential. Kalshi's market-data routes are public and
+    :class:`~windbreak.connector.kalshi.client.KalshiClient` never attaches an
+    auth header, so there is no ``*_api_key_env`` leaf to configure and no
+    secret that could reach a log or the hash-chained ledger. The resolved base
+    URL is screened against the deployment's own outbound allowlist before any
+    session exists (SPEC S15), and the object handed back is a
+    :class:`~windbreak.connector.live.MarketDataOnlyView` with no order surface
+    at all (SPEC S1.1 invariant 3).
+
+    Connector-side refusals and halts are recorded through the connector's
+    logging ledger writer -- the same seam ``--snapshot-fixture-dir``'s wiring
+    already uses -- rather than the hash-chained store, which
+    :func:`build_paper_deps` opens and owns for the duration of the run.
+
+    Args:
+        args: The parsed ``run`` arguments carrying ``--paper-live-ticker``.
+        config: The loaded configuration supplying the exchange environment and
+            the outbound allowlist.
+
+    Returns:
+        The live market-data view, or ``None`` when the flag was omitted.
+
+    Raises:
+        ValueError: If the configured environment is unrecognized, or the
+            venue host it resolves to is not on this deployment's allowlist --
+            refusing to start rather than dialing a venue nobody declared.
+    """
+    if args.paper_live_ticker is None:
+        return None
+    from windbreak.connector.live import build_kalshi_market_data
+    from windbreak.connector.snapshot import LoggingEventLedgerWriter
+    from windbreak.net.allowlist import allowlist_from_config
+
+    return build_kalshi_market_data(
+        environment=config.exchange.environment,
+        allowlist=allowlist_from_config(config),
+        ledger_writer=LoggingEventLedgerWriter(),
+    )
+
+
 def _build_paper_on_beat(
     args: argparse.Namespace, config: WindbreakConfig
 ) -> Callable[[int], None]:
@@ -958,6 +1025,10 @@ def _build_paper_on_beat(
     unless PAPER is actually activated. The dependency bundle -- which opens the
     ledger database -- is built once here, so no ledger is ever created on a run
     that does not activate PAPER.
+
+    ``market_data`` and ``live_ticker`` are passed as the pair they are: both
+    derive from ``--paper-live-ticker``, so this call site cannot supply half a
+    live configuration (issue #343).
 
     Args:
         args: The parsed ``run`` arguments carrying the four PAPER flags.
@@ -974,6 +1045,8 @@ def _build_paper_on_beat(
         ledger_path=args.ledger_path,
         report_dir=args.report_dir,
         config=config,
+        market_data=_resolve_paper_market_data(args, config),
+        live_ticker=args.paper_live_ticker,
     )
 
     def _on_beat(seq: int) -> None:
