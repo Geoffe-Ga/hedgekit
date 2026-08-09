@@ -312,17 +312,20 @@ def test_expire_due_emits_one_reservation_released_event_per_expired_reservation
 
 def test_approval_pipeline_veto_reserves_nothing_and_issues_no_token() -> None:
     """A vetoed intent yields no reservation, no token, and consumes no
-    ledger sequence number. A fully permissive context still vetoes today,
-    since 1 of the 24 SPEC S10.3 checks remains a deliberate stub
-    (`jurisdiction_product_eligibility`), so this exercises the real veto
-    branch without waiting on it to land.
+    ledger sequence number.
+
+    The veto is sourced from a real dimension -- an unknown jurisdiction, which
+    `jurisdiction_product_eligibility` fails closed on. Before issue #340 this
+    test took its veto for free from that check's unconditional stub arm, so a
+    fully permissive context sufficed; now such a context approves, and the
+    assertions below would fail by *reserving capital and minting a token*.
     """
     ledger = ReservationLedger(InMemoryKernelLedgerWriter())
     handle = SigningKeyHandle(_KEY_MATERIAL)
     issuer = TokenIssuer(handle)
     pipeline = ApprovalPipeline(ledger, issuer, config_hash="cfg-hash-1")
     intent = make_intent()
-    context = make_context()
+    context = make_context(jurisdiction_status=None)
 
     outcome = pipeline.approve(intent, context)
 
@@ -343,18 +346,18 @@ def test_approval_pipeline_veto_reserves_nothing_and_issues_no_token() -> None:
 def test_approval_pipeline_success_issues_a_token_and_reserves_capital(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the check pipeline approves (no veto), `ApprovalPipeline.approve`
-    reserves the worst-case cost, issues a signed token whose claims carry
-    the pipeline-computed `expires_at` / `max_fee_micros` /
-    `kernel_sequence_number`, and records an `ApprovalTokenIssued` event.
+    """An approving pipeline reserves the cost, issues a token, and ledgers it.
 
-    1 of the 24 SPEC S10.3 checks remains a deliberate stub
-    (`jurisdiction_product_eligibility`), so no real context yet reaches
-    this branch unaided; the approving
-    pipeline is stubbed here, mirroring
-    `tests/riskkernel/test_process_isolation.py`'s identical technique, so
-    the reservation/token-issuance contract is pinned before that remaining
-    logic exists.
+    `ApprovalPipeline.approve` reserves the worst-case cost, issues a signed
+    token whose claims carry the pipeline-computed `expires_at` /
+    `max_fee_micros` / `kernel_sequence_number`, and records an
+    `ApprovalTokenIssued` event.
+
+    Since issue #340 promoted the last SPEC S10.3 check, a permissive context
+    reaches this branch unaided. The pipeline is still stubbed here, mirroring
+    `tests/riskkernel/test_process_isolation.py`'s identical technique, so this
+    test pins the reservation/token-issuance contract in isolation from the
+    check sequence.
     """
     approved = checks_module.Decision(vetoed=False, reasons=())
     monkeypatch.setattr(
@@ -466,10 +469,8 @@ def test_approval_pipeline_admits_exactly_k_of_n_under_headroom_contention() -> 
     issuer = TokenIssuer(handle)
     pipeline = ApprovalPipeline(ledger, issuer, config_hash="cfg-hash-1")
 
-    # Isolate the floor invariant: 1 of the 24 SPEC S10.3 checks remains a
-    # deliberate stub (`jurisdiction_product_eligibility`) that vetoes
-    # unconditionally, which would otherwise mask the headroom behavior this
-    # test targets.
+    # Isolate the floor invariant from every other SPEC S10.3 check, so an
+    # unrelated veto cannot mask the headroom behavior this test targets.
     original_evaluate_intent = checks_module.evaluate_intent
     floor_only_checks = tuple(
         check

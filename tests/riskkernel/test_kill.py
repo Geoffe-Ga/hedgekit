@@ -734,8 +734,10 @@ def test_evaluate_intent_on_a_killed_kernel_returns_the_single_killed_reason() -
     """A `KILLED` kernel's `evaluate_intent` short-circuits the check pipeline
     entirely: it returns `reasons == ("KILLED",)` -- the one hard-veto reason,
     never the usual multi-reason pipeline veto -- and records one
-    `IntentVetoed` event. The identical pre-kill call must not produce that
-    same single-reason signature (proving the pipeline really ran pre-kill).
+    `IntentVetoed` event. The identical pre-kill call approves outright (issue
+    #340 made the last check real, so a permissive context now clears all 24),
+    which proves the full pipeline really ran pre-kill and that the single
+    `KILLED` reason is the hard veto, not a pipeline result.
     """
     writer = InMemoryKernelLedgerWriter()
     machine = ModeStateMachine(mode_ceiling=Mode.LIVE, mode=Mode.LIVE)
@@ -745,6 +747,7 @@ def test_evaluate_intent_on_a_killed_kernel_returns_the_single_killed_reason() -
 
     pre_kill_decision = kernel.evaluate_intent(intent, context)
     assert pre_kill_decision.reasons != ("KILLED",)
+    assert pre_kill_decision.vetoed is False
 
     machine.transition(Mode.KILLED)
     decision = kernel.evaluate_intent(intent, context)
@@ -756,7 +759,7 @@ def test_evaluate_intent_on_a_killed_kernel_returns_the_single_killed_reason() -
     vetoed_events = [
         event for event in writer.events if event.event_type == "IntentVetoed"
     ]
-    assert len(vetoed_events) == 2
+    assert len(vetoed_events) == 1
     assert list(vetoed_events[-1].payload["reasons"]) == ["KILLED"]
 
 

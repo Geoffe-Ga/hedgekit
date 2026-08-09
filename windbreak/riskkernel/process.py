@@ -831,10 +831,9 @@ class RiskKernel:
         when any check vetoes (with the veto reasons), or ``IntentApproved``
         when the pipeline passes the intent (with empty reasons). Gating the
         event type on ``decision.vetoed`` -- rather than always emitting
-        ``IntentVetoed`` -- keeps the audit trail correct: 1 of the 24 SPEC
-        S10.3 checks remains a stub, so no real context yet yields a
-        fully-approving decision, but the approving branch is already correct
-        for when that logic lands.
+        ``IntentVetoed`` -- keeps the audit trail correct. Since issue #340 made
+        the last SPEC S10.3 check real, both branches are live and reachable: a
+        context that clears all 24 checks genuinely yields ``IntentApproved``.
 
         Args:
             intent: The order intent to evaluate.

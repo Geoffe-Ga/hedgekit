@@ -33,6 +33,31 @@ market; `unknown` additionally raises an alert (the
   the product categories permitted or forbidden regardless of jurisdiction
   status.
 
+### How this is enforced at order time (issue #340)
+
+The SPEC §10.3 pre-trade check `jurisdiction_product_eligibility` enforces the
+§6.2 rule per order inside the Risk Kernel. It approves only a market proven
+`eligible` **and** proven to be a fully collateralized binary; an `unknown`,
+absent, or unrecognized value fails closed (SPEC §1.1 invariant 1).
+
+Three things are worth stating plainly, because they are decisions rather than
+deductions:
+
+- **The kernel arm is unconditional.** `config.exchange.require_jurisdiction_eligible`
+  governs the preflight and screener layers only; it does **not** relax the
+  kernel check. A SPEC §10.3 check whose contract is "all must pass" should not
+  be operator-flippable, or a single YAML edit would silently reopen the gate for
+  `unknown` markets. Whether that knob should ever relax the kernel arm is an
+  open owner decision.
+- **`product_allowlist` / `product_blocklist` remain unenforced.** No
+  `NormalizedMarket` field can hold the tokens those lists are written in terms
+  of, so wiring them would require a human-supplied product vocabulary. They have
+  no production readers today.
+- **Kalshi supplies no eligibility signal.** `normalize_market` stamps every
+  Kalshi market `jurisdiction_status="unknown"`, so on a live Kalshi path this
+  check vetoes every order by design. Only a market carrying real eligibility
+  metadata can clear it.
+
 ## Out-of-scope products and categories (SPEC §1.2)
 
 v1 trades only fully collateralized binary event contracts; margin, perps,
