@@ -312,6 +312,82 @@ JSON
   check "  ...stderr has no guard vocabulary (STEP A short-circuits before STEP B)" "no" \
     "$(grep -qi 'workflow validation' "$STDERR_FILE" && echo yes || echo no)"
 
+  # --- 9b) #400 subject binding: a verdict must be ABOUT this PR and this HEAD --
+  # The incident these replay: the review agent produced PR #398's review, and
+  # the poster landed it — correctly addressed, perfectly fresh, verdict line
+  # flawless — on PR #396, where it became the LATEST verdict. Every check that
+  # existed before #400 passed on that comment. Freshness cannot help: the wrong
+  # review arrived at the right time.
+  #
+  # The real incident SHAs were #396 head 635ac9d… and #398 head 4eb8ff…; look
+  # there in the run logs to line these cases up against what happened.
+  #
+  # The fixtures themselves are SYNTHETIC full-length SHAs, deliberately. A real
+  # 40-character git SHA is a hex high-entropy string, which detect-secrets flags
+  # on sight — and the repo's rule (PRs #260/#282) is to fix that structurally
+  # rather than annotate it or regenerate the baseline. Low-entropy digits keep
+  # the full 40-character production length, which is the part that matters, and
+  # are unmistakably test data. Do not "helpfully" restore real SHAs here.
+  HEAD_SHA_FIX="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+  OTHER_SHA_FIX="b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+
+  BOUND_COMMENTS="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\ngood\n\n## Verdict: LGTM\n\nReview subject: PR #'"$PR"' @ '"$HEAD_SHA_FIX"'\n"}')"
+  # The #400 comment itself: a real, well-formed CHANGES_REQUESTED whose subject
+  # is a DIFFERENT pull request.
+  WRONG_PR_COMMENTS="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\nThis PR wires two related issues (#344, #269) at the composition root.\n\n## Verdict: CHANGES_REQUESTED\n\nReview subject: PR #398 @ '"$OTHER_SHA_FIX"'\n"}')"
+  # A superseded concurrent run: right PR, but it reviewed an older commit. This
+  # is the case a createdAt-only staleness check is structurally blind to — the
+  # obsolete review is genuinely newer than the run start.
+  WRONG_SHA_COMMENTS="$(cj '{"createdAt":"'"$FRESH"'","body":"## Verdict: LGTM\n\nReview subject: PR #'"$PR"' @ '"$OTHER_SHA_FIX"'\n"}')"
+  # Wrong-PR review first, correct review second — the real #396 timeline.
+  MIXED_COMMENTS="$(cj '{"createdAt":"'"$FRESH"'","body":"## Verdict: CHANGES_REQUESTED\n\nReview subject: PR #398 @ '"$OTHER_SHA_FIX"'\n"},{"createdAt":"'"$FRESH"'","body":"## Verdict: LGTM\n\nReview subject: PR #'"$PR"' @ '"$HEAD_SHA_FIX"'\n"}')"
+
+  rc="$(COMMENTS_JSON="$BOUND_COMMENTS" run_capture "$PR" "$STARTED" --head-sha "$HEAD_SHA_FIX")"
+  check "verdict bound to this PR and this HEAD -> exit 0" "0" "$rc"
+
+  # NON-VACUITY, case 1 — the #400 incident itself. Same freshness, same valid
+  # verdict line; only the subject differs. It must NOT be accepted.
+  rc="$(COMMENTS_JSON="$WRONG_PR_COMMENTS" run_capture "$PR" "$STARTED" --head-sha "$HEAD_SHA_FIX")"
+  check "fresh, well-formed verdict about a DIFFERENT PR -> exit 1 (#400)" "1" "$rc"
+  check "  ...stderr names the required subject binding" "yes" \
+    "$(grep -qF "Review subject: PR #$PR @ $HEAD_SHA_FIX" "$STDERR_FILE" && echo yes || echo no)"
+  check "  ...stderr says it reviewed a different PR or older commit" "yes" \
+    "$(grep -qi 'DIFFERENT pull request or an OLDER head commit' "$STDERR_FILE" && echo yes || echo no)"
+  check "  ...stderr does not use the misleading 'no verdict' wording" "no" \
+    "$(grep -qi 'posted no verdict' "$STDERR_FILE" && echo yes || echo no)"
+
+  # NON-VACUITY, case 2 — right PR, stale commit (the superseded-run shape).
+  rc="$(COMMENTS_JSON="$WRONG_SHA_COMMENTS" run_capture "$PR" "$STARTED" --head-sha "$HEAD_SHA_FIX")"
+  check "fresh verdict bound to an OLDER head commit -> exit 1" "1" "$rc"
+
+  # NON-VACUITY, case 3 — a fresh verdict carrying no binding at all cannot pass
+  # once binding is demanded.
+  rc="$(COMMENTS_JSON="$FRESH_LGTM_COMMENTS" run_capture "$PR" "$STARTED" --head-sha "$HEAD_SHA_FIX")"
+  check "fresh verdict with NO subject binding -> exit 1" "1" "$rc"
+
+  # The guard must still accept when a correctly-bound verdict is present
+  # ALONGSIDE a cross-posted one — otherwise #396 could never have been unblocked.
+  rc="$(COMMENTS_JSON="$MIXED_COMMENTS" run_capture "$PR" "$STARTED" --head-sha "$HEAD_SHA_FIX")"
+  check "a correctly-bound verdict alongside a cross-posted one -> exit 0" "0" "$rc"
+
+  # Binding never rescues a comment that fails the pre-existing checks: a subject
+  # line on a STALE comment is still stale, and STEP A still outranks everything.
+  STALE_BOUND_COMMENTS="$(cj '{"createdAt":"'"$STALE"'","body":"## Verdict: LGTM\n\nReview subject: PR #'"$PR"' @ '"$HEAD_SHA_FIX"'\n"}')"
+  rc="$(COMMENTS_JSON="$STALE_BOUND_COMMENTS" run_capture "$PR" "$STARTED" --head-sha "$HEAD_SHA_FIX")"
+  check "correctly-bound but STALE verdict -> still exit 1" "1" "$rc"
+
+  rc="$(COMMENTS_JSON="$BOUND_COMMENTS" run_capture "$PR" "$STARTED" \
+        --head-sha "$HEAD_SHA_FIX" --execution-file "$ERROR_EXEC")"
+  check "STEP A is_error still outranks a correctly-bound verdict -> exit 1" "1" "$rc"
+
+  # Back-compat: WITHOUT --head-sha the binding check is a no-op, so pre-#400
+  # callers behave exactly as before. This is precisely why guard 11e(3)
+  # statically pins that code-review.yml keeps passing the flag.
+  rc="$(COMMENTS_JSON="$FRESH_LGTM_COMMENTS" run_capture "$PR" "$STARTED")"
+  check "no --head-sha: unbound fresh verdict still accepted (back-compat) -> exit 0" "0" "$rc"
+  rc="$(COMMENTS_JSON="$WRONG_PR_COMMENTS" run_capture "$PR" "$STARTED")"
+  check "no --head-sha: binding is not enforced (proves the flag is what binds) -> exit 0" "0" "$rc"
+
   # --- 10) cwd-independence guard -----------------------------------------------
   mkdir -p "$WORK/sub"
   a="$(COMMENTS_JSON="$FRESH_LGTM_COMMENTS" run_capture "$PR" "$STARTED")"
@@ -327,6 +403,20 @@ check "no args at all -> exit 2 (usage)" "2" "$rc"
 
 rc="$(run_capture "$PR")"
 check "PR given but STARTED_AT missing -> exit 2 (usage)" "2" "$rc"
+
+# --- 9a) --head-sha argument handling (#400) ----------------------------------
+# A malformed SHA is rejected LOUDLY rather than quietly never matching any
+# rendered subject line — which would fail every run for an unrelated-looking
+# reason. It is also the check that keeps the value hex-only before it is
+# spliced into the jq string literal.
+rc="$(run_capture "$PR" "$STARTED" --head-sha)"
+check "--head-sha with no value -> exit 2 (usage)" "2" "$rc"
+
+rc="$(run_capture "$PR" "$STARTED" --head-sha 'not-a-sha')"
+check "--head-sha with a non-hex value -> exit 2 (usage)" "2" "$rc"
+
+rc="$(run_capture "$PR" "$STARTED" --head-sha '635ac9d1ab7378f705303fcf802801d8c3ae5824"; x')"
+check "--head-sha carrying a quote cannot reach the jq literal -> exit 2" "2" "$rc"
 
 # --- 11) static guard over .github/workflows/code-review.yml ------------------
 # These pin the #135/#140 fix: a verification step must exist, its
@@ -387,6 +477,11 @@ check "code-review.yml documents the workflow-validation guard" \
 # It is an ALLOWLIST, deliberately, not a denylist of known-bad verbs: a
 # denylist silently permits whatever nobody thought to ban. Every entry in
 # --allowed-tools must match one of the read-only forms below, or this fails.
+#
+# Read/Grep/Glob joined the allowlist in #400. They are read-only and grant no
+# write or network reach; supplying --allowed-tools REPLACES the default
+# toolset, so without them the agent could not open a single file in a checkout
+# that is already this PR's merge ref.
 allowed_tools_line=$(grep -oE -- '--allowed-tools "[^"]*"' "$CODE_REVIEW_YML" 2>/dev/null | head -1) || true
 allowed_tools_value=${allowed_tools_line#--allowed-tools \"}
 allowed_tools_value=${allowed_tools_value%\"}
@@ -400,7 +495,7 @@ else
     _tool="${_tool#"${_tool%%[![:space:]]*}"}"   # ltrim
     _tool="${_tool%"${_tool##*[![:space:]]}"}"   # rtrim
     [[ -z "$_tool" ]] && continue
-    if ! [[ "$_tool" =~ ^Bash\(gh\ (issue\ view|issue\ list|search|pr\ diff|pr\ view|pr\ list):\*\)$ ]]; then
+    if ! [[ "$_tool" =~ ^(Bash\(gh\ (issue\ view|issue\ list|search|pr\ diff|pr\ view):\*\)|Read|Grep|Glob)$ ]]; then
       agent_tools_status="write-capable:$_tool"
       break
     fi
@@ -408,6 +503,25 @@ else
 fi
 check "review agent's --allowed-tools are all read-only (no write verbs)" \
   "read-only" "$agent_tools_status"
+
+# --- 11c-#400) static guard: `gh pr list` stays OUT of the agent's tools ------
+# This is the confirmed vector for the cross-posted review, so its absence is
+# pinned rather than merely intended. Reconstruction from run 31314440670: the
+# job checks out refs/remotes/pull/<N>/merge in DETACHED HEAD, so the prompt's
+# bare `gh pr diff` / `gh pr view` fail with "could not determine current
+# branch: failed to run git: not on any branch" (reproduced directly against
+# this repo). `gh pr list` was then the only remaining way to name a PR, and its
+# default ordering is newest-first — at 12:54Z that was #398, opened seven
+# minutes earlier, so #396's run reviewed #398. The prompt now states the PR
+# number outright, which makes listing PRs pure downside: it can only
+# reintroduce a guess where an authoritative answer already exists.
+if [[ "$allowed_tools_value" == *"gh pr list"* ]]; then
+  pr_list_status=present
+else
+  pr_list_status=absent
+fi
+check "review agent cannot run 'gh pr list' (the #400 wrong-PR fallback vector)" \
+  "absent" "$pr_list_status"
 
 # The write token is only justified while the agent is toolless-for-writes, so
 # pin the pairing itself: if someone drops the permission back to read the
@@ -445,6 +559,109 @@ else
 fi
 check "the posted '## Verdict: <X>' line matches verdict-regex.sh's shared patterns" \
   "matches-shared-regex" "$verdict_format_status"
+
+# --- 11e) static guards: the #400 subject binding -----------------------------
+# A well-formed verdict line proves a verdict was posted. It does NOT prove the
+# review is about THIS PR: in #400 the agent reviewed PR #398 and the poster
+# landed that review, correctly addressed, on PR #396, where it became the
+# latest verdict. Every guard above passed on it. These four pin the binding
+# that closes the hole end to end — rendered, shaped, enforced, and sourced from
+# the triggering event.
+#
+# (1) The comment must RENDER the subject line, in the shape REVIEW_SUBJECT_RE
+# owns. Matched exactly the way the real gate matches it — jq's test(), never
+# grep: the constants carry Oniguruma inline flags ((?im)) that only jq honours,
+# and BSD grep on macOS has no -P at all.
+subject_fmt=$(grep -oE -- "printf '[^']*Review subject: PR #%s @ %s[^']*'" "$CODE_REVIEW_YML" 2>/dev/null | head -1) || true
+if [[ -z "$subject_fmt" ]]; then
+  subject_format_status=missing
+else
+  # Synthetic low-entropy SHA, for the same detect-secrets reason as section 9b.
+  rendered_subject=$(printf '\nReview subject: PR #%s @ %s\n' "396" "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1")
+  if [[ "$(jq -Rrn --arg b "$rendered_subject" '$b | test("'"$REVIEW_SUBJECT_RE"'")')" == "true" ]]; then
+    subject_format_status=matches-shared-regex
+  else
+    subject_format_status=drifted
+  fi
+fi
+check "the posted 'Review subject: PR #<n> @ <sha>' line matches REVIEW_SUBJECT_RE" \
+  "matches-shared-regex" "$subject_format_status"
+
+# (2) The subject line must never be selectable AS a verdict line. If it were,
+# pr-ready.sh would pick the binding footer as "the latest verdict" and classify
+# a perfectly good LGTM as changes-requested by elimination.
+if [[ "$(jq -Rrn --arg b "$rendered_subject" '$b | test("'"$VERDICT_RE"'")')" == "false" ]]; then
+  subject_not_verdict=inert
+else
+  subject_not_verdict=selectable-as-verdict
+fi
+check "the subject line is not itself selectable as a verdict line" \
+  "inert" "$subject_not_verdict"
+
+# (3) The assert step must still be HANDED the head SHA. Without --head-sha the
+# binding check in assert-review-posted.sh is a no-op by design (it preserves
+# pre-#400 behaviour for other callers), so dropping the flag here would
+# silently restore the old "well-formed verdict about who-knows-what"
+# acceptance. This is the guard that keeps the guard non-vacuous in production.
+head_sha_hits=$(grep -cF -- '--head-sha' "$CODE_REVIEW_YML" 2>/dev/null) || true
+if [[ "$head_sha_hits" -ge 1 ]]; then head_sha_wired=yes; else head_sha_wired=no; fi
+check "code-review.yml passes --head-sha to assert-review-posted.sh" \
+  "yes" "$head_sha_wired"
+
+# (4) Both bound values must come from the TRIGGERING EVENT — never from the
+# branch, the checkout, or a prior step. That shared origin is the whole point:
+# the number that addresses the comment and the number written inside it cannot
+# disagree. `github.event.pull_request.head.sha` is also the only SHA that means
+# "the PR's head"; `github.sha` on a pull_request event is the merge commit and
+# would never match what a consumer resolves for the PR.
+event_sha_hits=$(grep -cF -- 'github.event.pull_request.head.sha' "$CODE_REVIEW_YML" 2>/dev/null) || true
+event_num_hits=$(grep -cF -- 'github.event.pull_request.number' "$CODE_REVIEW_YML" 2>/dev/null) || true
+if [[ "$event_sha_hits" -ge 1 && "$event_num_hits" -ge 1 ]]; then
+  subject_source_status=from-triggering-event
+else
+  subject_source_status=inferred-or-missing
+fi
+check "PR number and head SHA are both resolved from the triggering event" \
+  "from-triggering-event" "$subject_source_status"
+
+# --- 11f) static guard: the agent is TOLD its PR number (#400 AC 2) -----------
+# The prompt used to say "Read the change with `gh pr diff` and `gh pr view`" —
+# with no number, in a detached-HEAD checkout where both of those fail. The
+# agent must instead be handed the PR number it is reviewing, interpolated from
+# the event, so it never has to work out which PR it is on.
+#
+# The pattern is assembled with the `$` supplied by a variable rather than
+# written inside single quotes. A literal '${{ ... }}' here reads to shellcheck
+# as an expansion someone forgot to enable (SC2016), and the honest fix is to
+# stop writing a `$` we do not mean to expand — not to silence the check.
+dollar='$'
+prompt_pat="gh pr diff ${dollar}{{ github.event.pull_request.number }}"
+if grep -qF -- "$prompt_pat" "$CODE_REVIEW_YML" 2>/dev/null; then
+  prompt_binding_status=explicit
+else
+  prompt_binding_status=unbound
+fi
+check "the review prompt names the PR number explicitly for gh pr diff" \
+  "explicit" "$prompt_binding_status"
+
+# --- 11g) static guard: per-PR concurrency (#400 AC 5) ------------------------
+# Confirmed from the run logs, not assumed: PR #396 had two review runs in
+# flight on DIFFERENT head SHAs (run 31313993066 / sha 7ed0553 at 12:43:18Z and
+# run 31314080368 / sha e13b4d8 at 12:45:23Z). Neither was cancelled, both
+# posted, and the PR collected two near-identical LGTMs 109 seconds apart. The
+# superseded run's verdict describes an obsolete commit while still looking
+# fresh by createdAt — exactly what a timestamp-only staleness check cannot see.
+# The group must be keyed on the PR number: a coarser key (e.g. the workflow
+# name alone) would let one PR's run cancel an unrelated PR's review.
+concurrency_group=$(grep -A2 -- '^concurrency:' "$CODE_REVIEW_YML" 2>/dev/null | grep -- 'group:' | head -1) || true
+cancel_hits=$(grep -cE -- '^[[:space:]]*cancel-in-progress:[[:space:]]*true' "$CODE_REVIEW_YML" 2>/dev/null) || true
+if [[ "$concurrency_group" == *'github.event.pull_request.number'* && "$cancel_hits" -ge 1 ]]; then
+  concurrency_status=per-pr
+else
+  concurrency_status=missing-or-not-per-pr
+fi
+check "code-review.yml serialises review runs per-PR with cancel-in-progress" \
+  "per-pr" "$concurrency_status"
 
 # --- 12) static guard: self-wiring into ralph-fleet-tests.yml -----------------
 run_list_hits=$(grep -cF -- 'test_assert_review_posted.sh' "$FLEET_TESTS_YML" 2>/dev/null) || true
