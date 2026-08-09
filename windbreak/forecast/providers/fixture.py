@@ -41,6 +41,16 @@ if TYPE_CHECKING:
     from windbreak.forecast.sanitize import ResearchQuote
 
 #: The billed cost of a network-free fixture vote, in micro-dollars: none.
+#:
+#: This zero is a *known* zero, never an "unknown" one (issue #399): replaying
+#: a recorded cassette makes no paid call, so nothing was spent. It is emphatically
+#: not this provider's answer to "what did a live call cost" -- the transport seam
+#: hands back bare completion text with no token accounting, so this layer cannot
+#: price a call at all. On the live path this provider is always wrapped in a
+#: :class:`~windbreak.forecast.providers.retry.RetryingProvider`, which prices
+#: every attempt from the fail-closed
+#: :class:`~windbreak.forecast.budget.ProviderPriceTable`; see
+#: :mod:`windbreak.scheduler.provider_wiring` for why that wrap is structural.
 _FIXTURE_COST_MICROS = 0
 
 
