@@ -71,22 +71,32 @@ route -> PaperExchange fill -> reconcile
 
 Every stage appends an audit event to the shared hash-chained ledger, plus a
 per-tick `ModeHeartbeat`, `EquitySampled`, and `PositionsSnapshotRecorded`.
-The weekly report stub (below) is also (re-)written each tick.
+Since issue #353 each tick also runs one **read-only verification cycle**
+before it decides anything, which records exactly one `VerificationPassed`,
+`VerificationDrift`, or `VerificationMismatch` row. The weekly report stub
+(below) is also (re-)written each tick.
 
-**Known limitation -- today's tick never actually fills.** The `approve`
-stage composes the real `RiskKernel.evaluate_intent` with the real
-`ApprovalPipeline.approve` (`KernelApproval` in `windbreak/scheduler/loop.py`).
-Right now that seam can never mint an approval token, for **one** remaining
-reason. Two earlier causes have been removed: issue #340 made
-`jurisdiction_product_eligibility` a real check (it passes over a market with
-eligible metadata), and issue #342 wired real exchange-status and
-pipeline-heartbeat evidence, so `exchange_status_ok` and
-`pipeline_heartbeat_ok` now evaluate genuine observations and pass on a healthy
-exchange.
+**Known limitation -- today's tick still never fills, but no longer for any
+verification reason.** The `approve` stage composes the real
+`RiskKernel.evaluate_intent` with the real `ApprovalPipeline.approve`
+(`KernelApproval` in `windbreak/scheduler/loop.py`). Three earlier causes have
+been removed: issue #340 made `jurisdiction_product_eligibility` a real check,
+issue #342 wired real exchange-status and pipeline-heartbeat evidence, and
+issue #353 wired the read-only verification cycle so the three reconciliation
+checks evaluate a real snapshot and pass on a clean one.
 
-The remaining cause is verification: the three reconciliation checks fail
-closed on `verification=None`, which is exactly what the loop honestly supplies
-today -- no read-only exchange verification cycle runs in PAPER yet.
+The two remaining causes are both honest zero/`None` feeds in the *account and
+market view* `windbreak/scheduler/loop.py` composes, not in the kernel:
+
+- `daily_loss_limit` vetoes because `equity_start_of_day` is `0`, which floors
+  the loss threshold at `0`; a flat account's `realized_loss_today` of `0`
+  already "reaches" it.
+- `participation_cap_compliance` vetoes because `visible_depth` is `None`.
+
+Both are left honest on purpose: inventing a start-of-day equity or a depth
+figure would loosen two real exposure limits on fabricated evidence.
+`tests/integration/test_paper_verification.py::test_loop_production_context_vetoes_carry_no_verification_reason`
+pins this exact remaining reason set, so it cannot drift unnoticed.
 
 Note the status **value** is read from the connector every tick and never
 synthesized, so a `paused` or `closed` exchange still vetoes -- with the
@@ -94,14 +104,29 @@ distinct reason `exchange not open for trading` rather than `stale or missing`,
 so an operator can tell "the venue is shut" from "we have no reading".
 
 So a real PAPER tick ledgers a full decision trail (snapshot, forecast,
-selector decision, and an `IntentVetoed`) but routes nothing and fills
-nothing; `filled_centis` on every tick's outcome is `0`. Don't be surprised
-to see nothing but vetoes in `/decisions` or `selector_decisions.json` --
-that is the expected, honestly-ledgered state of the loop today. The first
-real, kernel-approved paper fill activates once a read-only verification feed
-is wired into the loop in place of today's fail-closed `None`. Exchange status
-and the pipeline heartbeat are already real (issue #342); verification is the
-last one outstanding.
+selector decision, verification outcome, and an `IntentVetoed`) but routes
+nothing and fills nothing; `filled_centis` on every tick's outcome is `0`.
+Don't be surprised to see nothing but vetoes in `/decisions` or
+`selector_decisions.json` -- that is the expected, honestly-ledgered state of
+the loop today.
+
+**Operationally important -- a verification breach HALTs the kernel.** The
+baseline the cycle reconciles against is frozen at process start from the
+venue's own opening state, and the ledger records no fill amounts that could
+update it. So the first tick after any real paper fill grades a `BREACH`: the
+kernel transitions to `HALT` (issue #32), records `VerificationMismatch` and
+`VerificationMismatchHalt`, the per-tick `ModeHeartbeat` starts reporting
+`HALT` instead of `PAPER`, and `TickOutcome.kernel_halted` is `True`. Every
+later approval then vetoes on the halted mode. **Watch `kernel_halted`**: a
+halted loop keeps ticking and keeps ledgering, but it is no longer a trading
+loop, and only a restart re-baselines it. That is the fail-closed reading of
+"our books cannot account for the venue" -- the alternative, re-reading the
+expectation off the same connector each cycle, would make all three
+reconciliation dimensions structurally incapable of failing.
+
+The verification path holds a `ReadOnlyConnectorView`
+(`windbreak/connector/readonly.py`), not the `PaperExchange` itself, so it has
+no `place_order`/`cancel_order` attribute at all (SPEC S1.1 invariant 3).
 
 **Known limitation -- the kill switch does not stop the PAPER loop yet.**
 `windbreak kill --state-dir <dir>` and `windbreak rearm --state-dir <dir>` write
@@ -289,12 +314,17 @@ pass.
 ### Known limitations (summary)
 
 - The real Risk Kernel currently vetoes every intent, but no longer because of
-  a stub: issue #340 made `jurisdiction_product_eligibility` a real check. The
-  three remaining causes are all honest `None` feeds -- the
-  `exchange_status_ok`/`pipeline_heartbeat_ok` checks and the three
-  reconciliation checks fail closed on the `None` status, heartbeat, and
-  verification the loop supplies. So no PAPER tick fills yet: expect vetoes, not
-  fills, in the ledger and dashboard.
+  a stub or of any missing evidence feed in the kernel: issue #340 made
+  `jurisdiction_product_eligibility` a real check, issue #342 wired real
+  exchange-status and pipeline-heartbeat evidence, and issue #353 wired the
+  read-only verification cycle the three reconciliation checks consume. The two
+  remaining causes are honest zeros in the loop's own account/market view --
+  `equity_start_of_day=0` (so `daily_loss_limit` vetoes) and
+  `visible_depth=None` (so `participation_cap_compliance` vetoes). So no PAPER
+  tick fills yet: expect vetoes, not fills, in the ledger and dashboard.
+- A verification `BREACH` HALTs the kernel and it stays halted for the life of
+  the process (see "What one PAPER tick actually does"). Watch
+  `TickOutcome.kernel_halted` and the `ModeHeartbeat` mode.
 - On a **live Kalshi** path the jurisdiction check vetoes for an additional
   reason: Kalshi publishes no eligibility signal, so `normalize_market` stamps
   every market `jurisdiction_status="unknown"`, which fails closed by design
