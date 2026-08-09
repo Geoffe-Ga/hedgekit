@@ -9,9 +9,9 @@ injected seam (never real HTTP; SPEC S7.1: CI runs offline).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from email.utils import format_datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import pytest
 
@@ -211,6 +211,163 @@ def test_2xx_without_date_header_has_none_server_date() -> None:
     response = client.get("markets")
 
     assert response.server_date is None
+
+
+#: Raw `Date` header values `parsedate_to_datetime` refuses to parse (issue
+#: #166). Deliberately near-misses rather than obvious garbage: each is a
+#: well-formed HTTP-date in every respect but one -- an out-of-range day, an
+#: unknown month token, an out-of-range hour, a bare epoch, a truncated value
+#: -- so the guard is pinned against the headers a broken or hostile server
+#: would actually emit, not merely against a string with no date-like content.
+_UNPARSEABLE_DATE_HEADERS: Final = (
+    "not-a-date",
+    "",
+    "Sun, 32 Dec 2024 12:30:00 GMT",
+    "Sun, 01 Foo 2024 12:30:00 GMT",
+    "Sun, 01 Dec 2024 25:30:00 GMT",
+    "1735732200",
+    "Sun, 01 Dec 2024",
+)
+
+
+@pytest.mark.parametrize("raw", _UNPARSEABLE_DATE_HEADERS)
+def test_unparseable_date_header_yields_none_server_date_without_raising(
+    raw: str,
+) -> None:
+    """An unparseable `Date` header degrades to `server_date is None`.
+
+    A venue's clock header is advisory metadata; a malformed one must never
+    abort an otherwise-good 2xx response, so the parse failure is swallowed and
+    reported as "unknown" (issue #166, `client.py` `except (TypeError,
+    ValueError)`). `None` is the fail-closed answer here precisely because
+    every consumer already treats an absent `server_date` as "no exchange
+    instant available" and falls back to its own clock -- an unparseable header
+    must land in that same "unprovable" bucket rather than becoming a datetime
+    from somewhere else. The payload assertion is what proves the *response*
+    survived: an exception escaping the parse would fail the test at
+    `client.get`, but a silent swap to a raising-then-empty result would not.
+    """
+    session = _RecordingSession(
+        _FakeResponse(200, {"markets": []}, headers={"Date": raw})
+    )
+    client = KalshiClient(
+        base_url="https://example.kalshi.test",
+        allowlist=_EXAMPLE_ALLOWLIST,
+        session=session,
+    )
+
+    response = client.get("markets")
+
+    assert response.payload == {"markets": []}
+    assert response.server_date is None
+
+
+def test_date_header_parser_raising_type_error_yields_none_server_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`TypeError` is caught alongside `ValueError`, not left to escape.
+
+    The stdlib parser raises `ValueError` for every malformed *string*, so the
+    parametrized cases above exercise only half of the guard's exception tuple:
+    dropping `TypeError` from it would leave them all green. `TypeError` is
+    what a non-`str` header value produces -- a shape the `Mapping[str, str]`
+    annotation forbids but a real header mapping deserialized from an untyped
+    source can still deliver -- so it is monkeypatched in here (the same device
+    the issue-#346 test above uses for its unreachable-by-the-parser shape).
+    """
+
+    def _raise_type_error(_raw: str) -> datetime:
+        """Stand in for a parser handed a value of the wrong type.
+
+        Args:
+            _raw: The raw header value; unused, since the answer is unconditional.
+
+        Raises:
+            TypeError: Always.
+        """
+        raise TypeError("strptime() argument 1 must be str, not int")
+
+    monkeypatch.setattr(client_module, "parsedate_to_datetime", _raise_type_error)
+
+    assert _parse_server_date({"Date": "Sun, 01 Dec 2024 12:30:00 GMT"}) is None
+
+
+#: Real `Date` header strings the stdlib parser returns *tz-naive* from: no
+#: zone token at all, RFC 5322's `-0000` ("the sender declines to state a
+#: zone"), and an unrecognized alphabetic zone token. All three are shapes a
+#: live venue can emit, so they reach the naive branch through the real parser
+#: -- unlike the issue-#346 case above, which has to be monkeypatched in.
+_TZ_NAIVE_DATE_HEADERS: Final = (
+    "Mon, 07 Jul 2025 12:00:00",
+    "Mon, 07 Jul 2025 12:00:00 -0000",
+    "Mon, 07 Jul 2025 12:00:00 QQQ",
+)
+
+
+@pytest.mark.parametrize("raw", _TZ_NAIVE_DATE_HEADERS)
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_tz_naive_date_header_is_stamped_utc_not_read_as_local_time(
+    raw: str,
+) -> None:
+    """A `tzinfo`-less parsed `Date` is stamped UTC, keeping its wall clock.
+
+    An HTTP-date is GMT by RFC 9110 S5.6.7 -- a fact about the protocol, not
+    about the machine that parsed it -- so the naive value is *labelled* UTC
+    rather than converted from local time. `astimezone` on a naive datetime
+    does not raise; it silently reads the wall clock as the host's local time,
+    which is why the `local_timezone_utc_minus_5` fixture is mandatory here:
+    on a UTC host (which CI is) both paths yield the identical instant and this
+    test would be a permanent false green. Pinned to UTC-05:00 the buggy path
+    yields 17:00Z against the correct 12:00Z.
+
+    Both halves of "stamped, not shifted" are asserted: the instant (which a
+    local-time read moves) and the wall-clock reading (which a *conversion* to
+    UTC would move even from a correctly-labelled zone).
+    """
+    session = _RecordingSession(
+        _FakeResponse(200, {"markets": []}, headers={"Date": raw})
+    )
+    client = KalshiClient(
+        base_url="https://example.kalshi.test",
+        allowlist=_EXAMPLE_ALLOWLIST,
+        session=session,
+    )
+
+    server_date = client.get("markets").server_date
+
+    assert server_date == datetime(2025, 7, 7, 12, 0, tzinfo=UTC)
+    assert server_date is not None
+    assert server_date.utcoffset() == timedelta(0)
+    assert server_date.replace(tzinfo=None) == datetime(2025, 7, 7, 12, 0)
+
+
+@pytest.mark.usefixtures("local_timezone_utc_minus_5")
+def test_offset_bearing_date_header_is_converted_to_the_same_utc_instant() -> None:
+    """An offset-bearing `Date` is *converted* to UTC, not relabelled.
+
+    The happy-path test above sends a `+0000` header, where converting and
+    relabelling agree -- so it cannot tell the aware branch's `astimezone(UTC)`
+    from the naive branch's `replace(tzinfo=UTC)`. A `+0530` header separates
+    them: converting gives 06:30Z (the same instant), relabelling would give
+    12:00Z (a five-and-a-half-hour lie about when the venue answered). The
+    local-timezone pin is kept so neither answer can coincide with the host's.
+    """
+    session = _RecordingSession(
+        _FakeResponse(
+            200, {"markets": []}, headers={"Date": "Mon, 07 Jul 2025 12:00:00 +0530"}
+        )
+    )
+    client = KalshiClient(
+        base_url="https://example.kalshi.test",
+        allowlist=_EXAMPLE_ALLOWLIST,
+        session=session,
+    )
+
+    server_date = client.get("markets").server_date
+
+    assert server_date == datetime(2025, 7, 7, 6, 30, tzinfo=UTC)
+    assert server_date is not None
+    assert server_date.replace(tzinfo=None) == datetime(2025, 7, 7, 6, 30)
 
 
 class _OffsetlessTimezone(tzinfo):
