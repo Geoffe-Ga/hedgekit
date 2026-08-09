@@ -376,6 +376,76 @@ if [[ "$workflow_guard_hits" -ge 1 ]]; then workflow_guard_documented=yes; else 
 check "code-review.yml documents the workflow-validation guard" \
   "yes" "$workflow_guard_documented"
 
+# --- 11c) static guard: the review agent holds NO write-capable tool ----------
+# The #152 fix raises the job's `pull-requests` permission from read to WRITE so
+# the deterministic "Post review" step can comment with the workflow's own
+# token. That is only safe because the AGENT itself was simultaneously stripped
+# of every write-capable tool: if a future edit re-adds one while the token is
+# write, a prompt-injected PR diff could make the agent post or approve
+# arbitrarily. This guard is the thing standing between those two facts.
+#
+# It is an ALLOWLIST, deliberately, not a denylist of known-bad verbs: a
+# denylist silently permits whatever nobody thought to ban. Every entry in
+# --allowed-tools must match one of the read-only forms below, or this fails.
+allowed_tools_line=$(grep -oE -- '--allowed-tools "[^"]*"' "$CODE_REVIEW_YML" 2>/dev/null | head -1) || true
+allowed_tools_value=${allowed_tools_line#--allowed-tools \"}
+allowed_tools_value=${allowed_tools_value%\"}
+
+if [[ -z "$allowed_tools_value" ]]; then
+  agent_tools_status=missing
+else
+  agent_tools_status=read-only
+  IFS=',' read -ra _tools <<<"$allowed_tools_value"
+  for _tool in "${_tools[@]}"; do
+    _tool="${_tool#"${_tool%%[![:space:]]*}"}"   # ltrim
+    _tool="${_tool%"${_tool##*[![:space:]]}"}"   # rtrim
+    [[ -z "$_tool" ]] && continue
+    if ! [[ "$_tool" =~ ^Bash\(gh\ (issue\ view|issue\ list|search|pr\ diff|pr\ view|pr\ list):\*\)$ ]]; then
+      agent_tools_status="write-capable:$_tool"
+      break
+    fi
+  done
+fi
+check "review agent's --allowed-tools are all read-only (no write verbs)" \
+  "read-only" "$agent_tools_status"
+
+# The write token is only justified while the agent is toolless-for-writes, so
+# pin the pairing itself: if someone drops the permission back to read the
+# posting step breaks silently, and if someone raises it without the allowlist
+# above the guard is the only thing left.
+pr_write_hits=$(grep -cE -- '^[[:space:]]*pull-requests:[[:space:]]*write' "$CODE_REVIEW_YML" 2>/dev/null) || true
+if [[ "$pr_write_hits" -ge 1 ]]; then pr_write_status="write"; else pr_write_status="not-write"; fi
+check "code-review.yml grants pull-requests: write for the deterministic poster" \
+  "write" "$pr_write_status"
+
+# --- 11d) static guard: the posted verdict line matches the shared regex ------
+# The verdict line is now rendered by a printf in workflow YAML rather than by
+# the agent, so nothing statically ties its format to verdict-regex.sh -- the
+# single source of truth that pr-ready.sh (merge gate) and assert-review-posted.sh
+# (post gate) both parse. A format drift here is the #135 silent-stall class:
+# a verdict the poster considers valid but the merger never sees.
+# shellcheck source=scripts/ralph/verdict-regex.sh
+# shellcheck disable=SC1091  # sourced at runtime; not followed without -x
+source "$RALPH_DIR/verdict-regex.sh"
+printf_fmt=$(grep -oE -- "printf '[^']*## Verdict: %s[^']*'" "$CODE_REVIEW_YML" 2>/dev/null | head -1) || true
+if [[ -z "$printf_fmt" ]]; then
+  verdict_format_status=missing
+else
+  # Render exactly what the workflow renders, then match it the SAME way the
+  # real gates do -- jq's test(), not grep. The constants carry Oniguruma
+  # inline flags ((?im)), which only jq honours; matching them any other way
+  # here would test a different thing than the gates enforce.
+  rendered=$(printf '\n\n## Verdict: %s\n' "LGTM")
+  if [[ "$(jq -Rrn --arg b "$rendered" '$b | test("'"$VERDICT_RE"'")')" == "true" \
+     && "$(jq -Rrn --arg b "$rendered" '$b | test("'"$VERDICT_LGTM_RE"'")')" == "true" ]]; then
+    verdict_format_status=matches-shared-regex
+  else
+    verdict_format_status=drifted
+  fi
+fi
+check "the posted '## Verdict: <X>' line matches verdict-regex.sh's shared patterns" \
+  "matches-shared-regex" "$verdict_format_status"
+
 # --- 12) static guard: self-wiring into ralph-fleet-tests.yml -----------------
 run_list_hits=$(grep -cF -- 'test_assert_review_posted.sh' "$FLEET_TESTS_YML" 2>/dev/null) || true
 if [[ "$run_list_hits" -ge 1 ]]; then run_list_wired=yes; else run_list_wired=no; fi
