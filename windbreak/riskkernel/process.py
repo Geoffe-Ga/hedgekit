@@ -355,6 +355,7 @@ class RiskKernel:
         *,
         mode_machine: ModeStateMachine | None = None,
         verifier: ReadOnlyVerifier | None = None,
+        clock: Callable[[], int] | None = None,
         gate_plan_store: LedgerStore | None = None,
         kill_integration: KillIntegration | None = None,
         ledger_blocked_promotions: bool = False,
@@ -392,6 +393,11 @@ class RiskKernel:
                 already-``HALT``/``KILLED`` guard, so a verifier handed to a
                 rebuilt-KILLED kernel never drives an illegal ``KILLED -> HALT``
                 transition.
+            clock: The rebuilt kernel's injected epoch-second clock, forwarded
+                verbatim to :meth:`__init__`, or ``None`` for the wall clock.
+                The PAPER loop threads its own tick clock through here (issue
+                #441) so a replayed kernel stamps its verification snapshots on
+                the same timeline the rest of the tick reads.
             gate_plan_store: The ledger the rebuilt kernel reads its PAPER gate
                 plan from at promotion time (issue #185), or ``None``.
             kill_integration: The kill switch and its trigger adapters to wire
@@ -413,6 +419,7 @@ class RiskKernel:
             ledger_writer,
             mode_machine=mode_machine,
             verifier=verifier,
+            clock=clock,
             gate_plan_store=gate_plan_store,
             kill_integration=kill_integration,
             ledger_blocked_promotions=ledger_blocked_promotions,
@@ -815,15 +822,26 @@ class RiskKernel:
             beat += 1
             self._emit_heartbeat(beat)
             self.run_verification_cycle()
-            self._poll_kill_triggers()
+            self.poll_kill_triggers()
             stop_event.wait(heartbeat_interval)
 
-    def _poll_kill_triggers(self) -> None:
+    def poll_kill_triggers(self) -> None:
         """Poll the wired kill-file watcher once, if any (issue #35).
 
         A no-op when no kill integration -- or no watcher within it -- is wired,
         so the ordinary heartbeat path is untouched until a kill switch is
         actually installed.
+
+        Public, rather than :meth:`run`'s private helper, because :meth:`run` is
+        not the only loop that drives a kernel (issue #441). The always-on PAPER
+        loop composes its own kernel and beats it through
+        :func:`~windbreak.scheduler.loop.run_single_tick`, which never enters
+        :meth:`run` at all -- so an operator ``KILL`` file could reach the
+        ``--process riskkernel`` kernel and not the one actually trading. This
+        is the seam that beat calls; keeping it private would have meant either
+        a second polling implementation or a private call across a module
+        boundary, and a kill switch is the last control that should have two of
+        anything.
         """
         integration = self._kill_integration
         if integration is None or integration.watcher is None:

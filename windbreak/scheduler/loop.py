@@ -84,6 +84,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
 
 from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
@@ -151,6 +152,12 @@ from windbreak.riskkernel.context import (
     MarketView,
     RiskLimits,
 )
+from windbreak.riskkernel.kill import (
+    KillFileWatcher,
+    KillIntegration,
+    KillSwitch,
+    ReconciliationMismatchMonitor,
+)
 from windbreak.riskkernel.modes import Mode, ModeStateMachine
 from windbreak.riskkernel.process import RiskKernel
 from windbreak.riskkernel.reservations import (
@@ -207,7 +214,6 @@ from windbreak.timekeeping import require_aware
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
     from datetime import date
-    from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
     from windbreak.connector.live import MarketDataSource
@@ -1780,6 +1786,96 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
     )
 
 
+def _build_kill_integration(
+    config: WindbreakConfig,
+    history: tuple[Event, ...],
+    mode_machine: ModeStateMachine,
+    writer: _SqliteKernelLedgerWriter,
+    clock: Callable[[], int],
+    dispatcher: AlertDispatcher,
+    reservations: ReservationLedger,
+) -> KillIntegration:
+    """Compose the always-on PAPER loop's kill switch and triggers (issue #441).
+
+    The same composition ``windbreak.main._build_risk_kernel`` builds for
+    ``windbreak run --process riskkernel``, over *this* loop's own seams: a
+    :class:`~windbreak.riskkernel.kill.KillSwitch` replayed from the loop's
+    hash chain, a :class:`~windbreak.riskkernel.kill.KillFileWatcher` over
+    ``config.ops.state_dir``, and a
+    :class:`~windbreak.riskkernel.kill.ReconciliationMismatchMonitor` at
+    ``config.risk.kill_after_consecutive_mismatches``.
+
+    Until this existed the PAPER loop -- the process that actually trades --
+    passed ``kill_integration=None``, so ``windbreak kill --state-dir DIR``
+    wrote a ``KILL`` file nothing polled and the configured auto-kill threshold
+    bound nothing. #144 wired the kill switch into the CLI's *other* kernel and
+    was closed as done; the RUNBOOK went on documenting a control the running
+    loop did not honour. For a safety-critical kill switch an inert one is worse
+    than none.
+
+    Four composition decisions, each deliberate:
+
+    * **Replayed, not fresh.** :meth:`KillSwitch.from_events` restores the
+      monotonic kill sequence from ``history``, so a post-restart kill still
+      increments rather than reissuing sequence 1 and letting a stale re-arm
+      phrase unlock it. Driving the machine itself back to ``KILLED`` is
+      :meth:`RiskKernel.from_events`'s job, so the two never race to transition
+      the one machine.
+    * **The state dir is read, never created.** A missing directory is exactly
+      "the operator has asked for nothing", which
+      :meth:`KillFileWatcher.poll_once` already reads correctly from a
+      presence check. Creating it here would put a filesystem side effect in
+      every ``build_paper_deps`` call for no control it buys: a mistyped
+      ``state_dir`` is equally unreachable created or not. A kill from a
+      non-file trigger still drops the ``KILL`` file, and
+      :meth:`KillSwitch._write_kill_file` creates the directory then.
+    * **The reservation ledger is wired.** A killed loop must hold no live
+      capital reservation, so the switch is handed the very ledger the approval
+      pipeline reserves against and releases every active one on kill.
+    * **No directive sink.** The one :class:`CancelAllDirective` is ledgered but
+      not delivered to the gateway, matching ``_build_risk_kernel``'s live
+      composition exactly: the gateway is built *after* this seam and exposes no
+      ``submit(directive)``. Resting-order cancellation on kill is therefore
+      still an audit record rather than an effect, on this path and the LIVE one
+      alike.
+
+    Args:
+        config: The configuration supplying ``ops.state_dir`` and the
+            consecutive-mismatch auto-kill threshold.
+        history: The replayed ledger history the kill sequence is restored from.
+        mode_machine: The one LOCKED mode machine the switch drives to
+            ``KILLED``.
+        writer: The seam every kill-path event is recorded through.
+        clock: The injected epoch-second clock ``KillEngaged.epoch`` is stamped
+            at, so a kill is dated on the same timeline the tick reads.
+        dispatcher: The run's one alert root the ``HALT_KILL`` page is delivered
+            through (issue #444), so a kill reaches the sinks the operator
+            configured rather than a second, log-only path.
+        reservations: The capital ledger whose active reservations a kill
+            releases.
+
+    Returns:
+        The composed :class:`~windbreak.riskkernel.kill.KillIntegration`.
+    """
+    state_dir = Path(config.ops.state_dir).expanduser()
+    switch = KillSwitch.from_events(
+        history,
+        mode_machine,
+        writer,
+        dispatcher,
+        reservation_ledger=reservations,
+        state_dir=state_dir,
+        clock=clock,
+    )
+    return KillIntegration(
+        switch=switch,
+        watcher=KillFileWatcher(switch, state_dir),
+        monitor=ReconciliationMismatchMonitor(
+            switch, threshold=config.risk.kill_after_consecutive_mismatches
+        ),
+    )
+
+
 def _build_approval(
     store: SqliteLedgerStore,
     config: WindbreakConfig,
@@ -1790,17 +1886,24 @@ def _build_approval(
 ) -> tuple[KernelApproval, RiskKernel]:
     """Wire the real kernel + approval pipeline into a `KernelApproval` seam.
 
-    The kernel tracks PAPER mode (so its ledgered evaluation stamps PAPER) with
-    ``kill_integration=None`` -- kill wiring is out of scope -- and shares the one
-    ephemeral signing key with the gateway. The same hash-chained ``store`` is
-    wired as the kernel's ``gate_plan_store`` (issue #185), so a PAPER ->
-    LIVE_MICRO promotion reads its three thresholds from the pre-registered gate
-    plan on the ledger, failing closed when none is registered.
+    The kernel tracks PAPER mode (so its ledgered evaluation stamps PAPER) and
+    shares the one ephemeral signing key with the gateway. The same hash-chained
+    ``store`` is wired as the kernel's ``gate_plan_store`` (issue #185), so a
+    PAPER -> LIVE_MICRO promotion reads its three thresholds from the
+    pre-registered gate plan on the ledger, failing closed when none is
+    registered.
 
     Issue #353 additionally wires a real read-only verifier and the tick's own
     injected ``clock``, so every cycle the kernel runs is stamped at the same
     instant the rest of the tick reads -- a snapshot aged against an unrelated
     wall clock could go stale against ``now_epoch_s`` for no real reason.
+
+    Issue #441 gave it the kill wiring this docstring used to declare out of
+    scope (see :func:`_build_kill_integration`), and rebuilt the kernel through
+    :meth:`RiskKernel.from_events` rather than the bare constructor, so an
+    engaged kill is recovered from the loop's own hash chain on restart --
+    durable ledgered state, not a file that can be deleted. The polling that
+    makes the wiring real is :func:`_kill_stage`, one call per tick.
 
     Args:
         store: The ledger both the kernel and the pipeline record through.
@@ -1820,15 +1923,19 @@ def _build_approval(
     mode_machine = ModeStateMachine(
         mode_ceiling=Mode.from_config(config.mode_ceiling), mode=Mode.PAPER
     )
-    kernel = RiskKernel(
+    ledger = ReservationLedger(writer)
+    history = events_from_records(store.read_all())
+    kernel = RiskKernel.from_events(
+        history,
         writer,
         mode_machine=mode_machine,
         verifier=_build_verifier(store, config, view, writer, dispatcher),
         clock=clock,
         gate_plan_store=store,
-        kill_integration=None,
+        kill_integration=_build_kill_integration(
+            config, history, mode_machine, writer, clock, dispatcher, ledger
+        ),
     )
-    ledger = ReservationLedger(writer)
     issuer = TokenIssuer.from_key_material(key)
     pipeline = ApprovalPipeline(ledger, issuer, config_hash=config_hash(config))
     return KernelApproval(kernel, pipeline), kernel
@@ -3138,6 +3245,33 @@ def _heartbeat_stage(deps: PaperTickDeps, now_epoch_s: int) -> int:
     return now_epoch_s
 
 
+def _kill_stage(deps: PaperTickDeps) -> None:
+    """Poll the operator's kill/re-arm files once, before the tick does anything.
+
+    The one call that makes issue #441's wiring real rather than merely present:
+    a :class:`~windbreak.riskkernel.kill.KillIntegration` that is composed but
+    never polled is indistinguishable at runtime from the ``None`` it replaced.
+
+    Runs *first*, ahead of the screen, the heartbeat, and the verification
+    cycle, because that is the fail-safe direction: a ``KILL`` file already on
+    disk when the beat starts must stop *this* tick rather than the next one.
+    The poll is bounded -- one directory probe, never a wait -- so it cannot
+    stall the beat, and it is also how a re-arm is consumed, since
+    :meth:`~windbreak.riskkernel.kill.KillFileWatcher.poll_once` reads the
+    ``REARM`` file only while the switch is ``KILLED``.
+
+    It deliberately does not decide anything about the tick. Whether the
+    universe is walked is read from the kernel's *mode* after the verification
+    cycle (:func:`run_single_tick`), not from a flag returned here, so the
+    file-driven kill and the reconciliation auto-kill -- which fires mid-cycle,
+    after this stage has run -- stop the tick by exactly the same mechanism.
+
+    Args:
+        deps: The tick's dependency bundle.
+    """
+    deps.kernel.poll_kill_triggers()
+
+
 def _verification_stage(deps: PaperTickDeps) -> None:
     """Run one read-only verification cycle, HALTing the kernel on a breach.
 
@@ -3359,6 +3493,27 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     positions snapshot, but every later approval vetoes on the halted mode, and
     :attr:`TickOutcome.kernel_halted` says so.
 
+    Since issue #441 the tick *opens* by polling the operator's kill/re-arm
+    files (:func:`_kill_stage`) and walks **no** candidates at all while the
+    kernel is ``KILLED``. Two triggers reach that state and both stop the same
+    tick: the ``KILL`` file ``windbreak kill`` writes, read before anything else
+    happens, and the ``AUTO_RECONCILIATION`` auto-kill that fires inside the
+    verification cycle once ``risk.kill_after_consecutive_mismatches``
+    consecutive breaches have accumulated. The mode is therefore read *after*
+    that cycle, so neither trigger needs its own path.
+
+    A killed tick is not a skipped tick. It still screens (the screen is free
+    and its rows are the honest record of what was examined), still stamps its
+    pipeline heartbeat, still reconciles the venue, still samples equity and
+    positions, and still writes the week's report -- an always-on loop must stay
+    observably alive and flat while dead, not fall silent. What it does not do
+    is research or route: the walk is where money is spent, and a kernel that
+    can approve nothing must not pay for forecasts it cannot act on.
+    ``ModeHeartbeat`` carries ``KILLED``, so the ledger and the heartbeat line
+    both say so. ``HALT`` deliberately does *not* skip the walk -- a halted
+    kernel is expected to recover and its approvals veto individually -- so this
+    is the kill switch's dead hand, not a general mode gate.
+
     A market whose per-forecast or per-UTC-day research budget is exhausted
     halts fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row,
     skips that market's forecast, select, and approve stages, and stops the
@@ -3397,10 +3552,18 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     """
     now_epoch_s = deps.clock()
     created_at = datetime.fromtimestamp(now_epoch_s, UTC)
+    _kill_stage(deps)
     candidates = _screen_stage(deps)
     heartbeat_epoch_s = _heartbeat_stage(deps, now_epoch_s)
     _verification_stage(deps)
-    universe = _run_universe(deps, candidates, created_at, heartbeat_epoch_s)
+    # Read *after* the verification cycle, so the reconciliation auto-kill that
+    # fires inside it stops this tick by the same door the operator's KILL file
+    # does. A killed kernel walks no candidates at all: its `evaluate_intent`
+    # would hard-veto every intent anyway, but the walk is where the loop spends
+    # research money, and a dead kernel paying for forecasts it can never act on
+    # is the one failure a kill switch exists to prevent.
+    tradeable = () if deps.kernel.mode is Mode.KILLED else candidates
+    universe = _run_universe(deps, tradeable, created_at, heartbeat_epoch_s)
     # The kernel's *real* mode, never a hardcoded PAPER: a verification breach
     # drives it to HALT mid-tick, and a heartbeat still claiming PAPER would be
     # the loop's own audit trail lying about whether it is trading.

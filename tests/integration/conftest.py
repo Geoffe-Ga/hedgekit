@@ -39,6 +39,7 @@ import pytest
 from windbreak.config.schema import (
     CapitalConfig,
     HorizonDays,
+    OpsConfig,
     RiskConfig,
     ScreenerConfig,
     WindbreakConfig,
@@ -173,11 +174,30 @@ def ledger_path_for(tmp_path: Path, name: str = "ledger.db") -> Path:
 
 
 @pytest.fixture
-def paper_config() -> WindbreakConfig:
+def state_dir(tmp_path: Path) -> Path:
+    """Provide the per-test kill/re-arm state directory, not yet created.
+
+    Since issue #441 the PAPER loop polls `config.ops.state_dir` for the
+    `KILL`/`REARM` files the `windbreak kill`/`windbreak rearm` CLIs write, so
+    every bundle this suite builds now reads a directory. It must be a
+    per-test scratch path: the shipped default is `~/.local/share/windbreak`,
+    and a developer who has ever run the reproduction in issue #441 would
+    otherwise have a real `KILL` file there silently killing unrelated tests.
+
+    Deliberately *not* created here -- a missing state directory is exactly
+    "the operator has asked for nothing", and the loop must handle it.
+    """
+    return tmp_path / "state"
+
+
+@pytest.fixture
+def paper_config(state_dir: Path) -> WindbreakConfig:
     """Provide a PAPER-ceilinged config with a permissive-but-real risk profile.
 
     `mode_ceiling="paper"` is the SPEC S16 token `Mode.from_config` maps to
-    `Mode.PAPER`. The risk thresholds are left at their SPEC §16 defaults
+    `Mode.PAPER`. `ops.state_dir` points at the per-test `state_dir` fixture
+    (see there for why the shipped `~/.local/share/windbreak` default would be
+    unsafe here). The risk thresholds are left at their SPEC §16 defaults
     (`RiskConfig()`) rather than artificially loosened: this suite's
     real-kernel-tick scenario does not depend on the selector actually
     emitting an intent (see `test_paper_loop.py`'s module docstring for why
@@ -189,6 +209,7 @@ def paper_config() -> WindbreakConfig:
     return WindbreakConfig(
         mode_ceiling="paper",
         capital=CapitalConfig(floor_micros=0),
+        ops=OpsConfig(state_dir=str(state_dir)),
         risk=RiskConfig(),
         screener=FIXTURE_SCREENER_CONFIG,
     )
