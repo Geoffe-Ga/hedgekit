@@ -529,9 +529,10 @@ def test_no_documented_command_uses_the_follow_form_of_f() -> None:
     for documented in _select("docker"):
         tokens = _tokens_of(documented)
         subcommand = _subcommand_of(tokens)
-        if subcommand is None or _FOLLOW_AMBIGUOUS_FLAG not in tokens:
+        if subcommand is None:
             continue
-        if tokens.index(_FOLLOW_AMBIGUOUS_FLAG) > tokens.index(subcommand):
+        after = tokens[tokens.index(subcommand) + 1 :]
+        if _FOLLOW_AMBIGUOUS_FLAG in after:
             misplaced.append(documented.where())
 
     assert not misplaced, (
