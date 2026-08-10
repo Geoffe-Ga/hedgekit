@@ -208,7 +208,21 @@ install-prefix-agnostic: `ExecStart=/usr/bin/env windbreak run --process
 Unlike the compose skeleton the units have no image to carry the repo, so they
 expect one installed at `/opt/windbreak` (the pipeline unit's
 `WorkingDirectory=`), against which its repo-relative fixture paths resolve —
-the same invocation [`docs/RUNBOOK.md`](docs/RUNBOOK.md) documents. The
+the same invocation [`docs/RUNBOOK.md`](docs/RUNBOOK.md) documents.
+
+They also have no image to carry the *state* directories. The pipeline unit
+declares `StateDirectory=windbreak/ledger windbreak/reports`, which is what
+creates `/var/lib/windbreak/{ledger,reports}` before `ExecStart` — the same two
+directories the `Dockerfile` pre-creates for the compose skeleton. Nothing else
+would: `--ledger-path`'s parent directory must already exist (the `.db` and its
+`-wal` sibling are created on first use, the directory is not), so without it
+the unit dies with `sqlite3.OperationalError: unable to open database file` on
+its first config load and then, with the start rate limit removed, retries
+forever writing nothing. `StateDirectory=` is preferred to an
+`ExecStartPre=/bin/mkdir`: systemd creates the directories itself and re-asserts
+their ownership on each start, handing them to whatever `User=` the unit
+declares — the units declare none, so they run as root and own them as root,
+but an operator who adds one needs no accompanying `chown`. The
 dashboard unit reads its bearer token from a mandatory
 `EnvironmentFile=/etc/windbreak/dashboard.env` containing one
 `WINDBREAK_DASHBOARD_TOKEN=<token>` line; the path is deliberately not

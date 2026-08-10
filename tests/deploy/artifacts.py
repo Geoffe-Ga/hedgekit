@@ -51,6 +51,17 @@ ENTRYPOINT = "windbreak"
 #: Docker's default dockerfile name inside a build context.
 DEFAULT_DOCKERFILE_NAME = "Dockerfile"
 
+#: systemd resolves every `StateDirectory=` name against this root.
+STATE_DIRECTORY_ROOT = Path("/var/lib")
+
+#: The prefix characters systemd permits on an `Exec*=` line before the
+#: executable (`-` ignore-failure, `+`/`!`/`!!` privilege overrides, `@` argv[0]
+#: override, `:` no-variable-expansion). They carry no directory information.
+EXEC_PREFIX_CHARS = "-+!@:"
+
+#: The command an `ExecStartPre=` line must invoke to count as provisioning.
+MKDIR_COMMAND = "mkdir"
+
 _SUBPROCESS_TIMEOUT_SECONDS = 60
 
 
@@ -212,6 +223,78 @@ def unit_exec_start_tokens(parser: configparser.ConfigParser) -> list[str]:
         The `ExecStart` line split with `shlex`.
     """
     return shlex.split(parser.get("Service", "ExecStart"))
+
+
+def unit_service_directive_values(unit_path: Path, key: str) -> list[str]:
+    """Return every value a unit's `[Service]` section assigns to `key`.
+
+    `ConfigParser` keeps only the last assignment for a repeated key, but
+    several systemd directives — `ExecStartPre=` and `StateDirectory=` among
+    them — are list-valued and legitimately repeat. Reading the raw lines is
+    what makes a unit that provisions across two lines readable here, and
+    backslash continuations are joined for the same reason a wrapped
+    Dockerfile `RUN` is (see :func:`dockerfile_instructions`).
+
+    Args:
+        unit_path: The unit file to read.
+        key: The directive name, exactly as systemd spells it.
+
+    Returns:
+        Each assigned value, in file order, stripped of surrounding space.
+    """
+    values: list[str] = []
+    section = ""
+    pending = ""
+    for raw in unit_path.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not pending and (not stripped or stripped.startswith(("#", ";"))):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+            continue
+        if stripped.endswith("\\"):
+            pending += stripped[:-1].strip() + " "
+            continue
+        line, pending = pending + stripped, ""
+        name, separator, value = line.partition("=")
+        if separator and section == "Service" and name.strip() == key:
+            values.append(value.strip())
+    return values
+
+
+def unit_provisioned_directories(unit_path: Path) -> set[Path]:
+    """Return the directories a unit creates before its `ExecStart` runs.
+
+    Two mechanisms count, because both are real answers to "who creates
+    `/var/lib/<name>`": systemd's own `StateDirectory=` (names resolved
+    against :data:`STATE_DIRECTORY_ROOT`) and an `ExecStartPre=` line invoking
+    `mkdir`.
+
+    Parent directories are **not** expanded into the result even though
+    systemd creates them. Crediting them would let a unit declare
+    `StateDirectory=windbreak` and still leave `/var/lib/windbreak/ledger`
+    missing — the exact hole this helper exists to close — so, like
+    :func:`dockerignore_exclusion`, it fails closed by demanding the deepest
+    directory be named outright.
+
+    Args:
+        unit_path: The unit file to read.
+
+    Returns:
+        The absolute directories the unit itself provisions.
+    """
+    provisioned = {
+        STATE_DIRECTORY_ROOT / name
+        for value in unit_service_directive_values(unit_path, "StateDirectory")
+        for name in value.split()
+    }
+    for value in unit_service_directive_values(unit_path, "ExecStartPre"):
+        tokens = shlex.split(value.lstrip(EXEC_PREFIX_CHARS))
+        if tokens and Path(tokens[0]).name == MKDIR_COMMAND:
+            provisioned.update(
+                Path(token) for token in tokens[1:] if token.startswith("/")
+            )
+    return provisioned
 
 
 def strip_env_shim(tokens: Sequence[str]) -> list[str]:

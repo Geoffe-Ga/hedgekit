@@ -394,6 +394,59 @@ def test_a_unit_passing_a_relative_path_declares_a_working_directory() -> None:
         )
 
 
+def _unit_state_path_arguments() -> list[tuple[str, str, Path]]:
+    """Collect every unit path argument that lives under systemd's state root.
+
+    Returns:
+        `(unit filename, dest, path)` triples, derived by parsing each real
+        `ExecStart=` with the CLI's own parser — never from a restated list of
+        paths, so a unit that starts writing somewhere new is checked too.
+    """
+    found: list[tuple[str, str, Path]] = []
+    for unit_path in artifacts.unit_paths():
+        args = _parsed(_unit_argv(unit_path.name))
+        found.extend(
+            (unit_path.name, dest, value)
+            for dest, value in sorted(artifacts.path_arguments(args).items())
+            if artifacts.STATE_DIRECTORY_ROOT in value.parents
+        )
+    return found
+
+
+def test_every_unit_state_path_is_provisioned_by_the_unit_that_writes_it() -> None:
+    """A unit that writes under `/var/lib` also creates the directory it needs.
+
+    Nothing else does. `docs/RUNBOOK.md` is explicit that `--ledger-path`'s
+    parent directory must exist — the ledger file and its `-wal` sibling are
+    created on first use, the directory is not — and `SqliteLedgerStore`
+    raises `sqlite3.OperationalError: unable to open database file` on the
+    very first config load when it is absent. Under `Restart=on-failure` with
+    `StartLimitIntervalSec=0`, that is not a unit that lands in `failed`; it
+    is one that retries forever while writing nothing, which is issue #446's
+    defect moved from the compose path onto the systemd path.
+
+    The directory is accepted as provisioned when the unit names it or its
+    immediate parent (`--report-dir X` names a directory, `--ledger-path
+    X/y.db` names a file inside one), so the check needs no hardcoded notion
+    of which flags are files.
+    """
+    state_paths = _unit_state_path_arguments()
+    assert state_paths, (
+        f"no shipped unit passes a path under {artifacts.STATE_DIRECTORY_ROOT}, "
+        f"so this test would pass vacuously"
+    )
+
+    for unit_filename, dest, value in state_paths:
+        provisioned = artifacts.unit_provisioned_directories(
+            artifacts.SYSTEMD_DIR / unit_filename
+        )
+        assert value in provisioned or value.parent in provisioned, (
+            f"{unit_filename} passes {dest}={value} but provisions only "
+            f"{sorted(str(path) for path in provisioned)}; nothing creates the "
+            f"directory, so the unit fails on every start"
+        )
+
+
 # --------------------------------------------------------------------------
 # Issue #446 consequence 3: the dashboard cannot start without its token.
 # --------------------------------------------------------------------------

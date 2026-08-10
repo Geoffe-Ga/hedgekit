@@ -14,14 +14,13 @@ from __future__ import annotations
 
 import os
 import shlex
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
+from tests.deploy import artifacts
 from windbreak.main import DASHBOARD_AUTH_ENV_VAR, build_parser
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -165,29 +164,8 @@ def test_every_published_port_binds_loopback_only() -> None:
             )
 
 
-def _docker_compose_available() -> bool:
-    """Probe whether `docker compose` (the v2 CLI plugin) is usable here.
-
-    Returns:
-        True if the `docker` binary exists and `docker compose version`
-        exits zero; False otherwise (missing binary, or the plugin absent).
-    """
-    if shutil.which("docker") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "version"],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
 @pytest.mark.skipif(
-    not _docker_compose_available(),
+    not artifacts.docker_compose_available(),
     reason="docker CLI or the docker compose v2 plugin is unavailable here",
 )
 @pytest.mark.timeout(60)
@@ -202,13 +180,8 @@ def test_docker_compose_config_validates() -> None:
     Compose's required-variable form; that an *unset* token is refused is
     asserted separately, in tests/deploy/test_deployment_launches_paper.py.
     """
-    result = subprocess.run(
-        ["docker", "compose", "-f", str(_COMPOSE_PATH), "config"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-        env={**os.environ, DASHBOARD_AUTH_ENV_VAR: "compose-config-probe"},
+    result = artifacts.run_docker_compose_config(
+        env={**os.environ, DASHBOARD_AUTH_ENV_VAR: "compose-config-probe"}
     )
 
     assert result.returncode == 0, result.stderr
