@@ -928,6 +928,30 @@ def test_the_composed_supervisor_writes_no_ledger_without_a_ledger_path(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_the_composed_supervisor_stamps_the_process_component_on_its_log_lines(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The escalation's log record carries the `--process` token, not a default.
+
+    The ledgered row and the log record are stamped from two different places,
+    so a hardcoded component in one of them is invisible to a test that only
+    reads the other. This reads the record's own `component` extra, which is
+    what every other heartbeat and shutdown line in this process is filtered by.
+    The alert package's own log-only fallback record is filtered out by logger
+    name: it is stamped `alerts`, which is correct and not what is under test.
+    """
+    caplog.set_level(logging.INFO)
+    args = argparse.Namespace(ledger_path=None, process="order_gateway")
+
+    _build_beat_supervisor(args, WindbreakConfig()).observe(1, _raising_hook([]))
+
+    assert [
+        record.__dict__["component"]
+        for record in caplog.records
+        if record.levelno == logging.CRITICAL and record.name == "windbreak"
+    ] == ["order_gateway"]
+
+
 def test_the_composed_supervisor_stamps_the_process_component_on_its_alerts(
     tmp_path: Path,
 ) -> None:
