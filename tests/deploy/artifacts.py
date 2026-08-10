@@ -162,6 +162,27 @@ def unit_paths() -> list[Path]:
     return sorted(SYSTEMD_DIR.glob("*.service"))
 
 
+class UnitParser(configparser.ConfigParser):
+    """A `ConfigParser` that preserves systemd's case-sensitive key names.
+
+    `ConfigParser` lowercases option names by default, which would turn
+    `ExecStart` into `execstart`; systemd unit keys are case-sensitive.
+    Overriding the method is the supported extension point, so no assignment
+    to a bound method — and no type-checker bypass — is needed.
+    """
+
+    def optionxform(self, optionstr: str) -> str:
+        """Return the option name unchanged.
+
+        Args:
+            optionstr: The key exactly as it appears in the unit file.
+
+        Returns:
+            The same string, uncased.
+        """
+        return optionstr
+
+
 def parse_unit(unit_path: Path) -> configparser.ConfigParser:
     """Parse a systemd unit file, preserving its case-sensitive key names.
 
@@ -169,11 +190,14 @@ def parse_unit(unit_path: Path) -> configparser.ConfigParser:
         unit_path: The unit file to read.
 
     Returns:
-        A `ConfigParser` with `optionxform` disabled so `ExecStart` is not
-        lowercased — systemd unit keys are case-sensitive.
+        A parser that leaves `ExecStart` uncased.
+
+    Raises:
+        FileNotFoundError: If no unit file exists at `unit_path`.
     """
-    parser = configparser.ConfigParser()
-    parser.optionxform = str  # type: ignore[method-assign]
+    if not unit_path.is_file():
+        raise FileNotFoundError(unit_path)
+    parser = UnitParser()
     parser.read(unit_path, encoding="utf-8")
     return parser
 

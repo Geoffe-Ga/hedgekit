@@ -11,13 +11,17 @@ underscored `order_gateway` token used by the CLI and the compose skeleton.
 
 from __future__ import annotations
 
-import configparser
 import shlex
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.deploy import artifacts
 from windbreak.main import build_parser
+
+if TYPE_CHECKING:
+    import configparser
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SYSTEMD_DIR = _REPO_ROOT / "deploy" / "systemd"
@@ -38,21 +42,15 @@ def _parse_unit(filename: str) -> configparser.ConfigParser:
         filename: The unit file's name under `deploy/systemd/`.
 
     Returns:
-        A `ConfigParser` with `optionxform` disabled so `ExecStart` is not
-        lowercased to `execstart` -- systemd unit keys are case-sensitive.
+        A `ConfigParser` that leaves `ExecStart` uncased rather than
+        lowercasing it to `execstart` -- systemd unit keys are case-sensitive.
 
     Raises:
         FileNotFoundError: If the unit file does not exist under
             `deploy/systemd/` (the expected RED state before issue #15
             lands the deploy skeleton).
     """
-    unit_path = _SYSTEMD_DIR / filename
-    if not unit_path.is_file():
-        raise FileNotFoundError(unit_path)
-    parser = configparser.ConfigParser()
-    parser.optionxform = str  # type: ignore[method-assign]
-    parser.read(unit_path, encoding="utf-8")
-    return parser
+    return artifacts.parse_unit(_SYSTEMD_DIR / filename)
 
 
 @pytest.mark.parametrize(("filename", "cli_token"), sorted(_UNIT_TO_CLI_TOKEN.items()))

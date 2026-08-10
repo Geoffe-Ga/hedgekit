@@ -16,10 +16,12 @@ edited wrongly" defects, so every test below reads the **real** artifact
 production code — the activation rule's own AST, the CLI's own parser, the
 Dockerfile's own `USER` — rather than restating a copy that can drift.
 
-Nothing here claims the deployment *trades*. In cassette mode the research
-transports find nothing by construction, so the pipeline abstains on
-`no_verified_citations` before any vote, every tick (issue #438). These tests
-pin activation and durability, not profit.
+Nothing here claims the deployment *trades*. Bringing the stack up shows the
+shipped `deep_walk` fixture's only market screened ineligible every tick
+(`blocked_by: ["min_depth_contract_centis", "horizon_days"]`), so the pipeline
+never reaches forecasting; behind that, cassette-mode research transports find
+nothing by construction (issue #438). These tests pin activation and
+durability, not profit.
 """
 
 from __future__ import annotations
@@ -452,9 +454,13 @@ def test_dashboard_unit_names_the_token_variable_and_requires_its_file() -> None
 
     `EnvironmentFile=` without a leading `-` is systemd's fail-closed form:
     a missing file fails the unit instead of starting a dashboard with no
-    token. The unit text must also name the variable, since the file's
-    required contents are otherwise undiscoverable from the unit.
+    token. The unit must also spell the assignment the file has to carry —
+    `WINDBREAK_DASHBOARD_TOKEN=...` — because an `EnvironmentFile` names a
+    path and nothing else, so the file's required contents are otherwise
+    undiscoverable from the unit. Merely mentioning the variable in prose is
+    not enough: the operator needs the line to write.
     """
+    variable = windbreak_main.DASHBOARD_AUTH_ENV_VAR
     unit_path = artifacts.SYSTEMD_DIR / _DASHBOARD_UNIT
     parser = artifacts.parse_unit(unit_path)
 
@@ -467,8 +473,14 @@ def test_dashboard_unit_names_the_token_variable_and_requires_its_file() -> None
         f"{_DASHBOARD_UNIT} marks its EnvironmentFile optional; a missing file "
         f"would start a tokenless dashboard"
     )
-    assert windbreak_main.DASHBOARD_AUTH_ENV_VAR in unit_path.read_text(
-        encoding="utf-8"
+    assignments = [
+        line
+        for line in unit_path.read_text(encoding="utf-8").splitlines()
+        if f"{variable}=" in line
+    ]
+    assert assignments, (
+        f"{_DASHBOARD_UNIT} never spells the `{variable}=<token>` line its "
+        f"EnvironmentFile {environment_file} must contain"
     )
 
 

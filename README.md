@@ -154,15 +154,16 @@ mount is read-only since it holds no trade authority.
 PAPER loop rather than a bare RESEARCH heartbeat (issue #446) — it reads the
 `deep_walk` paper-exchange fixture and the recorded forecast cassette from the
 image's copy of this repo, and writes its hash-chained ledger to the shared
-`ledger` volume and its weekly report stub to a `reports` volume. **Activating
-PAPER is not trading.** In cassette mode the research transports find nothing
-by construction, so every tick abstains before any vote (issue #438); the
-ledger fills with screen, verification, equity, position and heartbeat records
-and no order is placed.
+`ledger` volume and its weekly report stub to a `reports` volume.
 
-Process isolation in practice, and the ledger actually being written:
+The stack below was brought up from the file as committed; every transcript in
+this section is its actual output.
 
 ```bash
+$ docker compose -f deploy/docker-compose.yml logs --tail 2 pipeline
+{"level": "INFO", "component": "pipeline", "msg": "mode=PAPER heartbeat seq=6"}
+{"level": "INFO", "component": "pipeline", "msg": "mode=PAPER heartbeat seq=7"}
+
 $ docker compose -f deploy/docker-compose.yml exec pipeline \
     ls /var/lib/windbreak/ledger /var/lib/windbreak/reports
 /var/lib/windbreak/ledger:
@@ -178,6 +179,21 @@ deploy-order-gateway-1  running
 deploy-pipeline-1       exited
 deploy-riskkernel-1     running
 ```
+
+`mode=PAPER` rather than `mode=RESEARCH` is issue #446's fix stated in one
+token, and the `.db` file is the `ledger` volume finally being written.
+
+**Activating PAPER is not trading, and this stack places no order.** Two
+independent reasons, both observed in that run. First, the shipped `deep_walk`
+fixture's only market is screened **ineligible every tick** —
+`ScreenDecisionRecorded {"eligible": false, "blocked_by":
+["min_depth_contract_centis", "horizon_days"]}` — so the pipeline never reaches
+forecasting at all. Second, behind that, cassette-mode research transports find
+nothing by construction, so no forecast could clear verification anyway (issue
+#438). What the ledger actually accumulates is screen decisions, risk-kernel
+cash/position reconciliations (`VerificationPassed` is that, **not** citation
+verification), equity samples, position snapshots and heartbeats — a live,
+non-empty hash chain, and not a trade.
 
 **systemd**
 

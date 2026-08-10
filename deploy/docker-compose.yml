@@ -23,11 +23,18 @@
 # a config file that only restated the defaults would be a drift surface, not
 # a safeguard.
 #
-# WHAT THIS DOES *NOT* CLAIM. Activating PAPER is not trading. In cassette mode
-# the research transports find nothing by construction, so the pipeline abstains
-# on `no_verified_citations` before any vote, every tick (issue #438). The
-# ledger fills with screen, verification, equity, position and heartbeat
-# records; no order is placed.
+# WHAT THIS DOES *NOT* CLAIM. Activating PAPER is not trading, and this stack
+# places no order. Two independent reasons, both observed by bringing it up:
+#   1. The shipped `deep_walk` fixture's only market is screened INELIGIBLE
+#      every tick -- `ScreenDecisionRecorded {"eligible": false, "blocked_by":
+#      ["min_depth_contract_centis", "horizon_days"]}` -- so the pipeline never
+#      reaches forecasting at all.
+#   2. Behind that, in cassette mode the research transports find nothing by
+#      construction, so no forecast could clear verification anyway (#438).
+# The ledger fills with ScreenDecisionRecorded, VerificationPassed (the risk
+# kernel's cash/position reconciliation, not citation verification),
+# EquitySampled, PositionsSnapshotRecorded and heartbeat records. That is a
+# live, hash-chained, non-empty ledger -- and it is not a trade.
 x-build: &build
   context: ..
   dockerfile: Dockerfile
