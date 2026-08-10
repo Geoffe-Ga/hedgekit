@@ -45,7 +45,7 @@ import yaml
 from tests.deploy.test_deployment_cli_contract import parse_with_real_cli
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
 #: Repo root, derived from this file's own location
 #: (`<root>/tests/docs/test_documented_commands.py`).
@@ -89,40 +89,38 @@ _SINGLE_SERVICE_SUBCOMMANDS = frozenset({"exec", "run"})
 #: mistaken for a service name. `--tail 2 pipeline` is exactly the trap: without
 #: `--tail` here, `2` was read as a service name and the check failed on a
 #: perfectly correct README line.
-_VALUE_TAKING_COMPOSE_FLAGS = frozenset(
-    {
-        "--env-file",
-        "--file",
-        "--format",
-        "--index",
-        "--profile",
-        "--project-directory",
-        "--project-name",
-        "--tail",
-        "-f",
-        "-n",
-        "-p",
-    }
-)
+#:
+#: WHY THIS IS LITERAL, AND HOW IT IS KEPT HONEST. `docker compose` publishes no
+#: machine-readable option table to derive from: `--help` needs Docker
+#: installed, which this tier cannot assume, and Compose ships no completion
+#: data here. A hand-kept flag list is the "restated instead of derived" trap,
+#: so both sets are pinned from both ends and hold nothing speculative --
+#: exactly the flags the operator docs use today, and no more:
+#:
+#: * :func:`test_every_documented_compose_flag_is_classified` fails, naming the
+#:   flag and the document line, on anything in neither set. Unknown flags are
+#:   never guessed at.
+#: * :func:`test_every_classified_compose_flag_appears_in_the_docs` fails on an
+#:   entry no document uses, so neither set can grow ahead of the docs and rot.
+#:
+#: A newly documented flag therefore costs one line and a named failure telling
+#: you to write it -- which is the trade a list like this has to make to be
+#: worth having.
+_VALUE_TAKING_COMPOSE_FLAGS = frozenset({"--format", "--tail", "-f"})
 
 #: Compose flags that take no value, so the token after them IS a service name.
 #: Kept explicit so `test_every_documented_compose_flag_is_classified` can fail
 #: on anything in neither set, rather than guessing and mis-parsing silently.
-_BOOLEAN_COMPOSE_FLAGS = frozenset(
-    {
-        "--all",
-        "--build",
-        "--detach",
-        "--follow",
-        "--no-deps",
-        "--no-log-prefix",
-        "--quiet",
-        "--timestamps",
-        "-a",
-        "-d",
-        "-q",
-    }
-)
+_BOOLEAN_COMPOSE_FLAGS = frozenset({"-a", "-d"})
+
+#: `-f` is Compose's `--file` before the subcommand and `--follow` -- which takes
+#: no value -- after it on `logs`. Both sets are position-blind, so the two
+#: readings cannot coexist: classifying `-f` as value-taking (which the `-f
+#: deploy/docker-compose.yml` every documented command opens with requires) would
+#: make a documented `logs -f pipeline` swallow its service and check nothing.
+#: :func:`test_no_documented_command_uses_the_follow_form_of_f` keeps that
+#: collision impossible rather than latent.
+_FOLLOW_AMBIGUOUS_FLAG = "-f"
 
 #: Command prefixes that are environment setup rather than claims about this
 #: software: a virtualenv, a package install, a pre-commit invocation. They are
@@ -204,6 +202,86 @@ def _is_command_line(line: str) -> bool:
     return not line.startswith(("-", "|", ">"))
 
 
+def _shell_blocks(text: str) -> Iterator[list[tuple[int, str]]]:
+    """Group a document's lines into one list per fenced shell block.
+
+    Blocks are yielded whole because a backslash continuation is joined *within*
+    a block. Carrying that state across a closing fence would silently glue the
+    tail of one block onto the first line of the next.
+
+    Args:
+        text: The document's full text.
+
+    Yields:
+        ``(line number, raw line)`` pairs for each shell block, in order.
+    """
+    block: list[tuple[int, str]] = []
+    in_shell_block = False
+    for number, raw in enumerate(text.splitlines(), start=1):
+        fence = _FENCE.match(raw.rstrip())
+        if fence is None and not raw.rstrip().startswith("```"):
+            if in_shell_block:
+                block.append((number, raw))
+            continue
+        if in_shell_block and block:
+            yield block
+        block = []
+        in_shell_block = (
+            fence is not None and fence.group(1).lower() in _SHELL_LANGUAGES
+        )
+    if in_shell_block and block:
+        yield block
+
+
+def _commands_in_block(
+    document: str, block: list[tuple[int, str]]
+) -> list[DocumentedCommand]:
+    """Turn one shell block's lines into commands, joining continuations.
+
+    A command wrapped with a trailing backslash is one command, reported at the
+    line it starts on. Without the join its fragments are lexed separately, and
+    the tail of `docker compose ... exec pipeline \\` is not valid shell alone,
+    so the line falls out of every check in this module.
+
+    Two properties matter beyond the join itself, because a dropped command is
+    invisible to every other guard here -- including
+    :func:`test_every_documented_command_can_be_lexed`, which can only see a
+    command it was given:
+
+    * A continuation never escapes its block; :func:`_shell_blocks` bounds it.
+    * A dangling continuation at the end of a block is still emitted, rather
+      than silently discarded with the state it was accumulating.
+
+    Args:
+        document: Repo-relative document name.
+        block: ``(line number, raw line)`` pairs from one shell block.
+
+    Returns:
+        The block's commands, in order.
+    """
+    commands: list[DocumentedCommand] = []
+    pending = ""
+    start = 0
+    for number, raw in block:
+        text = raw.strip() if pending else _strip_prompt(raw)
+        if not pending:
+            if not _is_command_line(text):
+                continue
+            start = number
+        if text.endswith("\\"):
+            pending = f"{pending}{text[:-1].strip()} "
+            continue
+        commands.append(
+            DocumentedCommand(document=document, line=start, command=f"{pending}{text}")
+        )
+        pending = ""
+    if pending:
+        commands.append(
+            DocumentedCommand(document=document, line=start, command=pending.strip())
+        )
+    return commands
+
+
 def extract_commands(document: str) -> list[DocumentedCommand]:
     """Extract every shell command from a document's fenced shell blocks.
 
@@ -214,32 +292,11 @@ def extract_commands(document: str) -> list[DocumentedCommand]:
         The commands found, in document order.
     """
     text = (_REPO_ROOT / document).read_text(encoding="utf-8")
-    commands: list[DocumentedCommand] = []
-    in_shell_block = False
-    continued: tuple[int, str] | None = None
-    for number, raw in enumerate(text.splitlines(), start=1):
-        fence = _FENCE.match(raw.rstrip())
-        if fence is not None:
-            in_shell_block = fence.group(1).lower() in _SHELL_LANGUAGES
-            continue
-        if raw.rstrip().startswith("```"):
-            in_shell_block = False
-            continue
-        if not in_shell_block:
-            continue
-        command = _strip_prompt(raw)
-        if continued is not None:
-            command = f"{continued[1]} {command}"
-            number = continued[0]
-            continued = None
-        if command.endswith("\\"):
-            continued = (number, command[:-1].strip())
-            continue
-        if _is_command_line(command):
-            commands.append(
-                DocumentedCommand(document=document, line=number, command=command)
-            )
-    return commands
+    return [
+        command
+        for block in _shell_blocks(text)
+        for command in _commands_in_block(document, block)
+    ]
 
 
 def all_documented_commands() -> list[DocumentedCommand]:
@@ -425,6 +482,62 @@ def test_every_documented_compose_flag_is_classified() -> None:
         "These compose flags are in neither _VALUE_TAKING_COMPOSE_FLAGS nor "
         f"_BOOLEAN_COMPOSE_FLAGS, so _named_services mis-parses them: "
         f"{unclassified}"
+    )
+
+
+def test_every_classified_compose_flag_appears_in_the_docs() -> None:
+    """The flag sets expire: an entry no documented command uses fails.
+
+    The other half of keeping a hand-written table honest. The guard above stops
+    the sets being too *small*; this one stops them being too *large*, which is
+    the failure mode that actually happens -- a list seeded with every flag
+    someone could imagine, most entries never exercised, and no way to tell the
+    load-bearing ones from the decoration. An unused classification is not free:
+    it is an unchecked claim about a CLI this repo does not own.
+    """
+    used: set[str] = set()
+    for documented in _select("docker"):
+        used.update(
+            token for token in _tokens_of(documented)[2:] if token.startswith("-")
+        )
+
+    classified = _VALUE_TAKING_COMPOSE_FLAGS | _BOOLEAN_COMPOSE_FLAGS
+    unused = sorted(classified - used)
+
+    assert not unused, (
+        f"These compose flags are classified but appear in no documented "
+        f"command: {unused}. Delete them so the sets keep describing the docs "
+        f"rather than the whole Compose CLI."
+    )
+
+
+def test_no_documented_command_uses_the_follow_form_of_f() -> None:
+    """`-f` is only ever Compose's `--file`, never `logs --follow`.
+
+    Both classification sets are position-blind, and `-f` genuinely means two
+    things: `--file` before the subcommand, `--follow` after it on `logs`. It is
+    classified value-taking because every documented command opens with
+    `-f deploy/docker-compose.yml`. A documented `logs -f pipeline` would
+    therefore have its service swallowed as a filename and be checked against
+    nothing -- silently, since a command that names no service passes.
+
+    Rather than leave that latent, the collision is made impossible: `-f` may
+    only appear before the subcommand. A doc that needs `--follow` must spell it
+    out, which the classification guard then requires be added.
+    """
+    misplaced: list[str] = []
+    for documented in _select("docker"):
+        tokens = _tokens_of(documented)
+        subcommand = _subcommand_of(tokens)
+        if subcommand is None or _FOLLOW_AMBIGUOUS_FLAG not in tokens:
+            continue
+        if tokens.index(_FOLLOW_AMBIGUOUS_FLAG) > tokens.index(subcommand):
+            misplaced.append(documented.where())
+
+    assert not misplaced, (
+        f"These commands use {_FOLLOW_AMBIGUOUS_FLAG!r} after the subcommand, "
+        f"where Compose reads it as `--follow` rather than `--file`: "
+        f"{misplaced}. Spell it `--follow` and classify it as boolean."
     )
 
 
