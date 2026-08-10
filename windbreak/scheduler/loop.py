@@ -1644,11 +1644,36 @@ def _resolve_research_tools(
     return offline_research_tools(cache_dir)
 
 
+def _resolved_dispatcher(dispatcher: AlertDispatcher | None) -> AlertDispatcher:
+    """Return the injected alert root, or the documented log-only fallback.
+
+    The single place :func:`build_paper_deps`'s optional ``dispatcher`` becomes
+    concrete, so "no deliverable sink means log-only" is stated once rather than
+    re-derived at each consumer. A deployment that declares no sink must still
+    start and still log -- that is the shipped default (``config.alerts``'s SPEC
+    S16 entry is a placeholder that builds nothing) -- so this fallback is a
+    documented behaviour, not a silent degradation. Issue #444's defect was the
+    converse: this was the *only* behaviour available, including to a deployment
+    that had configured a real sink.
+
+    Args:
+        dispatcher: The composed alert root, or ``None``.
+
+    Returns:
+        ``dispatcher`` when one was injected, else a dispatcher over no sinks
+        whose ``log-only`` fallback carries every alert.
+    """
+    if dispatcher is not None:
+        return dispatcher
+    return AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter())
+
+
 def _build_verifier(
     store: SqliteLedgerStore,
     config: WindbreakConfig,
     view: ReadOnlyVenueView,
     writer: _SqliteKernelLedgerWriter,
+    dispatcher: AlertDispatcher,
 ) -> ReadOnlyVerifier:
     """Wire the PAPER loop's read-only verification cycle (issue #353).
 
@@ -1705,9 +1730,19 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
     all three dimensions structurally incapable of failing.
 
     The tolerances come from ``config.risk`` (both default to ``0``: exact
-    match). The dispatcher fans mismatch and unknown-jurisdiction alerts out
-    through the log-only fallback, matching every other no-sink composition
-    root in ``windbreak.main``.
+    match). The ``dispatcher`` that fans mismatch and unknown-jurisdiction
+    alerts out is *injected*, and that is the whole of issue #444: this function
+    used to build its own ``AlertDispatcher(sinks=[], ...)``, so the only
+    alerting surface the always-on loop has could reach nothing but the log-only
+    fallback no matter what ``config.alerts`` declared -- while
+    ``docs/RUNBOOK.md`` told the operator that declaring a sink was "a
+    prerequisite for any unattended run". The scheduler must not read
+    ``config.alerts`` itself: resolving a sink's ``*_env`` destination means
+    reading the real environment, and
+    :func:`windbreak.main._build_alert_dispatcher` is deliberately the one place
+    that happens, so no second composition site can leak a destination into a
+    log line or the append-only ledger. The seam is therefore a parameter, and
+    :func:`build_paper_deps` documents the one door it arrives through.
 
     Args:
         store: The hash-chained ledger whose replayed history seeds the
@@ -1716,6 +1751,8 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
         view: The narrow read-only venue view the cycle observes through -- it
             exposes no ``place_order``/``cancel_order`` (SPEC S1.1 invariant 3).
         writer: The kernel ledger writer each cycle's event is recorded through.
+        dispatcher: The composed alert root every mismatch and
+            unknown-jurisdiction alert is delivered through.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.verification.ReadOnlyVerifier`.
@@ -1738,7 +1775,7 @@ LedgerExpectationSource` folds the replayed history *once, here at startup*
                 config.risk.verification_position_tolerance_centis
             ),
         ),
-        dispatcher=AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
+        dispatcher=dispatcher,
         ledger_writer=writer,
     )
 
@@ -1749,6 +1786,7 @@ def _build_approval(
     key: bytes,
     view: ReadOnlyVenueView,
     clock: Callable[[], int],
+    dispatcher: AlertDispatcher,
 ) -> tuple[KernelApproval, RiskKernel]:
     """Wire the real kernel + approval pipeline into a `KernelApproval` seam.
 
@@ -1771,6 +1809,8 @@ def _build_approval(
         view: The read-only venue view the verification cycle observes through.
         clock: The injected epoch-second clock the verification cycle stamps
             its snapshots at.
+        dispatcher: The composed alert root the verification cycle's alerts are
+            delivered through (issue #444).
 
     Returns:
         The composed :class:`KernelApproval` seam and the kernel inside it, so
@@ -1783,7 +1823,7 @@ def _build_approval(
     kernel = RiskKernel(
         writer,
         mode_machine=mode_machine,
-        verifier=_build_verifier(store, config, view, writer),
+        verifier=_build_verifier(store, config, view, writer, dispatcher),
         clock=clock,
         gate_plan_store=store,
         kill_integration=None,
@@ -2019,6 +2059,7 @@ def build_paper_deps(
     market_data: MarketDataSource | None = None,
     live_ticker: str | None = None,
     provider_http: LiveProviderHttp | None = None,
+    dispatcher: AlertDispatcher | None = None,
 ) -> PaperTickDeps:
     """Assemble every real component one PAPER tick runs against.
 
@@ -2055,6 +2096,19 @@ def build_paper_deps(
     injection parameter, so there is no door an unscreened loop can arrive
     through.
 
+    ``dispatcher`` is the loop's alert root, and it is the *only* door alerting
+    arrives through (issue #444). Unlike the screener, the budget, and the
+    provider gate -- each of which this function builds from config so no
+    unguarded loop has an injection door -- an alert root cannot be built here:
+    turning ``config.alerts`` into live channels means resolving each sink's
+    ``*_env`` destination against the real environment, and
+    :func:`windbreak.main._build_alert_dispatcher` is deliberately the single
+    place that happens, so a destination (an ntfy topic, a webhook URL with a
+    token in its path) has exactly one code path that can ever hold it. Omitting
+    it composes the log-only fallback, which is the *documented* behaviour of a
+    deployment that declares no deliverable sink -- not, as before, the only
+    behaviour available to one that declares several.
+
     It also builds the process's one per-provider track-record gate from
     ``report_dir``'s M6 artifact and ``config.forecast.provider_gate`` (see
     :func:`_build_provider_gate`). Like the research budget there is deliberately
@@ -2080,6 +2134,10 @@ def build_paper_deps(
             default) to replay ``cassette_path``. Required by, and only by,
             ``forecast.provider_transport.mode == "live"``; see
             :func:`_resolve_forecast_transport`.
+        dispatcher: The composed alert root the verification cycle's mismatch
+            and unknown-jurisdiction alerts are delivered through, or ``None``
+            (the default) for the log-only fallback a deployment with no
+            deliverable sink documents.
 
     Returns:
         A fully wired :class:`PaperTickDeps`.
@@ -2121,7 +2179,12 @@ def build_paper_deps(
     # the baseline capture and the first booking (issue #365).
     fill_bookkeeper = LedgerFillBookkeeper(store, exchange, component=_COMPONENT)
     approval, kernel = _build_approval(
-        store, config, key, verification_view, resolved_clock
+        store,
+        config,
+        key,
+        verification_view,
+        resolved_clock,
+        _resolved_dispatcher(dispatcher),
     )
     gateway = _build_gateway(exchange, store, key, resolved_clock, ledger_path)
     reconciler = Reconciler(

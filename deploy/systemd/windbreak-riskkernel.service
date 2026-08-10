@@ -1,10 +1,15 @@
 [Unit]
 Description=windbreak risk kernel process (SPEC Process B)
 After=network.target
+# Retry forever. With the default limit (5 starts / 10s) a fast-failing
+# process is abandoned in `failed` -- silent, on the one deployment whose
+# entire purpose is running unattended (issue #446).
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/bin/env windbreak run --process riskkernel
 Restart=on-failure
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
