@@ -175,9 +175,14 @@ config is ledgered and a secret there would leak into the hash chain; a
 missing or blank token exits the process with code 1. Pass `--ledger-path` to
 back the status line and read-model views (positions, equity, decisions, ...)
 with a live ledger; without it, `/` reports `RESEARCH` / `never` and every
-view renders its "no data yet" placeholder. Mutations (pause, kill,
-acknowledge, raise floor) beyond the existing `POST /ack` arrive with later
-epics.
+view renders its "no data yet" placeholder. The dashboard is **read-only as
+shipped**: it exposes no working mutation surface at all — pause, kill,
+acknowledge and raise-floor all arrive with later epics, and the single write
+route the handler defines is an unwired seam the CLI never supplies a granter
+for. Use `windbreak ack` to grant an acknowledgement. The route table in
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md#observing-via-the-dashboard) is the one
+canonical, test-pinned statement of what each route answers — this README
+deliberately restates none of it.
 
 This is an M0 skeleton: the tracer `windbreak run` (no flags) still just idles
 in `RESEARCH` mode, emitting heartbeats.
