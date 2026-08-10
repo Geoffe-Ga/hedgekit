@@ -2651,7 +2651,10 @@ def _run_run_command(args: argparse.Namespace) -> int:
     Two ``--process`` choices diverge from the shared RESEARCH heartbeat loop
     (issue #15): ``dashboard`` serves the loopback dashboard server (issue #79),
     and ``riskkernel`` composes and drives a live :class:`RiskKernel` with its
-    kill-switch wiring (issue #144). Every other choice runs the heartbeat loop.
+    kill-switch wiring (issue #144). Every other choice runs the heartbeat loop
+    -- which, when PAPER is activated, drives a per-beat tick whose kernel
+    carries kill wiring of its own (issue #441), so the kill switch is no longer
+    something only the ``riskkernel`` branch has.
 
     Args:
         args: Parsed ``run`` arguments carrying ``process``.

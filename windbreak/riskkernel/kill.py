@@ -50,13 +50,28 @@ against a static fixture this exercises the reconciliation *plumbing*, not a
 real breach kill. A drift only arises from a mutating or live connector -- the
 ledger-derived expectation source seam tracked in issue #288. With no
 ``--snapshot-fixture-dir`` no verifier is wired and the operator ``KILL`` file
-remains the live trigger. Two edges remain: ``windbreak/riskkernel/
-process.py``'s ``main()`` (reachable only via ``python -m
-windbreak.riskkernel``, a dev-only path) still runs without kill wiring; and
-replaying an existing ``KILLED`` state from the ledger on startup is now wired
-into that composition (issue #235) whenever ``windbreak run --process
-riskkernel`` is given a ``--ledger-path``, with the on-disk ``KILL`` file below
-kept as the belt-and-suspenders restart measure alongside it.
+remains the live trigger. Replaying an existing ``KILLED`` state from the ledger
+on startup is also wired into that composition (issue #235) whenever
+``windbreak run --process riskkernel`` is given a ``--ledger-path``, with the
+on-disk ``KILL`` file below kept as the belt-and-suspenders restart measure
+alongside it.
+
+**The always-on PAPER loop (issue #441).** That composition was for a long time
+the *only* one, and it is reached only by ``--process riskkernel``. The PAPER
+loop -- the process that actually trades on ``windbreak run`` -- builds its own
+kernel in :func:`windbreak.scheduler.loop._build_approval`, and until issue #441
+built it with ``kill_integration=None``: ``windbreak kill --state-dir DIR`` wrote
+a ``KILL`` file that loop never polled, and
+``risk.kill_after_consecutive_mismatches`` bound nothing on it. #144 was closed
+as done while the gap was open, and the RUNBOOK went on documenting a control
+the running loop did not honour -- for a kill switch, an inert one is worse than
+none. :func:`windbreak.scheduler.loop._build_kill_integration` now composes the
+same switch/watcher/monitor triple over that loop's own hash chain, seams, and
+alert root, and :func:`windbreak.scheduler.loop._kill_stage` polls
+:meth:`KillFileWatcher.poll_once` once per tick -- ahead of the screen, so a
+``KILL`` file already on disk stops *that* tick. One edge remains:
+``windbreak/riskkernel/process.py``'s ``main()`` (reachable only via ``python -m
+windbreak.riskkernel``, a dev-only path) still runs without kill wiring.
 
 **Durable kill state (issue #123):** kill state need not live only in process
 memory, and the ``KILL`` file need not be the sole interim restart measure. The

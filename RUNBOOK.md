@@ -46,11 +46,16 @@ held, not routed, until acknowledged) by its 32-hex approval id:
 windbreak ack --approval-id <32-hex-approval-id> --state-dir <dir>
 ```
 
-**Known limitation.** `windbreak kill`/`windbreak rearm` write and clear the
-durable `KILL`/`REARM` files, but the always-on PAPER loop's `RiskKernel` is
-not yet constructed with a kill-file watcher wired in (issue #144), so these
-files do not yet stop a running loop. Until #144 lands, stop the process
-itself with a signal (procedure 1).
+`windbreak kill`/`windbreak rearm` write and clear the durable `KILL`/`REARM`
+files, and since issue #441 the always-on PAPER loop polls for them once per
+beat against its own `config.ops.state_dir`. A kill takes effect on the next
+beat: the loop stops researching and trading, holds its positions, releases its
+capital reservations, pages `HALT_KILL` through the configured sinks, and its
+mode heartbeat reads `KILLED` until an operator re-arms with the exact typed
+phrase. The kill is recorded on the hash chain, so it survives a restart even if
+the `KILL` file is deleted. `--state-dir` must be the *same* directory the
+running loop's `ops.state_dir` names, or the files land where nothing reads
+them.
 
 ## 3. Restore from backup
 
@@ -203,5 +208,5 @@ Each is described honestly below rather than invented as a fake command.
   (procedure 8); there is no `audit-bundle` or `tax-export` command. Tracked
   in issue #201.
 - **Pause the daemon.** There is no standalone pause command; stopping the
-  process (procedure 1) or engaging the kill switch (procedure 2, pending
-  #144's loop-wiring) are the current operator levers.
+  process (procedure 1) or engaging the kill switch (procedure 2) are the
+  current operator levers.

@@ -418,6 +418,16 @@ def test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once(
     keeps beating, because the halt persisting across beats is what makes the
     once-per-transition dedupe load-bearing rather than incidental.
 
+    The one configuration this test overrides is the consecutive-mismatch
+    auto-kill bar, raised above its own beat budget. Since issue #441 that bar
+    genuinely binds the PAPER loop's kernel, so at the `RiskConfig()` default of
+    three the *third* consecutive breach below would engage the kill switch and
+    the fourth beat would report `KILLED` rather than the third persistent
+    `HALT` this test's subject needs. That is correct behaviour, not a
+    regression, and `tests/integration/test_paper_kill_switch.py` pins it at two
+    different thresholds; raising the bar here isolates the supervisor's
+    escalation dedupe from it. `RiskConfig()`'s shipped default is untouched.
+
     Args:
         books_dir: The shared `deep_walk` books fixture.
         caplog: The pytest log capture fixture.
@@ -436,12 +446,18 @@ def test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once(
 
     tick_ledger_path = ledger_path_for(tmp_path, "tick.db")
     alert_ledger_path = ledger_path_for(tmp_path, "alerts.db")
+    config = dataclasses.replace(
+        paper_config,
+        risk=dataclasses.replace(
+            paper_config.risk, kill_after_consecutive_mismatches=5
+        ),
+    )
     deps = loop_module.build_paper_deps(
         books_dir=books_dir,
         cassette_path=cassette_path,
         ledger_path=tick_ledger_path,
         report_dir=report_dir,
-        config=paper_config,
+        config=config,
         research_tools=research_tools_factory(),
         clock=_fixed_clock,
     )
@@ -456,7 +472,7 @@ def test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once(
     )
     hook = _build_paper_on_beat(
         _paper_args(tmp_path, tick_ledger_path),
-        paper_config,
+        config,
         dispatcher=_log_only_dispatcher(),
     )
 
