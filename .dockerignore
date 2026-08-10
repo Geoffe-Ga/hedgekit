@@ -1,0 +1,40 @@
+# Build-context exclusions for the repo-root Dockerfile.
+#
+# The compose build context became the repository root in issue #445, so this
+# file is load-bearing: without it every `docker compose build` uploads the git
+# history, the Ralph worktrees (each a full second checkout) and every local
+# cache before reading a single instruction.
+#
+# WHAT IS DELIBERATELY *NOT* EXCLUDED: `tests/`. The deployment's paper-exchange
+# books (`tests/fixtures/books/deep_walk`) and forecast cassette
+# (`tests/fixtures/forecast/cassettes.json`) live there and are the fixtures the
+# shipped `pipeline` service names, so excluding it would produce an image that
+# builds cleanly and then dies on a missing fixture. That coupling is asserted
+# by tests/deploy/test_deployment_launches_paper.py rather than left to comment.
+
+# Version control and agent scratch state.
+.git
+.gitattributes
+.github
+.ralph
+.claude
+plan
+plans
+git-issues
+prompts
+
+# Local caches and build/test output.
+**/__pycache__
+**/*.py[cod]
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.hypothesis
+htmlcov
+coverage.xml
+.coverage
+*.egg-info
+build
+dist
+.venv
+venv

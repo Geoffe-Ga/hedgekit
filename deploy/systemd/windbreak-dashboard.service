@@ -1,10 +1,29 @@
 [Unit]
 Description=windbreak dashboard process (SPEC Process D)
 After=network.target
+# Retry forever. With the default limit (5 starts / 10s) a fast-failing
+# process is abandoned in `failed` -- silent, on the one deployment whose
+# entire purpose is running unattended (issue #446).
+StartLimitIntervalSec=0
 
 [Service]
+# The dashboard exits 1 when WINDBREAK_DASHBOARD_TOKEN is missing or blank, so
+# the unit must supply it. It is read from a file rather than an `Environment=`
+# line because a unit file is committed and a bearer token must not be; it is
+# never read from config, because config is hash-chained into the ledger and
+# nothing written there can be redacted. The path is NOT `-`-prefixed: a
+# missing file must fail the unit closed, not start a tokenless dashboard.
+#
+# The file must contain exactly one line:
+#   WINDBREAK_DASHBOARD_TOKEN=<the bearer token>
+# and should be mode 0600, owned by the unit's user.
+EnvironmentFile=/etc/windbreak/dashboard.env
+# No --ledger-path: it is the compose skeleton's read-only ledger mount that
+# makes that flag fatal there, and this unit is kept identical so the two
+# skeletons stay equivalent. See deploy/docker-compose.yml and the PR for #446.
 ExecStart=/usr/bin/env windbreak run --process dashboard
 Restart=on-failure
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
