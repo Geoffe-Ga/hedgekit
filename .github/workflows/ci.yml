@@ -171,8 +171,17 @@ jobs:
         # --cov-fail-under=90 enforcement for THIS job only. The tier exercises
         # windbreak in CHILD processes and containers, whose lines the parent's
         # collector cannot see, so a marker-filtered run would report near-zero
-        # and fail the coverage gate on a perfectly green run. The 90% floor is
-        # still enforced by the `quality` job, where these tests also run.
+        # and fail the coverage gate on a perfectly green run.
+        #
+        # NOTE, corrected in review of PR #477: unlike the `chaos` tests above,
+        # the `container` tests do NOT also run in the `quality` job --
+        # pyproject's addopts carry `-m "not container"` and check-all.sh never
+        # overrides that selection, so they are deselected there. This job is
+        # the only place they execute. That costs nothing in coverage terms,
+        # because they shell out to docker/systemd and execute no `windbreak`
+        # package code, so the 90% floor the `quality` job enforces is measured
+        # over exactly the same lines either way. The earlier wording was
+        # copy-pasted from the chaos job, where the claim IS true.
         #
         # `-m container` overrides the `-m "not container"` in pyproject
         # addopts, because pytest takes the LAST -m it is given. --strict-markers

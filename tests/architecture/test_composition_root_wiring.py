@@ -39,9 +39,10 @@ debt, the issue that will remove it.
 
 A registry that only ever grows is a rubber stamp, so
 :func:`test_every_registration_still_matches_a_real_site` fails on a *stale*
-entry. When #441 lands and the ``kill_integration=None`` disappears, this suite
-goes red until its registration is deleted. The registry cannot outlive the
-debt it documents.
+entry. That is not theoretical: #441 was fixed on `main` while this tier was
+being built, `kill_integration=None` disappeared, and this suite went red until
+its registration was deleted. The registry cannot outlive the debt it
+documents.
 
 WHAT THE EXPIRY DOES NOT CATCH
 
@@ -194,14 +195,6 @@ _REGISTERED: dict[tuple[str, str, str], Registration] = {
             "place that happens."
         ),
         issue=None,
-    ),
-    ("windbreak/scheduler/loop.py", "RiskKernel", "kill_integration"): Registration(
-        reason=(
-            "OPEN DEFECT. The always-on PAPER loop builds its kernel with no "
-            "kill integration, so `windbreak kill` cannot stop it approving. "
-            "Remove this registration when the wiring is fixed."
-        ),
-        issue=441,
     ),
 }
 
@@ -389,18 +382,25 @@ def test_every_registration_still_matches_a_real_site() -> None:
     )
 
 
-def test_the_known_open_defects_are_still_detected() -> None:
-    """The scanner actually finds #441 and #444 in the real tree.
+def test_the_scanner_still_finds_the_real_sites_it_is_registered_against() -> None:
+    """The scanner finds every site the registry claims exists.
 
-    Without this, a scanner that silently stopped matching -- a renamed
+    Anti-vacuity. A scanner that silently stopped matching -- a renamed
     parameter, a refactor into a helper, a bug in the AST walk -- would report
-    a clean tree and be believed. It pins that the guard is looking at
-    something real, not at nothing.
+    a clean tree and be believed. This pins that it is looking at something
+    real.
+
+    Deliberately derived from :data:`_REGISTERED` rather than naming defects
+    literally. The previous version hardcoded #441's `kill_integration=None`;
+    when #441 was fixed on `main` that assertion became false and had to be
+    edited by hand, which is the same maintenance burden the registry's own
+    key-based expiry exists to avoid.
     """
     findings = {finding.key for finding in scan_composition_roots()}
 
-    assert ("windbreak/scheduler/loop.py", "RiskKernel", "kill_integration") in findings
-    assert ("windbreak/scheduler/loop.py", "AlertDispatcher", "sinks") in findings
+    assert findings, "the scanner found nothing at all, which cannot be right"
+    for key in _REGISTERED:
+        assert key in findings
 
 
 def test_every_watched_collaborator_is_a_real_parameter_name() -> None:
