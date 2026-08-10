@@ -41,6 +41,17 @@ exist on the real, not-yet-updated `store.py` module yet, so importing it
 below fails collection with `ImportError: cannot import name
 'events_from_records' from 'windbreak.ledger.store'` -- the expected Gate 1
 RED state for issue #235.
+
+The disk-full tests (issue #448) pin the *diagnosability* of that same rollback
+handler. On conditions such as `SQLITE_FULL`, SQLite rolls the transaction back
+itself, so `append`'s own `ROLLBACK` then raises `cannot rollback - no
+transaction is active` from inside the `except` block -- replacing the real
+failure, which survives only as `__context__`. Both tests therefore assert the
+*exact* message reaching the caller, not merely its type: the masking error is
+itself a `sqlite3.OperationalError`, so a type-only assertion passes for the
+wrong reason both before and after the fix. One test drives a genuine, unmocked
+full database (`PRAGMA max_page_count` clamped to the file's current size); the
+other models SQLite's auto-rollback at `COMMIT` itself.
 """
 
 from __future__ import annotations
@@ -833,3 +844,218 @@ def test_reverse_type_scan_is_not_satisfied_by_a_bare_ledger_store() -> None:
             """Do nothing; the double holds no resources."""
 
     assert not isinstance(_BareStore(), ReverseTypeScan)
+
+
+# --- append surfaces the real failure, not its own rollback attempt (#448) ----
+
+#: Message SQLite raises when a write cannot grow the database file.
+_DISK_FULL_MESSAGE = "database or disk is full"
+
+#: Message SQLite raises when `ROLLBACK` runs with no transaction active -- the
+#: one that must never reach the caller in place of the real failure (#448).
+_NO_TRANSACTION_MESSAGE = "cannot rollback - no transaction is active"
+
+
+def _connect_capturing(
+    captured: list[sqlite3.Connection],
+) -> Callable[..., sqlite3.Connection]:
+    """Build a `sqlite3.connect` replacement that records each real connection.
+
+    Opens genuine connections and appends each to `captured`, so a test can
+    reach the very connection a `SqliteLedgerStore` is using and apply a
+    connection-scoped `PRAGMA` to it. Nothing about the connection's behaviour
+    is altered -- the SQLite errors these tests observe are entirely real.
+
+    Args:
+        captured: List every opened connection is appended to, in open order.
+
+    Returns:
+        A drop-in replacement for `sqlite3.connect`.
+    """
+    real_connect = sqlite3.connect
+
+    def _connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        """Open a real connection, recording it before returning it.
+
+        Args:
+            *args: Forwarded verbatim to `sqlite3.connect`.
+            **kwargs: Forwarded verbatim to `sqlite3.connect`.
+
+        Returns:
+            The genuine `sqlite3.Connection`.
+        """
+        connection = real_connect(*args, **kwargs)
+        captured.append(connection)
+        return connection
+
+    return _connect
+
+
+def test_append_surfaces_the_full_disk_error_not_its_own_failed_rollback(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuinely full database surfaces `database or disk is full` to the caller.
+
+    Drives the real SQLITE_FULL path with no faked exception anywhere: two
+    events are appended, then `PRAGMA max_page_count` is clamped to the file's
+    current size (SQLite refuses to shrink below it), so the next append -- one
+    carrying a payload far larger than the remaining free space -- cannot grow
+    the file. SQLite rolls that transaction back itself, which is precisely what
+    makes `append`'s own `ROLLBACK` raise `cannot rollback - no transaction is
+    active` from inside the `except` block and *replace* the real error.
+
+    The assertion is exact-message equality in both directions, because the
+    masking error is itself a `sqlite3.OperationalError`: `pytest.raises`
+    matching on type alone would pass before the fix. Before the fix the caller
+    sees the rollback message; after it, the disk message. The ledger is then
+    checked byte-for-byte unchanged, `verify_chain()` is called bare, the cap is
+    lifted, and a further append must land at sequence 3 and re-verify -- proof
+    the transaction really was released and the hash chain linked on unbroken.
+    """
+    connections: list[sqlite3.Connection] = []
+    monkeypatch.setattr(sqlite3, "connect", _connect_capturing(connections))
+    store = ledger_store_factory()
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=1))
+    snapshot_before_failure = store.read_all()
+    connection = connections[-1]
+    connection.execute("PRAGMA max_page_count=1")
+
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        store.append(
+            ConfigLoaded(
+                component="pipeline",
+                config_hash="big",
+                diff={"blob": "x" * 400_000},
+            )
+        )
+
+    assert type(caught.value) is sqlite3.OperationalError
+    assert str(caught.value) == _DISK_FULL_MESSAGE
+    assert str(caught.value) != _NO_TRANSACTION_MESSAGE
+    assert store.read_all() == snapshot_before_failure
+    store.verify_chain()
+
+    connection.execute("PRAGMA max_page_count=0")
+    recovery_sequence = store.append(
+        ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=2)
+    )
+
+    assert recovery_sequence == 3
+    assert [record.sequence_number for record in store.read_all()] == [1, 2, 3]
+    store.verify_chain()
+
+
+class _DiskFullAtCommitConnection:
+    """A connection proxy modelling a full disk detected at `COMMIT` (#448).
+
+    Wraps a real :class:`sqlite3.Connection` and delegates verbatim, except
+    that once :attr:`armed` is set the next `COMMIT` reproduces what SQLite
+    does on `SQLITE_FULL` at commit time: it rolls the open transaction back
+    *itself* (a real `ROLLBACK` on the wrapped connection) and then reports
+    `database or disk is full`. The proxy disarms itself so a later append
+    commits normally.
+
+    This is the sibling of `_CommitFailingConnection`, which fails `COMMIT`
+    while leaving the transaction open. Both faults land in the same
+    `except` block, but only this one leaves no transaction for `append`'s
+    `ROLLBACK` to release -- the condition under which that `ROLLBACK` raises
+    and displaces the real error.
+
+    Attributes:
+        armed: When `True`, the next `COMMIT` auto-rolls-back and raises.
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        """Wrap `real` with the one-shot disk-full fault disarmed.
+
+        Args:
+            real: The genuine SQLite connection every call delegates to.
+        """
+        self._real = real
+        self.armed = False
+
+    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        """Delegate to the real connection, failing one armed `COMMIT`.
+
+        Args:
+            sql: The SQL statement to execute.
+            *args: Optional bound parameters, forwarded verbatim.
+
+        Returns:
+            The real connection's cursor for every delegated statement.
+
+        Raises:
+            sqlite3.OperationalError: On the first `COMMIT` seen while armed,
+                after rolling the transaction back exactly as SQLite does on
+                `SQLITE_FULL`.
+        """
+        if self.armed and sql.strip().upper().startswith("COMMIT"):
+            self.armed = False
+            self._real.execute("ROLLBACK")
+            raise sqlite3.OperationalError(_DISK_FULL_MESSAGE)
+        return self._real.execute(sql, *args)
+
+    def close(self) -> None:
+        """Close the wrapped real connection."""
+        self._real.close()
+
+
+def test_append_surfaces_a_commit_time_disk_full_error_after_auto_rollback(
+    ledger_store_factory: Callable[..., SqliteLedgerStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `COMMIT` that fails *and* auto-rolls-back still reports the disk error.
+
+    The post-INSERT half of the issue #448 contract: the SELECT-last read,
+    hashing, and `INSERT` all run for real, and then `COMMIT` behaves the way
+    SQLite does when it hits `SQLITE_FULL` at commit -- discarding the
+    transaction itself before reporting `database or disk is full`. `append`'s
+    cleanup therefore finds no transaction to roll back, and must not let that
+    fact overwrite what the caller is told.
+
+    Asserted by exact message equality (the masking error shares the disk
+    error's type, so type alone cannot discriminate), plus: the inserted row is
+    gone, `verify_chain()` passes when called bare, and a subsequent append
+    lands at sequence 2 on an unbroken chain.
+    """
+    real_connect = sqlite3.connect
+    created_proxies: list[_DiskFullAtCommitConnection] = []
+
+    def fake_connect(*args: Any, **kwargs: Any) -> _DiskFullAtCommitConnection:
+        """Open a real connection wrapped in a disarmed disk-full proxy.
+
+        Args:
+            *args: Forwarded verbatim to `sqlite3.connect`.
+            **kwargs: Forwarded verbatim to `sqlite3.connect`.
+
+        Returns:
+            The recorded proxy standing in for the connection.
+        """
+        proxy = _DiskFullAtCommitConnection(real_connect(*args, **kwargs))
+        created_proxies.append(proxy)
+        return proxy
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+
+    store = ledger_store_factory()
+    store.append(ConfigLoaded(component="pipeline", config_hash="abc", diff={}))
+    snapshot_before_failure = store.read_all()
+
+    created_proxies[-1].armed = True
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=1))
+
+    assert type(caught.value) is sqlite3.OperationalError
+    assert str(caught.value) == _DISK_FULL_MESSAGE
+    assert str(caught.value) != _NO_TRANSACTION_MESSAGE
+    assert store.read_all() == snapshot_before_failure
+
+    recovery_sequence = store.append(
+        ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=2)
+    )
+
+    assert recovery_sequence == 2
+    assert [record.sequence_number for record in store.read_all()] == [1, 2]
+    store.verify_chain()

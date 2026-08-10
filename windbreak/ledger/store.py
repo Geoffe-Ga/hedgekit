@@ -31,6 +31,7 @@ it is not.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -381,10 +382,16 @@ class SqliteLedgerStore:
             The sequence number assigned to the new record.
 
         Raises:
-            Exception: Any failure mid-append (e.g. from hashing or the INSERT)
-                rolls back the ``BEGIN IMMEDIATE`` transaction — releasing the
-                write lock and leaving the ledger unchanged — and re-raises the
-                original exception unchanged.
+            Exception: Any failure mid-append (e.g. from hashing, the INSERT, or
+                the COMMIT) rolls back the ``BEGIN IMMEDIATE`` transaction —
+                releasing the write lock and leaving the ledger unchanged — and
+                re-raises the **original** exception unchanged. The rollback is
+                best-effort and can never displace that original: when SQLite has
+                already discarded the transaction itself (as it does on
+                ``SQLITE_FULL``), the resulting ``cannot rollback - no
+                transaction is active`` is suppressed so the caller still reads
+                the real condition, e.g. ``database or disk is full``
+                (issue #448).
         """
         created_at = self._now().isoformat(timespec="microseconds")
         payload_json = event.envelope_json
@@ -417,7 +424,16 @@ class SqliteLedgerStore:
             )
             self._conn.execute("COMMIT")
         except Exception:
-            self._conn.execute("ROLLBACK")
+            # The rollback is cleanup, never a second failure channel. SQLite
+            # discards the transaction itself on conditions like ``SQLITE_FULL``,
+            # so this ``ROLLBACK`` can raise ``cannot rollback - no transaction
+            # is active`` -- and an exception raised inside an ``except`` block
+            # REPLACES the one being handled, leaving the operator reading a
+            # transaction-management error where "database or disk is full"
+            # belongs (issue #448). Suppression is scoped to the rollback alone,
+            # so the original always propagates.
+            with contextlib.suppress(sqlite3.OperationalError):
+                self._conn.execute("ROLLBACK")
             raise
         return sequence_number
 
