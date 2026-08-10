@@ -43,11 +43,27 @@ violation is a Gate 1 failure, not a code-review nice-to-have.
 ## Preflight: production-readiness checks (SPEC §3.3, §15)
 
 `windbreak preflight` runs seven fail-closed checks before a live deployment
-and reports a nonzero exit code if any fails:
+and reports a nonzero exit code if any fails. `--fixture-dir` is required and
+names the directory of exchange JSON the read-only connector is built from, so
+the rehearsal invocation below is the one every operator can run from a clean
+checkout:
 
 ```bash
-windbreak preflight --fixture-dir drills/fixtures --json
+windbreak preflight --fixture-dir tests/fixtures/exchange --json
 ```
+
+**That is the rehearsal, and it is expected to fail.** Against the shipped
+fixtures this command exits `1`: those fixtures deliberately contain one
+`unknown`-jurisdiction and one `ineligible` market, so
+`jurisdiction.markets_eligible` reports FAIL and you see what a blocked
+deployment looks like — a checklist that has never been observed failing is not
+evidence of anything. A **real** preflight points `--fixture-dir` at exchange
+JSON captured from the venue you are about to deploy against, and must exit `0`
+with no FAIL rows before you go live; no shipped fixture directory does that
+today, and nothing in the CLI captures one from a live connector yet — see the
+known limitation below. The exact command above, its fixture directory, and its
+exit code are all pinned by `tests/docs/test_operator_control_claims.py`, which
+runs it (issue #449).
 
 | Check | What it verifies | SPEC ref |
 |---|---|---|

@@ -225,12 +225,45 @@ def _safe_shlex_split(command: str) -> list[str]:
         return []
 
 
+#: Prefixes that launch the *same* CLI as the ``windbreak`` console script, by
+#: running its module entrypoint. Documented this way, an invocation is every
+#: bit as copy-pasteable -- and every bit as capable of naming a flag or a path
+#: that does not exist -- so it is folded to the console-script form rather
+#: than left invisible to every check built on this extractor.
+_MODULE_ENTRYPOINT_PREFIXES = (
+    ("python", "-m", "windbreak"),
+    ("python3", "-m", "windbreak"),
+)
+
+
+def _normalize_entrypoint(tokens: list[str]) -> tuple[str, ...]:
+    """Return `tokens` with a ``python -m windbreak`` prefix folded to the verb.
+
+    Only the exact module ``windbreak`` is folded: ``python -m
+    windbreak.riskkernel`` launches a different entrypoint with a different
+    argument surface, so it stays unrecognized rather than being validated
+    against the console script's parser.
+
+    Args:
+        tokens: One logical command's shlex tokens.
+
+    Returns:
+        The tokens with any module-entrypoint prefix replaced by
+        ``windbreak``, or the tokens unchanged.
+    """
+    for prefix in _MODULE_ENTRYPOINT_PREFIXES:
+        if tuple(tokens[: len(prefix)]) == prefix:
+            return ("windbreak", *tokens[len(prefix) :])
+    return tuple(tokens)
+
+
 def extract_windbreak_invocations(doc_text: str) -> tuple[tuple[str, ...], ...]:
     """Return every ``windbreak ...`` invocation's shlex tokens in `doc_text`.
 
     Only scans fenced code blocks and inline code spans -- never prose --
-    joins backslash line-continuations into one logical command first, and
-    keeps only commands whose first shlex token is exactly ``windbreak``
+    joins backslash line-continuations into one logical command first, folds
+    the ``python -m windbreak`` module entrypoint to the console-script form,
+    and keeps only commands whose first token is then exactly ``windbreak``
     *and* that carry a verb after it. A bare ``windbreak`` code span (prose
     referring to the executable by name, e.g. "resolves ``windbreak`` from
     ``PATH``") is a name reference, not an invocation, so it is skipped --
@@ -240,15 +273,16 @@ def extract_windbreak_invocations(doc_text: str) -> tuple[tuple[str, ...], ...]:
         doc_text: The full markdown document (or any snippet) to scan.
 
     Returns:
-        Each matching invocation's shlex tokens, in source order.
+        Each matching invocation's shlex tokens, ``windbreak`` first, in
+        source order.
     """
     invocations: list[tuple[str, ...]] = []
     for span in _code_spans(doc_text):
         for logical_line in _logical_lines(span):
             command = _strip_prompt(logical_line)
-            tokens = _safe_shlex_split(command)
+            tokens = _normalize_entrypoint(_safe_shlex_split(command))
             if len(tokens) >= 2 and tokens[0] == "windbreak":
-                invocations.append(tuple(tokens))
+                invocations.append(tokens)
     return tuple(invocations)
 
 
@@ -303,6 +337,36 @@ def test_extract_windbreak_invocations_ignores_non_windbreak_commands() -> None:
 def test_extract_windbreak_invocations_ignores_prose_mentions() -> None:
     """A bare prose mention of ``windbreak run`` outside any code is ignored."""
     doc_text = "Running windbreak run is not inside code, so it is ignored."
+
+    assert extract_windbreak_invocations(doc_text) == ()
+
+
+def test_extract_windbreak_invocations_folds_the_module_entrypoint() -> None:
+    """``python -m windbreak <verb>`` is the same CLI, so it is extracted.
+
+    Issue #449 was reproduced with exactly this form; leaving it unrecognized
+    would keep a whole documented invocation shape out of reach of every
+    check built on this extractor.
+    """
+    doc_text = "```bash\npython -m windbreak preflight --fixture-dir x\n```"
+
+    assert extract_windbreak_invocations(doc_text) == (
+        ("windbreak", "preflight", "--fixture-dir", "x"),
+    )
+
+
+def test_extract_windbreak_invocations_folds_the_python3_module_entrypoint() -> None:
+    """``python3 -m windbreak`` folds the same way ``python -m`` does."""
+    doc_text = "```bash\npython3 -m windbreak run --max-beats 3\n```"
+
+    assert extract_windbreak_invocations(doc_text) == (
+        ("windbreak", "run", "--max-beats", "3"),
+    )
+
+
+def test_extract_windbreak_invocations_ignores_a_different_module() -> None:
+    """A submodule entrypoint is a different CLI, so it is not folded in."""
+    doc_text = "```bash\npython -m windbreak.riskkernel --beat 1\n```"
 
     assert extract_windbreak_invocations(doc_text) == ()
 
