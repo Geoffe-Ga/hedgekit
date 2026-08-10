@@ -12,13 +12,16 @@ bound to `127.0.0.1` only (never the implicit `0.0.0.0`).
 
 from __future__ import annotations
 
-import shutil
-import subprocess
+import os
+import shlex
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+
+from tests.deploy import artifacts
+from windbreak.main import DASHBOARD_AUTH_ENV_VAR, build_parser
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _COMPOSE_PATH = _REPO_ROOT / "deploy" / "docker-compose.yml"
@@ -87,12 +90,20 @@ def test_services_are_exactly_the_four_spec_processes() -> None:
 def test_service_command_runs_windbreak_with_matching_process_token(
     service_name: str, cli_token: str
 ) -> None:
-    """Each service's command runs `windbreak run --process <token>` exactly."""
+    """Each service launches `windbreak run` for its own `--process` token.
+
+    The command is parsed by the CLI's own parser rather than compared to a
+    literal string, so the composition flags issue #446 added to `pipeline`
+    (and any later flag) do not falsify the process-token claim this test is
+    actually about. That the pipeline command still *activates* PAPER is
+    tests/deploy/test_deployment_launches_paper.py's job.
+    """
     data = _load_compose()
 
-    service = data["services"][service_name]
-    expected = f"windbreak run --process {cli_token}"
-    assert _command_string(service["command"]) == expected
+    tokens = shlex.split(_command_string(data["services"][service_name]["command"]))
+    assert tokens[0] == "windbreak"
+    assert tokens[1] == "run"
+    assert build_parser().parse_args(tokens[1:]).process == cli_token
 
 
 @pytest.mark.parametrize("service_name", sorted(_SERVICE_TO_CLI_TOKEN))
@@ -153,29 +164,8 @@ def test_every_published_port_binds_loopback_only() -> None:
             )
 
 
-def _docker_compose_available() -> bool:
-    """Probe whether `docker compose` (the v2 CLI plugin) is usable here.
-
-    Returns:
-        True if the `docker` binary exists and `docker compose version`
-        exits zero; False otherwise (missing binary, or the plugin absent).
-    """
-    if shutil.which("docker") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "version"],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
 @pytest.mark.skipif(
-    not _docker_compose_available(),
+    not artifacts.docker_compose_available(),
     reason="docker CLI or the docker compose v2 plugin is unavailable here",
 )
 @pytest.mark.timeout(60)
@@ -185,13 +175,13 @@ def test_docker_compose_config_validates() -> None:
     Secondary to the always-on YAML structural tests above -- this only
     confirms Compose itself agrees the file is well-formed, and only runs
     when Compose happens to be installed in the executing environment.
+
+    The dashboard token variable is supplied because the file declares it in
+    Compose's required-variable form; that an *unset* token is refused is
+    asserted separately, in tests/deploy/test_deployment_launches_paper.py.
     """
-    result = subprocess.run(
-        ["docker", "compose", "-f", str(_COMPOSE_PATH), "config"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
+    result = artifacts.run_docker_compose_config(
+        env={**os.environ, DASHBOARD_AUTH_ENV_VAR: "compose-config-probe"}
     )
 
     assert result.returncode == 0, result.stderr
