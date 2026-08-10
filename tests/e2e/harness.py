@@ -149,17 +149,24 @@ def run_windbreak(
     env: Mapping[str, str] | None = None,
     cwd: Path | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run the CLI to completion as a child process and capture its output.
 
     For processes that are expected to terminate on their own. Long-running
     ones belong to :class:`ProcessLauncher`, which guarantees their teardown.
 
+    ``input_text`` defaults to ``None``, which closes the child's stdin rather
+    than inheriting the test runner's. That matters: `windbreak rearm` reads a
+    confirmation phrase with :func:`input`, and a child inheriting a terminal
+    would block forever instead of failing.
+
     Args:
         *args: Arguments passed to the windbreak CLI.
         env: Complete environment for the child. ``None`` inherits this one.
         cwd: Working directory for the child. ``None`` inherits this one.
         timeout: Seconds to allow before the child is killed.
+        input_text: Text fed to the child's stdin. ``None`` sends EOF at once.
 
     Returns:
         The completed process, with ``stdout``/``stderr`` decoded as text.
@@ -169,6 +176,7 @@ def run_windbreak(
     """
     return subprocess.run(
         windbreak_argv(*args),
+        input="" if input_text is None else input_text,
         capture_output=True,
         text=True,
         timeout=timeout,

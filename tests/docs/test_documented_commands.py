@@ -278,6 +278,11 @@ def _named_services(tokens: list[str]) -> tuple[Path | None, list[str]]:
     Returns:
         The referenced compose file (if any) and the service names named.
     """
+    assert tokens[:2] == ["docker", "compose"], (
+        "this extractor only understands `docker compose ...` invocations, and "
+        f"the docs now contain another docker command: {tokens}. Teach "
+        "_named_services about it rather than letting it be mis-parsed silently"
+    )
     compose_file: Path | None = None
     services: list[str] = []
     subcommand: str | None = None
