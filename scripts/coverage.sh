@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/coverage.sh - Run tests with coverage report
-# Usage: ./scripts/coverage.sh [--html] [--xml] [--verbose] [--help]
+# Usage: ./scripts/coverage.sh [--html] [--xml] [--metrics] [--verbose] [--help]
 
 set -euo pipefail
 
@@ -8,12 +8,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 HTML_REPORT=false
+METRICS=false
 XML_REPORT=false
 VERBOSE=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --metrics)
+            METRICS=true
+            shift
+            ;;
         --html)
             HTML_REPORT=true
             shift
@@ -35,6 +40,11 @@ Run tests with coverage report.
 OPTIONS:
     --html      Generate HTML coverage report
     --xml       Generate XML coverage report (for CI)
+    --metrics   Print {"coverage_pct": <num>, "branch_coverage_pct": <num>}
+                as JSON on stdout and exit 0, for the quality dashboard
+                (issue #122). Measurement, not a gate: the suite runs without
+                --cov-fail-under, so a coverage regression is reported rather
+                than enforced. Shares its pytest run with test.sh --metrics.
     --verbose   Show detailed output
     --help      Display this help message
 
@@ -63,6 +73,16 @@ cd "$PROJECT_ROOT"
 # the coverage threshold must be measured against the pinned dependency set, not
 # whichever pytest/pytest-cov pair happens to be first on PATH.
 PYTEST="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-tool pytest)"
+
+# Dashboard measurement mode (issue #122). Dispatched before the gate below so
+# stdout carries exactly the one JSON object collect_metrics.py parses. The
+# probe writes a coverage report and a JUnit report from ONE suite run and
+# reuses them for test.sh --metrics while no source or test file is newer, so
+# a full collection runs the suite once rather than twice.
+if $METRICS; then
+    METRICS_PYTHON="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-python)"
+    exec "$METRICS_PYTHON" "$SCRIPT_DIR/metrics_probe.py" coverage --pytest "$PYTEST"
+fi
 
 # Set verbosity
 if $VERBOSE; then

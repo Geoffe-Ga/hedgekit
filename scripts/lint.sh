@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/lint.sh - Run linting checks (Ruff, float-lint, shellcheck)
-# Usage: ./scripts/lint.sh [--fix] [--check] [--verbose] [--help]
+# Usage: ./scripts/lint.sh [--fix] [--check] [--metrics] [--verbose] [--help]
 
 set -euo pipefail
 
@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 FIX=false
+METRICS=false
 VERBOSE=false
 
 # Parse command line arguments
@@ -20,6 +21,10 @@ while [[ $# -gt 0 ]]; do
         --check)
             # Check-only is the default behaviour; accept the flag as a
             # no-op so callers (e.g. check-all.sh) can pass it explicitly.
+            shift
+            ;;
+        --metrics)
+            METRICS=true
             shift
             ;;
         --verbose)
@@ -41,6 +46,10 @@ OPTIONS:
                 float-lint nor shellcheck has an autofix, so both run the
                 identical scan in --fix and check modes)
     --check     Check only, fail if issues found (default mode)
+    --metrics   Print {"violations": <int>} as JSON on stdout and exit 0, for
+                the quality dashboard (issue #122). Measurement, not a gate:
+                findings are reported, never enforced. The count is null when
+                any half of the lint could not be counted.
     --verbose   Show detailed output
     --help      Display this help message
 
@@ -75,6 +84,17 @@ FLOAT_LINT_PYTHON="$(bash "$TOOLCHAIN_ENV" --print-python)"
 # than at the point of use) keeps every tool this script needs proven present
 # before any check reports a verdict.
 PRE_COMMIT="$(bash "$TOOLCHAIN_ENV" --print-tool pre-commit)"
+
+# Dashboard measurement mode (issue #122). Dispatched here -- after tool
+# resolution, before any gate output -- so stdout carries exactly the one JSON
+# object scripts/collect_metrics.py parses, and the gate path below is left
+# untouched. `exec` guarantees nothing else in this script can run afterwards.
+if $METRICS; then
+    exec "$FLOAT_LINT_PYTHON" "$SCRIPT_DIR/metrics_probe.py" lint \
+        --ruff "$RUFF" \
+        --python "$FLOAT_LINT_PYTHON" \
+        --pre-commit "$PRE_COMMIT"
+fi
 
 # Set verbosity
 if $VERBOSE; then
