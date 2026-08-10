@@ -130,38 +130,74 @@ docs/                # Live metrics dashboard (GitHub Pages) + docs/RUNBOOK.md
 
 SPEC §5.1 mandates process isolation: the four processes run as **separate
 services** sharing only the ledger volume and localhost sockets — killing one
-must never kill another. `deploy/` ships two equivalent skeletons for this at
-M0.
+must never kill another. (`pipeline` also mounts a `reports` volume, which no
+other service touches, so it shares nothing.) `deploy/` ships two equivalent
+skeletons for this at M0.
 
 **docker compose**
 
 ```bash
+export WINDBREAK_DASHBOARD_TOKEN=...   # required; see Dashboard below
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
 Starts four services — `pipeline`, `riskkernel`, `order-gateway`, `dashboard`
-— each built from the repo-root `Dockerfile` and running
-`windbreak run --process <name>`, with `restart: on-failure`. Only `dashboard`
-publishes a port, bound to `127.0.0.1:8080` (SPEC §14: no public inbound), and
-its ledger mount is read-only since it holds no trade authority. Process
-isolation in practice:
+— each built from the repo-root `Dockerfile` with `restart: on-failure`. The
+build context is the repo root, set explicitly as `context: ..`: Compose
+resolves a relative context against the *compose file's own* directory, so the
+previous `build: .` meant `deploy/`, which holds no `Dockerfile`, and `up -d`
+failed before creating a container (issue #445). Only `dashboard` publishes a
+port, bound to `127.0.0.1:8080` (SPEC §14: no public inbound), and its ledger
+mount is read-only since it holds no trade authority.
+
+`pipeline` carries the four PAPER composition flags, so the stack runs the
+PAPER loop rather than a bare RESEARCH heartbeat (issue #446) — it reads the
+`deep_walk` paper-exchange fixture and the recorded forecast cassette from the
+image's copy of this repo, and writes its hash-chained ledger to the shared
+`ledger` volume and its weekly report stub to a `reports` volume. **Activating
+PAPER is not trading.** In cassette mode the research transports find nothing
+by construction, so every tick abstains before any vote (issue #438); the
+ledger fills with screen, verification, equity, position and heartbeat records
+and no order is placed.
+
+Process isolation in practice, and the ledger actually being written:
 
 ```bash
+$ docker compose -f deploy/docker-compose.yml exec pipeline \
+    ls /var/lib/windbreak/ledger /var/lib/windbreak/reports
+/var/lib/windbreak/ledger:
+windbreak.db  windbreak.db-shm  windbreak.db-wal
+
+/var/lib/windbreak/reports:
+weekly-2026-08-10.md
+
 $ docker compose -f deploy/docker-compose.yml kill pipeline
-$ docker compose -f deploy/docker-compose.yml ps --format '{{.Name}} {{.State}}'
-windbreak-pipeline       exited
-windbreak-riskkernel     running
-windbreak-order-gateway  running
-windbreak-dashboard      running
+$ docker compose -f deploy/docker-compose.yml ps -a --format '{{.Name}} {{.State}}'
+deploy-dashboard-1      running
+deploy-order-gateway-1  running
+deploy-pipeline-1       exited
+deploy-riskkernel-1     running
 ```
 
 **systemd**
 
 `deploy/systemd/` ships one unit per process —
 `windbreak-{pipeline,riskkernel,order-gateway,dashboard}.service` — each with
-`Restart=on-failure`. Units are install-prefix-agnostic:
-`ExecStart=/usr/bin/env windbreak run --process <name>` resolves `windbreak`
-from `PATH` rather than a hardcoded install path.
+`Restart=on-failure`, `RestartSec=5s` and `StartLimitIntervalSec=0` (without
+the last two, five failures in ten seconds leave a unit permanently `failed`,
+which is the one outcome an unattended deployment cannot afford). Units are
+install-prefix-agnostic: `ExecStart=/usr/bin/env windbreak run --process
+<name>` resolves `windbreak` from `PATH` rather than a hardcoded install path.
+
+Unlike the compose skeleton the units have no image to carry the repo, so they
+expect one installed at `/opt/windbreak` (the pipeline unit's
+`WorkingDirectory=`), against which its repo-relative fixture paths resolve —
+the same invocation [`docs/RUNBOOK.md`](docs/RUNBOOK.md) documents. The
+dashboard unit reads its bearer token from a mandatory
+`EnvironmentFile=/etc/windbreak/dashboard.env` containing one
+`WINDBREAK_DASHBOARD_TOKEN=<token>` line; the path is deliberately not
+`-`-prefixed, so a missing file fails the unit rather than starting a
+tokenless dashboard.
 
 **Dashboard**
 
@@ -172,10 +208,27 @@ matching the `127.0.0.1:8080` compose publish). Every request must present a
 bearer token (`Authorization: Bearer <token>`) read from the
 `WINDBREAK_DASHBOARD_TOKEN` environment variable — never from config, since
 config is ledgered and a secret there would leak into the hash chain; a
-missing or blank token exits the process with code 1. Pass `--ledger-path` to
-back the status line and read-model views (positions, equity, decisions, ...)
-with a live ledger; without it, `/` reports `RESEARCH` / `never` and every
-view renders its "no data yet" placeholder. The dashboard is **read-only as
+missing or blank token exits the process with code 1 — so the compose file
+declares the variable in Compose's required form (`${WINDBREAK_DASHBOARD_TOKEN:?...}`),
+which refuses the whole invocation before any container exists rather than
+letting the service crash-loop under `restart: on-failure`. Pass
+`--ledger-path` to back the status line and read-model views (positions,
+equity, decisions, ...) with a live ledger; without it, `/` reports
+`RESEARCH` / `never` and every view renders its "no data yet" placeholder.
+
+**Two things the shipped skeletons deliberately do not claim.** Neither
+skeleton passes `--ledger-path` to the dashboard, so it renders those
+placeholders: `_load_and_ledger_config` opens the ledger read-write for any
+process given that flag, and `SqliteLedgerStore` runs `PRAGMA
+journal_mode=WAL` plus a `CREATE TABLE` on open, so the flag is fatal against
+the read-only ledger mount SPEC §5.1 asks for. And the dashboard binds the
+*container's* `127.0.0.1`, which a published port cannot reach, so the
+compose stack's `127.0.0.1:8080` publish does not currently make it
+reachable from the host. Both need a change in `windbreak/`, not in
+`deploy/`. Until then the dashboard is reachable only from inside its own
+container or from a systemd host running the unit directly.
+
+The dashboard is **read-only as
 shipped**: it exposes no working mutation surface at all — pause, kill,
 acknowledge and raise-floor all arrive with later epics, and the single write
 route the handler defines is an unwired seam the CLI never supplies a granter
@@ -184,8 +237,9 @@ for. Use `windbreak ack` to grant an acknowledgement. The route table in
 canonical, test-pinned statement of what each route answers — this README
 deliberately restates none of it.
 
-This is an M0 skeleton: the tracer `windbreak run` (no flags) still just idles
-in `RESEARCH` mode, emitting heartbeats.
+This is still an M0 skeleton. The tracer `windbreak run` (no flags) idles in
+`RESEARCH` mode emitting heartbeats; the shipped `pipeline` service and unit
+are what supply the flags that make it a PAPER loop instead.
 
 ### Ralph fleet loop
 

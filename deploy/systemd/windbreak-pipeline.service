@@ -1,10 +1,22 @@
 [Unit]
 Description=windbreak pipeline process (SPEC Process A)
 After=network.target
+# Retry forever. With the default limit (5 starts / 10s) a fast-failing
+# process is abandoned in `failed` -- silent, on the one deployment whose
+# entire purpose is running unattended (issue #446).
+StartLimitIntervalSec=0
 
 [Service]
-ExecStart=/usr/bin/env windbreak run --process pipeline
+# The unit runs out of an installed copy of this repository, so the fixture
+# paths below are repo-relative -- identical to the invocation in
+# docs/RUNBOOK.md. systemd's default working directory is `/`, so this line is
+# what makes them resolve.
+WorkingDirectory=/opt/windbreak
+# All four PAPER composition flags, or `_resolve_on_beat` returns None and this
+# is a bare RESEARCH heartbeat that writes no ledger (issue #446).
+ExecStart=/usr/bin/env windbreak run --process pipeline --paper-books-dir tests/fixtures/books/deep_walk --cassette-path tests/fixtures/forecast/cassettes.json --ledger-path /var/lib/windbreak/ledger/windbreak.db --report-dir /var/lib/windbreak/reports
 Restart=on-failure
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
