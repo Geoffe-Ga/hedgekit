@@ -26,6 +26,7 @@ reinterpreted against the host's zone.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -35,8 +36,11 @@ from windbreak.evaluation.ingest import (
     MARKET_RESOLVED_EVENT_TYPE,
     IngestedResolution,
     MarketResolved,
+    ingested_resolution_of,
     ingested_resolutions_from_records,
+    parse_resolution_instant,
     resolution_outcomes,
+    resolutions_conflict,
 )
 from windbreak.evaluation.resolution import ResolutionOutcome
 from windbreak.evaluation.temporal import resolution_sequences_from_instants
@@ -355,9 +359,10 @@ def test_ingested_resolutions_fails_closed_on_a_contradicting_re_ingest() -> Non
     """A second, *different* resolution for one market raises rather than wins.
 
     Silently letting the later row win would let a mis-typed outcome overwrite
-    a correct one with no trace in the report; the settlement-reversal
-    vocabulary in `windbreak.evaluation.resolution` is the supported way to
-    correct a settled market.
+    a correct one with no trace in the report. The message quotes both claims
+    exactly and names no remedy that does not exist: there is no settlement
+    reversal to perform (issue #484), and the verb refuses this append before
+    it is ever written.
     """
     records = [
         _record(
@@ -380,9 +385,164 @@ def test_ingested_resolutions_fails_closed_on_a_contradicting_re_ingest() -> Non
     assert type(exc_info.value) is ValueError
     assert str(exc_info.value) == (
         "MarketResolved at sequence_number=2 contradicts an earlier resolution "
-        "of market_ticker='MKT-A'; a settled market is corrected through a "
-        "settlement reversal, never by a second conflicting ingest"
+        "of market_ticker='MKT-A': the ledger already carries outcome='no' "
+        "resolved_at=2026-03-01T12:00:00.000000Z, this row carries "
+        "outcome='yes' resolved_at=2026-03-01T12:00:00.000000Z. "
+        "`windbreak ingest-resolution` refuses a conflicting append before "
+        "writing anything, so a ledger carrying both rows was not written by "
+        "it; the ledger is append-only and neither row can be un-written. See "
+        "docs/RUNBOOK.md, 'Ingesting a resolved outcome'."
     )
+    assert "settlement reversal" not in str(exc_info.value)
+
+
+def test_a_re_ingest_differing_only_in_source_is_not_a_contradiction() -> None:
+    """Retyping the free-text provenance label is idempotent, not a conflict.
+
+    `source` records where an operator read the settlement; it says nothing
+    about what the market did. Comparing whole frozen records made
+    `"kalshi settlement notice"` and `"kalshi-settlement-notice"` a reported
+    contradiction *about the settled outcome*, which was false -- and, because
+    this fold runs on every tick over an append-only ledger, terminal.
+    """
+    records = [
+        _record(
+            sequence_number=1,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=_resolved_payload(source="kalshi settlement notice"),
+        ),
+        _record(
+            sequence_number=2,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-02T13:00:00.000000+00:00",
+            payload=_resolved_payload(source="kalshi-settlement-notice"),
+        ),
+    ]
+
+    resolutions = ingested_resolutions_from_records(records)
+
+    assert resolutions == (
+        IngestedResolution(
+            market_ticker="MKT-A",
+            outcome=ResolutionOutcome.NO,
+            resolved_at=_RESOLVED_AT,
+            source="kalshi settlement notice",
+        ),
+    )
+
+
+def test_a_re_ingest_one_microsecond_apart_is_a_contradiction() -> None:
+    """The settlement instant is compared exactly, not rounded to the second.
+
+    Two instants inside one second can project onto different ledger positions
+    and therefore admit or refuse different forecasts, so a microsecond's
+    difference is a genuine disagreement about which forecasts could have
+    peeked -- not a formatting nit to be smoothed over.
+    """
+    records = [
+        _record(
+            sequence_number=1,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=_resolved_payload(resolved_at="2026-03-01T12:00:00.000000Z"),
+        ),
+        _record(
+            sequence_number=2,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-02T13:00:00.000000+00:00",
+            payload=_resolved_payload(resolved_at="2026-03-01T12:00:00.000001Z"),
+        ),
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        ingested_resolutions_from_records(records)
+
+    assert str(exc_info.value).startswith(
+        "MarketResolved at sequence_number=2 contradicts an earlier resolution "
+        "of market_ticker='MKT-A': the ledger already carries outcome='no' "
+        "resolved_at=2026-03-01T12:00:00.000000Z, this row carries "
+        "outcome='no' resolved_at=2026-03-01T12:00:00.000001Z."
+    )
+
+
+def test_the_same_instant_written_at_two_offsets_is_not_a_contradiction() -> None:
+    """Offset spelling is not a claim: `07:00-05:00` and `12:00Z` are one instant."""
+    records = [
+        _record(
+            sequence_number=1,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=_resolved_payload(resolved_at="2026-03-01T12:00:00.000000Z"),
+        ),
+        _record(
+            sequence_number=2,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-02T13:00:00.000000+00:00",
+            payload=_resolved_payload(resolved_at="2026-03-01T07:00:00.000000-05:00"),
+        ),
+    ]
+
+    resolutions = ingested_resolutions_from_records(records)
+
+    assert len(resolutions) == 1
+    assert resolutions[0].resolved_at == _RESOLVED_AT
+
+
+def test_resolutions_conflict_ignores_source_and_compares_the_other_three() -> None:
+    """The shared conflict predicate reads exactly three fields, and not `source`."""
+    base = IngestedResolution(
+        market_ticker="MKT-A",
+        outcome=ResolutionOutcome.NO,
+        resolved_at=_RESOLVED_AT,
+        source="kalshi-settlement-notice",
+    )
+
+    assert resolutions_conflict(base, replace(base, source="a wholly other label")) is (
+        False
+    )
+    assert resolutions_conflict(base, replace(base, market_ticker="MKT-B")) is True
+    assert resolutions_conflict(base, replace(base, outcome=ResolutionOutcome.YES)) is (
+        True
+    )
+    assert (
+        resolutions_conflict(
+            base, replace(base, resolved_at=_RESOLVED_AT + timedelta(microseconds=1))
+        )
+        is True
+    )
+
+
+def test_a_round_tripped_event_folds_back_to_its_own_projection(
+    tmp_path: Path,
+) -> None:
+    """`ingested_resolution_of` equals what a fold of the appended row returns.
+
+    The `ingest-resolution` verb compares its candidate against the ledger
+    *before* appending, so its projection of an unwritten event must equal what
+    the tick's fold would later read back. The instant carries microseconds
+    precisely so this cannot be assumed: `iso_z` writes `%f` and
+    `fromisoformat` reads it, and this pins that the round trip is lossless.
+
+    Args:
+        tmp_path: Pytest's per-test temporary directory.
+    """
+    event = MarketResolved(
+        component=_COMPONENT,
+        market_ticker="MKT-A",
+        outcome=ResolutionOutcome.NO,
+        resolved_at=_RESOLVED_AT + timedelta(microseconds=123_456),
+        source="kalshi-settlement-notice",
+    )
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    try:
+        store.append(event)
+        folded = ingested_resolutions_from_records(store.read_all())
+    finally:
+        store.close()
+
+    assert folded == (ingested_resolution_of(event),)
+    assert folded[0].resolved_at.microsecond == 123_456
 
 
 def test_resolution_outcomes_projects_the_ticker_keyed_outcome_mapping() -> None:
@@ -532,3 +692,48 @@ def test_projection_returns_no_entry_for_a_market_that_never_resolved() -> None:
     base = datetime(2026, 3, 1, tzinfo=UTC)
 
     assert resolution_sequences_from_instants([(1, base)], {}) == {}
+
+
+# ---------------------------------------------------------------------------
+# `parse_resolution_instant`: the CLI's own boundary, exercised directly.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_resolution_instant_returns_the_aware_instant_it_was_given() -> None:
+    """A well-formed offset-carrying instant parses to that exact moment."""
+    assert parse_resolution_instant("2026-03-01T07:00:00-05:00") == _RESOLVED_AT
+
+
+def test_parse_resolution_instant_refuses_a_non_iso_string() -> None:
+    """A string that is not ISO-8601 is named, with the expected shape shown."""
+    with pytest.raises(ValueError) as exc_info:
+        parse_resolution_instant("last Tuesday")
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == (
+        "resolved_at is not an ISO-8601 instant: 'last Tuesday' "
+        "(expected e.g. 2026-03-01T12:00:00+00:00)"
+    )
+
+
+def test_parse_resolution_instant_refuses_a_parseable_but_naive_instant(
+    local_timezone_utc_minus_5: None,
+) -> None:
+    """An offsetless instant is refused rather than read as the host's zone.
+
+    This is the guard `MarketResolved.__post_init__` also carries, so deleting
+    it left the whole suite green -- defense in depth that nothing exercised.
+    Here it is exercised on its own, with the process timezone pinned five
+    hours off UTC so a host that quietly read the wall clock as local time
+    would produce a different instant instead of an error.
+
+    Args:
+        local_timezone_utc_minus_5: Pins the process timezone west of UTC.
+    """
+    with pytest.raises(ValueError) as exc_info:
+        parse_resolution_instant("2026-03-01T12:00:00")
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value).startswith(
+        "resolved_at must be timezone-aware, got naive 2026-03-01T12:00:00."
+    )

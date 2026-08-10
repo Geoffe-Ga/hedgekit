@@ -495,6 +495,78 @@ already-written file untouched). The stub carries markdown section headers
 -- populating the real bodies from ledgered data is a later documentation
 pass.
 
+### Ingesting a resolved outcome (issue #439)
+
+**Nothing in the running system learns that a market settled on its own.** There
+is no venue settlement feed (issues #450/#451). Until an operator runs the verb
+below, every evaluation metric in the weekly report reads `UNDEFINED` — not
+"not enough data yet", but structurally unreachable — so the paper track record
+can neither pass nor fail a promotion gate. **This is a manual step, and the
+unattended PAPER loop does not become self-evaluating without it.**
+
+```bash
+windbreak ingest-resolution \
+  --ledger-path /path/to/state/ledger.db \
+  --market-ticker KXPRES-26-DJT \
+  --outcome no \
+  --resolved-at 2026-03-01T12:00:00+00:00 \
+  --source "kalshi settlement notice, retrieved 2026-03-01"
+```
+
+Every flag is required; nothing defaults. A defaulted market, outcome, instant
+or provenance would be a fabricated fact in a hash-chained audit trail.
+
+| Flag | Meaning |
+|------|---------|
+| `--ledger-path` | The same ledger the loop runs against. The row is appended to it; the next weekly fold picks it up with no restart and no scheduler change. |
+| `--market-ticker` | The settled market. Must match the ticker on the `ForecastCreated` rows exactly, or the forecasts stay `UNRESOLVED`. |
+| `--outcome` | `yes` or `no`. Nothing else parses. |
+| `--resolved-at` | The instant the market **actually settled**, ISO-8601 **with a UTC offset**. Not the time you are typing this. |
+| `--source` | Free text recording where you read the settlement. Never blank. |
+
+`--resolved-at` is the load-bearing field. It is projected onto the ledger's
+sequence axis to decide which forecasts could already have known the answer, so
+a forecast created after that instant is refused `backdated` and never scored.
+That is what makes ingesting a week late safe. It also means **the instant is
+taken on your word** — nothing cross-checks it against the venue — so an instant
+typed later than the true settlement silently admits forecasts that could have
+peeked. Read it off the settlement notice; do not estimate it.
+
+The verb exits `0` and logs `resolution ingested … sequence=N` on success. It
+exits `1` and writes **nothing** if the instant carries no UTC offset or is not
+ISO-8601, if `--source` or `--market-ticker` is blank, or if this market already
+resolved on this ledger with a different outcome or a different instant.
+
+#### If you mistype a flag
+
+- **You notice before the market has resolved on the ledger**: there is nothing
+  to undo. Nothing was written unless the verb printed `sequence=N`.
+- **You re-run the verb with the same outcome and instant** (e.g. to correct the
+  `--source` wording, or having forgotten you already ran it): this is
+  accepted and harmless. Provenance is an audit label, not a claim about what
+  the market did, so two spellings of it are one resolution. A second row is
+  appended and the fold reads one resolution back, keeping the first row's
+  label.
+- **You re-run with a different `--outcome` or `--resolved-at`**: the verb
+  **refuses** — exit `1`, nothing written — and names both the value the ledger
+  already carries and the one you just typed. Re-run with the values on the
+  ledger. This refusal is deliberate and load-bearing: the ledger is
+  append-only, so a contradicting row could never be un-written, and the weekly
+  fold runs on *every* tick, which would leave the loop reporting
+  `mode=TICK_FAILED` forever with no recovery.
+- **You ingested a wrong outcome and it is the only row for that market**:
+  nothing refuses this, because nothing contradicts it, and **there is no
+  correction path today** — issue #484 tracks the settlement-reversal mechanism.
+  Do not attempt to correct it by ingesting again; that will be refused, and
+  would be terminal if it were not. Until #484 ships, treat the wrong row as
+  permanent and discount that market's contribution to the track record by
+  hand.
+
+To see what a ledger currently believes resolved, read the report the next tick
+writes into `--report-dir`: the `## Cost meter` section's `resolved forecasts`
+count and the `== rejections ==` ledger under `## Evaluation` are both derived
+from these rows.
+
 ### Known limitations (summary)
 
 - The real Risk Kernel currently vetoes every intent, but no longer because of
@@ -524,6 +596,11 @@ pass.
   `--token` CLI flag.
 - Weekly reports are structural stubs (`No data yet.` bodies); the real
   report content is a later pass.
+- Evaluation metrics only move if an operator runs `windbreak
+  ingest-resolution` (see "Ingesting a resolved outcome"). There is no venue
+  settlement feed, so an otherwise-unattended loop still needs this one manual
+  step per settled market, and a wrong outcome ingested that way cannot be
+  corrected yet (issue #484).
 
 ### Declaring correlation buckets (required to size anything)
 

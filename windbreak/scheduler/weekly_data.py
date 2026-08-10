@@ -310,7 +310,14 @@ def weekly_report_body(records: list[LedgerRecord], *, today: date) -> str:
     rejected ``PRE_DEPLOYMENT``. Each rejection lands in the report's
     ``== rejections ==`` ledger. The cost meter's total is the summed research
     spend of every folded forecast, admitted or not -- the money was spent
-    either way.
+    either way. Its ``resolved forecasts`` count is on the same footing: a
+    forecast counts once its *market* resolved, whether or not the temporal
+    gate admitted it for scoring, so in a fold carrying rejections that count
+    is strictly larger than the number of forecasts a metric was computed over.
+    Both denominators are defensible; this one answers "what did research cost
+    per question that got an answer", which is the question the meter is for,
+    and it is asserted at exactly that divergence in
+    ``tests/scheduler/test_weekly_resolution_fold.py``.
 
     Args:
         records: The full ledger read (``SqliteLedgerStore.read_all()``), in

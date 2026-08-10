@@ -11,21 +11,36 @@ unprovable evidence and is refused rather than reinterpreted against whatever
 timezone the operator's shell happens to carry, and a refused ingest must leave
 the ledger byte-for-byte unchanged -- a half-ingested resolution would be worse
 than none, because the report would then quote a number nothing supports.
+
+One refusal has to happen *here* and nowhere else. The ledger is append-only
+and `weekly_report_body` folds it on every tick, so a row contradicting an
+earlier resolution is not a bad record but a permanent stop on the always-on
+loop, which re-ingesting the correct value cannot undo. The verb therefore
+reads the existing resolutions back before it appends anything, through the
+same fold the tick uses, and exits 1 without writing. The mirror of that: a
+call differing only in the free-text `--source` label is *not* a contradiction
+and is accepted, because provenance is not a claim about what the market did.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from windbreak.evaluation.ingest import MARKET_RESOLVED_EVENT_TYPE
+from windbreak.evaluation.ingest import (
+    MARKET_RESOLVED_EVENT_TYPE,
+    MarketResolved,
+    ingested_resolutions_from_records,
+)
+from windbreak.evaluation.resolution import ResolutionOutcome
 from windbreak.ledger.events import ModeHeartbeat
 from windbreak.ledger.store import SqliteLedgerStore
 from windbreak.main import build_parser, main
+from windbreak.scheduler.weekly_data import weekly_report_body
 
 #: A well-formed settlement instant, with an explicit UTC offset.
 _RESOLVED_AT = "2026-03-01T12:00:00+00:00"
@@ -253,3 +268,251 @@ def test_ingest_resolution_appends_to_an_existing_chain_and_keeps_it_valid(
         verifier.verify_chain()
     finally:
         verifier.close()
+
+
+# ---------------------------------------------------------------------------
+# The verb refuses a conflicting append rather than letting the fold refuse it.
+# ---------------------------------------------------------------------------
+
+
+def _fatal_messages(captured: str) -> str:
+    """Decode the `msg` field of every structured log line on stderr.
+
+    Args:
+        captured: The captured stderr text.
+
+    Returns:
+        The decoded messages, newline-joined.
+    """
+    return "\n".join(
+        str(json.loads(line).get("msg", "")) for line in captured.splitlines() if line
+    )
+
+
+def _ingest(
+    ledger_path: Path,
+    *,
+    outcome: str = "no",
+    resolved_at: str = _RESOLVED_AT,
+    source: str = "kalshi-settlement-notice",
+) -> int:
+    """Run one `ingest-resolution` call against `MKT-A`.
+
+    Args:
+        ledger_path: The ledger database the verb appends into.
+        outcome: The `--outcome` token.
+        resolved_at: The `--resolved-at` instant.
+        source: The `--source` provenance label.
+
+    Returns:
+        The verb's exit code.
+    """
+    argv = _ingest_argv(ledger_path, resolved_at=resolved_at)
+    argv[argv.index("--outcome") + 1] = outcome
+    argv[argv.index("--source") + 1] = source
+    return main(argv)
+
+
+def test_a_second_ingest_differing_only_in_source_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """Retyping the free-text provenance label is not a contradiction.
+
+    `source` says where an operator read the settlement, never what the market
+    did, so the two spellings below make one claim. Both rows land -- the
+    ledger is append-only and records what was actually run -- and the fold
+    reads one resolution back off them.
+
+    Args:
+        tmp_path: Pytest's per-test temporary directory.
+    """
+    ledger_path = tmp_path / "ledger.db"
+
+    first = _ingest(ledger_path, source="kalshi settlement notice")
+    second = _ingest(ledger_path, source="kalshi-settlement-notice")
+
+    assert (first, second) == (0, 0)
+    assert len(_ledger_rows(ledger_path)) == 2
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        resolutions = ingested_resolutions_from_records(store.read_all())
+    finally:
+        store.close()
+    assert len(resolutions) == 1
+    assert resolutions[0].source == "kalshi settlement notice"
+
+
+def test_a_contradicting_ingest_exits_one_and_appends_nothing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A second call claiming a different outcome is refused before it writes.
+
+    This is the whole point of checking at the verb. The ledger is append-only
+    and `weekly_report_body` folds it on every tick, so letting this row land
+    would stop the loop permanently -- and re-ingesting the correct value could
+    not undo it.
+
+    Args:
+        tmp_path: Pytest's per-test temporary directory.
+        capsys: Captures the structured `FATAL` diagnostic.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    assert _ingest(ledger_path, outcome="no") == 0
+    capsys.readouterr()
+
+    exit_code = _ingest(ledger_path, outcome="yes")
+
+    assert exit_code == 1
+    assert len(_ledger_rows(ledger_path)) == 1
+    assert json.loads(_ledger_rows(ledger_path)[0][1])["data"]["outcome"] == "no"
+    assert _fatal_messages(capsys.readouterr().err) == (
+        "FATAL: refusing to ingest market_ticker='MKT-A': it already resolved "
+        "on this ledger with outcome='no' "
+        "resolved_at=2026-03-01T12:00:00.000000Z, and this call claims "
+        "outcome='yes' resolved_at=2026-03-01T12:00:00.000000Z. The ledger is "
+        "append-only, so a contradicting row could never be un-written and "
+        "every later weekly fold -- one per tick -- would refuse to read it. "
+        "Nothing was written. Re-run with the values the ledger already "
+        "carries; correcting a genuinely wrong recorded outcome needs the "
+        "settlement-reversal path, which does not exist yet (issue #484) and "
+        "cannot be improvised by ingesting again."
+    )
+
+
+def test_an_ingest_at_a_different_instant_is_refused(tmp_path: Path) -> None:
+    """A second call moving the settlement instant is refused, exactly.
+
+    The instant decides which forecasts could have peeked, so a different one
+    is a different claim -- compared at full microsecond precision.
+
+    Args:
+        tmp_path: Pytest's per-test temporary directory.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    assert _ingest(ledger_path, resolved_at="2026-03-01T12:00:00+00:00") == 0
+
+    exit_code = _ingest(ledger_path, resolved_at="2026-03-01T12:00:00.000001+00:00")
+
+    assert exit_code == 1
+    assert len(_ledger_rows(ledger_path)) == 1
+
+
+def test_an_ingest_restating_the_same_instant_at_another_offset_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """`07:00-05:00` and `12:00+00:00` are one instant, so this is idempotent.
+
+    Args:
+        tmp_path: Pytest's per-test temporary directory.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    assert _ingest(ledger_path, resolved_at="2026-03-01T12:00:00+00:00") == 0
+
+    exit_code = _ingest(ledger_path, resolved_at="2026-03-01T07:00:00-05:00")
+
+    assert exit_code == 0
+    assert len(_ledger_rows(ledger_path)) == 2
+
+
+def test_an_ingest_into_an_already_contradictory_ledger_is_refused(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A ledger this verb did not write is not made worse by appending to it.
+
+    Two conflicting rows can only reach a ledger by some path other than this
+    verb, and once there the weekly fold cannot read it at all. Appending a
+    third row would not help, so the verb refuses and quotes the fold's own
+    diagnosis.
+
+    Args:
+        tmp_path: Pytest's per-test temporary directory.
+        capsys: Captures the structured `FATAL` diagnostic.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        for outcome in (ResolutionOutcome.NO, ResolutionOutcome.YES):
+            store.append(
+                MarketResolved(
+                    component="operator",
+                    market_ticker="MKT-A",
+                    outcome=outcome,
+                    resolved_at=datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC),
+                    source="hand-written",
+                )
+            )
+    finally:
+        store.close()
+    capsys.readouterr()
+
+    exit_code = _ingest(ledger_path, outcome="no")
+
+    assert exit_code == 1
+    assert len(_ledger_rows(ledger_path)) == 2
+    messages = _fatal_messages(capsys.readouterr().err)
+    assert messages.startswith(
+        "FATAL: refusing to ingest market_ticker='MKT-A': this ledger's "
+        "existing MarketResolved rows cannot be folded -- MarketResolved at "
+        "sequence_number=2 contradicts an earlier resolution of "
+        "market_ticker='MKT-A':"
+    )
+    assert messages.endswith("Nothing was written.")
+
+
+def test_a_refused_ingest_leaves_the_weekly_fold_working(tmp_path: Path) -> None:
+    """The loop keeps beating: the fold still renders after a refused call.
+
+    The end-to-end shape of the bug this closes. Two `ingest-resolution` calls
+    that differ only in a mistyped field used to both exit 0 and leave every
+    subsequent `weekly_report_body` -- and therefore every tick -- raising
+    forever. Now the second call is refused and the fold still returns a body.
+
+    Args:
+        tmp_path: Pytest's per-test temporary directory.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    assert _ingest(ledger_path, outcome="no") == 0
+
+    assert _ingest(ledger_path, outcome="yes") == 1
+
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        body = weekly_report_body(store.read_all(), today=date(2026, 3, 8))
+    finally:
+        store.close()
+    assert "## Cost meter" in body
+
+
+def test_a_different_market_is_unaffected_by_an_existing_resolution(
+    tmp_path: Path,
+) -> None:
+    """The conflict check is per-market, not per-ledger.
+
+    A ledger accumulates one resolution per settled market, so a check that
+    compared against whichever resolution it found first would refuse every
+    market after the first one -- and the operator would be locked out of
+    ingesting at exactly the point the harness started having enough data to
+    say anything.
+
+    Args:
+        tmp_path: Pytest's per-test temporary directory.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    assert _ingest(ledger_path, outcome="no") == 0
+    argv = _ingest_argv(ledger_path)
+    argv[argv.index("--market-ticker") + 1] = "MKT-B"
+    argv[argv.index("--outcome") + 1] = "yes"
+
+    exit_code = main(argv)
+
+    assert exit_code == 0
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        resolutions = ingested_resolutions_from_records(store.read_all())
+    finally:
+        store.close()
+    assert [
+        (resolution.market_ticker, resolution.outcome) for resolution in resolutions
+    ] == [("MKT-A", ResolutionOutcome.NO), ("MKT-B", ResolutionOutcome.YES)]

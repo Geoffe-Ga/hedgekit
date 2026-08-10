@@ -381,6 +381,18 @@ def test_a_forecast_predating_its_resolution_is_scored_and_one_postdating_it_is_
     both_scored_ppm = ((_PROBABILITY_PPM**2) + (900_000**2)) // 2_000_000
     assert both_scored_ppm != _BRIER_OF_ONE_NO_MARKET_PPM
     assert str(both_scored_ppm) not in _metric_line(body, "brier")
+    # The cost meter's denominator is the LOOSE count -- forecasts whose market
+    # resolved -- not the count actually scored. Here the two differ: both
+    # markets settled, so both forecasts are "resolved", while only `fc-early`
+    # survived the temporal gate. Every other fold in this suite rejects
+    # nothing, which makes the two counts coincide and the assertion vacuous;
+    # this is the one place tightening the denominator to the scored count (1,
+    # $2.000000) or loosening it further can fail something.
+    assert _cost_meter_line(body, "resolved forecasts") == "resolved forecasts: 2"
+    assert len(_rejection_lines(body)) == 1
+    assert _cost_meter_line(body, "cost per resolved forecast") == (
+        "cost per resolved forecast: $1.000000"
+    )
 
 
 def test_a_resolution_after_every_ledger_row_refuses_nothing(tmp_path: Path) -> None:

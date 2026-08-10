@@ -40,6 +40,44 @@ a missing payload key, a blank provenance label, and a second *contradicting*
 resolution for one market all raise :class:`ValueError` naming the offending
 field, rather than defaulting to something that reads healthy.
 
+WHAT COUNTS AS A CONTRADICTION
+
+Only the *evidentiary* fields do: ``market_ticker``, ``outcome`` and
+``resolved_at`` (see :func:`resolutions_conflict`). Those three are what the
+harness adjudicates against -- the outcome is the ground truth a forecast is
+scored on, and the instant is the coordinate
+:func:`windbreak.evaluation.temporal.resolution_sequences_from_instants`
+projects onto the sequence axis to decide which forecasts could have peeked.
+``source`` is deliberately excluded: it is a free-text audit label naming where
+an operator read the settlement, so ``"kalshi settlement notice"`` and
+``"kalshi-settlement-notice"`` are two spellings of one provenance, never two
+claims about what the market did. Comparing whole frozen records -- which is
+what this module shipped first -- reported that retyping to a differing label
+as a contradiction *about the settled outcome*, which was both false and, at the
+fold, unrecoverable. Both rows stay on the append-only ledger and stay
+auditable; the fold's projection carries the first row's label.
+
+``resolved_at`` is compared at full microsecond precision, offset-normalized
+(so ``12:00:00+00:00`` and ``07:00:00-05:00`` are the same instant, as
+:class:`~datetime.datetime` equality already has it). It is not rounded to the
+second, because two instants inside one second can project onto *different*
+ledger positions and therefore admit or refuse different forecasts: rounding
+would silently merge two claims that gate differently. Exactness costs a
+mistyping operator one retyped command, because the ``ingest-resolution`` verb
+refuses a conflicting call *before* it writes anything (issue #439 review) --
+it never costs them a stalled loop.
+
+THE CHECK BELONGS AT THE VERB, NOT ONLY AT THE FOLD
+
+The ledger is append-only: a contradicting row can never be un-written, and
+this fold runs inside ``weekly_report_body`` on every tick. A raise here is
+therefore *terminal* -- which is why
+:func:`windbreak.main._run_ingest_resolution` reads the existing resolutions
+back through this very function and refuses a conflicting append at ingest
+time, exit 1 and nothing written. The guard below remains as the last line of
+defense for a ledger this verb did not write, and its message no longer offers
+a remedy that does not exist.
+
 The typed event derives its base :class:`~windbreak.ledger.events.Event` fields
 through a LOCAL ``_derive_typed_event`` -- the house pattern from
 :mod:`windbreak.evaluation.preregistration`,
@@ -184,6 +222,85 @@ class IngestedResolution:
     outcome: ResolutionOutcome
     resolved_at: datetime
     source: str
+
+
+def _evidentiary_claim(
+    resolution: IngestedResolution,
+) -> tuple[str, ResolutionOutcome, datetime]:
+    """Project a resolution onto the fields that make it evidence.
+
+    Args:
+        resolution: The resolution to project.
+
+    Returns:
+        Its ``(market_ticker, outcome, resolved_at)`` triple. ``source`` is
+        excluded by construction: see this module's docstring for why a
+        differing provenance label is not a contradiction.
+    """
+    return (resolution.market_ticker, resolution.outcome, resolution.resolved_at)
+
+
+def resolutions_conflict(
+    existing: IngestedResolution, candidate: IngestedResolution
+) -> bool:
+    """Report whether two resolutions make incompatible claims.
+
+    The single authority on what "contradicting" means, shared by the ledger
+    fold and by the ``ingest-resolution`` verb's pre-append check, so the verb
+    refuses exactly the appends the fold would later refuse to read.
+
+    Args:
+        existing: The resolution already on the ledger.
+        candidate: The resolution being compared against it.
+
+    Returns:
+        ``True`` when the two disagree on ticker, outcome or settlement
+        instant; ``False`` when they agree on all three, whatever their
+        ``source`` labels say.
+    """
+    return _evidentiary_claim(existing) != _evidentiary_claim(candidate)
+
+
+def describe_resolution_claim(resolution: IngestedResolution) -> str:
+    """Render a resolution's evidentiary claim for an operator-facing message.
+
+    Args:
+        resolution: The resolution to describe.
+
+    Returns:
+        A ``outcome=... resolved_at=...`` fragment carrying exact values, so a
+        refusal shows the operator what differs rather than only that
+        something did.
+    """
+    return (
+        f"{_OUTCOME_KEY}={resolution.outcome.value!r} "
+        f"{_RESOLVED_AT_KEY}={iso_z(resolution.resolved_at)}"
+    )
+
+
+def ingested_resolution_of(event: MarketResolved) -> IngestedResolution:
+    """Project a not-yet-appended event into the resolution the fold will read.
+
+    Lets the ``ingest-resolution`` verb compare what it is about to write
+    against what is already on the ledger using the same type, and therefore
+    the same equality, the tick's fold uses. The projection is exact rather
+    than approximate: :func:`windbreak.timekeeping.iso_z` renders microseconds
+    and :meth:`datetime.datetime.fromisoformat` reads them back, so the round
+    trip through the ledger returns an equal instant --
+    ``test_a_round_tripped_event_folds_back_to_its_own_projection`` pins that.
+
+    Args:
+        event: The ``MarketResolved`` event about to be appended.
+
+    Returns:
+        The :class:`IngestedResolution` a fold of the appended row would yield.
+    """
+    return IngestedResolution(
+        market_ticker=event.market_ticker,
+        outcome=event.outcome,
+        resolved_at=event.resolved_at,
+        source=event.source,
+    )
 
 
 def _parsed_instant(text: str) -> datetime | None:
@@ -332,23 +449,24 @@ def ingested_resolutions_from_records(
 
     Rows of any other event type are ignored. A market may be ingested more
     than once -- an operator re-running the verb, or a replayed script -- and a
-    byte-identical re-ingest is idempotent. A *contradicting* re-ingest is not:
-    letting the later row win would let a mistyped outcome overwrite a correct
-    one with no trace in the report, so it raises instead. Correcting a settled
-    market is what the settlement-reversal vocabulary in
-    :mod:`windbreak.evaluation.resolution` is for.
+    re-ingest making the same evidentiary claim is idempotent, including one
+    that spells its ``source`` label differently (see this module's docstring on
+    what counts as a contradiction). A re-ingest claiming a *different* outcome
+    or settlement instant is not: letting the later row win would let a mistyped
+    outcome overwrite a correct one with no trace in the report, so it raises
+    instead.
 
     Args:
         records: The ledger rows to fold, in append order.
 
     Returns:
         One :class:`IngestedResolution` per distinct market, in the order each
-        market was first ingested.
+        market was first ingested, carrying that first row's ``source``.
 
     Raises:
         ValueError: If a ``MarketResolved`` row is malformed (see
-            :func:`_resolution_from_record`), or if two rows carry different
-            resolutions for one market.
+            :func:`_resolution_from_record`), or if two rows make different
+            evidentiary claims about one market.
     """
     resolutions: dict[str, IngestedResolution] = {}
     for record in records:
@@ -358,13 +476,18 @@ def ingested_resolutions_from_records(
         existing = resolutions.get(resolution.market_ticker)
         if existing is None:
             resolutions[resolution.market_ticker] = resolution
-        elif existing != resolution:
+        elif resolutions_conflict(existing, resolution):
             raise ValueError(
                 f"MarketResolved at sequence_number={record.sequence_number} "
                 "contradicts an earlier resolution of "
-                f"{_MARKET_TICKER_KEY}={resolution.market_ticker!r}; a settled "
-                "market is corrected through a settlement reversal, never by a "
-                "second conflicting ingest"
+                f"{_MARKET_TICKER_KEY}={resolution.market_ticker!r}: the ledger "
+                f"already carries {describe_resolution_claim(existing)}, this "
+                f"row carries {describe_resolution_claim(resolution)}. "
+                "`windbreak ingest-resolution` refuses a conflicting append "
+                "before writing anything, so a ledger carrying both rows was "
+                "not written by it; the ledger is append-only and neither row "
+                "can be un-written. See docs/RUNBOOK.md, 'Ingesting a resolved "
+                "outcome'."
             )
     return tuple(resolutions.values())
 
