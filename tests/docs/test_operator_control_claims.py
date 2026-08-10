@@ -24,6 +24,13 @@ Control 1 -- the dashboard's HTTP surface.
     wiring ``ack_granter`` later turns the ``POST /ack`` row RED on the day
     it is wired, and a new view cannot ship undocumented.
 
+    That table is also the *only* place any document may name a route: every
+    root and ``docs/`` markdown file is scanned for route names in code
+    spans, ``docs/RUNBOOK.md`` itself included, exempting only the
+    marker-delimited table region. Exempting the whole runbook -- the file
+    the defect actually lived in -- would have left its likeliest recurrence
+    site uncovered.
+
 Control 2 -- ``SECURITY.md``'s preflight invocation.
     ``windbreak preflight --fixture-dir drills/fixtures --json`` names a
     directory that has never existed in this repo, and ``--fixture-dir`` is
@@ -183,6 +190,37 @@ def _unfence(cell: str) -> str:
     return cell.strip().strip("`").strip()
 
 
+def split_route_table_region(doc_text: str) -> tuple[str, str]:
+    """Split `doc_text` into its pinned route-table region and everything else.
+
+    The marker-delimited region is the one span of the runbook whose route
+    claims a mechanism reads: every row in it is replayed against the running
+    server. Everything outside it is prose, so the two halves are handled
+    differently -- the table is parsed, the prose is scanned for route names
+    it must not restate.
+
+    Args:
+        doc_text: The full markdown document to split.
+
+    Returns:
+        The ``(table_region, surrounding_prose)`` pair. The table region
+        starts at the begin marker and stops at the end marker; the prose is
+        the document with that region (and the end marker) removed.
+
+    Raises:
+        AssertionError: If either marker is missing or they are misordered --
+            which would otherwise silently reduce both halves of this guard
+            to checking nothing.
+    """
+    begin = doc_text.find(_ROUTES_BEGIN_MARKER)
+    end = doc_text.find(_ROUTES_END_MARKER)
+    assert begin != -1, f"{_ROUTES_BEGIN_MARKER} marker is missing"
+    assert end > begin, f"{_ROUTES_END_MARKER} marker is missing or misordered"
+
+    prose = doc_text[:begin] + doc_text[end + len(_ROUTES_END_MARKER) :]
+    return doc_text[begin:end], prose
+
+
 def parse_route_table(doc_text: str) -> tuple[DocumentedRoute, ...]:
     """Return every route row inside `doc_text`'s pinned route-table markers.
 
@@ -202,13 +240,10 @@ def parse_route_table(doc_text: str) -> tuple[DocumentedRoute, ...]:
             is not an integer -- both of which would otherwise silently
             reduce this guard to checking nothing.
     """
-    begin = doc_text.find(_ROUTES_BEGIN_MARKER)
-    end = doc_text.find(_ROUTES_END_MARKER)
-    assert begin != -1, f"{_ROUTES_BEGIN_MARKER} marker is missing"
-    assert end > begin, f"{_ROUTES_END_MARKER} marker is missing or misordered"
+    table_region, _prose = split_route_table_region(doc_text)
 
     routes: list[DocumentedRoute] = []
-    for line in doc_text[begin:end].splitlines():
+    for line in table_region.splitlines():
         stripped = line.strip()
         if not stripped.startswith("|"):
             continue
@@ -359,6 +394,22 @@ def test_parse_route_table_requires_the_begin_marker() -> None:
         parse_route_table("| `GET` | `/` | `200` |\n")
 
 
+def test_split_route_table_region_separates_the_table_from_its_prose() -> None:
+    """Route names inside the markers stay in; prose around them stays out."""
+    doc_text = (
+        "The `POST /ack` route grants it.\n\n"
+        f"{_ROUTES_BEGIN_MARKER} -->\n\n"
+        "| `POST` | `/ack` | `404` |\n\n"
+        f"{_ROUTES_END_MARKER}\n\n"
+        "And `GET /acks` renders them.\n"
+    )
+
+    table_region, prose = split_route_table_region(doc_text)
+
+    assert route_code_spans(table_region) == ("/ack",)
+    assert route_code_spans(prose) == ("POST /ack", "GET /acks")
+
+
 @pytest.mark.parametrize("route", _documented_routes(), ids=_route_id)
 def test_documented_dashboard_route_answers_its_documented_status(
     route: DocumentedRoute, cli_dashboard_address: tuple[str, int]
@@ -429,20 +480,60 @@ def test_route_code_spans_ignores_a_prose_slash_word() -> None:
     assert route_code_spans("the `research/execution` firewall") == ()
 
 
-def test_every_dashboard_route_reference_lives_in_the_pinned_document() -> None:
-    """Only the document carrying the pinned table names dashboard routes.
+def _unverified_text(doc: Path, root: Path) -> str:
+    """Return the part of `doc` whose route claims no mechanism replays.
 
-    Exactly one document describes the dashboard's HTTP surface; every other
-    links to it. Without this rule a second document can restate a route's
+    For every document but the one carrying the pinned table that is the
+    whole file. For the runbook it is everything outside the markers: the
+    table's own rows are replayed against the running server row by row, so
+    they are the one place a route may be named, and the prose around them --
+    including the paragraphs above the table, where issue #449's defect
+    actually lived -- is scanned like any other document.
+
+    Args:
+        doc: The document being scanned.
+        root: The repo root, used to recognize the pinned document.
+
+    Returns:
+        The document text whose route references must be delegated away.
+    """
+    doc_text = doc.read_text(encoding="utf-8")
+    if doc != root / DASHBOARD_ROUTES_DOC:
+        return doc_text
+    _table_region, prose = split_route_table_region(doc_text)
+    return prose
+
+
+def test_the_pinned_table_names_every_route_it_exempts() -> None:
+    """The exempted region is where the route names actually are.
+
+    Non-vacuity for the stray scan below: that scan asserts an empty result,
+    so a `route_code_spans` that matched nothing anywhere -- a renamed
+    routing constant, a broken word-boundary -- would leave it green while
+    checking nothing. Requiring the exempted region to name every served
+    route makes the same failure RED here first.
+    """
+    table_region, _prose = split_route_table_region(_read_doc(DASHBOARD_ROUTES_DOC))
+
+    assert set(route_code_spans(table_region)) == _served_paths() - {_ROOT_PATH}
+
+
+def test_every_dashboard_route_reference_lives_in_the_pinned_table() -> None:
+    """Only the pinned route table names dashboard routes -- in any document.
+
+    Exactly one *region* of one document describes the dashboard's HTTP
+    surface; every other document, and the runbook's own surrounding prose,
+    links to it. Without this rule a second sentence can restate a route's
     behaviour in prose no mechanism reads -- which is precisely how "the
-    existing ``POST /ack``" survived in README.md while the route 404ed.
+    existing ``POST /ack``" survived in README.md while the route 404ed, and
+    how ``POST /ack`` "grants the same acknowledgement" survived three
+    paragraphs above the table that contradicts it.
     """
     root = _repo_root()
     strays = [
         f"{doc.relative_to(root)}: `{span}`"
         for doc in _doc_corpus()
-        if doc != root / DASHBOARD_ROUTES_DOC
-        for span in route_code_spans(doc.read_text(encoding="utf-8"))
+        for span in route_code_spans(_unverified_text(doc, root))
     ]
 
     assert strays == []
@@ -743,6 +834,19 @@ def test_input_path_claims_finds_a_relative_fixture_dir() -> None:
     assert input_path_claims(doc_text) == (("--fixture-dir", "drills/fixtures"),)
 
 
+def test_input_path_claims_reads_a_module_entrypoint_invocation() -> None:
+    """``python -m windbreak ...`` is scanned like the console script is.
+
+    This is the exact form issue #449 used to reproduce its defect, so a
+    documented path behind it must be checked, not skipped.
+    """
+    doc_text = (
+        "```bash\npython -m windbreak preflight --fixture-dir drills/fixtures\n```"
+    )
+
+    assert input_path_claims(doc_text) == (("--fixture-dir", "drills/fixtures"),)
+
+
 def test_input_path_claims_reads_an_equals_joined_value() -> None:
     """``--fixture-dir=<value>`` is read the same as a space-separated value."""
     doc_text = "```bash\nwindbreak preflight --fixture-dir=drills/fixtures\n```"
@@ -804,6 +908,35 @@ PREFLIGHT_DOC = "SECURITY.md"
 #: The documented exit code, written in SECURITY.md prose as ``exits `N` ``.
 _DOCUMENTED_EXIT_CODE_PATTERN = re.compile(r"exits `(\d+)`")
 
+#: The heading opening the section that documents the preflight command. The
+#: exit-code claim is read from inside this section only: SECURITY.md
+#: documents several other commands, and an ``exits `N` `` sentence added to
+#: any of them would otherwise silently repoint the assertion below at prose
+#: about a different command.
+_PREFLIGHT_SECTION_HEADING = "## Preflight: production-readiness checks"
+
+
+def _preflight_section(doc_text: str) -> str:
+    """Return the text of `doc_text`'s preflight section.
+
+    Args:
+        doc_text: The full SECURITY.md text.
+
+    Returns:
+        The section text, from its heading to the next ``##`` heading (or the
+        end of the document).
+
+    Raises:
+        AssertionError: If the section heading is absent, which would leave
+            the scope of the exit-code claim below undefined.
+    """
+    start = doc_text.find(_PREFLIGHT_SECTION_HEADING)
+    assert start != -1, (
+        f"{PREFLIGHT_DOC} must carry a {_PREFLIGHT_SECTION_HEADING!r} section"
+    )
+    end = doc_text.find("\n## ", start + len(_PREFLIGHT_SECTION_HEADING))
+    return doc_text[start:] if end == -1 else doc_text[start:end]
+
 
 def _documented_preflight_invocation() -> tuple[str, ...]:
     """Return SECURITY.md's single documented ``windbreak preflight`` command.
@@ -832,20 +965,73 @@ def _documented_preflight_invocation() -> tuple[str, ...]:
     return invocations[0]
 
 
-def _documented_preflight_exit_code() -> int:
-    """Return the exit code SECURITY.md documents for its preflight command.
+def documented_preflight_exit_code(doc_text: str) -> int:
+    """Return the exit code `doc_text`'s preflight section claims.
+
+    Scoped to the preflight section rather than the whole document: taking
+    the first ``exits `N` `` anywhere in SECURITY.md would let an unrelated
+    sentence added above it repoint this assertion at a different command's
+    prose, and the suite would go on passing against the wrong claim.
+
+    Args:
+        doc_text: The full SECURITY.md text.
 
     Returns:
-        The integer inside SECURITY.md's ``exits `N` `` claim.
+        The integer inside the section's ``exits `N` `` claim.
 
     Raises:
-        AssertionError: If SECURITY.md states no such exit code.
+        AssertionError: If the section states zero or several such exit
+            codes -- either leaves "the documented exit code" ambiguous.
     """
-    match = _DOCUMENTED_EXIT_CODE_PATTERN.search(_read_doc(PREFLIGHT_DOC))
-    assert match is not None, (
-        f"{PREFLIGHT_DOC} must state the preflight command's exit code as ``exits `N```"
+    claims = _DOCUMENTED_EXIT_CODE_PATTERN.findall(_preflight_section(doc_text))
+    assert len(claims) == 1, (
+        f"{PREFLIGHT_DOC}'s preflight section must state the command's exit "
+        f"code exactly once as ``exits `N```; found {len(claims)}"
     )
-    return int(match.group(1))
+    return int(claims[0])
+
+
+def test_documented_preflight_exit_code_ignores_another_section_claim() -> None:
+    """An ``exits `N` `` sentence above the preflight section is not read.
+
+    The regression this pins: an unrelated claim added earlier in SECURITY.md
+    used to become "the documented exit code" simply by being first.
+    """
+    doc_text = (
+        "## Credential boundaries\n\n"
+        "A key with withdrawal scope exits `9` at startup.\n\n"
+        f"{_PREFLIGHT_SECTION_HEADING} (SPEC §15)\n\n"
+        "Against the shipped fixtures this command exits `1`.\n"
+    )
+
+    assert documented_preflight_exit_code(doc_text) == 1
+
+
+def test_documented_preflight_exit_code_stops_at_the_next_section() -> None:
+    """A claim in the section *after* preflight is out of scope too."""
+    doc_text = (
+        f"{_PREFLIGHT_SECTION_HEADING}\n\nThis command exits `1`.\n\n"
+        "## Outbound network egress allowlist\n\n"
+        "A blocked host exits `7`.\n"
+    )
+
+    assert documented_preflight_exit_code(doc_text) == 1
+
+
+def test_documented_preflight_exit_code_rejects_two_claims_in_section() -> None:
+    """Two exit-code claims in the section are ambiguous, so they fail."""
+    doc_text = (
+        f"{_PREFLIGHT_SECTION_HEADING}\n\nIt exits `1` here and exits `0` there.\n"
+    )
+
+    with pytest.raises(AssertionError, match="exactly once"):
+        documented_preflight_exit_code(doc_text)
+
+
+def test_documented_preflight_exit_code_requires_the_section() -> None:
+    """A document with no preflight section fails rather than scanning it all."""
+    with pytest.raises(AssertionError, match="section"):
+        documented_preflight_exit_code("This command exits `1`.\n")
 
 
 def test_security_md_preflight_command_parses_on_the_real_cli() -> None:
@@ -890,4 +1076,4 @@ def test_security_md_preflight_command_is_runnable_as_written(
 
     exit_code = main(list(tokens[1:]))
 
-    assert exit_code == _documented_preflight_exit_code()
+    assert exit_code == documented_preflight_exit_code(_read_doc(PREFLIGHT_DOC))

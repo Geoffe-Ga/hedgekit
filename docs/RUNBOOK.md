@@ -228,9 +228,9 @@ so an operator can tell "the venue is shut" from "we have no reading".
 So a real PAPER tick ledgers a full decision trail (snapshot, forecast,
 selector decision, verification outcome, and an `IntentVetoed`) but routes
 nothing and fills nothing; `filled_centis` on every tick's outcome is `0`.
-Don't be surprised to see nothing but vetoes in `/decisions` or
-`selector_decisions.json` -- that is the expected, honestly-ledgered state of
-the loop today.
+Don't be surprised to see nothing but vetoes in the dashboard's decisions view
+or `selector_decisions.json` -- that is the expected, honestly-ledgered state
+of the loop today.
 
 **Operationally important -- a verification breach HALTs the kernel.** The
 baseline the cycle reconciles against is frozen at process start from the
@@ -277,9 +277,9 @@ writes `<dir>/acks/<approval_id>`, which the kernel's ack-file watcher grants on
 its next beat and then removes. The `--approval-id` must be exactly 32 lowercase
 hex characters (the shape the kernel mints); any other token is rejected as a
 usage error before a file is written. This CLI verb is the **only** way to
-grant an acknowledgement today: the dashboard's `POST /ack` route is an
-unwired seam that answers `404` under `windbreak run --process dashboard` (see
-the route table [below](#observing-via-the-dashboard)). As with the kill
+grant an acknowledgement today: the dashboard's ack route is an unwired seam
+under `windbreak run --process dashboard`, as the route table
+[below](#observing-via-the-dashboard) records row by row. As with the kill
 switch, the live loop that polls the ack drop-box is not wired yet — this verb
 writes the durable grant signal a future live loop consumes.
 
@@ -301,6 +301,14 @@ server by `tests/docs/test_operator_control_claims.py`, which also fails if the
 server grows a route this table omits, so a row here can never quietly become
 a claim about a control that is not wired (issue #449).
 
+The table below is also the **only** place in this repository's documentation
+that may name a route path in a code span. The same suite scans every root and
+`docs/` markdown file — this runbook's own prose included, since that is where
+issue #449's defect actually lived — and fails on a route name found anywhere
+outside these markers. So prose names the view ("the decisions view", "the
+provider panel") and the replayed table names the route; a second, unverified
+sentence about what a route answers cannot exist.
+
 <!-- dashboard-routes:begin -->
 
 | Method | Path | Status | Renders |
@@ -317,16 +325,16 @@ a claim about a control that is not wired (issue #449).
 
 <!-- dashboard-routes:end -->
 
-**The dashboard is read-only as shipped.** `POST /ack` is the handler's only
-write route and it is an unwired seam: `windbreak run --process dashboard`
-builds the server with no `ack_granter`, so the route answers `404` and no
-acknowledgement can be granted over HTTP. `GET /acks` does answer `200`, but
-with no `pending_acks_source` wired it renders its empty placeholder rather
-than real pending acknowledgements — an empty page there means "nothing is
-wired", never "nothing is pending".
+**The dashboard is read-only as shipped.** The handler's only write route is
+the ack route in the table above, and it is an unwired seam:
+`windbreak run --process dashboard` builds the server with no `ack_granter`,
+so no acknowledgement can be granted over HTTP. The pending-acknowledgements
+view does answer, but with no `pending_acks_source` wired it renders its empty
+placeholder rather than real pending acknowledgements — an empty page there
+means "nothing is wired", never "nothing is pending".
 
 A library caller that passes both seams to `create_server` gets the full
-behaviour the handler already implements: `POST /ack` shares the same bearer
+behaviour the handler already implements: the ack route shares the same bearer
 gate as every read route (an unauthenticated post gets a `401` and never
 reaches the granter) and rejects a malformed, oversized, or non-32-hex body
 with a `400` before invoking the granter. Wiring those seams changes the table
@@ -366,7 +374,7 @@ server = create_server(
 server.serve_forever()
 ```
 
-Until the loop has ledgered data, `/positions`, `/equity`, and `/decisions`
+Until the loop has ledgered data, the positions, equity, and decisions views
 each render a plain "No data yet." placeholder rather than an empty table or
 an error -- this is the documented behavior, not a bug. Passing no
 `read_models_source` at all (the default) renders that same placeholder on
@@ -402,7 +410,7 @@ This writes (or overwrites) eleven files into `--output-dir`:
 - `forecasts.json` -- every `ForecastCreated` row, in ledger order (issue
   #195), feeding the fleet cost-per-forecast/abstention fold.
 - `provider_vote_costs.json` -- the per-provider vote-cost aggregate folded
-  from `ProviderVoteRecorded` events (issue #281), feeding the `/providers`
+  from `ProviderVoteRecorded` events (issue #281), feeding the provider
   panel's real per-provider `cost_per_forecast` and `abstain_rate`.
 
 `rebuild` verifies the ledger's hash chain before projecting; a corrupted
@@ -686,7 +694,7 @@ the moment any provider drifts:
    cat var/read-models/canary_status.json    # latest verdict per provider
    ```
 
-   or the live dashboard's `/providers` route, started with
+   or the live dashboard's provider panel, started with
    `windbreak run --process dashboard --ledger-path var/ledger.db` and
    bearer-gated via `WINDBREAK_DASHBOARD_TOKEN` (see
    [Observing via the dashboard](#observing-via-the-dashboard) above), which
@@ -928,7 +936,7 @@ research, which is fail-closed but easy to mistake for a hung loop.
    ```
 
    then check `var/read-models/canary_status.json` for the new `"provider"`
-   entry, or hit the dashboard's `/providers` route, or check the weekly
+   entry, or hit the dashboard's provider panel, or check the weekly
    report's `## Providers` section (`windbreak.reports.providers`'s
    `provider=<p> resolved=<n> ...` line) once that section is wired to real
    data (see the known limitation below).
@@ -942,9 +950,9 @@ research, which is fail-closed but easy to mistake for a hung loop.
 `canary_status.json` fold (`canary_status_read_model`) is append-only and
 keeps the LATEST verdict per provider ever ledgered; there is no tombstone or
 removal event. A retired provider's last verdict therefore stays visible in
-`canary_status.json` and on the `/providers` dashboard panel indefinitely --
+`canary_status.json` and on the dashboard's provider panel indefinitely --
 "confirm it is gone" is not literally achievable with today's tooling.
-Instead, treat a `canary_status.json` / `GET /providers` entry whose
+Instead, treat a `canary_status.json` or provider-panel entry whose
 `created_at` predates the retirement date as the retirement signal, until a
 future retirement/tombstone mechanism ships. Similarly, the weekly report's
 `## Providers` section (`windbreak.reports.providers.render_provider_lines`)
