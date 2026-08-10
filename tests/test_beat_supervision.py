@@ -61,6 +61,7 @@ from windbreak.main import (
     BeatSupervisor,
     LedgerAlertWriter,
     LedgerModeWriter,
+    _beat_alert_root,
     _build_beat_supervisor,
     _build_dashboard_status_source,
     _build_paper_on_beat,
@@ -117,6 +118,35 @@ def _supervisor() -> tuple[BeatSupervisor, _RecordingSink]:
         ),
         sink,
     )
+
+
+def _composed_supervisor(args: argparse.Namespace) -> BeatSupervisor:
+    """Compose the supervisor the CLI builds, over the run's real alert root.
+
+    Since issue #444 the alert root is composed once per run and shared with
+    the PAPER tick's verification cycle, so `_build_beat_supervisor` is handed
+    a dispatcher rather than composing its own. Going through
+    `_beat_alert_root` here keeps these tests exercising the real
+    `config.alerts` -> `build_sinks` path they were written to pin.
+
+    Args:
+        args: The parsed `run` namespace carrying `ledger_path` and `process`.
+
+    Returns:
+        The supervisor `run_loop` would be handed.
+    """
+    return _build_beat_supervisor(
+        args, dispatcher=_beat_alert_root(args, WindbreakConfig())()
+    )
+
+
+def _log_only_dispatcher() -> AlertDispatcher:
+    """Build the sink-less dispatcher a no-sink deployment composes.
+
+    Returns:
+        A dispatcher whose `log-only` fallback carries every alert.
+    """
+    return AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter())
 
 
 def _heartbeat_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -1072,6 +1102,7 @@ def _paper_args(tmp_path: Path) -> argparse.Namespace:
         ledger_path=tmp_path / "ledger.db",
         report_dir=tmp_path / "reports",
         paper_live_ticker=None,
+        process="pipeline",
     )
 
 
@@ -1112,7 +1143,9 @@ def test_the_paper_hook_reports_the_kernel_mode_and_both_halt_flags(
     monkeypatch.setattr(loop_module, "build_paper_deps", lambda **_kwargs: deps)
     monkeypatch.setattr(loop_module, "run_single_tick", lambda _deps, *, beat: outcome)
 
-    hook = _build_paper_on_beat(_paper_args(tmp_path), WindbreakConfig())
+    hook = _build_paper_on_beat(
+        _paper_args(tmp_path), WindbreakConfig(), dispatcher=_log_only_dispatcher()
+    )
 
     assert hook(7) == BeatReport(
         mode=mode_name, halted=kernel_halted, research_halted=research_halted
@@ -1159,7 +1192,9 @@ def test_the_paper_hooks_tick_failure_is_supervised_end_to_end(
     run_loop(
         0,
         max_beats=2,
-        on_beat=_build_paper_on_beat(_paper_args(tmp_path), WindbreakConfig()),
+        on_beat=_build_paper_on_beat(
+            _paper_args(tmp_path), WindbreakConfig(), dispatcher=_log_only_dispatcher()
+        ),
         supervisor=supervisor,
     )
 
@@ -1310,7 +1345,7 @@ def test_the_composed_supervisor_dispatches_through_the_configured_sinks(
     monkeypatch.setattr("windbreak.main.build_sinks", lambda *_a, **_k: [sink])
     args = argparse.Namespace(ledger_path=tmp_path / "ledger.db", process="pipeline")
 
-    supervisor = _build_beat_supervisor(args, WindbreakConfig())
+    supervisor = _composed_supervisor(args)
     supervisor.observe(1, _raising_hook([]))
 
     assert [message for _type, _severity, message in sink.delivered] == [
@@ -1325,7 +1360,7 @@ def test_the_composed_supervisor_ledgers_to_the_configured_ledger_path(
     ledger_path = tmp_path / "ledger.db"
     args = argparse.Namespace(ledger_path=ledger_path, process="pipeline")
 
-    _build_beat_supervisor(args, WindbreakConfig()).observe(1, _raising_hook([]))
+    _composed_supervisor(args).observe(1, _raising_hook([]))
 
     assert _alert_payloads(ledger_path) == [
         {
@@ -1345,7 +1380,7 @@ def test_the_composed_supervisor_writes_no_ledger_without_a_ledger_path(
     """
     args = argparse.Namespace(ledger_path=None, process="pipeline")
 
-    _build_beat_supervisor(args, WindbreakConfig()).observe(1, _raising_hook([]))
+    _composed_supervisor(args).observe(1, _raising_hook([]))
 
     assert list(tmp_path.iterdir()) == []
 
@@ -1365,7 +1400,7 @@ def test_the_composed_supervisor_stamps_the_process_component_on_its_log_lines(
     caplog.set_level(logging.INFO)
     args = argparse.Namespace(ledger_path=None, process="order_gateway")
 
-    _build_beat_supervisor(args, WindbreakConfig()).observe(1, _raising_hook([]))
+    _composed_supervisor(args).observe(1, _raising_hook([]))
 
     assert [
         record.__dict__["component"]
@@ -1386,7 +1421,7 @@ def test_the_composed_supervisor_stamps_the_process_component_on_its_alerts(
     ledger_path = tmp_path / "ledger.db"
     args = argparse.Namespace(ledger_path=ledger_path, process="order_gateway")
 
-    _build_beat_supervisor(args, WindbreakConfig()).observe(1, _raising_hook([]))
+    _composed_supervisor(args).observe(1, _raising_hook([]))
 
     store = SqliteLedgerStore(ledger_path)
     try:
@@ -1496,12 +1531,13 @@ def test_the_shutdown_handlers_are_installed_before_the_beat_hook_is_built(
     original_sigterm = signal.getsignal(signal.SIGTERM)
     original_sigint = signal.getsignal(signal.SIGINT)
 
-    def _resolve(_args: object, _config: object) -> None:
+    def _resolve(_args: object, _config: object, **_kwargs: object) -> None:
         """Deliver a SIGTERM to whatever handler is installed right now.
 
         Args:
             _args: The parsed `run` arguments, unused.
             _config: The loaded configuration, unused.
+            **_kwargs: The alert-root factory, unused.
 
         Returns:
             `None`, so the loop runs a bare heartbeat if it runs at all.
