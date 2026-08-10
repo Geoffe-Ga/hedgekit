@@ -134,6 +134,52 @@ jobs:
         # -o addopts=, which would silently drop them).
         run: pytest -m chaos --no-cov -v
 
+  container:
+    name: End-to-End Container Tier (epic #465)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ env.PYTHON_VERSION_PRIMARY }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_PRIMARY }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -c constraints-quality.txt -r requirements.txt
+          pip install -c constraints-quality.txt -r requirements-dev.txt
+          pip install -e . -c constraints-quality.txt
+
+      - name: Report the runtimes this job actually has
+        # Printed, not asserted. The tier SKIPS where a runtime is absent, so a
+        # silent skip would otherwise read as a pass; this line is what makes
+        # the log answer "did it really run?" without opening the test output.
+        run: |
+          docker info --format 'docker daemon: {{.ServerVersion}}' || echo 'docker daemon: UNAVAILABLE'
+          test -d /run/systemd/system && echo 'systemd: running' || echo 'systemd: NOT running'
+          command -v systemd-analyze >/dev/null && echo 'systemd-analyze: present' || echo 'systemd-analyze: absent'
+
+      - name: Container tier (docker / systemd end-to-end)
+        # This is NOT a gate weakening, and it is the same reasoning the chaos
+        # job above records. --no-cov disables coverage collection AND the
+        # --cov-fail-under=90 enforcement for THIS job only. The tier exercises
+        # windbreak in CHILD processes and containers, whose lines the parent's
+        # collector cannot see, so a marker-filtered run would report near-zero
+        # and fail the coverage gate on a perfectly green run. The 90% floor is
+        # still enforced by the `quality` job, where these tests also run.
+        #
+        # `-m container` overrides the `-m "not container"` in pyproject
+        # addopts, because pytest takes the LAST -m it is given. --strict-markers
+        # and --strict-config stay active (we deliberately avoid --override-ini
+        # and -o addopts=, which would silently drop them).
+        run: pytest -m container --no-cov -v
+
   build:
     name: Build Distribution
     runs-on: ubuntu-latest

@@ -480,6 +480,31 @@ def test_mutation_release_gate_resolves_mutmut_from_the_pinned_toolchain() -> No
         )
 
 
+def test_e2e_tier_script_resolves_pytest_from_the_pinned_toolchain() -> None:
+    """`e2e.sh` gets the same treatment, for a sharper reason than most.
+
+    It is not dispatched by `check-all.sh` -- the `e2e` tier runs inside the
+    ordinary suite -- so it is not in `_GATE_SCRIPT_TOOLS` above, and gets a
+    dedicated test the way `mutation.sh` does.
+
+    The reason it must be anchored is stronger than the usual one. This tier
+    spawns child processes with `sys.executable`, so the interpreter pytest
+    runs under IS the interpreter under test. An ambient pytest would report a
+    green end-to-end run about an installation that is not the one this repo
+    pins -- a false negative in the tier whose entire job is checking the
+    shipped artifact (epic #465, issue #466).
+    """
+    source = _read(_SCRIPTS_DIR / "e2e.sh")
+
+    assert "toolchain-env.sh" in source, (
+        "scripts/e2e.sh does not resolve through scripts/toolchain-env.sh, so "
+        "which interpreter the end-to-end tier exercises depends on the "
+        "caller's PATH"
+    )
+    offenders = _bare_invocations(source, "pytest")
+    assert not offenders, f"scripts/e2e.sh invokes 'pytest' by bare name: {offenders}"
+
+
 def test_architecture_scripts_inherited_path_is_documented() -> None:
     """The one still-inherited sub-check must be named, with its reason.
 
