@@ -48,9 +48,27 @@ addopts = [
     "--cov-fail-under=90",
     "-p",
     "pytester",
+    # The `container` tier is deselected by default (issue #466, epic #465).
+    # Those tests need a docker daemon or a running systemd, so on a developer
+    # machine they would only ever skip -- noise in every local run -- while in
+    # CI they get a dedicated job that DOES have a daemon. Deselecting here and
+    # selecting there keeps one marker meaning one thing in both places.
+    #
+    # This is a `-m` expression, and pytest takes the LAST `-m` it is given, so
+    # an explicit `pytest -m container` (the CI job) and `pytest -m chaos` (the
+    # chaos job) both override this line rather than intersecting with it.
+    #
+    # The `e2e` tier is deliberately NOT deselected: it spawns real windbreak
+    # processes but needs no container runtime, so it stays inside the default
+    # run and inside Gate 1. That is the point of splitting the tier by cost
+    # rather than by importance.
+    "-m",
+    "not container",
 ]
 markers = [
     "chaos: fault-injection chaos suite over the Order Gateway (SPEC §11.5); also selected standalone by the CI chaos job",
+    "e2e: end-to-end tier (issue #466); spawns real windbreak processes, needs no container runtime, stays in the default run",
+    "container: end-to-end tier needing a docker daemon or running systemd; deselected by default, run by the CI container job, and skipped -- never silently passed -- where the runtime is absent",
 ]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
