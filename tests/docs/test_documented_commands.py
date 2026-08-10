@@ -74,14 +74,55 @@ _PLACEHOLDER_VALUES = {
     "<32-hex-approval-id>": "0" * 32,
 }
 
-#: Compose subcommands whose trailing bare tokens name services.
+#: Compose subcommands whose trailing bare tokens all name services.
 _SERVICE_TAKING_SUBCOMMANDS = frozenset(
-    {"up", "down", "kill", "ps", "logs", "restart", "start", "stop", "rm", "exec"}
+    {"up", "down", "kill", "ps", "logs", "restart", "start", "stop", "rm"}
 )
 
+#: Compose subcommands that take exactly ONE service and then a command to run
+#: inside it. `exec pipeline ls /var/lib/...` names one service, not three: the
+#: rest is the command, and treating it as service names produced a confident,
+#: completely wrong failure on a correct README line.
+_SINGLE_SERVICE_SUBCOMMANDS = frozenset({"exec", "run"})
+
 #: Compose flags that consume the following token as their value, so it is not
-#: mistaken for a service name.
-_VALUE_TAKING_COMPOSE_FLAGS = frozenset({"-f", "--file", "--format", "--project-name"})
+#: mistaken for a service name. `--tail 2 pipeline` is exactly the trap: without
+#: `--tail` here, `2` was read as a service name and the check failed on a
+#: perfectly correct README line.
+_VALUE_TAKING_COMPOSE_FLAGS = frozenset(
+    {
+        "--env-file",
+        "--file",
+        "--format",
+        "--index",
+        "--profile",
+        "--project-directory",
+        "--project-name",
+        "--tail",
+        "-f",
+        "-n",
+        "-p",
+    }
+)
+
+#: Compose flags that take no value, so the token after them IS a service name.
+#: Kept explicit so `test_every_documented_compose_flag_is_classified` can fail
+#: on anything in neither set, rather than guessing and mis-parsing silently.
+_BOOLEAN_COMPOSE_FLAGS = frozenset(
+    {
+        "--all",
+        "--build",
+        "--detach",
+        "--follow",
+        "--no-deps",
+        "--no-log-prefix",
+        "--quiet",
+        "--timestamps",
+        "-a",
+        "-d",
+        "-q",
+    }
+)
 
 #: Command prefixes that are environment setup rather than claims about this
 #: software: a virtualenv, a package install, a pre-commit invocation. They are
@@ -175,6 +216,7 @@ def extract_commands(document: str) -> list[DocumentedCommand]:
     text = (_REPO_ROOT / document).read_text(encoding="utf-8")
     commands: list[DocumentedCommand] = []
     in_shell_block = False
+    continued: tuple[int, str] | None = None
     for number, raw in enumerate(text.splitlines(), start=1):
         fence = _FENCE.match(raw.rstrip())
         if fence is not None:
@@ -186,6 +228,13 @@ def extract_commands(document: str) -> list[DocumentedCommand]:
         if not in_shell_block:
             continue
         command = _strip_prompt(raw)
+        if continued is not None:
+            command = f"{continued[1]} {command}"
+            number = continued[0]
+            continued = None
+        if command.endswith("\\"):
+            continued = (number, command[:-1].strip())
+            continue
         if _is_command_line(command):
             commands.append(
                 DocumentedCommand(document=document, line=number, command=command)
@@ -266,6 +315,32 @@ def _compose_document(compose_path: Path) -> dict[str, Any]:
     return yaml.safe_load(compose_path.read_text(encoding="utf-8"))
 
 
+def _subcommand_of(tokens: list[str]) -> str | None:
+    """Return the compose subcommand, skipping flags and their values.
+
+    Shared by :func:`_named_services` and its classification guard so the two
+    cannot disagree about which token is the subcommand -- two parsers that must
+    agree being the defect shape this module exists to catch.
+
+    Args:
+        tokens: The full `docker compose ...` token list.
+
+    Returns:
+        The subcommand, or ``None`` if the command names none.
+    """
+    index = 2
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _VALUE_TAKING_COMPOSE_FLAGS:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return None
+
+
 def _named_services(tokens: list[str]) -> tuple[Path | None, list[str]]:
     """Extract the compose file and any service names a command references.
 
@@ -299,10 +374,58 @@ def _named_services(tokens: list[str]) -> tuple[Path | None, list[str]]:
             continue
         if subcommand is None:
             subcommand = token
+        elif subcommand in _SINGLE_SERVICE_SUBCOMMANDS:
+            services.append(token)
+            break
         elif subcommand in _SERVICE_TAKING_SUBCOMMANDS:
             services.append(token)
         index += 1
     return compose_file, services
+
+
+def test_every_documented_compose_subcommand_is_classified() -> None:
+    """Every compose subcommand in the docs has known service-argument shape.
+
+    Compose subcommands differ in how many trailing tokens are service names:
+    `kill pipeline` names one-or-more, `exec pipeline ls ...` names exactly one
+    and then a command. An unclassified subcommand defaults to "no services",
+    which silently stops checking rather than failing -- so it is named here.
+    """
+    known = _SERVICE_TAKING_SUBCOMMANDS | _SINGLE_SERVICE_SUBCOMMANDS
+    unclassified: list[str] = []
+    for documented in _select("docker"):
+        subcommand = _subcommand_of(_tokens_of(documented))
+        if subcommand is not None and subcommand not in known:
+            unclassified.append(f"{documented.where()} -> {subcommand}")
+
+    assert not unclassified, (
+        "These compose subcommands are classified in neither "
+        "_SERVICE_TAKING_SUBCOMMANDS nor _SINGLE_SERVICE_SUBCOMMANDS, so their "
+        f"service arguments go unchecked: {unclassified}"
+    )
+
+
+def test_every_documented_compose_flag_is_classified() -> None:
+    """Every compose flag in the docs is known to take a value, or not to.
+
+    `_named_services` decides what is a service by skipping flags and their
+    values. An unclassified flag therefore either swallows a real service name
+    or leaks its own argument in as one -- and both mis-parse silently. Adding
+    a documented `logs --tail 2 pipeline` did exactly the latter, reading `2`
+    as a service. This makes the next unknown flag a named failure instead.
+    """
+    unclassified: list[str] = []
+    known = _VALUE_TAKING_COMPOSE_FLAGS | _BOOLEAN_COMPOSE_FLAGS
+    for documented in _select("docker"):
+        for token in _tokens_of(documented)[2:]:
+            if token.startswith("-") and token not in known:
+                unclassified.append(f"{documented.where()} -> {token}")
+
+    assert not unclassified, (
+        "These compose flags are in neither _VALUE_TAKING_COMPOSE_FLAGS nor "
+        f"_BOOLEAN_COMPOSE_FLAGS, so _named_services mis-parses them: "
+        f"{unclassified}"
+    )
 
 
 def test_every_documented_command_can_be_lexed() -> None:

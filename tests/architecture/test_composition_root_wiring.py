@@ -42,6 +42,22 @@ A registry that only ever grows is a rubber stamp, so
 entry. When #441 lands and the ``kill_integration=None`` disappears, this suite
 goes red until its registration is deleted. The registry cannot outlive the
 debt it documents.
+
+WHAT THE EXPIRY DOES NOT CATCH
+
+Registrations are keyed on ``(module, call, parameter)`` rather than line
+number, because line-keyed entries go stale on any edit above them and train
+reviewers to re-bless the registry without reading it. The cost is that a site
+which *survives* a fix with inverted intent keeps matching, so its stated
+reason can rot while the key stays live.
+
+That is not hypothetical: #444 was fixed while this PR was open. The dispatcher
+became an injected parameter, and ``AlertDispatcher(sinks=[])`` survived in
+`scheduler/loop.py` as the fallback for when none is supplied -- the same shape
+as `main.py`'s, and no longer debt. The key still matched, so nothing went red;
+only reading the diff caught that the reason had inverted. Stated here so the
+guard is trusted for what it does -- finding *unregistered* null wiring -- and
+not for auditing the prose of entries that are already registered.
 """
 
 from __future__ import annotations
@@ -166,11 +182,18 @@ _REGISTERED: dict[tuple[str, str, str], Registration] = {
     ),
     ("windbreak/scheduler/loop.py", "AlertDispatcher", "sinks"): Registration(
         reason=(
-            "OPEN DEFECT. The PAPER loop's verifier can only ever reach the "
-            "log-only fallback, so no configured sink receives a paper-loop "
-            "alert. Remove this registration when the wiring is fixed."
+            "Deliberate log-only fallback since #444 was fixed, not debt. The "
+            "dispatcher is now INJECTED into the PAPER loop, and this "
+            "construction is reached only when no dispatcher was supplied. "
+            "#444's defect was the converse: this was the only behaviour "
+            "available, so a deployment that had configured a real sink still "
+            "reached nothing but the log-only fallback. The scheduler must not "
+            "read `config.alerts` itself -- resolving a sink's `*_env` "
+            "destination reads the real environment, and "
+            "`windbreak.main._build_alert_dispatcher` is deliberately the one "
+            "place that happens."
         ),
-        issue=444,
+        issue=None,
     ),
     ("windbreak/scheduler/loop.py", "RiskKernel", "kill_integration"): Registration(
         reason=(

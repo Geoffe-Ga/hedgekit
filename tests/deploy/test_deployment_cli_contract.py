@@ -1,30 +1,41 @@
-"""The deployment files are checked against the real CLI parser (#471, epic #465).
+"""The deployment files are checked against the real CLI parser (#471, #465).
 
 `deploy/` ships two ways to start the same four processes: four systemd units
-and four compose services. Until now nothing type-checked either argv against
-`windbreak.main.build_parser()`, which leaves two failure modes open.
+and four compose services. Until #471 nothing type-checked either argv against
+`windbreak.main.build_parser()`, which left two failure modes open.
 
 **Flag drift.** A flag renamed or removed in the CLI leaves both deployment
-paths silently wrong. This one fails *open*: a bare `windbreak run` is valid,
-so the process starts happily and does the wrong thing. Nothing goes red.
-Issue #446 is a live instance -- no deployment path passes the PAPER flags, so
-the shipped deployment runs bare RESEARCH heartbeats.
+paths silently wrong. This one fails *open*: a bare `windbreak run` is valid, so
+the process starts happily and does the wrong thing. Issue #446 was a live
+instance -- no deployment path passed the PAPER flags, so the shipped
+deployment ran bare RESEARCH heartbeats.
 
 **Path divergence.** systemd and compose can drift from *each other*, so the
 documented deployment behaves differently depending on which one an operator
-used. Neither had any guard at all.
+used. Neither file's own tests could see it, because each was only ever read in
+isolation.
 
-Both are closed here by encoding the intended contract ONCE, in
-:data:`_DEPLOYMENT_CONTRACT`, and checking both paths against it.
+Both are closed by encoding the intended argv ONCE, in
+:data:`_DEPLOYMENT_CONTRACT`, and checking both paths against it and against
+each other.
 
-ON THE KNOWN GAP
+RELATIONSHIP TO `tests/deploy/test_deployment_launches_paper.py`
 
-:func:`test_no_deployment_path_yet_passes_the_paper_flags` pins #446's absence
-rather than asserting the fixed state, because a test that is red on `main` is
-not a guard -- it is noise that trains people to ignore the suite. It is
-written to FAIL the moment #446 lands, which forces the contract above to be
-updated in the same change that fixes the deployment. The gap cannot be closed
-quietly and it cannot be forgotten.
+That module (from #445/#446) asserts the *deployment* properties: build
+contexts, mounts, volumes, dockerignore, token handling, restart limits. This
+one asserts the *CLI contract*: that the argv both paths pass is accepted by the
+real parser, that the two paths agree, and that every SPEC process is covered
+once. The parsing helpers are shared -- this module imports
+`tests.deploy.artifacts` rather than keeping a second compose/unit parser, since
+two parsers that must agree is the same defect shape this file exists to catch.
+
+WHAT CHANGED WHEN #446 LANDED
+
+`test_no_deployment_path_yet_passes_the_paper_flags` used to pin the gap and was
+written to fail the moment it closed. It did exactly that: #446 added the four
+activation arguments, the test went red, and the contract below was updated in
+the same change. The test is gone because the thing it guarded is gone -- which
+is the whole point of a self-expiring pin.
 """
 
 from __future__ import annotations
@@ -34,11 +45,11 @@ import io
 import shlex
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pytest
-import yaml
 
+from tests.deploy import artifacts
 from tests.e2e.harness import RUNTIME_PROBE_TIMEOUT_SECONDS, systemd_skip_reason
 from windbreak.main import PROCESS_CHOICES, build_parser
 
@@ -58,6 +69,22 @@ _COMPOSE_PATH = _REPO_ROOT / "deploy" / "docker-compose.yml"
 #: `["windbreak", "run", ...]` reduce to the same argument list.
 _ENTRY_POINT = "windbreak"
 
+#: The four arguments that activate the always-on PAPER loop (#446). Only the
+#: pipeline process runs that loop, so only its argv carries them; the other
+#: three are deliberately bare. `test_exactly_one_process_activates_the_paper_loop`
+#: pins that asymmetry, so PAPER activation cannot be copy-pasted onto a process
+#: that does not run the loop.
+_PAPER_ACTIVATION = (
+    "--paper-books-dir",
+    "tests/fixtures/books/deep_walk",
+    "--cassette-path",
+    "tests/fixtures/forecast/cassettes.json",
+    "--ledger-path",
+    "/var/lib/windbreak/ledger/windbreak.db",
+    "--report-dir",
+    "/var/lib/windbreak/reports",
+)
+
 #: THE DEPLOYMENT CONTRACT -- one source of truth, checked against BOTH paths.
 #:
 #: Maps each SPEC process token to the argv tail every deployment path must
@@ -65,7 +92,7 @@ _ENTRY_POINT = "windbreak"
 #: is underscored (`order-gateway` vs `order_gateway`), which is exactly the
 #: kind of near-miss this table exists to pin.
 _DEPLOYMENT_CONTRACT: dict[str, tuple[str, ...]] = {
-    "pipeline": ("run", "--process", "pipeline"),
+    "pipeline": ("run", "--process", "pipeline", *_PAPER_ACTIVATION),
     "riskkernel": ("run", "--process", "riskkernel"),
     "order_gateway": ("run", "--process", "order_gateway"),
     "dashboard": ("run", "--process", "dashboard"),
@@ -86,34 +113,6 @@ _UNIT_TO_TOKEN = {
     "windbreak-order-gateway.service": "order_gateway",
     "windbreak-dashboard.service": "dashboard",
 }
-
-#: The flags the always-on PAPER loop needs. Issue #446 reports that no
-#: deployment path passes any of them, so the shipped deployment runs bare
-#: RESEARCH heartbeats. Named here so the gap is explicit and self-expiring.
-_PAPER_FLAGS = ("--paper-books-dir", "--cassette-path", "--ledger-path", "--report-dir")
-
-
-def _read_exec_start(unit_path: Path) -> str:
-    """Extract a unit's single ``ExecStart=`` value.
-
-    Args:
-        unit_path: Path to the systemd unit file.
-
-    Returns:
-        The verbatim right-hand side of the ``ExecStart=`` assignment.
-
-    Raises:
-        AssertionError: If the unit has no ``ExecStart=`` line, or more than one.
-    """
-    lines = [
-        line.strip()
-        for line in unit_path.read_text(encoding="utf-8").splitlines()
-        if line.strip().startswith("ExecStart=")
-    ]
-    assert len(lines) == 1, (
-        f"{unit_path.name} must declare exactly one ExecStart=, found {len(lines)}"
-    )
-    return lines[0].split("=", 1)[1].strip()
 
 
 def _argv_tail(tokens: list[str], *, source: str) -> list[str]:
@@ -139,13 +138,17 @@ def _argv_tail(tokens: list[str], *, source: str) -> list[str]:
 def systemd_argv_tails() -> dict[str, list[str]]:
     """Read each systemd unit's windbreak arguments.
 
+    Parsing is delegated to :mod:`tests.deploy.artifacts` so this module and
+    `test_deployment_launches_paper.py` read the units through one parser.
+
     Returns:
         Process token mapped to the argv tail its unit passes.
     """
     tails: dict[str, list[str]] = {}
-    for unit_name, token in _UNIT_TO_TOKEN.items():
-        exec_start = _read_exec_start(_SYSTEMD_DIR / unit_name)
-        tails[token] = _argv_tail(shlex.split(exec_start), source=unit_name)
+    for unit_path in artifacts.unit_paths():
+        token = _UNIT_TO_TOKEN[unit_path.name]
+        tokens = artifacts.unit_exec_start_tokens(artifacts.parse_unit(unit_path))
+        tails[token] = _argv_tail(tokens, source=unit_path.name)
     return tails
 
 
@@ -154,20 +157,11 @@ def compose_argv_tails() -> dict[str, list[str]]:
 
     Returns:
         Process token mapped to the argv tail its service passes.
-
-    Raises:
-        AssertionError: If a service declares no ``command``.
     """
-    document: dict[str, Any] = yaml.safe_load(_COMPOSE_PATH.read_text(encoding="utf-8"))
-    services: dict[str, Any] = document["services"]
     tails: dict[str, list[str]] = {}
-    for service_name, token in _SERVICE_TO_TOKEN.items():
-        command = services[service_name].get("command")
-        assert command is not None, (
-            f"compose service {service_name!r} declares no command, so its "
-            "process token cannot be checked against the CLI"
-        )
-        tokens = shlex.split(command) if isinstance(command, str) else list(command)
+    for service_name, service in artifacts.compose_services().items():
+        token = _SERVICE_TO_TOKEN[service_name]
+        tokens = artifacts.command_tokens(service)
         tails[token] = _argv_tail(tokens, source=f"compose service {service_name!r}")
     return tails
 
@@ -269,33 +263,31 @@ def test_both_paths_cover_every_spec_process_exactly_once() -> None:
     assert len(_SERVICE_TO_TOKEN) == len(expected)
 
 
-def test_no_deployment_path_yet_passes_the_paper_flags() -> None:
-    """Pins issue #446's gap, and fails the moment #446 closes it.
+def test_exactly_one_process_activates_the_paper_loop() -> None:
+    """Only the pipeline process carries PAPER activation, in both paths.
 
-    The shipped deployment starts bare RESEARCH heartbeats: no service or unit
-    passes `--paper-books-dir`, `--cassette-path`, `--ledger-path` or
-    `--report-dir`, so the always-on PAPER loop never runs.
+    Replaces the self-expiring pin that guarded #446's gap. That pin fired when
+    #446 landed and was deleted; this is its successor, guarding the *fixed*
+    state rather than the absence.
 
-    Asserting the *fixed* state instead would leave `main` red, which is not a
-    guard -- it is noise. Asserting the *current* state makes the gap explicit
-    and self-expiring: when #446 adds those flags this test fails, and the fix
-    must update `_DEPLOYMENT_CONTRACT` in the same change. The gap cannot be
-    closed quietly, and it cannot be forgotten.
+    The asymmetry is the point: `--paper-books-dir` and friends belong on the
+    process that actually runs the loop. Copy-pasting them onto `riskkernel` or
+    `dashboard` would look like thoroughness and would be wrong.
     """
-    all_arguments = {
-        argument
-        for tails in (systemd_argv_tails(), compose_argv_tails())
-        for tail in tails.values()
-        for argument in tail
-    }
+    for source, tails in (
+        ("systemd", systemd_argv_tails()),
+        ("compose", compose_argv_tails()),
+    ):
+        activating = sorted(
+            token
+            for token, tail in tails.items()
+            if any(flag in tail for flag in _PAPER_ACTIVATION[::2])
+        )
 
-    present = sorted(flag for flag in _PAPER_FLAGS if flag in all_arguments)
-
-    assert not present, (
-        "A deployment path now passes PAPER flags "
-        f"({present}), so issue #446 has been fixed. Update "
-        "_DEPLOYMENT_CONTRACT to the new intended argv and delete this test."
-    )
+        assert activating == ["pipeline"], (
+            f"{source}: expected only 'pipeline' to activate the PAPER loop, "
+            f"got {activating}"
+        )
 
 
 @pytest.fixture
