@@ -78,16 +78,43 @@ EDGE_BUCKET_EDGES_PPM = (
 )
 
 
-class NoResolvedForecastsError(ValueError):
+class UndefinedMetricError(ValueError):
+    """Raised when a metric has no value over otherwise-valid inputs (#439).
+
+    This is the narrow vocabulary for "the mathematics does not define an
+    answer here", as distinct from "these inputs are malformed". The registry's
+    ``gated_compute`` choke point catches this type and maps it to the
+    ``UNDEFINED`` sentinel; every other :class:`ValueError` -- a missing
+    temporal context, an out-of-range probability -- still propagates, so a
+    genuinely broken input is never quietly rendered as a dash.
+
+    The distinction became load-bearing when issue #439 gave the always-on
+    loop's weekly fold real ground truth. Three registered metrics are
+    undefined over inputs the fold now routinely produces: the calibration
+    slope and intercept need a non-zero forecast variance, which a *single*
+    resolved forecast can never have; the skill ratio needs a baseline that
+    made some error; and the log score diverges on a probability of exactly
+    zero. Each previously raised a bare :class:`ValueError` that nothing
+    caught, which was unreachable only because the fold hardcoded
+    ``resolutions={}`` and :class:`NoResolvedForecastsError` always fired
+    first. The first market ever to resolve would otherwise have taken the
+    whole weekly report down with it.
+
+    Subclassing :class:`ValueError` keeps every pre-existing
+    ``pytest.raises(ValueError)`` expectation passing unchanged.
+    """
+
+
+class NoResolvedForecastsError(UndefinedMetricError):
     """Raised when a metric is asked to score an empty resolved set (#188).
 
-    A dedicated :class:`ValueError` subclass for the "no resolved forecasts"
-    guard, so the registry's ``gated_compute`` choke point can catch it by type
-    (mirroring the existing
-    :class:`~windbreak.evaluation.cohorts.EmptyCohortError` adapter) and map it
-    to the ``UNDEFINED`` sentinel rather than crashing a whole-ledger fold that
-    has no resolutions yet. Subclassing :class:`ValueError` keeps every
-    pre-existing ``pytest.raises(ValueError)`` expectation passing unchanged.
+    The original member of the :class:`UndefinedMetricError` family: a fold
+    with nothing resolved yet is an ordinary whole-ledger, pre-resolution
+    state, not an error, so the registry's ``gated_compute`` choke point maps
+    it to the ``UNDEFINED`` sentinel (mirroring the existing
+    :class:`~windbreak.evaluation.cohorts.EmptyCohortError` adapter) rather
+    than crashing the fold. It remains a distinct type so a caller that cares
+    specifically about "nothing resolved" can still say so.
     """
 
 
@@ -290,7 +317,9 @@ def _skill_from_term_sums(forecast_sum: int, baseline_sum: int) -> int:
             undefined against a baseline that made no error.
     """
     if baseline_sum == 0:
-        raise ValueError("baseline Brier-term sum is zero; skill is undefined")
+        raise UndefinedMetricError(
+            "baseline Brier-term sum is zero; skill is undefined"
+        )
     return divide(
         (baseline_sum - forecast_sum) * PPM_SCALE,
         baseline_sum,
@@ -370,7 +399,9 @@ def _ln_micro_nats(arg_ppm: int) -> int:
             infinite log penalty and cannot be scored.
     """
     if arg_ppm == 0:
-        raise ValueError("log-score probability is 0 (certain-wrong); -ln(0) diverges")
+        raise UndefinedMetricError(
+            "log-score probability is 0 (certain-wrong); -ln(0) diverges"
+        )
     if arg_ppm == PPM_SCALE:
         return 0
     log2_fixed = _log2_reciprocal_fixed(arg_ppm)
@@ -589,7 +620,9 @@ def _require_forecast_variance(sums: _OlsSums) -> int:
     """
     variance_numerator = sums.variance_numerator
     if variance_numerator == 0:
-        raise ValueError("forecast variance is zero; calibration slope is undefined")
+        raise UndefinedMetricError(
+            "forecast variance is zero; calibration slope is undefined"
+        )
     return variance_numerator
 
 

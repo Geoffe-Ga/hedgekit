@@ -32,6 +32,8 @@ from windbreak.config import (
 )
 from windbreak.drills.catalog import DRILL_NAMES
 from windbreak.drills.context import bind_paper_context, bind_production_context
+from windbreak.evaluation.ingest import MarketResolved, parse_resolution_instant
+from windbreak.evaluation.resolution import ResolutionOutcome
 from windbreak.ledger import (
     AlertEmitted as LedgerAlertEmitted,
 )
@@ -76,6 +78,13 @@ MODE_RESEARCH = "RESEARCH"
 #: watches has to say the tick failed rather than keep claiming the RESEARCH
 #: mode of a healthy pass.
 MODE_TICK_FAILED = "TICK_FAILED"
+
+#: Component label stamped on an operator-ingested ``MarketResolved`` event
+#: (issue #439). Deliberately *not* one of the pipeline process labels: the
+#: resolution is a human's claim about the outside world, and stamping it with a
+#: component that never produced it would forge provenance in a hash-chained
+#: audit trail.
+_RESOLUTION_INGEST_COMPONENT = "operator"
 
 #: Mode reported where there is no evidence of any mode -- the dashboard's
 #: no-ledger and no-heartbeat defaults (issue #447). Absent evidence is not
@@ -406,6 +415,47 @@ def _add_verify_arguments(verify_parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_ingest_resolution_arguments(ingest_parser: argparse.ArgumentParser) -> None:
+    """Register the ``ingest-resolution`` subcommand's options on its subparser.
+
+    Every option is required. A resolution with a defaulted market, outcome,
+    instant or provenance would be a fabricated fact in a hash-chained audit
+    trail, so there is nothing to default to.
+
+    Args:
+        ingest_parser: The ``ingest-resolution`` subparser to populate.
+    """
+    ingest_parser.add_argument(
+        "--ledger-path",
+        type=Path,
+        required=True,
+        help="Path to the SQLite ledger database to append the resolution to.",
+    )
+    ingest_parser.add_argument(
+        "--market-ticker",
+        required=True,
+        help="Ticker of the market that settled.",
+    )
+    ingest_parser.add_argument(
+        "--outcome",
+        required=True,
+        choices=[member.value for member in ResolutionOutcome],
+        help="The settled ground-truth outcome.",
+    )
+    ingest_parser.add_argument(
+        "--resolved-at",
+        required=True,
+        help="ISO-8601 instant the market settled, WITH a UTC offset "
+        "(e.g. 2026-03-01T12:00:00+00:00). An offsetless instant is refused.",
+    )
+    ingest_parser.add_argument(
+        "--source",
+        required=True,
+        help="Where the settlement was read (the claim's provenance), "
+        "recorded verbatim in the ledgered event.",
+    )
+
+
 def _add_kill_arguments(kill_parser: argparse.ArgumentParser) -> None:
     """Register the ``kill`` subcommand's options on its subparser.
 
@@ -531,7 +581,10 @@ def build_parser() -> argparse.ArgumentParser:
         exposing ``--ledger-path`` and ``--output-dir``; ``anchor`` and
         ``verify`` subcommands exposing ``--ledger-path`` and ``--anchor-path``
         (append the ledger head to, and check the live chain against, the
-        anchor file); ``kill`` and ``rearm`` subcommands exposing
+        anchor file); an ``ingest-resolution`` subcommand exposing
+        ``--ledger-path``, ``--market-ticker``, ``--outcome``, ``--resolved-at``
+        and ``--source`` (record that a market settled, so forecasts on it can
+        be scored); ``kill`` and ``rearm`` subcommands exposing
         ``--state-dir``; an ``ack`` subcommand exposing ``--approval-id`` and
         ``--state-dir``; and a developer-only ``alert-test`` subcommand hidden
         from ``--help``.
@@ -560,6 +613,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_verify_arguments(
         subparsers.add_parser(
             "verify", help="Verify the ledger's live chain against its anchors."
+        )
+    )
+    _add_ingest_resolution_arguments(
+        subparsers.add_parser(
+            "ingest-resolution",
+            help="Record that a market settled, so forecasts on it can be scored.",
         )
     )
     _add_kill_arguments(
@@ -1387,6 +1446,56 @@ def _run_alert_test(args: argparse.Namespace) -> int:
         _LOGGER.critical("FATAL: %s", exc)
         return 1
     dispatcher.dispatch(alert_type, args.message)
+    return 0
+
+
+def _run_ingest_resolution(args: argparse.Namespace) -> int:
+    """Append one ``MarketResolved`` row recording that a market settled.
+
+    This is the seam through which ground truth enters the running system
+    (issue #439). Nothing else ever learns that a market resolved, so until an
+    operator runs this every evaluation metric the weekly report prints reads
+    ``UNDEFINED`` -- structurally, not for want of data. The next weekly fold
+    (:func:`windbreak.scheduler.weekly_data.weekly_report_body`) reads the row
+    back off the same ledger and scores the forecasts on that market against it.
+
+    The resolution is validated *before* the ledger is opened, so a refused
+    ingest leaves the chain -- and, on a first run, the database file itself --
+    untouched. A half-ingested resolution would be worse than none: the report
+    would then quote a number nothing supports.
+
+    Args:
+        args: Parsed ``ingest-resolution`` arguments carrying ``ledger_path``,
+            ``market_ticker``, ``outcome``, ``resolved_at`` and ``source``.
+
+    Returns:
+        The process exit code: 0 once the row is appended, 1 on a refused
+        resolution (with the reason logged as a ``FATAL`` critical).
+    """
+    try:
+        event = MarketResolved(
+            component=_RESOLUTION_INGEST_COMPONENT,
+            market_ticker=args.market_ticker,
+            outcome=ResolutionOutcome(args.outcome),
+            resolved_at=parse_resolution_instant(args.resolved_at),
+            source=args.source,
+        )
+    except ValueError as exc:
+        _LOGGER.critical("FATAL: %s", exc)
+        return 1
+    store = SqliteLedgerStore(args.ledger_path)
+    try:
+        sequence_number = store.append(event)
+    finally:
+        store.close()
+    _LOGGER.info(
+        "resolution ingested ticker=%s outcome=%s resolved_at=%s source=%s sequence=%d",
+        event.market_ticker,
+        event.outcome.value,
+        event.payload["resolved_at"],
+        event.source,
+        sequence_number,
+    )
     return 0
 
 
@@ -2676,6 +2785,7 @@ _COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "rebuild": rebuild_command,
     "anchor": anchor_command,
     "verify": verify_command,
+    "ingest-resolution": _run_ingest_resolution,
     "kill": _run_kill,
     "ack": _run_ack,
     "rearm": _run_rearm,

@@ -1,0 +1,534 @@
+"""Tests for resolution ingestion and its instant/sequence projection (#439).
+
+Nothing in the running system ever learned that a market resolved: the only
+loader in `windbreak.evaluation.resolution` reads a known-answer *fixture*, so
+the always-on loop's fold hardcoded `resolutions={}` and every evaluation
+metric read `UNDEFINED` forever. `windbreak.evaluation.ingest` is the missing
+seam -- a `MarketResolved` ledger event carrying the settled outcome, the
+*instant* the market settled, and the provenance of that claim.
+
+The instant is the load-bearing part. The temporal gate
+(`windbreak.evaluation.temporal`) is sequence-based by design (SPEC S1.1-6, no
+wall clock on the value path), so a wall-clock resolution instant must be
+*projected* onto the ledger's sequence axis before it can gate anything:
+`resolution_sequences_from_instants` answers "at what ledger position could
+this market's answer first have been known". That projection is what makes a
+late-ingested resolution still refuse a forecast made after the market
+actually settled -- if the gate keyed on the ingesting row's own position
+instead, an operator who ingested a week late would silently score a week of
+forecasts that already knew the answer.
+
+Every instant in this module is exact and timezone-aware; a naive one is
+refused at the boundary (`windbreak.timekeeping.require_aware`) rather than
+reinterpreted against the host's zone.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
+
+import pytest
+
+from windbreak.evaluation.ingest import (
+    MARKET_RESOLVED_EVENT_TYPE,
+    IngestedResolution,
+    MarketResolved,
+    ingested_resolutions_from_records,
+    resolution_outcomes,
+)
+from windbreak.evaluation.resolution import ResolutionOutcome
+from windbreak.evaluation.temporal import resolution_sequences_from_instants
+from windbreak.ledger.store import LedgerRecord, SqliteLedgerStore
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+#: The component label stamped on every event this suite ledgers.
+_COMPONENT = "operator"
+
+#: The exact instant the fixtures treat as "the market settled".
+_RESOLVED_AT = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
+
+
+def _record(
+    *,
+    sequence_number: int,
+    event_type: str,
+    created_at: str,
+    payload: dict[str, object],
+) -> LedgerRecord:
+    """Build one `LedgerRecord` with a hand-written envelope.
+
+    Args:
+        sequence_number: The row's position in the chain.
+        event_type: The row's event-type discriminator.
+        created_at: The row's ISO-8601 creation timestamp.
+        payload: The typed payload nested under the envelope's `data` key.
+
+    Returns:
+        The assembled `LedgerRecord`; the hash columns are filler, since no
+        consumer under test verifies the chain.
+    """
+    envelope = {"component": _COMPONENT, "data": payload, "schema_version": 1}
+    return LedgerRecord(
+        sequence_number=sequence_number,
+        event_type=event_type,
+        created_at=created_at,
+        component=_COMPONENT,
+        payload_json=json.dumps(envelope, sort_keys=True, separators=(",", ":")),
+        payload_schema_version=1,
+        prev_hash="0" * 64,
+        event_hash="f" * 64,
+    )
+
+
+def _resolved_payload(
+    *,
+    market_ticker: str = "MKT-A",
+    outcome: str = "no",
+    resolved_at: str = "2026-03-01T12:00:00.000000Z",
+    source: str = "kalshi-settlement-notice",
+) -> dict[str, object]:
+    """Build a well-formed `MarketResolved` payload, overridable field by field.
+
+    Args:
+        market_ticker: The market the resolution names.
+        outcome: The settled outcome token.
+        resolved_at: The ISO-8601 settlement instant.
+        source: Where the operator read the settlement.
+
+    Returns:
+        The four-key payload dict.
+    """
+    return {
+        "market_ticker": market_ticker,
+        "outcome": outcome,
+        "resolved_at": resolved_at,
+        "source": source,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 1. The MarketResolved ledger event: shape, provenance, and boundary refusals.
+# ---------------------------------------------------------------------------
+
+
+def test_market_resolved_event_stamps_its_type_and_four_field_payload() -> None:
+    """`MarketResolved` derives the fixed event type and a four-key payload."""
+    event = MarketResolved(
+        component=_COMPONENT,
+        market_ticker="MKT-A",
+        outcome=ResolutionOutcome.NO,
+        resolved_at=_RESOLVED_AT,
+        source="kalshi-settlement-notice",
+    )
+
+    assert event.event_type == MARKET_RESOLVED_EVENT_TYPE
+    assert event.event_type == "MarketResolved"
+    assert event.payload == {
+        "market_ticker": "MKT-A",
+        "outcome": "no",
+        "resolved_at": "2026-03-01T12:00:00.000000Z",
+        "source": "kalshi-settlement-notice",
+    }
+
+
+def test_market_resolved_refuses_a_naive_resolution_instant() -> None:
+    """A `resolved_at` with no UTC offset is refused, never read as local time."""
+    with pytest.raises(ValueError) as exc_info:
+        MarketResolved(
+            component=_COMPONENT,
+            market_ticker="MKT-A",
+            outcome=ResolutionOutcome.NO,
+            resolved_at=datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None),
+            source="kalshi-settlement-notice",
+        )
+
+    assert type(exc_info.value) is ValueError
+    assert "resolved_at must be timezone-aware" in str(exc_info.value)
+
+
+def test_market_resolved_refuses_a_blank_source() -> None:
+    """A blank `source` is refused: an unprovenanced outcome is not evidence."""
+    with pytest.raises(ValueError) as exc_info:
+        MarketResolved(
+            component=_COMPONENT,
+            market_ticker="MKT-A",
+            outcome=ResolutionOutcome.NO,
+            resolved_at=_RESOLVED_AT,
+            source="   ",
+        )
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == (
+        "source must be a non-blank provenance label; an outcome nothing "
+        "attributes is unprovable evidence and is refused rather than ingested"
+    )
+
+
+def test_market_resolved_refuses_a_blank_market_ticker() -> None:
+    """A blank `market_ticker` is refused: it can never join to a forecast."""
+    with pytest.raises(ValueError) as exc_info:
+        MarketResolved(
+            component=_COMPONENT,
+            market_ticker=" ",
+            outcome=ResolutionOutcome.NO,
+            resolved_at=_RESOLVED_AT,
+            source="kalshi-settlement-notice",
+        )
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == (
+        "market_ticker must be a non-blank market identifier; a resolution "
+        "naming no market can never join to a forecast"
+    )
+
+
+def test_market_resolved_round_trips_through_a_real_ledger(tmp_path: Path) -> None:
+    """An appended `MarketResolved` reads back as an `IngestedResolution`."""
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    store.append(
+        MarketResolved(
+            component=_COMPONENT,
+            market_ticker="MKT-A",
+            outcome=ResolutionOutcome.YES,
+            resolved_at=_RESOLVED_AT,
+            source="kalshi-settlement-notice",
+        )
+    )
+
+    resolutions = ingested_resolutions_from_records(store.read_all())
+
+    assert resolutions == (
+        IngestedResolution(
+            market_ticker="MKT-A",
+            outcome=ResolutionOutcome.YES,
+            resolved_at=_RESOLVED_AT,
+            source="kalshi-settlement-notice",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. The record fold: it reads only MarketResolved rows, and fails closed.
+# ---------------------------------------------------------------------------
+
+
+def test_ingested_resolutions_ignores_every_other_event_type() -> None:
+    """Non-`MarketResolved` rows contribute nothing and never crash the fold."""
+    records = [
+        _record(
+            sequence_number=1,
+            event_type="ConfigLoaded",
+            created_at="2026-03-01T00:00:00.000000+00:00",
+            payload={"config_hash": "abc", "diff": {}},
+        ),
+        _record(
+            sequence_number=2,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=_resolved_payload(),
+        ),
+    ]
+
+    resolutions = ingested_resolutions_from_records(records)
+
+    assert len(resolutions) == 1
+    assert resolutions[0].market_ticker == "MKT-A"
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    ["market_ticker", "outcome", "resolved_at", "source"],
+)
+def test_ingested_resolutions_fails_closed_on_a_missing_payload_key(
+    missing_key: str,
+) -> None:
+    """A `MarketResolved` row missing any key raises, naming the missing key."""
+    payload = _resolved_payload()
+    del payload[missing_key]
+    records = [
+        _record(
+            sequence_number=1,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=payload,
+        )
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        ingested_resolutions_from_records(records)
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == (
+        f"MarketResolved payload at sequence_number=1 is missing {missing_key!r}"
+    )
+
+
+def test_ingested_resolutions_fails_closed_on_an_unknown_outcome_token() -> None:
+    """An outcome token outside `{yes, no}` raises, naming the offending token."""
+    records = [
+        _record(
+            sequence_number=4,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=_resolved_payload(outcome="maybe"),
+        )
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        ingested_resolutions_from_records(records)
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == (
+        "MarketResolved payload at sequence_number=4 carries an unknown "
+        "outcome: 'maybe' (expected one of ['yes', 'no'])"
+    )
+
+
+def test_ingested_resolutions_fails_closed_on_an_unparseable_instant() -> None:
+    """A `resolved_at` that is not an ISO-8601 instant raises, naming the field."""
+    records = [
+        _record(
+            sequence_number=7,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=_resolved_payload(resolved_at="last Tuesday"),
+        )
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        ingested_resolutions_from_records(records)
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == (
+        "MarketResolved payload at sequence_number=7 carries an unparseable "
+        "resolved_at: 'last Tuesday' (expected an ISO-8601 instant)"
+    )
+
+
+def test_ingested_resolutions_fails_closed_on_a_naive_instant_on_disk() -> None:
+    """A hand-written row whose `resolved_at` has no offset is refused."""
+    records = [
+        _record(
+            sequence_number=9,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=_resolved_payload(resolved_at="2026-03-01T12:00:00.000000"),
+        )
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        ingested_resolutions_from_records(records)
+
+    assert type(exc_info.value) is ValueError
+    assert "resolved_at must be timezone-aware" in str(exc_info.value)
+
+
+def test_ingested_resolutions_tolerates_an_identical_re_ingest() -> None:
+    """Re-ingesting the byte-identical resolution is idempotent, not an error."""
+    payload = _resolved_payload()
+    records = [
+        _record(
+            sequence_number=1,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=dict(payload),
+        ),
+        _record(
+            sequence_number=2,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-02T13:00:00.000000+00:00",
+            payload=dict(payload),
+        ),
+    ]
+
+    resolutions = ingested_resolutions_from_records(records)
+
+    assert len(resolutions) == 1
+    assert resolutions[0].outcome is ResolutionOutcome.NO
+
+
+def test_ingested_resolutions_fails_closed_on_a_contradicting_re_ingest() -> None:
+    """A second, *different* resolution for one market raises rather than wins.
+
+    Silently letting the later row win would let a mis-typed outcome overwrite
+    a correct one with no trace in the report; the settlement-reversal
+    vocabulary in `windbreak.evaluation.resolution` is the supported way to
+    correct a settled market.
+    """
+    records = [
+        _record(
+            sequence_number=1,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-01T13:00:00.000000+00:00",
+            payload=_resolved_payload(outcome="no"),
+        ),
+        _record(
+            sequence_number=2,
+            event_type=MARKET_RESOLVED_EVENT_TYPE,
+            created_at="2026-03-02T13:00:00.000000+00:00",
+            payload=_resolved_payload(outcome="yes"),
+        ),
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        ingested_resolutions_from_records(records)
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == (
+        "MarketResolved at sequence_number=2 contradicts an earlier resolution "
+        "of market_ticker='MKT-A'; a settled market is corrected through a "
+        "settlement reversal, never by a second conflicting ingest"
+    )
+
+
+def test_resolution_outcomes_projects_the_ticker_keyed_outcome_mapping() -> None:
+    """`resolution_outcomes` yields the shape the evaluation harness scores."""
+    resolutions = (
+        IngestedResolution(
+            market_ticker="MKT-A",
+            outcome=ResolutionOutcome.YES,
+            resolved_at=_RESOLVED_AT,
+            source="notice",
+        ),
+        IngestedResolution(
+            market_ticker="MKT-B",
+            outcome=ResolutionOutcome.NO,
+            resolved_at=_RESOLVED_AT,
+            source="notice",
+        ),
+    )
+
+    assert resolution_outcomes(resolutions) == {
+        "MKT-A": ResolutionOutcome.YES,
+        "MKT-B": ResolutionOutcome.NO,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3. The instant -> sequence projection: both directions, exact instants.
+# ---------------------------------------------------------------------------
+
+
+def test_projection_maps_an_instant_to_the_first_position_at_or_after_it() -> None:
+    """The projected sequence is the earliest row whose instant is >= the answer.
+
+    Positions 1..4 sit one hour apart. A market settling at 02:00 could first
+    have been known at position 3, so a forecast at position 2 predates the
+    answer and one at position 3 does not.
+    """
+    base = datetime(2026, 3, 1, tzinfo=UTC)
+    positions = [(index, base + timedelta(hours=index - 1)) for index in range(1, 5)]
+
+    sequences = resolution_sequences_from_instants(
+        positions, {"MKT-A": base + timedelta(hours=2)}
+    )
+
+    assert sequences == {"MKT-A": 3}
+
+
+def test_projection_ignores_where_the_resolution_row_itself_landed() -> None:
+    """A late-ingested resolution still gates on when the market *settled*.
+
+    The resolution row lands last (position 5) but names an instant at
+    position 2. The projection must return 2, not 5: keying on the ingesting
+    row's own position would silently admit every forecast made between the
+    settlement and the operator noticing it.
+    """
+    base = datetime(2026, 3, 1, tzinfo=UTC)
+    positions = [
+        (1, base),
+        (2, base + timedelta(hours=1)),
+        (3, base + timedelta(hours=2)),
+        (4, base + timedelta(hours=3)),
+        (5, base + timedelta(days=7)),
+    ]
+
+    sequences = resolution_sequences_from_instants(
+        positions, {"MKT-A": base + timedelta(hours=1)}
+    )
+
+    assert sequences == {"MKT-A": 2}
+
+
+def test_projection_places_a_future_resolution_one_past_the_ledger_head() -> None:
+    """An instant after every recorded row cannot have leaked into any of them."""
+    base = datetime(2026, 3, 1, tzinfo=UTC)
+    positions = [(1, base), (2, base + timedelta(hours=1))]
+
+    sequences = resolution_sequences_from_instants(
+        positions, {"MKT-A": base + timedelta(days=365)}
+    )
+
+    assert sequences == {"MKT-A": 3}
+
+
+def test_projection_over_no_positions_fails_closed_to_sequence_zero() -> None:
+    """With no ledger positions the ordering is unprovable, so nothing is safe.
+
+    Sequence numbers start at 1, so a projected `0` makes every forecast
+    `created_sequence >= 0` -- refused rather than scored against an ordering
+    nothing established.
+    """
+    sequences = resolution_sequences_from_instants(
+        (), {"MKT-A": datetime(2026, 3, 1, tzinfo=UTC)}
+    )
+
+    assert sequences == {"MKT-A": 0}
+
+
+def test_projection_refuses_a_naive_ledger_instant() -> None:
+    """A ledger position carrying an offsetless instant is refused, not compared."""
+    with pytest.raises(ValueError) as exc_info:
+        resolution_sequences_from_instants(
+            [(1, _RESOLVED_AT.replace(tzinfo=None))],
+            {"MKT-A": datetime(2026, 3, 1, tzinfo=UTC)},
+        )
+
+    assert type(exc_info.value) is ValueError
+    assert "ledger_instant must be timezone-aware" in str(exc_info.value)
+
+
+def test_projection_refuses_a_naive_resolution_instant() -> None:
+    """A resolution instant with no offset is refused, not compared."""
+    with pytest.raises(ValueError) as exc_info:
+        resolution_sequences_from_instants(
+            [(1, datetime(2026, 3, 1, tzinfo=UTC))],
+            {"MKT-A": _RESOLVED_AT.replace(tzinfo=None)},
+        )
+
+    assert type(exc_info.value) is ValueError
+    assert "resolution_instant must be timezone-aware" in str(exc_info.value)
+
+
+def test_projection_is_insensitive_to_the_order_positions_are_supplied_in() -> None:
+    """Positions are ordered by sequence number, not by the caller's iteration.
+
+    The projection answers "the *earliest* ledger position at or after this
+    instant", which is only the earliest if the walk is in sequence order. A
+    caller handing the pairs over in some other order -- a set, a dict, a
+    reversed scan -- would otherwise get the first *supplied* match instead.
+    """
+    base = datetime(2026, 3, 1, tzinfo=UTC)
+    shuffled = [
+        (3, base + timedelta(hours=2)),
+        (1, base),
+        (4, base + timedelta(hours=3)),
+        (2, base + timedelta(hours=1)),
+    ]
+
+    sequences = resolution_sequences_from_instants(
+        shuffled, {"MKT-A": base + timedelta(hours=1)}
+    )
+
+    assert sequences == {"MKT-A": 2}
+
+
+def test_projection_returns_no_entry_for_a_market_that_never_resolved() -> None:
+    """An empty resolution mapping projects to an empty sequence mapping."""
+    base = datetime(2026, 3, 1, tzinfo=UTC)
+
+    assert resolution_sequences_from_instants([(1, base)], {}) == {}

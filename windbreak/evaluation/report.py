@@ -22,11 +22,12 @@ from typing import TYPE_CHECKING
 
 from windbreak.evaluation.abstention import summarize_abstentions
 from windbreak.evaluation.cohorts import (
+    UNDEFINED,
     Cohort,
     UndefinedBrier,
     cohort_brier_table,
 )
-from windbreak.evaluation.metrics import NoResolvedForecastsError
+from windbreak.evaluation.metrics import NoResolvedForecastsError, UndefinedMetricError
 from windbreak.evaluation.power import power_analysis
 from windbreak.evaluation.registry import (
     HEADLINE_SKILL_METRIC,
@@ -63,7 +64,7 @@ if TYPE_CHECKING:
     from windbreak.evaluation.cohorts import CohortBrier, CohortBrierValue
     from windbreak.evaluation.costs import CostMeter
     from windbreak.evaluation.power import PowerAnalysis
-    from windbreak.evaluation.registry import MetricValue
+    from windbreak.evaluation.registry import MetricSpec, MetricValue
     from windbreak.evaluation.temporal import RejectionEvent
 
 #: The blunt banner printed under the forecast track when the headline skill
@@ -520,6 +521,48 @@ def _build_inputs(payload: Mapping[str, Any]) -> EvaluationInputs:
     )
 
 
+def _metric_value_or_undefined(
+    spec: MetricSpec, inputs: EvaluationInputs
+) -> MetricValue:
+    """Compute one metric for the report, rendering an undefined one as a sentinel.
+
+    Several registered metrics have no value over inputs that are otherwise
+    entirely valid: the calibration slope and intercept need a non-zero forecast
+    variance, which a *single* resolved forecast can never have; the skill ratio
+    needs a baseline that made some error; and the log score diverges on a
+    probability of exactly zero. Each raises an
+    :class:`~windbreak.evaluation.metrics.UndefinedMetricError`, which is mapped
+    here to the same ``UNDEFINED`` sentinel the report already prints for a
+    metric that is built but genuinely undefined.
+
+    That mattered the moment issue #439 gave the always-on loop's weekly fold
+    real ground truth: the first market ever to resolve leaves exactly one
+    resolved forecast, so without this the first real resolution would have
+    taken the whole weekly report -- and the tick that writes it -- down.
+
+    The mapping lives here rather than inside the registry's ``gated_compute``
+    choke point on purpose. The other consumer of a registered spec,
+    :func:`windbreak.evaluation.crosscheck.crosscheck_gates`, exists to notice
+    Python-vs-SQL disagreement and renders a raising reference metric as its own
+    ``PYTHON_COMPUTE_FAILED`` sentinel; swallowing the raise at the choke point
+    would have left that guard unreachable. The catch is scoped **by type**, so
+    an invalid-input ``ValueError`` still propagates rather than being rendered
+    as a dash.
+
+    Args:
+        spec: The registered metric spec to compute.
+        inputs: The typed evaluation inputs.
+
+    Returns:
+        The metric's value, or the ``UNDEFINED`` sentinel when it has none over
+        these inputs.
+    """
+    try:
+        return spec.compute(inputs)
+    except UndefinedMetricError:
+        return UNDEFINED
+
+
 def _build_tracks(inputs: EvaluationInputs) -> tuple[TrackReport, ...]:
     """Compute every registered metric and group results into track reports.
 
@@ -539,7 +582,7 @@ def _build_tracks(inputs: EvaluationInputs) -> tuple[TrackReport, ...]:
             MetricResult(
                 name=spec.name,
                 window=spec.window,
-                value=spec.compute(inputs),
+                value=_metric_value_or_undefined(spec, inputs),
             )
         )
     return tuple(
