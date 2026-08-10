@@ -250,12 +250,47 @@ The verification path holds a `ReadOnlyConnectorView`
 (`windbreak/connector/readonly.py`), not the `PaperExchange` itself, so it has
 no `place_order`/`cancel_order` attribute at all (SPEC S1.1 invariant 3).
 
-**Known limitation -- the kill switch does not stop the PAPER loop yet.**
-`windbreak kill --state-dir <dir>` and `windbreak rearm --state-dir <dir>` write
-and clear a `KILL`/`REARM` file, but the PAPER loop's `RiskKernel` is
-constructed with `kill_integration=None` (`windbreak/scheduler/loop.py`), so no
-kill-file watcher is polled. To stop the loop today, stop the process itself
-(`Ctrl-C`/SIGINT or SIGTERM).
+**Stopping the PAPER loop with the kill switch (issue #441).**
+`windbreak kill --state-dir <dir>` writes a `KILL` file, and the PAPER loop
+polls for it once per beat -- first thing, before it screens, researches, or
+trades anything -- against the directory `config.ops.state_dir` names. Pass the
+*same* directory the running loop is configured with, or the file lands where
+nothing reads it.
+
+On the next beat the loop:
+
+- transitions its kernel to `KILLED` and stamps `KILLED` on the `ModeHeartbeat`
+  row and the heartbeat log line, so a killed loop is never reported healthy;
+- walks no markets at all -- no forecast is run and no research money is spent,
+  which is stronger than vetoing the intents afterwards;
+- **holds every position**, cancelling only resting orders (ledgered as one
+  `CancelAllDirective`; see the caveat below) and releasing its capital
+  reservations;
+- pages `HALT_KILL` through the sinks `config.alerts` declares, and ledgers one
+  `AlertEmitted` audit row for that page.
+
+It stays killed until an operator re-arms. The loop keeps beating, keeps
+reconciling the venue, and keeps sampling equity while killed -- observably
+alive and flat, which is what an unattended deployment needs. The kill is
+recorded on the hash chain, so a restart comes back `KILLED` even if the `KILL`
+file has been deleted; the file is belt-and-suspenders, the ledger is
+authoritative.
+
+`config.risk.kill_after_consecutive_mismatches` (default 3) is the same switch's
+automatic trigger: that many *consecutive* reconciliation `BREACH` outcomes
+engage it with trigger `AUTO_RECONCILIATION`, and any non-breach cycle resets
+the run. The first breach still drives the kernel to `HALT` (SPEC §32); a
+sustained run of them kills.
+
+To re-arm, type the phrase for the engaged kill's sequence number verbatim (see
+the re-arm procedure below). Stopping the process with a signal remains
+available, but it is not equivalent: a signal provides none of hold-positions,
+durable state, or manual re-arm.
+
+**Caveat.** The `CancelAllDirective` a kill emits is ledgered, not delivered:
+no `directive_sink` is wired on this path or on the `--process riskkernel` one,
+so resting orders are recorded as due for cancellation rather than actually
+cancelled at the venue.
 
 ### Acknowledging a held order (LIVE_MICRO / LIVE)
 
@@ -479,8 +514,10 @@ pass.
   every market `jurisdiction_status="unknown"`, which fails closed by design
   (SPEC §20 Q3, unresolved). Only a market carrying real eligibility metadata --
   as the paper fixture books do -- can clear that check.
-- `windbreak kill`/`windbreak rearm` do not stop or gate the PAPER loop today
-  (`kill_integration=None`); use process signals to stop the loop.
+- `windbreak kill`/`windbreak rearm` do stop and re-arm the PAPER loop (issue
+  #441), provided `--state-dir` is the directory `config.ops.state_dir` names.
+  The cancel-all a kill emits is ledgered but not delivered to the venue, so
+  resting orders are not actually cancelled.
 - `windbreak run --process dashboard` boots the HTTP dashboard server directly
   (issue #79); its bearer token comes only from `WINDBREAK_DASHBOARD_TOKEN`
   and its port only from `config.dashboard.port` -- there is no `--port` or
