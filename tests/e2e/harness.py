@@ -11,7 +11,9 @@ into the state epic #465 describes:
   operator would have.
 * **Teardown is not the test's responsibility.** :class:`ProcessLauncher` owns
   every process it starts and reaps them all, in reverse order, even when the
-  test body raises. Children are started in their own session so a whole
+  test body raises, and even when one of them refuses to die -- a child that
+  survives ``SIGKILL`` is reported after its siblings are reaped, never
+  instead of them. Children are started in their own session so a whole
   process group can be signalled rather than just its leader.
 * **Waiting is always bounded and always on a real condition.** See
   :func:`wait_until`. There is no unconditional sleep in this tier: a fixed
@@ -292,6 +294,23 @@ class ProcessLauncher:
         """
         return tuple(self._spawned)
 
+    def track(self, spawned: SpawnedProcess) -> SpawnedProcess:
+        """Adopt an already-started process into this launcher's lifetime.
+
+        For processes this launcher did not start itself -- a different
+        executable, such as the console script installed into a clean
+        virtualenv -- so they still get the same guaranteed teardown as
+        everything else.
+
+        Args:
+            spawned: The already-started process to take ownership of.
+
+        Returns:
+            The same process, for convenient chaining.
+        """
+        self._spawned.append(spawned)
+        return spawned
+
     def spawn(
         self,
         *args: str,
@@ -340,9 +359,33 @@ class ProcessLauncher:
 
         Reaping in reverse start order stops readers before the writers they
         depend on, which keeps shutdown logs legible.
+
+        A process that survives ``SIGKILL`` within the grace period does not
+        abandon its siblings. Every remaining process is still reaped, and the
+        survivors are reported together at the end. The earlier version let the
+        second :class:`subprocess.TimeoutExpired` propagate straight out of this
+        loop, which left every not-yet-reaped process running -- turning one
+        stuck child into a leak of all of them, and quietly falsifying this
+        class's "guarantees" claim. Found in review of PR #477.
+
+        Raises:
+            AssertionError: If any process was still alive after ``SIGKILL``.
+                Raised only once every other process has been reaped.
         """
+        survivors: list[str] = []
         while self._spawned:
-            reap(self._spawned.pop())
+            spawned = self._spawned.pop()
+            try:
+                reap(spawned)
+            except subprocess.TimeoutExpired:
+                survivors.append(f"{spawned.name} (pid {spawned.pid})")
+        if survivors:
+            message = (
+                "these processes were still alive after SIGKILL: "
+                f"{', '.join(survivors)}. Every other tracked process was "
+                "still reaped."
+            )
+            raise AssertionError(message)
 
 
 def reap(spawned: SpawnedProcess, *, grace: float = TERMINATE_GRACE_SECONDS) -> None:

@@ -200,7 +200,29 @@ def _null_literal(node: ast.expr) -> str | None:
         return "{}"
     if isinstance(node, ast.Tuple) and not node.elts:
         return "()"
-    return None
+    return _empty_constructor_call(node)
+
+
+#: Builtin constructors whose no-argument call is an empty collection. Raised in
+#: review of PR #477: without these, `AlertDispatcher(sinks=list())` disables the
+#: same capability as `sinks=[]` while evading a literals-only scanner.
+_EMPTY_CONSTRUCTORS = frozenset({"dict", "frozenset", "list", "set", "tuple"})
+
+
+def _empty_constructor_call(node: ast.expr) -> str | None:
+    """Classify a no-argument builtin collection call as a null literal.
+
+    Args:
+        node: The keyword argument's value expression.
+
+    Returns:
+        The call's source form, e.g. ``list()``, or ``None`` if it is not one.
+    """
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
+        return None
+    if not isinstance(node.func, ast.Name) or node.func.id not in _EMPTY_CONSTRUCTORS:
+        return None
+    return f"{node.func.id}()"
 
 
 def _callee_name(node: ast.Call) -> str:
@@ -417,6 +439,9 @@ def _package_parameter_names() -> set[str]:
         ("Fold(resolutions={})", 1),
         ("Thing(reconciliation_source=())", 1),
         ("build_deps(kill_integration=None)", 1),
+        ("AlertDispatcher(sinks=list())", 1),
+        ("Fold(resolutions=dict())", 1),
+        ("Thing(reconciliation_source=tuple())", 1),
     ],
 )
 def test_scanner_detects_seeded_null_wiring(source: str, expected: int) -> None:
@@ -444,6 +469,8 @@ def test_scanner_detects_seeded_null_wiring(source: str, expected: int) -> None:
         "SelectorDecision(intents=())",
         "AlertDispatcher(sinks=configured_sinks)",
         "RiskKernel(writer, kill_integration=integration)",
+        "AlertDispatcher(sinks=list(configured))",
+        "Fold(resolutions=dict(loaded))",
     ],
 )
 def test_scanner_ignores_absent_values_and_real_wiring(source: str) -> None:

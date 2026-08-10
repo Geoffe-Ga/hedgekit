@@ -16,12 +16,14 @@ failure gets disabled within a week, and the coverage goes with it.
 from __future__ import annotations
 
 import subprocess
+from typing import cast
 
 import pytest
 
 from tests.e2e.harness import (
     ProcessLauncher,
     RunRoot,
+    SpawnedProcess,
     docker_skip_reason,
     pid_alive,
     run_windbreak,
@@ -174,3 +176,154 @@ def test_one_shot_runner_raises_on_a_child_that_overruns_its_timeout(
             str(run_root.ledger_path),
             timeout=2.0,
         )
+
+
+class _UnkillableProcess:
+    """A `Popen` stand-in that never dies, to exercise the reaping loop.
+
+    A genuinely `SIGKILL`-proof child needs uninterruptible kernel I/O, which a
+    test cannot reliably arrange. Faking the one behaviour that matters -- a
+    `wait` that always times out -- tests the loop's resilience directly, which
+    is the property under review.
+    """
+
+    #: Stands in for a real child's process id in failure messages.
+    pid = -1
+
+    def poll(self) -> None:
+        """Report the process as still running.
+
+        Returns:
+            ``None``, meaning "has not exited".
+        """
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Never exit.
+
+        Args:
+            timeout: Ignored; present to match `Popen.wait`'s signature.
+
+        Raises:
+            subprocess.TimeoutExpired: Always.
+        """
+        raise subprocess.TimeoutExpired(cmd="unkillable", timeout=timeout or 0.0)
+
+
+def _unkillable(run_root: RunRoot) -> SpawnedProcess:
+    """Build a tracked process that cannot be reaped.
+
+    Args:
+        run_root: The run root whose log dir backs the fake streams.
+
+    Returns:
+        A :class:`SpawnedProcess` wrapping :class:`_UnkillableProcess`.
+    """
+    stdout_path = run_root.log_dir / "unkillable.stdout.log"
+    stderr_path = run_root.log_dir / "unkillable.stderr.log"
+    return SpawnedProcess(
+        name="unkillable",
+        argv=("fake",),
+        process=cast("subprocess.Popen[bytes]", _UnkillableProcess()),
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        stdout_stream=stdout_path.open("wb"),
+        stderr_stream=stderr_path.open("wb"),
+    )
+
+
+def test_reap_all_still_reaps_siblings_when_one_survives_sigkill(
+    run_root: RunRoot,
+) -> None:
+    """One stuck child does not strand the others, and is reported by name.
+
+    Found in review of PR #477: the loop used to let the post-`SIGKILL`
+    `TimeoutExpired` propagate, so a single unkillable process left every
+    not-yet-reaped sibling running. That turned one stuck child into a leak of
+    all of them while the module still claimed to "guarantee" reaping.
+
+    The unkillable process is popped LAST -- `reap_all` works newest-first --
+    so this asserts the real child is reaped after the failure is encountered,
+    not merely before it.
+    """
+    process_launcher = ProcessLauncher(run_root.log_dir)
+    process_launcher.track(_unkillable(run_root))
+    real = process_launcher.spawn(
+        "run",
+        "--process",
+        "pipeline",
+        "--heartbeat-interval",
+        _LONG_INTERVAL_SECONDS,
+        "--ledger-path",
+        str(run_root.ledger_path),
+        name="sibling",
+    )
+    wait_until(
+        lambda: pid_alive(real.pid),
+        timeout=30.0,
+        description="the sibling process to be running",
+    )
+
+    with pytest.raises(AssertionError, match="still alive after SIGKILL"):
+        process_launcher.reap_all()
+
+    assert not real.is_running()
+    wait_until(
+        lambda: not pid_alive(real.pid),
+        timeout=30.0,
+        description="the sibling process to be reaped despite the stuck one",
+    )
+
+
+#: Pid recorded by the `launcher`-fixture test below, asserted dead by the test
+#: after it. Observing a fixture's teardown requires outliving the test that
+#: requested it, and pytest runs a module's tests in declaration order.
+_FIXTURE_SPAWNED_PID: list[int] = []
+
+
+def test_launcher_fixture_spawns_a_tracked_process(
+    launcher: ProcessLauncher, run_root: RunRoot
+) -> None:
+    """The `launcher` fixture starts a real, tracked child process.
+
+    Closes a coverage gap raised in review: the fixture -- whose ``finally``
+    is what the harness's raise-safety guarantee actually rests on -- was not
+    requested by any test, so its teardown path never ran under test.
+
+    Args:
+        launcher: The fixture under test.
+        run_root: The run root supplying the ledger path.
+    """
+    spawned = launcher.spawn(
+        "run",
+        "--process",
+        "pipeline",
+        "--heartbeat-interval",
+        _LONG_INTERVAL_SECONDS,
+        "--ledger-path",
+        str(run_root.ledger_path),
+        name="fixture-managed",
+    )
+    wait_until(
+        lambda: pid_alive(spawned.pid),
+        timeout=30.0,
+        description="the fixture-managed process to be running",
+    )
+    _FIXTURE_SPAWNED_PID.append(spawned.pid)
+
+    assert launcher.spawned == (spawned,)
+
+
+def test_launcher_fixture_teardown_reaped_the_previous_test_s_process() -> None:
+    """The `launcher` fixture's teardown actually reaped what it started.
+
+    Reads the pid recorded by the test above. A fixture's teardown runs after
+    its test returns, so the only way to observe it is from outside that test.
+    """
+    assert _FIXTURE_SPAWNED_PID, "the preceding test did not record a pid"
+
+    wait_until(
+        lambda: not pid_alive(_FIXTURE_SPAWNED_PID[0]),
+        timeout=30.0,
+        description="the fixture's teardown to have reaped its process",
+    )

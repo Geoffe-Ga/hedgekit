@@ -305,6 +305,50 @@ def _named_services(tokens: list[str]) -> tuple[Path | None, list[str]]:
     return compose_file, services
 
 
+def test_every_documented_command_can_be_lexed() -> None:
+    """No documented command is silently dropped because shlex cannot lex it.
+
+    Raised in review of PR #477. `_tokens_of` swallows shlex's `ValueError`
+    into an empty token list, so an unbalanced quote or a backslash
+    line-continuation would remove a command from every check below without
+    anyone noticing -- the "extractor quietly stops covering a doc form"
+    failure this module's own anti-vacuity philosophy warns about. This makes
+    that removal loud.
+    """
+    unlexable = [
+        documented.where()
+        for documented in all_documented_commands()
+        if not _tokens_of(documented)
+    ]
+
+    assert not unlexable, (
+        "These documented lines could not be lexed, so they are excluded from "
+        f"every check in this module: {unlexable}"
+    )
+
+
+def test_no_project_command_hides_behind_a_wrapper() -> None:
+    """A documented `sudo windbreak ...` would be silently unchecked.
+
+    Also from review of PR #477. `_select` matches on `tokens[0]`, so a project
+    command behind `sudo`, `env` or a `time` prefix falls out of every check
+    while still looking covered. Rather than guess at wrapper semantics, this
+    fails loudly and says what to do.
+    """
+    hidden: list[str] = []
+    for documented in all_documented_commands():
+        tokens = _tokens_of(documented)
+        for checked in ("windbreak", "docker"):
+            if checked in tokens[1:]:
+                hidden.append(f"{documented.where()} (found {checked!r} at index > 0)")
+
+    assert not hidden, (
+        "These documented lines invoke a checked command behind a wrapper, so "
+        f"_select skips them: {hidden}. Teach _select about the wrapper rather "
+        "than leaving the line unchecked."
+    )
+
+
 def test_operator_docs_contain_commands_to_check() -> None:
     """The extractor finds commands, so a silent regression cannot pass.
 
