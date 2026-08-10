@@ -242,12 +242,18 @@ def test_reap_all_still_reaps_siblings_when_one_survives_sigkill(
     not-yet-reaped sibling running. That turned one stuck child into a leak of
     all of them while the module still claimed to "guarantee" reaping.
 
-    The unkillable process is popped LAST -- `reap_all` works newest-first --
-    so this asserts the real child is reaped after the failure is encountered,
-    not merely before it.
+    ORDER IS THE WHOLE TEST. `reap_all` pops newest-first, so the unkillable
+    process is tracked LAST and therefore fails on the FIRST iteration, leaving
+    the real child to be reaped on the second -- and only if the loop genuinely
+    continues past the failure.
+
+    The reverse order looks equivalent and is not: the real child would be
+    popped and fully reaped before the failure was ever raised, so the test
+    would pass on a loop that merely happened to fail last. It was written that
+    way, and a `break` in the exception handler -- the exact regression this
+    guards -- survived it. Raised in review of PR #477.
     """
     process_launcher = ProcessLauncher(run_root.log_dir)
-    process_launcher.track(_unkillable(run_root))
     real = process_launcher.spawn(
         "run",
         "--process",
@@ -263,6 +269,7 @@ def test_reap_all_still_reaps_siblings_when_one_survives_sigkill(
         timeout=30.0,
         description="the sibling process to be running",
     )
+    process_launcher.track(_unkillable(run_root))
 
     with pytest.raises(AssertionError, match="still alive after SIGKILL"):
         process_launcher.reap_all()
