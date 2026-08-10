@@ -38,6 +38,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -819,10 +820,18 @@ def test_the_shared_suite_run_is_parallelised(
 def _future() -> float:
     """Return a timestamp comfortably ahead of any file just written.
 
+    Reads the wall clock, not this file's own mtime. The mtime version was a
+    time bomb: it returned `<checkout time> + 1h`, which stops being "the
+    future" one hour after checkout. CI never saw it because `actions/checkout`
+    writes every file fresh on each run, so the value was always ~now + 1h --
+    the test passed for a reason that had nothing to do with what it asserts,
+    while any working tree older than an hour failed it. Discovered by epic
+    #465's own Gate 1 run.
+
     Returns:
         An epoch-seconds value one hour in the future.
     """
-    return Path(__file__).stat().st_mtime + 3600.0
+    return time.time() + 3600.0
 
 
 def test_complexity_probe_averages_every_analysed_block(
