@@ -1,18 +1,29 @@
-"""A `store.append` failure mid-tick must not terminate the process (#443).
+"""Real ticks driven to failure and to HALT, through the real loop (#443/#447).
 
-Issue #443's second acceptance criterion asks for an integration test, not a
-unit double: a *real* `run_single_tick` over the shared offline fixtures, whose
-ledger volume fills partway through the tick, driven by the *real*
-`_build_paper_on_beat` hook through the *real* `run_loop`. Only the disk is
-faked, by the one wrapper that turns `EquitySampled`'s append -- the exact call
-in the issue's traceback (`loop.py:3038` -> `store.py:420`) -- into the
-`sqlite3.OperationalError` a full volume raises.
+Both issues' acceptance criteria ask for integration tests, not unit doubles.
+Every test here runs a *real* `run_single_tick` over the shared offline fixtures
+through the *real* `_build_paper_on_beat` hook and the *real* `run_loop`.
 
-Before the fix that raise unwound out of `run_loop` and killed the daemon after
-the first beat. The assertions below are the whole survival contract: beat 2
-still runs, the failure is alerted exactly once and ledgered, the heartbeat line
-stops claiming RESEARCH, and the hash chain the tick had already written
-survives -- a liveness failure, never a corruption one.
+1. `test_a_full_volume_mid_tick_leaves_the_loop_beating_and_says_so` (#443).
+   Only the disk is faked, by the one wrapper that turns `EquitySampled`'s
+   append -- the exact call in the issue's traceback (`loop.py:3038` ->
+   `store.py:420`) -- into the `sqlite3.OperationalError` a full volume raises.
+   Before the fix that raise unwound out of `run_loop` and killed the daemon
+   after the first beat. The assertions are the whole survival contract: beat 2
+   still runs, the failure is alerted exactly once and ledgered, the heartbeat
+   line stops claiming RESEARCH, the *dashboard* stops reporting `PAPER`, and
+   the hash chain the tick had already written survives -- a liveness failure,
+   never a corruption one.
+2. `test_the_same_tick_without_a_full_volume_reports_its_real_mode` -- the
+   control, without which the survival test could pass against a loop that
+   reports `TICK_FAILED` unconditionally.
+3. `test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once`
+   (#447). Nothing is faked at all: an order placed on the exchange behind the
+   loop's back drives `_verification_stage` -> `run_verification_cycle` to a
+   genuine breach, `deps.kernel.mode` to `Mode.HALT`, and the loop's heartbeat
+   to `HALT` -- and keeps it there across later beats, which is the only way to
+   exercise the once-per-transition dedupe against a real halt rather than a
+   hand-built `BeatReport`.
 """
 
 from __future__ import annotations
@@ -28,8 +39,11 @@ from tests.integration.conftest import FIXED_NOW_EPOCH_S, ledger_path_for
 from windbreak.alerts import AlertDispatcher
 from windbreak.ledger import SqliteLedgerStore
 from windbreak.main import (
+    BeatReport,
     BeatSupervisor,
     LedgerAlertWriter,
+    LedgerModeWriter,
+    _build_dashboard_status_source,
     _build_paper_on_beat,
     run_loop,
 )
@@ -40,6 +54,7 @@ if TYPE_CHECKING:
 
     import pytest
 
+    from windbreak.alerts import AlertSeverity, AlertType
     from windbreak.config.schema import WindbreakConfig
     from windbreak.ledger import Event
     from windbreak.ledger.store import LedgerRecord, LedgerStore
@@ -48,6 +63,36 @@ if TYPE_CHECKING:
 #: appends it after the tick's `ModeHeartbeat`, so the tick is genuinely partway
 #: through when the disk gives out -- the shape of issue #443's traceback.
 _FULL_AT_EVENT_TYPE = "EquitySampled"
+
+#: The single ticker in the shared `deep_walk` books fixture.
+_TICKER = "MKT-DEEP"
+
+
+@dataclasses.dataclass
+class _RecordingSink:
+    """An `AlertSink` double recording every alert delivered through it.
+
+    Attributes:
+        name: The sink's identifier, as the `AlertSink` protocol requires.
+        delivered: One `(type, severity, message)` triple per delivered alert.
+    """
+
+    name: str = "recording"
+    delivered: list[tuple[AlertType, AlertSeverity, str]] = dataclasses.field(
+        default_factory=list
+    )
+
+    def send(
+        self, alert_type: AlertType, severity: AlertSeverity, message: str
+    ) -> None:
+        """Record one delivered alert.
+
+        Args:
+            alert_type: The dispatched alert type.
+            severity: The alert's severity.
+            message: The alert body.
+        """
+        self.delivered.append((alert_type, severity, message))
 
 
 class _FullVolumeStore:
@@ -197,6 +242,7 @@ def test_a_full_volume_mid_tick_leaves_the_loop_beating_and_says_so(
             sinks=[],
             ledger_writer=LedgerAlertWriter(alert_ledger_path, component="pipeline"),
         ),
+        mode_writer=LedgerModeWriter(tick_ledger_path, component="pipeline"),
     )
 
     run_loop(
@@ -221,10 +267,22 @@ def test_a_full_volume_mid_tick_leaves_the_loop_beating_and_says_so(
         "beat seq=1 failed: OperationalError: database or disk is full"
     ]
     store.verify_chain()
-    assert [record.event_type for record in store.read_all()].count(
-        "ModeHeartbeat"
-    ) == 2
     store.close()
+    # The dashboard is the path that matters, and the one the verifier caught
+    # still reporting health: `run_single_tick` stamps `ModeHeartbeat(PAPER)`
+    # *before* `_equity_and_positions_stage` raises, so each failing beat left
+    # a healthy row with a freshened timestamp for `_ledger_source` to read.
+    # The supervisor's own row lands after the tick's, so the latest one names
+    # what the beat actually did.
+    assert _ledgered_modes(tick_ledger_path) == [
+        "PAPER",
+        "TICK_FAILED",
+        "PAPER",
+        "TICK_FAILED",
+    ]
+    status = _build_dashboard_status_source(tick_ledger_path)()
+    assert status.mode == "TICK_FAILED"
+    assert status.mode != "PAPER"
 
 
 def test_the_same_tick_without_a_full_volume_reports_its_real_mode(
@@ -292,5 +350,135 @@ def test_the_same_tick_without_a_full_volume_reports_its_real_mode(
         if "heartbeat seq=" in record.message
     ] == ["mode=PAPER heartbeat seq=1"]
     assert not alert_ledger_path.exists()
+    deps.store.verify_chain()
+    deps.store.close()
+
+
+def _ledgered_modes(ledger_path: Path) -> list[str]:
+    """Read every ledgered `ModeHeartbeat` mode, verifying the chain first.
+
+    Args:
+        ledger_path: The tick ledger's path.
+
+    Returns:
+        One mode token per `ModeHeartbeat` row, in ledger order.
+    """
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        store.verify_chain()
+        records = store.read_all()
+    finally:
+        store.close()
+    return [
+        str(json.loads(record.payload_json)["data"]["mode"])
+        for record in records
+        if record.event_type == "ModeHeartbeat"
+    ]
+
+
+def test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once(
+    books_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    research_tools_factory: Callable[[], object],
+    tmp_path: Path,
+) -> None:
+    """#447's acceptance criteria driven by a *real* kernel reaching HALT.
+
+    Every other halt assertion in this PR hands `run_loop` a hand-constructed
+    `BeatReport(mode="HALT", halted=True)` or a kernel double. A double cannot
+    fail at the seam the issue is about: whether a genuine breach reaches
+    `deps.kernel.mode`, whether `_on_beat` projects it, and whether the loop
+    prints it. So this drives the kernel to `Mode.HALT` the way production
+    would -- an order placed on the exchange behind the loop's back, which
+    `_verification_stage` grades as a mismatch on the next tick -- and then
+    keeps beating, because the halt persisting across beats is what makes the
+    once-per-transition dedupe load-bearing rather than incidental.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        caplog: The pytest log capture fixture.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used to hand the hook the shared dependency bundle.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory.
+        research_tools_factory: Builds the offline research tools.
+        tmp_path: The per-test scratch directory.
+    """
+    caplog.set_level(logging.INFO)
+    from windbreak.connector.paper import PaperOrderIntent
+    from windbreak.numeric.types import ContractCentis, PricePips
+    from windbreak.riskkernel.modes import Mode
+    from windbreak.scheduler import loop as loop_module
+
+    tick_ledger_path = ledger_path_for(tmp_path, "tick.db")
+    alert_ledger_path = ledger_path_for(tmp_path, "alerts.db")
+    deps = loop_module.build_paper_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=tick_ledger_path,
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools=research_tools_factory(),
+        clock=_fixed_clock,
+    )
+    monkeypatch.setattr(loop_module, "build_paper_deps", lambda **_kwargs: deps)
+    sink = _RecordingSink()
+    supervisor = BeatSupervisor(
+        component="pipeline",
+        dispatcher=AlertDispatcher(
+            sinks=[sink],
+            ledger_writer=LedgerAlertWriter(alert_ledger_path, component="pipeline"),
+        ),
+    )
+    hook = _build_paper_on_beat(_paper_args(tmp_path, tick_ledger_path), paper_config)
+
+    def _on_beat(seq: int) -> BeatReport | None:
+        """Trade on the venue behind the loop's back, then run the real beat.
+
+        Args:
+            seq: The 1-based beat sequence number.
+
+        Returns:
+            Whatever the real PAPER hook reports for this beat.
+        """
+        if seq == 2:
+            deps.exchange.place_order(
+                PaperOrderIntent(
+                    ticker=_TICKER,
+                    side="yes",
+                    price=PricePips(4600),
+                    quantity=ContractCentis(100),
+                ),
+                None,
+            )
+        return hook(seq)
+
+    run_loop(0, max_beats=4, on_beat=_on_beat, supervisor=supervisor)
+
+    assert deps.kernel.mode is Mode.HALT
+    assert [
+        record.message
+        for record in caplog.records
+        if "heartbeat seq=" in record.message
+    ] == [
+        "mode=PAPER heartbeat seq=1",
+        "mode=HALT heartbeat seq=2",
+        "mode=HALT heartbeat seq=3",
+        "mode=HALT heartbeat seq=4",
+    ]
+    assert [message for _type, _severity, message in sink.delivered] == [
+        "risk kernel HALT at beat seq=2 (mode=HALT)"
+    ]
+    assert _alert_messages(alert_ledger_path) == [
+        "risk kernel HALT at beat seq=2 (mode=HALT)"
+    ]
+    assert _ledgered_modes(tick_ledger_path) == ["PAPER", "HALT", "HALT", "HALT"]
+    event_types = [record.event_type for record in deps.store.read_all()]
+    assert "VerificationMismatch" in event_types
+    assert "VerificationMismatchHalt" in event_types
     deps.store.verify_chain()
     deps.store.close()

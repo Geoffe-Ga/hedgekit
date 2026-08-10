@@ -16,8 +16,17 @@ The two fixes interact, and the interaction is the point: catching the raise
 without escalating it would have *deepened* #447 -- a loop that swallows every
 tick failure while still logging `mode=RESEARCH heartbeat seq=N` is precisely
 the undetectable-failure shape. So every test below asserts the failure or halt
-becomes *louder*: a distinct heartbeat mode token, a CRITICAL log line on every
-affected beat, and an alert dispatched exactly once per transition.
+becomes *louder*: a distinct heartbeat mode token, a CRITICAL log line carrying
+the raising beat's traceback on every affected beat, a ledgered mode row the
+dashboard cannot mistake for health, and an alert dispatched exactly once per
+transition.
+
+The *conjunction* of the two issues is its own test, because it is the case a
+naive dedupe gets wrong. A persistent kernel HALT with an intermittent tick
+failure flips the escalation kind every beat; a single last-escalated slot then
+reads every beat as a transition and pages every beat, which at the issues' own
+`--heartbeat-interval 0.01` is a hundred pages a second. See
+`test_a_persistent_halt_behind_an_intermittent_failure_pages_twice`.
 """
 
 from __future__ import annotations
@@ -25,7 +34,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -40,7 +51,8 @@ from windbreak.alerts import (
 )
 from windbreak.alerts.factory import AlertSinkConfigError
 from windbreak.config.schema import WindbreakConfig
-from windbreak.ledger import SqliteLedgerStore
+from windbreak.ledger import ModeHeartbeat, SqliteLedgerStore
+from windbreak.logging_setup import configure_logging, redact_text
 from windbreak.main import (
     MODE_RESEARCH,
     MODE_TICK_FAILED,
@@ -48,6 +60,7 @@ from windbreak.main import (
     BeatReport,
     BeatSupervisor,
     LedgerAlertWriter,
+    LedgerModeWriter,
     _build_beat_supervisor,
     _build_dashboard_status_source,
     _build_paper_on_beat,
@@ -226,16 +239,133 @@ def test_a_run_of_failing_beats_dispatches_exactly_one_alert() -> None:
     assert message == "beat seq=1 failed: RuntimeError: database or disk is full"
 
 
-def test_a_failure_that_heals_and_recurs_alerts_once_per_transition() -> None:
-    """Beats 1 and 3 fail with beat 2 healthy: two transitions, two alerts.
+def test_a_failure_that_heals_for_a_full_clear_run_and_recurs_alerts_twice() -> None:
+    """Beat 1 fails, beats 2-4 are clean, beat 5 fails: two transitions.
 
     Deduplication must be per *transition*, not per process: a recurrence after
-    a recovery is new information and must page again.
+    a genuine recovery is new information and must page again. "Genuine" is
+    `_ESCALATION_CLEAR_RUN_BEATS` clean beats, not one -- see
+    `test_a_failure_flapping_every_other_beat_pages_only_on_its_first_arrival`
+    for the reason.
     """
     supervisor, sink = _supervisor()
 
     def _hook(seq: int) -> BeatReport | None:
-        """Fail on the odd beats, succeed on the even one.
+        """Fail on beats 1 and 5, succeed on the three beats between.
+
+        Args:
+            seq: The 1-based beat sequence number.
+
+        Returns:
+            `None` on a clean beat.
+
+        Raises:
+            RuntimeError: On beats 1 and 5.
+        """
+        if seq in {1, 5}:
+            raise RuntimeError(f"failure on {seq}")
+        return None
+
+    run_loop(0, max_beats=5, on_beat=_hook, supervisor=supervisor)
+
+    assert [message for _type, _severity, message in sink.delivered] == [
+        "beat seq=1 failed: RuntimeError: failure on 1",
+        "beat seq=5 failed: RuntimeError: failure on 5",
+    ]
+
+
+def test_a_failure_one_beat_short_of_a_clear_run_does_not_page_again() -> None:
+    """Two clean beats are one short of re-arming, so the recurrence is quiet.
+
+    The boundary of `_ESCALATION_CLEAR_RUN_BEATS`, asserted from below: with
+    the constant at 3, a two-beat lull is the outage continuing. Paired with
+    the test above -- which differs only in having a third clean beat -- this
+    pins the exact threshold rather than merely "some hysteresis exists".
+    """
+    supervisor, sink = _supervisor()
+
+    def _hook(seq: int) -> BeatReport | None:
+        """Fail on beats 1 and 4, succeed on beats 2 and 3.
+
+        Args:
+            seq: The 1-based beat sequence number.
+
+        Returns:
+            `None` on a clean beat.
+
+        Raises:
+            RuntimeError: On beats 1 and 4.
+        """
+        if seq in {1, 4}:
+            raise RuntimeError(f"failure on {seq}")
+        return None
+
+    run_loop(0, max_beats=4, on_beat=_hook, supervisor=supervisor)
+
+    assert [message for _type, _severity, message in sink.delivered] == [
+        "beat seq=1 failed: RuntimeError: failure on 1"
+    ]
+
+
+def test_a_persistent_halt_behind_an_intermittent_failure_pages_twice() -> None:
+    """The #443 + #447 conjunction: two conditions alternating, two alerts.
+
+    This is the shape a single last-escalated slot cannot survive. A persistent
+    kernel HALT with a tick failure on every other beat -- which is what a
+    near-full volume looks like, refusing some appends and accepting others --
+    flips the escalation kind every beat, so *every* beat reads as a transition
+    and every beat pages. At `--heartbeat-interval 0.01` that is roughly a
+    hundred pages a second, each also opening and closing a SQLite connection
+    through `LedgerAlertWriter`.
+
+    Tracking each kind's active state independently, and re-arming only after a
+    full clear run, makes the whole eight-beat sequence exactly two alerts: one
+    per condition, on its first arrival. The count is exact, and so is the pair
+    of messages -- an assertion on the length alone would pass if both pages
+    named the same condition.
+    """
+    supervisor, sink = _supervisor()
+
+    def _hook(seq: int) -> BeatReport | None:
+        """Report the persistent halt on odd beats; raise on even ones.
+
+        Args:
+            seq: The 1-based beat sequence number.
+
+        Returns:
+            The halted report on an odd beat.
+
+        Raises:
+            OSError: On every even beat, as a near-full volume does.
+        """
+        if seq % 2 == 0:
+            raise OSError("database or disk is full")
+        return BeatReport(mode="HALT", halted=True)
+
+    run_loop(0, max_beats=8, on_beat=_hook, supervisor=supervisor)
+
+    assert [message for _type, _severity, message in sink.delivered] == [
+        "risk kernel HALT at beat seq=1 (mode=HALT)",
+        "beat seq=2 failed: OSError: database or disk is full",
+    ]
+
+
+def test_a_failure_flapping_every_other_beat_pages_only_on_its_first_arrival(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A one-beat lull is the outage continuing, not the outage clearing.
+
+    The other half of the conjunction above, isolated: a tick failure that
+    alternates with clean beats and no halt anywhere. Re-arming on a single
+    quiet beat turns this into one page per recurrence. The CRITICAL line is
+    still emitted on every failing beat, so nothing goes quiet -- only the
+    pager is spared.
+    """
+    caplog.set_level(logging.INFO)
+    supervisor, sink = _supervisor()
+
+    def _hook(seq: int) -> BeatReport | None:
+        """Fail on the odd beats, succeed on the even ones.
 
         Args:
             seq: The 1-based beat sequence number.
@@ -250,12 +380,304 @@ def test_a_failure_that_heals_and_recurs_alerts_once_per_transition() -> None:
             raise RuntimeError(f"failure on {seq}")
         return None
 
-    run_loop(0, max_beats=3, on_beat=_hook, supervisor=supervisor)
+    run_loop(0, max_beats=7, on_beat=_hook, supervisor=supervisor)
 
     assert [message for _type, _severity, message in sink.delivered] == [
+        "beat seq=1 failed: RuntimeError: failure on 1"
+    ]
+    assert _messages_at(caplog, logging.CRITICAL) == [
         "beat seq=1 failed: RuntimeError: failure on 1",
         "beat seq=3 failed: RuntimeError: failure on 3",
+        "beat seq=5 failed: RuntimeError: failure on 5",
+        "beat seq=7 failed: RuntimeError: failure on 7",
     ]
+
+
+def test_a_failing_beat_never_clears_a_halt_it_could_not_observe() -> None:
+    """A beat that raised read no kernel mode, so it settles nothing about one.
+
+    If a raising beat counted as a clear observation of the kernel, a run of
+    failures long enough to complete a clear run would re-arm the halt, and the
+    still-halted kernel on the next completed beat would page a second time --
+    a flip-flop on top of the one above. A beat that never reached
+    `deps.kernel.mode` is silence about the kernel, not evidence it recovered.
+    The failing run here is exactly `_ESCALATION_CLEAR_RUN_BEATS` long, which
+    is what makes the distinction observable.
+    """
+    supervisor, sink = _supervisor()
+
+    def _hook(seq: int) -> BeatReport | None:
+        """Halt on beats 1 and 5, raise on beats 2, 3 and 4.
+
+        Args:
+            seq: The 1-based beat sequence number.
+
+        Returns:
+            The halted report on beats 1 and 5.
+
+        Raises:
+            RuntimeError: On beats 2 through 4.
+        """
+        if seq in {2, 3, 4}:
+            raise RuntimeError("boom")
+        return BeatReport(mode="HALT", halted=True)
+
+    run_loop(0, max_beats=5, on_beat=_hook, supervisor=supervisor)
+
+    assert [message for _type, _severity, message in sink.delivered] == [
+        "risk kernel HALT at beat seq=1 (mode=HALT)",
+        "beat seq=2 failed: RuntimeError: boom",
+    ]
+
+
+def test_a_failing_beats_critical_line_carries_the_raising_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The broad `except Exception` must not swallow what the operator needed.
+
+    Before the supervisor existed, a tick failure printed a full traceback on
+    the way out of `main()`. Catching it and logging only
+    `type(exc).__name__: exc` would leave a week-long outage saying
+    `OperationalError: database or disk is full` and nothing at all about
+    *which* append site or tick stage produced it -- the exact "resilience
+    `except` that swallows what the operator needed" failure.
+
+    `JsonFormatter` renders `record.exc_info` through `redact_text`, so this
+    also confirms the traceback goes out on the redacting path rather than
+    around it.
+    """
+    caplog.set_level(logging.INFO)
+    supervisor, _sink = _supervisor()
+
+    run_loop(0, max_beats=1, on_beat=_raising_hook([]), supervisor=supervisor)
+
+    criticals = [
+        record for record in caplog.records if record.levelno == logging.CRITICAL
+    ]
+    assert len(criticals) == 1
+    exc_info = criticals[0].exc_info
+    assert exc_info is not None
+    exc_type, exc_value, traceback = exc_info
+    assert exc_type is RuntimeError
+    assert str(exc_value) == "database or disk is full"
+    assert traceback is not None
+    rendered = logging.Formatter().formatException(exc_info)
+    assert "raise RuntimeError" in rendered
+    assert redact_text(rendered) == rendered
+
+
+def test_a_secret_in_the_raising_beats_traceback_is_redacted_on_the_way_out(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Attaching the traceback must not open a path secrets escape by.
+
+    `JsonFormatter` renders `record.exc_info` through `redact_text`, so the
+    traceback goes out on the same redacting path every other field does. That
+    is what makes `exc_info` safe to switch on -- and it is worth an assertion
+    rather than a claim, because the alternative (a bare
+    `logging.Formatter`) would emit the exception's text verbatim.
+    """
+    configure_logging()
+    supervisor, _sink = _supervisor()
+
+    def _hook(_seq: int) -> BeatReport | None:
+        """Raise an exception whose message embeds an API key.
+
+        Args:
+            _seq: The 1-based beat sequence number, unused.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        raise RuntimeError("upstream rejected sk-abcdef0123456789abcdef")
+
+    run_loop(0, max_beats=1, on_beat=_hook, supervisor=supervisor)
+    captured = capsys.readouterr().err
+
+    assert "sk-abcdef0123456789abcdef" not in captured
+    payloads = [json.loads(line) for line in captured.splitlines() if line.strip()]
+    tracebacks = [payload["exc_info"] for payload in payloads if "exc_info" in payload]
+    assert len(tracebacks) == 1
+    assert "raise RuntimeError" in tracebacks[0]
+    assert "REDACTED" in tracebacks[0]
+
+
+def test_a_halts_critical_line_carries_no_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A halt is a reported state, not a raise, so it has no traceback to log.
+
+    The control for the test above: `exc_info` must be threaded from the
+    `except` clause, not switched on unconditionally, which would attach
+    whatever exception happened to be in flight elsewhere.
+    """
+    caplog.set_level(logging.INFO)
+    supervisor, _sink = _supervisor()
+
+    run_loop(
+        0,
+        max_beats=1,
+        on_beat=lambda _seq: BeatReport(mode="HALT", halted=True),
+        supervisor=supervisor,
+    )
+
+    criticals = [
+        record for record in caplog.records if record.levelno == logging.CRITICAL
+    ]
+    assert len(criticals) == 1
+    assert criticals[0].exc_info is None
+
+
+def test_the_inter_beat_wait_backs_off_while_beats_keep_escalating() -> None:
+    """#443's own instruction: continue on the next beat *with backoff*.
+
+    A loop whose every beat fails gains nothing by retrying at full cadence --
+    it burns the venue's rate limit and floods a log that may be on the volume
+    that filled. The wait doubles per consecutive escalating beat and caps, so
+    the sequence is exact rather than merely "increasing".
+    """
+    supervisor, _sink = _supervisor()
+    hook = _raising_hook([])
+
+    waits = []
+    for seq in range(1, 8):
+        supervisor.observe(seq, hook)
+        waits.append(supervisor.wait_seconds(0.5))
+
+    assert waits == [1.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0]
+
+
+def test_the_inter_beat_wait_returns_to_the_configured_interval_on_recovery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One clean beat cancels the whole backoff, so recovery is noticed fast.
+
+    Backoff must not outlive the condition that caused it: a loop still waiting
+    80 seconds between beats an hour after the disk was cleared would be its
+    own outage. Unlike the *alert* re-arm, which needs a clear run, the cadence
+    resets immediately -- beating fast again costs nothing, paging again does.
+    """
+    caplog.set_level(logging.INFO)
+    supervisor, _sink = _supervisor()
+
+    def _hook(seq: int) -> BeatReport | None:
+        """Fail on the first two beats, then recover.
+
+        Args:
+            seq: The 1-based beat sequence number.
+
+        Returns:
+            `None` once recovered.
+
+        Raises:
+            RuntimeError: On beats 1 and 2.
+        """
+        if seq <= 2:
+            raise RuntimeError("boom")
+        return None
+
+    assert supervisor.wait_seconds(0.5) == 0.5
+    supervisor.observe(1, _hook)
+    supervisor.observe(2, _hook)
+    assert supervisor.wait_seconds(0.5) == 2.0
+    supervisor.observe(3, _hook)
+
+    assert supervisor.wait_seconds(0.5) == 0.5
+
+
+class _WaitRecordingEvent(threading.Event):
+    """A stop event recording every interval `run_loop` actually waits on.
+
+    Attributes:
+        waits: One entry per `wait` call, in order.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the event with an empty wait log."""
+        super().__init__()
+        self.waits: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Record the requested timeout, then return without sleeping.
+
+        Args:
+            timeout: The interval `run_loop` asked to wait for.
+
+        Returns:
+            Whether the event is set, checked without blocking.
+        """
+        self.waits.append(timeout)
+        return super().wait(0)
+
+
+def test_run_loop_waits_the_backed_off_interval_not_the_configured_one() -> None:
+    """The backoff has to reach the loop's own wait, not just be computable.
+
+    `wait_seconds` returning the right number is worth nothing if `run_loop`
+    keeps passing `interval_seconds` straight to `stop_event.wait`. Beats 1 and
+    2 fail and beat 3 is clean, so the recorded sequence pins the doubling and
+    the reset in the one place either can actually take effect.
+    """
+    supervisor, _sink = _supervisor()
+    stop_event = _WaitRecordingEvent()
+
+    def _hook(seq: int) -> BeatReport | None:
+        """Fail on the first two beats, then recover.
+
+        Args:
+            seq: The 1-based beat sequence number.
+
+        Returns:
+            `None` once recovered.
+
+        Raises:
+            RuntimeError: On beats 1 and 2.
+        """
+        if seq <= 2:
+            raise RuntimeError("boom")
+        return None
+
+    run_loop(
+        0.5, max_beats=3, stop_event=stop_event, on_beat=_hook, supervisor=supervisor
+    )
+
+    assert stop_event.waits == [1.0, 2.0, 0.5]
+
+
+def test_a_run_of_halted_beats_backs_off_the_same_way_a_failing_run_does() -> None:
+    """A halted kernel vetoes every intent, so beating at full cadence is waste.
+
+    Pins that the backoff keys on *escalation*, not on the exception path
+    alone: a halt is the other condition the supervisor exists for and it slows
+    the loop identically.
+    """
+    supervisor, _sink = _supervisor()
+
+    for seq in range(1, 4):
+        supervisor.observe(seq, lambda _seq: BeatReport(mode="HALT", halted=True))
+
+    assert supervisor.wait_seconds(0.25) == 2.0
+
+
+def test_a_research_budget_halt_alone_does_not_back_off_the_loop() -> None:
+    """A spent research budget is expected and self-clearing, so cadence holds.
+
+    The counterpart to the halt test above, and the reason the backoff cannot
+    simply key on "the beat logged something": a daily budget ceiling would
+    otherwise slow every afternoon's loop by 16x.
+    """
+    supervisor, _sink = _supervisor()
+
+    for seq in range(1, 4):
+        supervisor.observe(
+            seq,
+            lambda _seq: BeatReport(mode="PAPER", halted=False, research_halted=True),
+        )
+
+    assert supervisor.wait_seconds(0.25) == 0.25
 
 
 def test_a_failure_followed_by_a_halt_alerts_for_both_conditions() -> None:
@@ -481,11 +903,11 @@ def test_every_halted_beat_logs_its_own_critical_line(
 
 
 def test_a_halt_that_clears_and_returns_alerts_once_per_transition() -> None:
-    """A cleared halt that recurs is new information and alerts again."""
+    """A halt cleared for a full clear run and then recurring alerts again."""
     supervisor, sink = _supervisor()
 
     def _hook(seq: int) -> BeatReport | None:
-        """Halt on beats 1 and 3, recover on beat 2.
+        """Halt on beats 1 and 5, run PAPER on beats 2-4.
 
         Args:
             seq: The 1-based beat sequence number.
@@ -493,15 +915,15 @@ def test_a_halt_that_clears_and_returns_alerts_once_per_transition() -> None:
         Returns:
             The beat's report.
         """
-        if seq == 2:
-            return BeatReport(mode="PAPER", halted=False)
-        return BeatReport(mode="HALT", halted=True)
+        if seq in {1, 5}:
+            return BeatReport(mode="HALT", halted=True)
+        return BeatReport(mode="PAPER", halted=False)
 
-    run_loop(0, max_beats=3, on_beat=_hook, supervisor=supervisor)
+    run_loop(0, max_beats=5, on_beat=_hook, supervisor=supervisor)
 
     assert [message for _type, _severity, message in sink.delivered] == [
         "risk kernel HALT at beat seq=1 (mode=HALT)",
-        "risk kernel HALT at beat seq=3 (mode=HALT)",
+        "risk kernel HALT at beat seq=5 (mode=HALT)",
     ]
 
 
@@ -955,7 +1377,12 @@ def test_the_composed_supervisor_stamps_the_process_component_on_its_log_lines(
 def test_the_composed_supervisor_stamps_the_process_component_on_its_alerts(
     tmp_path: Path,
 ) -> None:
-    """The ledgered alert carries the `--process` token, not a hardcoded one."""
+    """Both ledgered rows carry the `--process` token, not a hardcoded one.
+
+    A supervised failure writes two rows -- the emitted alert and the beat's
+    own `ModeHeartbeat` -- and each is stamped from a different writer, so both
+    are asserted here rather than only whichever happens to land first.
+    """
     ledger_path = tmp_path / "ledger.db"
     args = argparse.Namespace(ledger_path=ledger_path, process="order_gateway")
 
@@ -963,11 +1390,14 @@ def test_the_composed_supervisor_stamps_the_process_component_on_its_alerts(
 
     store = SqliteLedgerStore(ledger_path)
     try:
-        components = [record.component for record in store.read_all()]
+        stamped = [(record.event_type, record.component) for record in store.read_all()]
     finally:
         store.close()
 
-    assert components == ["order_gateway"]
+    assert stamped == [
+        ("AlertEmitted", "order_gateway"),
+        ("ModeHeartbeat", "order_gateway"),
+    ]
 
 
 # --- the supervised run refuses to start with an undeliverable alert path ---
@@ -1045,6 +1475,60 @@ def test_a_run_with_an_undeliverable_alert_sink_fails_closed_at_startup(
     assert [message for message in messages if "heartbeat" in message] == []
 
 
+def test_the_shutdown_handlers_are_installed_before_the_beat_hook_is_built(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SIGTERM arriving while the hook is built must unwind, not kill.
+
+    `_resolve_on_beat` -> `_build_paper_on_beat` eagerly builds the entire PAPER
+    bundle: it opens the SQLite ledger, loads the books, and constructs the
+    connector. That is the slowest window in startup, and until
+    `_install_signal_handlers` has run a SIGTERM arriving inside it hits the
+    default disposition and kills the process outright rather than unwinding
+    through `ShutdownState`. Ordering the two calls is therefore a behavioural
+    property, not a stylistic one.
+
+    Delivering a real SIGTERM would kill the test runner, so the check is that
+    a *callable* handler is already installed at that instant and that invoking
+    it stops the loop before its first beat. Under the wrong ordering
+    `signal.getsignal` returns `signal.SIG_DFL`, which is an int.
+    """
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _resolve(_args: object, _config: object) -> None:
+        """Deliver a SIGTERM to whatever handler is installed right now.
+
+        Args:
+            _args: The parsed `run` arguments, unused.
+            _config: The loaded configuration, unused.
+
+        Returns:
+            `None`, so the loop runs a bare heartbeat if it runs at all.
+
+        Raises:
+            AssertionError: If no Python handler is installed yet, which is the
+                wrong ordering and the whole point of this test.
+        """
+        handler = signal.getsignal(signal.SIGTERM)
+        if not callable(handler):
+            raise AssertionError(f"SIGTERM still at its default: {handler!r}")
+        handler(signal.SIGTERM, None)
+        return None
+
+    monkeypatch.setattr("windbreak.main._resolve_on_beat", _resolve)
+    try:
+        exit_code = main(_snapshot_run_argv())
+    finally:
+        signal.signal(signal.SIGTERM, original_sigterm)
+        signal.signal(signal.SIGINT, original_sigint)
+    messages = _logged_messages(capsys)
+
+    assert exit_code == 0
+    assert [message for message in messages if "heartbeat" in message] == []
+    assert "shutdown reason=SIGTERM" in messages
+
+
 def test_a_failing_beat_under_the_real_cli_pages_the_configured_sink(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1116,8 +1600,6 @@ def test_the_dashboard_reports_halt_from_the_ledgers_mode_heartbeat(
     The riskkernel and scheduler sides already ledger the real mode; this pins
     that the dashboard surfaces it rather than the RESEARCH default.
     """
-    from windbreak.ledger.events import ModeHeartbeat
-
     ledger_path = tmp_path / "ledger.db"
     store = SqliteLedgerStore(ledger_path)
     try:
@@ -1143,3 +1625,123 @@ def test_the_dashboard_reports_unknown_when_the_ledger_has_no_heartbeat(
 
     assert status.mode == MODE_UNKNOWN
     assert status.last_heartbeat is None
+
+
+def test_the_dashboard_stops_reporting_health_once_a_beat_has_failed(
+    tmp_path: Path,
+) -> None:
+    """The deployed path: a failing beat must not read as healthy (#447).
+
+    Changing only the *no-ledger* default fixes the one configuration no
+    deployment uses. The ledger-backed source is the one the dashboard actually
+    runs, and it was indistinguishable from healthy through an outage:
+    `run_single_tick` appends its `ModeHeartbeat(mode=PAPER)` *before* the
+    stages that raise, so every failing beat re-stamped a healthy row and this
+    source dutifully reported it, timestamp refreshed to now. A value
+    re-stamped to now can never veto anything.
+
+    The supervisor's own row lands after the tick's, so the latest row names the
+    outcome the beat actually had.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        store.append(ModeHeartbeat(component="scheduler", mode="PAPER", beat=1))
+    finally:
+        store.close()
+    supervisor = BeatSupervisor(
+        component="pipeline",
+        dispatcher=AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
+        mode_writer=LedgerModeWriter(ledger_path, component="pipeline"),
+    )
+
+    assert _build_dashboard_status_source(ledger_path)().mode == "PAPER"
+    supervisor.observe(1, _raising_hook([]))
+
+    status = _build_dashboard_status_source(ledger_path)()
+    assert status.mode == MODE_TICK_FAILED
+    assert status.mode != "PAPER"
+    assert status.last_heartbeat is not None
+
+
+def test_the_dashboard_returns_to_the_ticks_mode_once_a_beat_succeeds(
+    tmp_path: Path,
+) -> None:
+    """Recovery needs no second mechanism: the tick's own row lands last again.
+
+    The control for the test above. Without it, a supervisor that ledgered
+    `TICK_FAILED` and never let go would pin the dashboard to a failure the
+    operator had already fixed.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    supervisor = BeatSupervisor(
+        component="pipeline",
+        dispatcher=AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
+        mode_writer=LedgerModeWriter(ledger_path, component="pipeline"),
+    )
+    supervisor.observe(1, _raising_hook([]))
+    assert _build_dashboard_status_source(ledger_path)().mode == MODE_TICK_FAILED
+
+    supervisor.observe(2, lambda _seq: BeatReport(mode="PAPER", halted=False))
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        store.append(ModeHeartbeat(component="scheduler", mode="PAPER", beat=2))
+    finally:
+        store.close()
+
+    assert _build_dashboard_status_source(ledger_path)().mode == "PAPER"
+
+
+def test_a_successful_beat_ledgers_no_mode_row_of_its_own(tmp_path: Path) -> None:
+    """Only failures are ledgered here; a completed tick ledgers its own mode.
+
+    Duplicating `run_single_tick`'s `ModeHeartbeat` on every beat would double
+    the busiest row type in the chain for no new information. Pinned as an
+    exact row list so a supervisor that ledgered unconditionally fails.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    supervisor = BeatSupervisor(
+        component="pipeline",
+        dispatcher=AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
+        mode_writer=LedgerModeWriter(ledger_path, component="pipeline"),
+    )
+
+    supervisor.observe(1, lambda _seq: BeatReport(mode="PAPER", halted=False))
+    supervisor.observe(2, lambda _seq: BeatReport(mode="HALT", halted=True))
+    supervisor.observe(3, lambda _seq: None)
+
+    assert not ledger_path.exists()
+
+
+def test_a_mode_row_that_cannot_be_written_never_takes_the_loop_down(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """The ledger volume is the outage: its own row's append may fail too.
+
+    The honest limit of a ledger-backed status source on a full disk. It must
+    be announced at CRITICAL and survived, never raised -- raising would put
+    the daemon back exactly where #443 found it.
+    """
+    caplog.set_level(logging.INFO)
+    unwritable = tmp_path / "missing-dir" / "ledger.db"
+    supervisor, sink = _supervisor()
+    supervisor = BeatSupervisor(
+        component="pipeline",
+        dispatcher=AlertDispatcher(sinks=[sink], ledger_writer=LoggingLedgerWriter()),
+        mode_writer=LedgerModeWriter(unwritable, component="pipeline"),
+    )
+
+    run_loop(0, max_beats=2, on_beat=_raising_hook([]), supervisor=supervisor)
+
+    assert _heartbeat_lines(caplog) == [
+        "mode=TICK_FAILED heartbeat seq=1",
+        "mode=TICK_FAILED heartbeat seq=2",
+    ]
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("beat mode ledgering failed: ")
+    ] == [
+        "beat mode ledgering failed: OperationalError: unable to open database file",
+        "beat mode ledgering failed: OperationalError: unable to open database file",
+    ]
