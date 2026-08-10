@@ -13,8 +13,25 @@ carrying only a fingerprint of the untrusted text, never the raw bytes. Untrust
 runs in both directions: :func:`build_vote_prompt` screens the *market's own*
 free-text metadata before inlining it into the prompt's trusted scaffold and
 refuses a hostile market as a :class:`ProviderMarketMetadataRejectedError`
-(issue #265), so a forged delimiter cannot reach a model in the first place. The
-module is stdlib-only and float-free -- it sits on the probability path guarded
+(issue #265), so a forged delimiter cannot reach a model *through this prompt
+builder*.
+
+That scope is the literal truth and no more, stated here because an
+overclaim about a security boundary is worse than none. The guard sits inside
+:func:`build_vote_prompt` rather than at the provider seam, so it covers exactly
+the providers that build their request through it --
+:class:`~windbreak.forecast.providers.fixture.FixtureVoteProvider` and any
+future caller -- and not one that assembles its own body:
+:class:`~windbreak.forecast.providers.futuresearch.FutureSearchProvider` ships
+``ticker``/``title``/``resolution_criteria`` to a hosted forecaster without ever
+calling :func:`build_vote_prompt`, so on a FutureSearch-configured run those
+bytes still reach a model unscreened (issue #462). What the guard *rejects* is
+bounded too: the two literal untrusted-data delimiter tokens and the tool-call
+markers :func:`~windbreak.forecast.sanitize.screen_untrusted_text` names -- not
+metadata whose embedded newlines forge scaffold *lines* carrying no delimiter at
+all (issue #463). Both gaps are filed follow-ups, not silently-implied closures.
+
+The module is stdlib-only and float-free -- it sits on the probability path guarded
 by ``scripts/lint_no_floats.py`` -- and, per the SPEC S8.3 sandbox boundary,
 never imports ``windbreak.config``: an ensemble member is accepted structurally
 through :class:`EnsembleMemberLike`, so a config-owned
@@ -395,8 +412,15 @@ class ProviderMarketMetadataRejectedError(ProviderVoteError):
         screen_failure: The ``RESPONSE_FAILURE_*`` verdict
             :func:`~windbreak.forecast.sanitize.screen_untrusted_text` returned.
         field_fingerprint: The sha256 digest of the rejected field's value.
-            Fingerprint only: the tainted bytes never reach a log or the
-            append-only ledger, exactly as with a rejected response.
+            Fingerprint only -- *this error* never carries the tainted bytes
+            onward, neither in its message nor in its ``args``, exactly as with
+            a rejected response. That is a property of the error object and not
+            a claim about the run: the vote-collection loop ledgers
+            ``market_ticker`` straight off the market
+            (``pipeline.ForecastRecorder.record_discard``), so a hostile
+            *ticker*'s raw bytes still land in the append-only ledger, where
+            nothing written can be undone afterwards (issue #464). Refusing the
+            vote is what this error guarantees; a clean ledger is not.
     """
 
     def __init__(
@@ -691,6 +715,21 @@ def _screen_market_metadata(market: NormalizedMarket) -> None:
     them, so the field a multiply-hostile market is refused on is deterministic.
     ``close_time`` and the baseline price are rendered from a ``datetime`` and an
     ``int``, which cannot carry a delimiter, so they are not screened.
+
+    The *whole* S8.5 screen is applied, tool-call markers included, not only the
+    delimiter check issue #265 names. That carries a deliberate availability
+    cost, decided rather than inherited:
+    :data:`~windbreak.forecast.sanitize.TOOL_CALL_MARKERS` matches by plain
+    substring, so a legitimate title quoting a marker word -- ``Will OpenAI ship
+    a "tool" API before 2026?`` -- makes its market unforecastable across every
+    ensemble member, not merely discarded for one response. The justification
+    ``sanitize`` records for that substring test ("only a discard signal")
+    genuinely does not transfer here, so it is re-argued on its own terms: a
+    skipped market is a missed opportunity, while a forecast of a question
+    nobody asked is a priced trade on a forged prompt, and the two are not
+    symmetric. Honouring only a chosen verdict would also fail *open* the day
+    the screen learns a new one. The cost is pinned by test rather than left
+    undiscovered.
 
     Args:
         market: The market whose metadata is about to be interpolated.

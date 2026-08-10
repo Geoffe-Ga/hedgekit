@@ -519,6 +519,12 @@ _TOOL_CALL_MARKER = next(iter(sorted(TOOL_CALL_MARKERS)))
 #: a marker. Derived, so it tracks a renamed marker rather than restating one.
 _TOOL_CALL_MARKER_WORD = _TOOL_CALL_MARKER.strip('"')
 
+#: The shortest tool-call marker: the one whose plain-substring test collides
+#: with ordinary English, and therefore the entire availability cost of
+#: screening market metadata with the response-side screen. Derived by length
+#: (the minimum is unique), never restated.
+_SHORTEST_TOOL_CALL_MARKER = min(TOOL_CALL_MARKERS, key=len)
+
 #: A title that closes the enclosing data block, injects an instruction, and
 #: opens a fresh one -- the exact breakout the pre-#265 f-string permitted.
 _FORGED_TITLE = (
@@ -625,6 +631,44 @@ def test_build_vote_prompt_refuses_market_metadata_embedding_a_tool_call_lure(
     assert excinfo.value.field_name == "title"
 
 
+def test_build_vote_prompt_refuses_a_benign_title_that_merely_quotes_the_marker(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """Pin the decided availability cost of screening metadata fail-closed.
+
+    `TOOL_CALL_MARKERS` matches by plain substring, so an ordinary market
+    question that happens to quote the marker word is refused -- and because
+    `build_vote_prompt` is deterministic in the market, it is refused for
+    *every* ensemble member, leaving the market permanently unforecastable
+    rather than costing one discarded response. `sanitize`'s own justification
+    for the substring test ("only a discard signal") does not transfer to
+    metadata, so this is accepted deliberately, not inherited: see
+    `_screen_market_metadata` for the argument. Pinned here so the cost cannot
+    be paid unnoticed, and so narrowing the screen later is a visible decision
+    rather than a silent regression.
+
+    Both directions matter. The unquoted word must still build -- a guard that
+    refused the bare word would refuse a far larger share of real markets.
+    """
+    word = _SHORTEST_TOOL_CALL_MARKER.strip('"')
+    assert f'"{word}"' == _SHORTEST_TOOL_CALL_MARKER
+    assert word.isalpha()
+
+    unquoted = f"Will OpenAI ship a {word} API before 2026?"
+    quoted = f"Will OpenAI ship a {_SHORTEST_TOOL_CALL_MARKER} API before 2026?"
+
+    assert unquoted in build_vote_prompt(
+        dataclasses.replace(market, title=unquoted), baseline, 0, ()
+    )
+
+    hostile = dataclasses.replace(market, title=quoted)
+    for vote_index in range(3):
+        with pytest.raises(ProviderMarketMetadataRejectedError) as excinfo:
+            build_vote_prompt(hostile, baseline, vote_index, ())
+        assert excinfo.value.field_name == "title"
+        assert excinfo.value.screen_failure == RESPONSE_FAILURE_TOOL_CALL_LURE
+
+
 def test_build_vote_prompt_metadata_refusal_is_a_discardable_provider_vote_error(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
@@ -640,15 +684,23 @@ def test_build_vote_prompt_metadata_refusal_is_a_discardable_provider_vote_error
     error = excinfo.value
     assert error.response_fingerprint == NO_RESPONSE_FINGERPRINT
     assert error.cost_micros == 0
-    assert error.field_fingerprint != NO_RESPONSE_FINGERPRINT
+    # The two digests live in two attributes and never merge: a consumer reading
+    # `response_fingerprint` is handed the truthful no-body sentinel, never the
+    # metadata hash wearing a response's name.
+    assert error.field_fingerprint == fingerprint_response(_FORGED_TITLE)
+    assert error.field_fingerprint != error.response_fingerprint
 
 
 def test_build_vote_prompt_metadata_refusal_never_echoes_the_hostile_text(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
     """The refusal carries a fingerprint, never the tainted bytes: neither the
-    message nor the exception args may leak the forged delimiters onward into a
-    log or the append-only ledger.
+    message nor the exception args may leak the forged delimiters onward.
+
+    Scoped to the error object on purpose. It is NOT a claim that the run keeps
+    the tainted bytes out of the ledger -- the vote-collection loop ledgers
+    `market_ticker` straight off the market, so a hostile ticker still reaches
+    the append-only ledger by a path this error does not sit on.
     """
     hostile = dataclasses.replace(market, title=_FORGED_TITLE)
 
@@ -762,25 +814,40 @@ def test_market_metadata_failure_code_is_its_own_distinguishable_wire_value() ->
     assert PROVIDER_FAILURE_MARKET_METADATA_REJECTED != NO_RESPONSE_FINGERPRINT
 
 
-#: Every free-text `str` field on `NormalizedMarket` -- i.e. every one whose
-#: value `__post_init__` does NOT constrain to a closed set (`market_type` and
-#: `jurisdiction_status` are the two it does). Any of these could in principle
-#: be interpolated into the prompt by a later edit; the guard screens exactly
-#: the three that are.
-_FREE_TEXT_MARKET_FIELDS = (
-    "exchange",
-    "ticker",
-    "event_ticker",
-    "title",
-    "resolution_criteria",
-    "category",
-    "mutually_exclusive_group_id",
-    "raw_exchange_payload_hash",
-)
-
-#: The subset of the above that `build_vote_prompt` actually inlines, and so
-#: exactly the set `_screen_market_metadata` must screen.
+#: The subset of `NormalizedMarket`'s free-text fields that `build_vote_prompt`
+#: actually inlines, and so exactly the set `_screen_market_metadata` must
+#: screen.
 _SCREENED_MARKET_FIELDS = frozenset({"ticker", "title", "resolution_criteria"})
+
+
+def _free_text_market_fields(market: NormalizedMarket) -> frozenset[str]:
+    """Return every `NormalizedMarket` field whose annotation admits free text.
+
+    DERIVED from `dataclasses.fields`, never restated. A hand-written tuple of
+    field names only probes the fields it happens to name on the day it was
+    written, so a *newly added* free-text field is invisible to it -- and a new
+    field interpolated into the trusted scaffold unscreened is issue #265
+    reopened under a new name, with the extent test below still green. Proven,
+    not argued: adding `subtitle: str` to `NormalizedMarket` and inlining it
+    unscreened left the hardcoded-tuple version passing.
+
+    `windbreak.connector.models` runs under PEP 563, so each `Field.type` is the
+    annotation's source text; union members are therefore split textually. A
+    `Literal[...]` field (`market_type`, `jurisdiction_status`) is excluded
+    because `__post_init__` refuses any value outside its closed set, so it
+    cannot carry attacker-controlled text at all.
+
+    Args:
+        market: A market instance whose dataclass fields are inspected.
+
+    Returns:
+        The names of every field declared `str`, alone or as a union member.
+    """
+    return frozenset(
+        field.name
+        for field in dataclasses.fields(market)
+        if "str" in {member.strip() for member in str(field.type).split("|")}
+    )
 
 
 def test_screened_fields_are_exactly_the_free_text_fields_the_prompt_inlines(
@@ -788,14 +855,22 @@ def test_screened_fields_are_exactly_the_free_text_fields_the_prompt_inlines(
 ) -> None:
     """Pin the guard's *extent*, not just that it fires somewhere.
 
-    Each free-text field gets a distinct sentinel, so the prompt reveals which
-    ones it inlines. That set must equal the set the screen covers: a field
-    interpolated but unscreened is the #265 hole reopened under a new name, and
-    a field screened but not interpolated is a refusal nothing justifies. Both
-    directions are asserted -- checking only the count, or only one direction,
-    is the wrong-dimension guard of #429.
+    Every free-text field `NormalizedMarket` declares -- discovered from the
+    dataclass, not from a list -- gets a distinct sentinel, so the prompt
+    reveals which ones it inlines. That set must equal the set the screen
+    covers: a field interpolated but unscreened is the #265 hole reopened under
+    a new name, and a field screened but not interpolated is a refusal nothing
+    justifies. Both directions are asserted -- checking only the count, or only
+    one direction, is the wrong-dimension guard of #429.
     """
-    sentinels = {name: f"sentinel-{name}-value" for name in _FREE_TEXT_MARKET_FIELDS}
+    free_text = _free_text_market_fields(market)
+
+    # A proper superset: the screened fields are all discoverable (so the
+    # refusal loop runs) AND at least one free-text field is left over (so the
+    # tolerated loop runs). Either loop over an empty set would pass forever.
+    assert free_text > _SCREENED_MARKET_FIELDS
+
+    sentinels = {name: f"sentinel-{name}-value" for name in free_text}
     probed = dataclasses.replace(market, **sentinels)
 
     prompt = build_vote_prompt(probed, baseline, 0, ())
@@ -807,6 +882,6 @@ def test_screened_fields_are_exactly_the_free_text_fields_the_prompt_inlines(
         with pytest.raises(ProviderMarketMetadataRejectedError) as excinfo:
             build_vote_prompt(hostile, baseline, 0, ())
         assert excinfo.value.field_name == name
-    for name in set(_FREE_TEXT_MARKET_FIELDS) - _SCREENED_MARKET_FIELDS:
+    for name in free_text - _SCREENED_MARKET_FIELDS:
         tolerated = dataclasses.replace(probed, **{name: f"{DATA_BLOCK_END} x"})
         assert build_vote_prompt(tolerated, baseline, 0, ()) == prompt
