@@ -161,10 +161,29 @@ windbreak run --paper-books-dir ... --cassette-path ... --ledger-path ... \
   with no live seam, or a live seam without live mode. Silently replaying a
   recording for an operator who asked for novel forecasts would hand them a
   paper tape they believed was the market. An unrecognized `mode` refuses too.
-- **Live providers and live research are independent.** Leaving
+- **Live providers and live research are independent, and unconfigured research
+  produces no evidence at all.** Leaving
   `forecast.research.search_endpoint_url` unconfigured means research finds
   nothing, so the pipeline abstains on zero verified citations *before* any vote
-  (SPEC S8.8) -- fail-closed, and no reason to invent a search endpoint.
+  (SPEC S8.8). That is the correct fail-closed direction, but do not read it as
+  a benign default: a loop left this way abstains on **every tick, forever**,
+  and a week of uptime yields exactly the evidence that zero days would.
+  `research.search_endpoint_url`, `allowed_research_hosts` and
+  `research.search_api_key_env` are therefore **required** for any
+  evidence-producing run, not optional.
+
+  No concrete end-to-end working configuration can be named here yet, and the
+  reason is not research. Configuring research clears one of six barriers
+  between an activated PAPER loop and a single order intent; the decisive one
+  is arithmetic and unconditional -- every full-pipeline forecast books a flat
+  $3.00 research charge, and the selector amortizes the whole of it over a
+  fixed 1.00-contract entry probe, so `net_edge_min` is unreachable for any
+  market, at any price, with any capital (issue #483). Until that is resolved,
+  an activated PAPER loop cannot emit an order intent regardless of how
+  research is configured, and nothing in the loop refuses to start or says so
+  (issue #485). `tests/scheduler/test_paper_intent_barriers.py` drives the real
+  tick over the real shipped composition and pins each barrier with the exact
+  values it records.
 - **Every live vote is retried and priced.** `RetryingProvider` bounds attempts,
   the total deadline, backoff, and spend from the `retry` block above, and
   charges each failed attempt against the `prices` table. The cassette path is

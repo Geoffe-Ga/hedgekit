@@ -54,10 +54,60 @@ carries every stage. The parametrized negatives in
 condition back one at a time and watch the intent disappear, so every barrier
 is shown independently load-bearing rather than jointly asserted.
 
-Nothing here relaxes a threshold. ``min_depth_contract_centis``,
-``horizon_days``, ``min_net_edge_ppm`` and the price bands are read at their
-production defaults throughout; where a barrier is cleared it is cleared by
-handing the loop an input that genuinely satisfies the gate.
+An intent is not a trade, so the chain is followed one beat further.
+:func:`test_the_intent_is_vetoed_on_beat_one_and_fills_on_beat_two` pins a
+seventh, transient barrier the six above sit in front of: on the first beat of
+a fresh ledger the risk kernel vetoes on ``daily loss limit reached``, because
+``equity_start_of_day`` is 0 until that beat's own ``EquitySampled`` row exists
+and the check fires on ``0 >= 0``. The next beat approves the same intent and
+the venue fills it.
+
+No *threshold* is relaxed. ``min_depth_contract_centis``, ``horizon_days``,
+``min_net_edge_ppm`` and the price bands are read at their production defaults
+throughout, and barriers 1-5 are each cleared by handing the loop an input that
+genuinely satisfies the gate: a book that really is deep, a close that really is
+30 days out, a real correlation declaration, a real M6 artifact.
+
+**Barrier 6 is the exception, and it is not an input.** The positive control
+clears it by monkeypatching ``windbreak.forecast.pipeline._RESEARCH_COST_MICROS``
+-- a production module constant, not anything the loop is handed. Arithmetically
+that is indistinguishable from lowering ``min_net_edge_ppm`` by 2 100 000 ppm
+(from 30 000 to the -2 070 000 the best case actually measures). Saying so
+plainly matters, because the looser phrasing -- "every barrier is cleared by a
+genuine input" -- would be false, and a claim of that shape is exactly what this
+module exists to catch. It is a *control*, not an assertion that 3 000 micros is
+the right charge: barrier 6 refuses every market at every price with any
+capital, so no input exists that would let any stage below the selector be
+observed at all, and
+:func:`test_restoring_any_single_barrier_removes_the_intent` puts the shipped
+charge straight back and watches the intent disappear.
+
+Issue #438's acceptance criteria
+--------------------------------
+
+This module does **not** satisfy them, and neither branch can be satisfied
+today. That is the finding, not a footnote:
+
+* *"with research configured against a recorded transport, a tick reaches*
+  ``SelectorDecisionRecorded`` *with* ``intent_count >= 1``\\ *"* -- unachievable
+  as written. Barrier 6 is arithmetic and unconditional, so no research
+  configuration, recorded transport, fixture or cassette reaches it. Only a
+  change inside ``windbreak/forecast`` or ``windbreak/selector`` can, and that
+  is filed as **#483**.
+* *"a test that activates the PAPER loop the way the CLI activates it and
+  asserts the run refuses to start"* -- unachievable for a different reason:
+  there is no startup guard to assert against. The shipped loop starts, opens a
+  ledger, screens, and reports healthy.
+  :func:`test_shipped_configuration_never_forecasts` pins precisely that, which
+  is the *opposite* of what the AC asks a test to assert. It is pinned as
+  observed present behaviour and must never be read as desired behaviour.
+  Building the guard is a production change to the activation path, filed as
+  **#485**; it is deliberately not made from here, because a guard keyed on the
+  research configuration would name the wrong cause -- research is barrier 2 of
+  six, and clearing it changes nothing.
+
+So #438 stays open and its acceptance criteria need amending against the
+evidence below rather than closing against it.
 """
 
 from __future__ import annotations
@@ -74,6 +124,8 @@ import pytest
 from windbreak.config.schema import (
     CorrelationConfig,
     CorrelationTagConfig,
+    HorizonDays,
+    RiskConfig,
     WindbreakConfig,
 )
 from windbreak.connector.paper import PaperExchange
@@ -84,6 +136,7 @@ from windbreak.forecast.providers.base import build_vote_prompt
 from windbreak.forecast.records import BaselineQuoteSnapshot
 from windbreak.forecast.sandbox import build_research_tools
 from windbreak.scheduler.loop import build_paper_deps, run_single_tick
+from windbreak.screener import horizon_filter
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -145,13 +198,19 @@ FIXED_NOW_EPOCH_S = 1_800_000_000
 #: satisfied rather than widened.
 IN_WINDOW_HORIZON_DAYS = 30
 
-#: The ask price, in pips, the barrier-6 tests quote: the lowest price inside
-#: `price_within_bands`' [500, 9500] open band, and therefore the price that
-#: maximizes the gross edge an in-band market can offer.
-BEST_CASE_ASK_PIPS = 600
+#: The ask price, in pips, the barrier-6 tests quote. `price_within_bands`
+#: (`windbreak/selector/entry.py:219`) fails only on
+#: `price < min_open_price_pips`, and that floor is 500
+#: (`RiskConfig.min_open_price_pips`), so 500 itself is admitted -- the lowest
+#: price the open band allows, and therefore the price that maximizes the gross
+#: edge an in-band fill can offer. `test_best_case_ask_is_the_open_band_floor`
+#: pins that this constant really is that floor rather than merely near it.
+BEST_CASE_ASK_PIPS = 500
 
-#: The best-case bid, one tick below the best-case ask.
-BEST_CASE_BID_PIPS = 590
+#: The best-case bid, one tick below the best-case ask. The band is checked
+#: against the executable (taker) price only, so the bid sits below the floor
+#: without affecting `price_within_bands`.
+BEST_CASE_BID_PIPS = 490
 
 #: A resting size, in contract-centis, far above `min_depth_contract_centis`.
 DEEP_QUANTITY_CENTIS = 100_000
@@ -174,6 +233,14 @@ RESEARCH_COST_ATTR = "_RESEARCH_COST_MICROS"
 
 #: The twelve SPEC S9.3 entry conditions, in the order the selector renders
 #: them, as they read when every one passes.
+#:
+#: Two of the twelve are **inert seams**, not measurements:
+#: `_jurisdiction_eligible` and `_category_eligible`
+#: (`windbreak/selector/entry.py:184-205`) are hardcoded ``passed=True``,
+#: because the metadata they would read is not threaded into ``SelectorInputs``
+#: (SPEC S9.1); their own docstrings say they "pass ... vacuously" and defer to
+#: the screener. Their presence here records what the selector *renders*, and
+#: must not be read as evidence that either condition was evaluated.
 ALL_ENTRY_CONDITIONS_PASSING = [
     "pass:net_edge_min",
     "pass:annualized_hurdle",
@@ -188,6 +255,22 @@ ALL_ENTRY_CONDITIONS_PASSING = [
     "pass:price_within_bands",
     "pass:forecast_live_eligible",
 ]
+
+#: The thirteenth and last reason the selector renders on the emitting path:
+#: the sizing line. Pinned alongside the twelve conditions so the emitting
+#: test compares the *whole* rendered sequence rather than a leading slice --
+#: a slice would silently drop a thirteenth condition appended later.
+SIZING_REASON = (
+    "sizing: raw_centis=1756421 g_ppm=1000000 "
+    "binding_cap=participation final_centis=25000"
+)
+
+#: The order size, in contract-centis, the sizing line above settles on and the
+#: paper venue fills on the beat after the intent is approved.
+SIZED_FILL_CENTIS = 25000
+
+#: The kernel's veto reason on the first beat of a fresh ledger.
+DAILY_LOSS_VETO_REASON = "daily loss limit reached"
 
 
 class _FindingResearchTransport:
@@ -631,6 +714,11 @@ def test_shipped_vote_cassette_cannot_serve_the_pipelines_own_prompt(
     :func:`~windbreak.scheduler.loop.run_single_tick`, not an abstention --
     which is the honest posture, and worth pinning so a later change cannot
     quietly downgrade it into a silently skipped vote.
+
+    The committed keys are read and compared rather than described, and the
+    raised digest is checked against them, so "keyed on placeholders, never on
+    a real request hash" is a claim this test can actually falsify: recording
+    one real hash into that file would fail it.
     """
     _set_close_time(
         shipped_books, closes_at=_fixed_now() + timedelta(days=IN_WINDOW_HORIZON_DAYS)
@@ -654,8 +742,13 @@ def test_shipped_vote_cassette_cannot_serve_the_pipelines_own_prompt(
     message = str(caught.value)
     assert message.startswith(prefix)
     digest = message[len(prefix) :]
-    assert len(digest) == 64
-    assert set(digest) <= set("0123456789abcdef")
+    recorded = json.loads(SHIPPED_CASSETTE.read_text(encoding="utf-8"))
+    assert list(recorded) == [
+        "placeholder-hash-vote-1",
+        "placeholder-hash-vote-2",
+        "placeholder-hash-vote-3",
+    ]
+    assert digest not in recorded
 
 
 def test_static_vote_cassette_and_horizon_filter_are_mutually_exclusive() -> None:
@@ -670,20 +763,53 @@ def test_static_vote_cassette_and_horizon_filter_are_mutually_exclusive() -> Non
     close that moves with the clock, and a cassette key that moves with the
     clock cannot be committed. The two requirements contradict.
 
-    Derived, not restated: both prompts come from the real builder and both
+    Both halves are exercised, and the same market object carries them, which
+    is what makes the contradiction a single chain rather than two adjacent
+    claims:
+
+    1. **The horizon half.** One fixed close, evaluated twice against the real
+       filter at two clock readings. It clears at the first and is refused at
+       the second, one whole day under ``HorizonDays().min`` -- so no fixed
+       close *keeps* clearing. The only market still clearing at the later
+       reading is one whose close moved by exactly the clock's own drift.
+    2. **The cassette half.** That moved market is then handed to the real
+       prompt builder and the real request hash, and its replay key differs.
+
+    Derived, not restated: the window bounds are read from
+    :class:`~windbreak.config.schema.HorizonDays` at their production defaults
+    rather than transcribed, both prompts come from the real builder and both
     keys from the real hash, and the differing line is *located* rather than
     assumed, so a change to either surface stays covered.
     """
-    market = PaperExchange.from_fixture_dir(SHIPPED_BOOKS).get_market(TICKER)
-    later = dataclasses.replace(
-        market, close_time=market.close_time + timedelta(days=1)
+    window = HorizonDays()
+    now = _fixed_now()
+    shipped = PaperExchange.from_fixture_dir(SHIPPED_BOOKS).get_market(TICKER)
+    market = dataclasses.replace(
+        shipped, close_time=now + timedelta(days=IN_WINDOW_HORIZON_DAYS)
     )
+    drift = timedelta(days=IN_WINDOW_HORIZON_DAYS - window.min + 1)
+    later = dataclasses.replace(market, close_time=market.close_time + drift)
+
+    cleared = horizon_filter(market, now=now, min_days=window.min, max_days=window.max)
+    drifted = horizon_filter(
+        market, now=now + drift, min_days=window.min, max_days=window.max
+    )
+    restored = horizon_filter(
+        later, now=now + drift, min_days=window.min, max_days=window.max
+    )
+
+    assert cleared.passed is True
+    assert cleared.measured == IN_WINDOW_HORIZON_DAYS
+    assert drifted.passed is False
+    assert drifted.measured == window.min - 1
+    assert restored.passed is True
+    assert restored.measured == IN_WINDOW_HORIZON_DAYS
+
     baseline = BaselineQuoteSnapshot(
         snapshot_id="snapshot-1",
         price_pips=BEST_CASE_ASK_PIPS,
-        fetched_at=_fixed_now(),
+        fetched_at=now,
     )
-
     prompt = build_vote_prompt(market, baseline, 0)
     later_prompt = build_vote_prompt(later, baseline, 0)
 
@@ -748,8 +874,8 @@ def test_flat_research_charge_makes_net_edge_unreachable(
     assert _only(rows, "SelectorDecisionRecorded")["intent_count"] == 0
     reasons = _reasons(rows)
     assert [reason for reason in reasons if reason.startswith("fail:")] == [
-        "fail:net_edge_min: net_edge_ppm=-2080000 min_net_edge_ppm=30000",
-        "fail:annualized_hurdle: annualized_ppm=-421777778 hurdle_ppm=240000",
+        "fail:net_edge_min: net_edge_ppm=-2070000 min_net_edge_ppm=30000",
+        "fail:annualized_hurdle: annualized_ppm=-503700000 hurdle_ppm=240000",
     ]
     assert FULL_PIPELINE_RESEARCH_COST_MICROS > 1_000_000
 
@@ -800,8 +926,126 @@ def test_one_intent_is_emitted_once_the_research_charge_is_amortizable(
     assert entered.count("SelectorDecisionRecorded") == 1
     assert _only(rows, "SelectorDecisionRecorded")["intent_count"] == 1
     reasons = _reasons(rows)
-    assert reasons[:12] == ALL_ENTRY_CONDITIONS_PASSING
+    assert reasons == [*ALL_ENTRY_CONDITIONS_PASSING, SIZING_REASON]
     assert [reason for reason in reasons if reason.startswith("fail:")] == []
+
+
+def test_best_case_ask_is_the_open_band_floor(
+    shipped_books: Path,
+    tmp_path: Path,
+    report_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One pip under :data:`BEST_CASE_ASK_PIPS` is refused by the open band.
+
+    Barrier 6's argument is stated at the *best case*, so the price the
+    barrier-6 tests quote has to really be the cheapest fill the band admits,
+    not merely a cheap one. Two things make that load-bearing rather than
+    asserted: the constant is compared against the production floor it claims
+    to be, and a real tick at one pip below it is refused by
+    ``price_within_bands`` and by nothing else.
+
+    That second half also pins the comparison's direction.
+    ``_price_within_bands`` refuses on ``price < min_open_price_pips``, so the
+    floor itself is admitted; a change to ``<=`` would leave the barrier-6
+    tests quoting a price the band rejects, and this test red.
+
+    Args:
+        shipped_books: A private copy of the shipped books fixture.
+        tmp_path: pytest's per-test temporary directory.
+        report_dir: The evaluation-artifact directory.
+        monkeypatch: The active patcher.
+    """
+    assert RiskConfig().min_open_price_pips == BEST_CASE_ASK_PIPS
+    monkeypatch.setattr(
+        forecast_pipeline, RESEARCH_COST_ATTR, AMORTIZABLE_RESEARCH_COST_MICROS
+    )
+    _tradeable_books(shipped_books)
+    _set_book(
+        shipped_books,
+        bid_pips=BEST_CASE_BID_PIPS,
+        ask_pips=BEST_CASE_ASK_PIPS - 1,
+        quantity=DEEP_QUANTITY_CENTIS,
+    )
+    _write_track_records(report_dir)
+    deps = _build_deps(
+        books=shipped_books,
+        tmp_path=tmp_path,
+        report_dir=report_dir,
+        config=_bucketed_config(),
+        research=_finding_research_tools(tmp_path / "cache"),
+        votes=_NearCertainVoteTransport(),
+    )
+
+    outcome = run_single_tick(deps, beat=1)
+
+    assert outcome.intent_count == 0
+    assert [
+        reason for reason in _reasons(_rows(deps)) if reason.startswith("fail:")
+    ] == [
+        "fail:price_within_bands: price_below_min_open_band "
+        f"executable_price_pips={BEST_CASE_ASK_PIPS - 1} "
+        f"band=[{RiskConfig().min_open_price_pips},"
+        f"{RiskConfig().max_open_price_pips}]"
+    ]
+
+
+def test_the_intent_is_vetoed_on_beat_one_and_fills_on_beat_two(
+    shipped_books: Path,
+    tmp_path: Path,
+    report_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selector intent is not a trade: the kernel vetoes the first beat.
+
+    The emitting configuration produces an intent on beat 1 and the tick still
+    fills nothing, because :class:`windbreak.riskkernel.checks._DailyLossLimit`
+    vetoes on ``realized_loss_today (0) >= threshold (0)`` -- the threshold is a
+    ppm share of ``equity_start_of_day``, which is 0 until the beat's own
+    ``EquitySampled`` row exists. It is the correct fail-closed direction, but
+    it is a guard whose threshold equals its own measured value and therefore
+    fires unconditionally on a fresh ledger, so it is pinned rather than left
+    as prose: the first beat of every new UTC day can never place an order.
+
+    Beat 2 then runs against the equity the first beat sampled, the same intent
+    is approved, and the paper venue fills it. Pinning both beats is what keeps
+    the barrier list honest in the other direction too -- barrier 6 is a claim
+    about intents, and this is the evidence that clearing it really does reach a
+    fill rather than merely a selector row.
+
+    Args:
+        shipped_books: A private copy of the shipped books fixture.
+        tmp_path: pytest's per-test temporary directory.
+        report_dir: The evaluation-artifact directory.
+        monkeypatch: The active patcher.
+    """
+    monkeypatch.setattr(
+        forecast_pipeline, RESEARCH_COST_ATTR, AMORTIZABLE_RESEARCH_COST_MICROS
+    )
+    _tradeable_books(shipped_books)
+    _write_track_records(report_dir)
+    deps = _build_deps(
+        books=shipped_books,
+        tmp_path=tmp_path,
+        report_dir=report_dir,
+        config=_bucketed_config(),
+        research=_finding_research_tools(tmp_path / "cache"),
+        votes=_NearCertainVoteTransport(),
+    )
+
+    first = run_single_tick(deps, beat=1)
+    second = run_single_tick(deps, beat=2)
+
+    rows = _rows(deps)
+    assert first.intent_count == 1
+    assert first.filled_centis == 0
+    assert _only(rows, "IntentVetoed")["reasons"] == [DAILY_LOSS_VETO_REASON]
+    assert second.intent_count == 1
+    assert second.filled_centis == SIZED_FILL_CENTIS
+    assert _only(rows, "IntentApproved")["reasons"] == []
+    assert [
+        data["event"] for event, data in rows if event == "OrderTransitionLedgered"
+    ] == ["APPROVE", "REQUEST_SUBMISSION", "SUBMIT", "ACK"]
 
 
 def _restore_shipped_research_charge(
@@ -959,7 +1203,7 @@ def _evidence_research_charge(rows: list[tuple[str, dict[str, object]]]) -> None
         rows: The ledgered rows.
     """
     _assert_reason(
-        rows, "fail:net_edge_min: net_edge_ppm=-2080000 min_net_edge_ppm=30000"
+        rows, "fail:net_edge_min: net_edge_ppm=-2070000 min_net_edge_ppm=30000"
     )
 
 
