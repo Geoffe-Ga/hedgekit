@@ -282,20 +282,32 @@ def test_reap_all_still_reaps_siblings_when_one_survives_sigkill(
     )
 
 
-#: Pid recorded by the `launcher`-fixture test below, asserted dead by the test
-#: after it. Observing a fixture's teardown requires outliving the test that
-#: requested it, and pytest runs a module's tests in declaration order.
-_FIXTURE_SPAWNED_PID: list[int] = []
-
-
-def test_launcher_fixture_spawns_a_tracked_process(
+def test_launcher_fixture_spawns_and_owns_a_tracked_process(
     launcher: ProcessLauncher, run_root: RunRoot
 ) -> None:
-    """The `launcher` fixture starts a real, tracked child process.
+    """The `launcher` fixture starts a real child and takes ownership of it.
 
-    Closes a coverage gap raised in review: the fixture -- whose ``finally``
-    is what the harness's raise-safety guarantee actually rests on -- was not
-    requested by any test, so its teardown path never ran under test.
+    Closes a coverage gap raised in review: the fixture -- whose ``finally`` is
+    what the harness's raise-safety guarantee rests on -- was requested by no
+    test, so its teardown path never ran under test at all.
+
+    WHY THIS DOES NOT ASSERT THE TEARDOWN ITSELF
+
+    An earlier version passed the pid to a *following* test through a
+    module-level list, since a fixture's teardown outlives the test that
+    requested it. That silently assumed serial, same-process execution.
+    `scripts/metrics_probe.py` runs the whole `tests/` tree under
+    `pytest -n auto`, where module-level state is not shared across xdist
+    workers and adjacent tests are not guaranteed to share one -- so the pair
+    would have failed intermittently on `main` for a reason unrelated to the
+    code under test. (`@pytest.mark.xdist_group` would not have saved it
+    either: that marker only takes effect under `--dist loadgroup`, and the
+    metrics run uses the default `load`.) Raised in review of PR #477.
+
+    The teardown semantics are pinned instead by
+    :func:`test_launcher_reaps_its_child_when_the_test_body_raises`, which
+    drives a `ProcessLauncher` through the identical ``try``/``finally`` shape
+    the fixture uses and asserts the reaping from inside a single test.
 
     Args:
         launcher: The fixture under test.
@@ -316,21 +328,6 @@ def test_launcher_fixture_spawns_a_tracked_process(
         timeout=30.0,
         description="the fixture-managed process to be running",
     )
-    _FIXTURE_SPAWNED_PID.append(spawned.pid)
 
     assert launcher.spawned == (spawned,)
-
-
-def test_launcher_fixture_teardown_reaped_the_previous_test_s_process() -> None:
-    """The `launcher` fixture's teardown actually reaped what it started.
-
-    Reads the pid recorded by the test above. A fixture's teardown runs after
-    its test returns, so the only way to observe it is from outside that test.
-    """
-    assert _FIXTURE_SPAWNED_PID, "the preceding test did not record a pid"
-
-    wait_until(
-        lambda: not pid_alive(_FIXTURE_SPAWNED_PID[0]),
-        timeout=30.0,
-        description="the fixture's teardown to have reaped its process",
-    )
+    assert spawned.is_running()
