@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # scripts/security.sh - Run security checks with Bandit, pip-audit and detect-secrets
-# Usage: ./scripts/security.sh [--verbose] [--help]
+# Usage: ./scripts/security.sh [--metrics] [--verbose] [--help]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+METRICS=false
 VERBOSE=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --metrics)
+            METRICS=true
+            shift
+            ;;
         --verbose)
             VERBOSE=true
             shift
@@ -27,6 +32,12 @@ so this script audits the same environment whether it is run directly or via
 ./scripts/check-all.sh, regardless of the caller's PATH.
 
 OPTIONS:
+    --metrics   Print {"bandit_issues": <int>} as JSON on stdout and exit 0,
+                for the quality dashboard (issue #122). Measurement, not a
+                gate: only bandit is counted (it is the key the collector
+                reads), and the count is null when the scan produced no usable
+                report. pip-audit and the detect-secrets baseline stay on the
+                enforcing path below.
     --verbose   Show detailed output
     --help      Display this help message
 
@@ -58,6 +69,12 @@ BANDIT="$(bash "$TOOLCHAIN_ENV" --print-tool bandit)"
 # The interpreter is the load-bearing artifact for the dependency audit below:
 # pip-audit audits the site-packages of whichever interpreter imports it.
 AUDIT_PYTHON="$(bash "$TOOLCHAIN_ENV" --print-python)"
+
+# Dashboard measurement mode (issue #122). Dispatched before the gate below so
+# stdout carries exactly the one JSON object collect_metrics.py parses.
+if $METRICS; then
+    exec "$AUDIT_PYTHON" "$SCRIPT_DIR/metrics_probe.py" security --bandit "$BANDIT"
+fi
 
 # Set verbosity
 if $VERBOSE; then
