@@ -1,9 +1,29 @@
 """Temporal-integrity enforcement for the evaluation harness (SPEC-EPIC_07, #52).
 
-This module makes training-data leakage into gate metrics *structurally*
-impossible. The temporal coordinate is exclusively the monotonic integer
-``sequence_number`` on the append-only ledger -- there is no wall-clock and no
-float anywhere on the value path, only exact integer comparisons.
+This module's *adjudication* of training-data leakage is structural. The
+temporal coordinate is exclusively the monotonic integer ``sequence_number`` on
+the append-only ledger -- there is no wall-clock and no float anywhere on the
+value path, only exact integer comparisons.
+
+WHAT IS STRUCTURAL, AND WHAT IS ATTESTED (issue #439 review)
+
+The comparison is structural; one of its two inputs is not. A forecast's
+``created_sequence`` and the deployment sequence are both ledger facts the
+system wrote about itself and cannot restate. The *resolution's* coordinate is
+not: since #439 it originates as a free-text ``--resolved-at`` an operator
+types into ``windbreak ingest-resolution``, projected onto the sequence axis by
+:func:`resolution_sequences_from_instants`. Nothing cross-checks that instant
+against the venue -- there is no settlement feed (issues #450/#451) -- so an
+operator who types an instant later than the true settlement moves the
+resolution sequence forward and every prior forecast on that market is admitted
+and scored, exactly as if it had never been able to peek.
+
+So leakage is structurally impossible *given a truthful settlement instant*,
+and the truthfulness of that instant is operator attestation, not a property of
+this module. The guards here are still worth having -- they make every other
+route to leakage impossible, and they refuse an offsetless instant rather than
+guessing a zone -- but the stronger unconditional claim this docstring used to
+make was not one the code could keep.
 
 A forecast is rejected, at ingestion, when it cannot be an honest prediction:
 
@@ -35,9 +55,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from windbreak.evaluation.resolution import SettlementEventType
+from windbreak.timekeeping import require_aware
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
+    from datetime import datetime
     from typing import Any, Final
 
     from windbreak.evaluation.registry import EvaluationInputs, FixtureForecast
@@ -45,6 +67,12 @@ if TYPE_CHECKING:
 
 #: The immutable event-type token stamped on every ledgered rejection record.
 EVALUATION_RECORD_REJECTED: Final[str] = "EVALUATION_RECORD_REJECTED"
+
+#: The sequence a settlement instant projects to when there is no ledger
+#: position to project it onto at all. Real sequence numbers start at ``1``, so
+#: ``0`` makes every forecast ``created_sequence >= 0`` -- i.e. BACKDATED --
+#: rather than scored against an ordering nothing established (fail closed).
+_UNPROVABLE_RESOLUTION_SEQUENCE = 0
 
 #: JSON top-level key holding the ordered mode-transition ledger.
 _MODE_TRANSITIONS_KEY = "mode_transitions"
@@ -337,6 +365,87 @@ def resolution_sequences_from_events(
         )
         if is_first_settlement:
             sequences[event.market_ticker] = event.sequence_number
+    return sequences
+
+
+def _first_position_at_or_after(
+    positions: tuple[tuple[int, datetime], ...], instant: datetime
+) -> int:
+    """Return the earliest ledger position whose instant is at or after ``instant``.
+
+    Args:
+        positions: The ledger's ``(sequence_number, created_at)`` pairs, sorted
+            ascending by sequence number.
+        instant: The settlement instant to locate.
+
+    Returns:
+        The sequence number of the first position at or after ``instant``; one
+        past the ledger's head when the instant postdates every position
+        (nothing recorded could have known the answer yet); and
+        :data:`_UNPROVABLE_RESOLUTION_SEQUENCE` when there are no positions at
+        all.
+    """
+    for sequence_number, moment in positions:
+        if moment >= instant:
+            return sequence_number
+    if not positions:
+        return _UNPROVABLE_RESOLUTION_SEQUENCE
+    return positions[-1][0] + 1
+
+
+def resolution_sequences_from_instants(
+    ledger_instants: Iterable[tuple[int, datetime]],
+    resolution_instants: Mapping[str, datetime],
+) -> Mapping[str, int]:
+    """Project wall-clock settlement instants onto the ledger's sequence axis.
+
+    The temporal gate's coordinate is the monotonic integer ``sequence_number``
+    -- exact, float-free, and unfakeable. A resolution ingested from the outside
+    world carries a wall-clock instant instead, so the two must be reconciled
+    before the gate can adjudicate anything. The reconciliation is: a market's
+    answer could first have been known at the earliest ledger position stamped
+    at or after the instant it settled.
+
+    Doing it this way is what makes a *late* ingest safe. Keying the gate on the
+    position of the ``MarketResolved`` row itself would place the answer at the
+    moment the operator noticed rather than the moment the market settled, and
+    every forecast made in between -- each of which could have peeked -- would
+    be silently admitted and scored.
+
+    Note the precise claim: the resolution row's own position is *not* excluded
+    from consideration. Callers pass every ledger row
+    (:func:`windbreak.scheduler.weekly_data._temporal_context` passes the whole
+    read), so the ``MarketResolved`` row is one candidate position among the
+    rest, and when the market settled after every earlier row it is legitimately
+    the earliest position at or after the instant, and wins. What is guaranteed
+    is the direction that matters: the projected sequence is never *later* than
+    the ingesting row's own, so a late ingest can only refuse more forecasts
+    than a prompt one would, never admit more.
+
+    Args:
+        ledger_instants: The ledger's ``(sequence_number, created_at)`` pairs.
+            Order is immaterial; they are sorted by sequence number here.
+        resolution_instants: Each resolved market's settlement instant, keyed by
+            ``market_ticker``.
+
+    Returns:
+        A mapping from ``market_ticker`` to the sequence number at or after
+        which its answer was knowable; empty when no market resolved.
+
+    Raises:
+        ValueError: If any ledger instant or settlement instant carries no UTC
+            offset. Comparing an offsetless instant would silently shift it by
+            the host's offset -- and this comparison decides whether a forecast
+            is scored or refused -- so it is refused rather than normalized
+            against a guessed timezone.
+    """
+    positions = tuple(sorted(ledger_instants))
+    for _, moment in positions:
+        require_aware(moment, "ledger_instant")
+    sequences: dict[str, int] = {}
+    for market_ticker, instant in resolution_instants.items():
+        require_aware(instant, "resolution_instant")
+        sequences[market_ticker] = _first_position_at_or_after(positions, instant)
     return sequences
 
 

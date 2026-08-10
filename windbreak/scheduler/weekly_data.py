@@ -19,12 +19,31 @@ rendered by the :mod:`windbreak.reports.sections` line renderers, replacing the
 Every ``ForecastCreated`` record folds into a :class:`FixtureForecast` with
 ``created_sequence`` sourced from the record's ``sequence_number``, its
 ``baseline_executable_price_pips`` and research cost read verbatim off the
-payload, ``traded=False`` and ``live=False``. A whole-ledger fold has no
-ground-truth resolutions available at all, so the fold always gates against an
-empty ``resolutions`` and a ``TemporalContext`` with ``deployment_sequence=0``:
-every folded forecast is temporally admitted (``created_sequence >= 1 > 0``) and
-then rejected by the evaluation gate's own ``UNRESOLVED`` reason, landing in the
-rendered report's ``== rejections ==`` ledger rather than silently vanishing.
+payload, ``traded=False`` and ``live=False``.
+
+Issue #439 gave the fold real ground truth. Until then it hardcoded
+``resolutions={}`` and ``deployment_sequence=0``, so every folded forecast was
+temporally admitted and then immediately rejected ``UNRESOLVED`` -- which meant
+every metric in the always-on loop's only evaluation consumer read ``UNDEFINED``
+after seven days exactly as it did after seven minutes. Both coordinates are now
+read off the same ledger the forecasts come from:
+
+* ``resolutions`` folds the ``MarketResolved`` rows an operator ingests through
+  ``windbreak ingest-resolution`` (see :mod:`windbreak.evaluation.ingest`). A
+  market with no such row is still rejected ``UNRESOLVED``, as before.
+* ``TemporalContext.resolution_sequences`` projects each resolution's *instant*
+  onto the ledger's sequence axis
+  (:func:`~windbreak.evaluation.temporal.resolution_sequences_from_instants`),
+  so a forecast created after its market settled is refused ``BACKDATED`` even
+  when the resolution was ingested long afterwards.
+* ``TemporalContext.deployment_sequence`` is the ledger's own deployment
+  marker: the first ``ConfigLoaded`` row, which every real run writes before any
+  loop event. A fold carrying no marker cannot prove when the system deployed,
+  so it fails closed to the ledger's head -- refusing every forecast
+  ``PRE_DEPLOYMENT`` rather than admitting them on trust.
+
+Every rejection still lands in the rendered report's ``== rejections ==`` ledger
+rather than silently vanishing.
 
 A legacy (pre-#188, ``payload_schema_version == 1``) ``ForecastCreated`` row --
 missing ``research_cost_micros`` / ``market_price_baseline_pips`` -- fails closed
@@ -39,12 +58,21 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from windbreak.evaluation.costs import aggregate_research_costs
+from windbreak.evaluation.ingest import (
+    ingested_resolutions_from_records,
+    resolution_instants,
+    resolution_outcomes,
+)
 from windbreak.evaluation.registry import EvaluationInputs, FixtureForecast
 from windbreak.evaluation.report import build_evaluation_report, render_weekly_report
-from windbreak.evaluation.temporal import TemporalContext
+from windbreak.evaluation.temporal import (
+    TemporalContext,
+    resolution_sequences_from_instants,
+)
 from windbreak.ledger.rebuild import (
     equity_curve_read_model,
     positions_read_model,
@@ -62,10 +90,17 @@ if TYPE_CHECKING:
     from datetime import date
     from typing import Any
 
+    from windbreak.evaluation.ingest import IngestedResolution
     from windbreak.ledger.store import LedgerRecord
 
 #: The ledger event type discriminating a PAPER-loop forecast record.
 _FORECAST_CREATED_EVENT_TYPE = "ForecastCreated"
+
+#: The ledger event type marking the system's first recorded act of a run: the
+#: config load that ``windbreak run`` persists before any loop event. It is the
+#: ledger analogue of a fixture's ``mode_transitions`` block, and the earliest
+#: one is the deployment point the temporal gate measures forecasts against.
+_CONFIG_LOADED_EVENT_TYPE = "ConfigLoaded"
 
 #: Envelope key under which a ledgered event's typed payload is nested (mirrors
 #: :func:`windbreak.ledger.rebuild._gateway_projection`'s own ``["data"]`` read).
@@ -77,10 +112,12 @@ _RESEARCH_COST_KEY = "research_cost_micros"
 #: The v2 ``ForecastCreated`` baseline-price payload key the fold reads verbatim.
 _BASELINE_PIPS_KEY = "market_price_baseline_pips"
 
-#: The deployment sequence a whole-ledger fold gates against: ``0``, so every
-#: folded forecast (``created_sequence >= 1``) is temporally admitted and then
-#: rejected ``UNRESOLVED`` (the fold carries no ground-truth resolutions).
-_FOLD_DEPLOYMENT_SEQUENCE = 0
+#: The deployment sequence an *empty* fold gates against. Real sequence numbers
+#: start at ``1``, so ``0`` admits everything -- which is inert here precisely
+#: because a fold with no records has no forecasts to admit. A non-empty fold
+#: never uses this value: it either finds a deployment marker or fails closed to
+#: its own head (:func:`_deployment_sequence`).
+_EMPTY_FOLD_DEPLOYMENT_SEQUENCE = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,14 +203,121 @@ def _forecast_from_record(
     return forecast, cost_row
 
 
+def _deployment_sequence(records: list[LedgerRecord]) -> int:
+    """Return the deployment sequence this fold gates its forecasts against.
+
+    Deployment is the earliest ``ConfigLoaded`` row: ``windbreak run`` persists
+    the config-load events it captured *before* opening the PAPER loop, so on a
+    live ledger that row is the system's first recorded act. Taking the minimum
+    (rather than the newest) mirrors
+    :func:`~windbreak.evaluation.temporal.deployment_sequence_from_fixture`,
+    which takes the minimum ``mode_transitions`` sequence: a restart writes
+    another marker, and deployment is still the first one.
+
+    A fold that carries no marker cannot prove when the system deployed, so it
+    fails closed to the ledger's head -- every forecast is then at or before the
+    deployment sequence and is refused ``PRE_DEPLOYMENT``, visibly, in the
+    report's rejection ledger. Admitting them instead would let a ledger seeded
+    with simulated forecasts score as if the system had made them live.
+
+    Args:
+        records: The full ledger read, in append order.
+
+    Returns:
+        The earliest ``ConfigLoaded`` sequence number; else the fold's highest
+        sequence number; else :data:`_EMPTY_FOLD_DEPLOYMENT_SEQUENCE` when the
+        fold is empty (and so has no forecasts to gate).
+    """
+    markers = [
+        record.sequence_number
+        for record in records
+        if record.event_type == _CONFIG_LOADED_EVENT_TYPE
+    ]
+    if markers:
+        return min(markers)
+    return max(
+        (record.sequence_number for record in records),
+        default=_EMPTY_FOLD_DEPLOYMENT_SEQUENCE,
+    )
+
+
+def _record_instant(record: LedgerRecord) -> tuple[int, datetime]:
+    """Return one record's ``(sequence_number, created_at)`` position.
+
+    Args:
+        record: The ledger row to read.
+
+    Returns:
+        The row's sequence number paired with its parsed creation instant.
+
+    Raises:
+        ValueError: If ``created_at`` is not an ISO-8601 instant, naming the
+            offending row so it is locatable on a live ledger.
+    """
+    try:
+        moment = datetime.fromisoformat(record.created_at)
+    except ValueError as exc:
+        raise ValueError(
+            f"ledger row at sequence_number={record.sequence_number} carries an "
+            f"unparseable created_at: {record.created_at!r}"
+        ) from exc
+    return record.sequence_number, moment
+
+
+def _temporal_context(
+    records: list[LedgerRecord], resolutions: tuple[IngestedResolution, ...]
+) -> TemporalContext:
+    """Build the temporal context this fold gates against.
+
+    The ledger's ``created_at`` column is parsed only when at least one market
+    has actually resolved: with no ground truth there is no instant to project,
+    and a fold that never resolves anything should not be able to fail on a
+    malformed timestamp in a row it does not consult.
+
+    Args:
+        records: The full ledger read, in append order.
+        resolutions: The ground truth folded out of the same records.
+
+    Returns:
+        The :class:`TemporalContext` carrying the real deployment sequence and
+        the instant-derived resolution sequences.
+
+    Raises:
+        ValueError: If a row's ``created_at``, or a resolution's instant, is
+            unparseable or carries no UTC offset.
+    """
+    instants = resolution_instants(resolutions)
+    sequences: Mapping[str, int] = {}
+    if instants:
+        sequences = resolution_sequences_from_instants(
+            (_record_instant(record) for record in records), instants
+        )
+    return TemporalContext(
+        deployment_sequence=_deployment_sequence(records),
+        resolution_sequences=sequences,
+    )
+
+
 def weekly_report_body(records: list[LedgerRecord], *, today: date) -> str:
     """Fold a whole-ledger read into a rendered weekly report body (#188).
 
     Every ``ForecastCreated`` record is folded into a :class:`FixtureForecast`
-    and a research-cost source; non-forecast records are ignored. The fold gates
-    against no resolutions (a whole-ledger fold has no ground truth), so every
-    folded forecast lands in the report's ``== rejections ==`` ledger, and the
-    cost meter's total is the summed research spend of every folded forecast.
+    and a research-cost source; non-forecast records are ignored. Every
+    ``MarketResolved`` record is folded into the run's ground truth, and every
+    forecast is then gated against it: one whose market never resolved is still
+    rejected ``UNRESOLVED``, one created after its market settled is rejected
+    ``BACKDATED``, and one that predates the ledger's deployment marker is
+    rejected ``PRE_DEPLOYMENT``. Each rejection lands in the report's
+    ``== rejections ==`` ledger. The cost meter's total is the summed research
+    spend of every folded forecast, admitted or not -- the money was spent
+    either way. Its ``resolved forecasts`` count is on the same footing: a
+    forecast counts once its *market* resolved, whether or not the temporal
+    gate admitted it for scoring, so in a fold carrying rejections that count
+    is strictly larger than the number of forecasts a metric was computed over.
+    Both denominators are defensible; this one answers "what did research cost
+    per question that got an answer", which is the question the meter is for,
+    and it is asserted at exactly that divergence in
+    ``tests/scheduler/test_weekly_resolution_fold.py``.
 
     Args:
         records: The full ledger read (``SqliteLedgerStore.read_all()``), in
@@ -185,7 +329,10 @@ def weekly_report_body(records: list[LedgerRecord], *, today: date) -> str:
 
     Raises:
         ValueError: If any ``ForecastCreated`` record is a legacy v1 row missing
-            a v2 cost/baseline key (message names the missing key).
+            a v2 cost/baseline key (message names the missing key); if a
+            ``MarketResolved`` record is malformed or contradicts an earlier
+            resolution of the same market; or if an instant a resolution is
+            gated against is unparseable or carries no UTC offset.
     """
     forecasts: list[FixtureForecast] = []
     cost_rows: list[_ForecastCostRow] = []
@@ -195,16 +342,15 @@ def weekly_report_body(records: list[LedgerRecord], *, today: date) -> str:
         forecast, cost_row = _forecast_from_record(record)
         forecasts.append(forecast)
         cost_rows.append(cost_row)
+    resolutions = ingested_resolutions_from_records(records)
+    outcomes = resolution_outcomes(resolutions)
     inputs = EvaluationInputs(
         forecasts=tuple(forecasts),
-        resolutions={},
-        temporal=TemporalContext(
-            deployment_sequence=_FOLD_DEPLOYMENT_SEQUENCE,
-            resolution_sequences={},
-        ),
+        resolutions=outcomes,
+        temporal=_temporal_context(records, resolutions),
     )
     cost_meter = aggregate_research_costs(
-        cost_rows, resolutions={}, trade_pnls_micros={}
+        cost_rows, resolutions=outcomes, trade_pnls_micros={}
     )
     return render_weekly_report(
         today=today,

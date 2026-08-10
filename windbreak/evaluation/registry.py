@@ -535,6 +535,18 @@ class MetricSpec:
             The catch is scoped to that one exception type; any other
             invalid-input ``ValueError`` still propagates.
 
+            Its siblings in the
+            :class:`~windbreak.evaluation.metrics.UndefinedMetricError` family
+            (#439) are deliberately NOT caught here. They are mapped to the same
+            sentinel one layer up, in
+            :func:`windbreak.evaluation.report._build_tracks`, because the other
+            consumer of a registered spec --
+            :func:`windbreak.evaluation.crosscheck.crosscheck_gates` -- must
+            keep seeing the raise: its whole job is to notice when the Python
+            and SQL paths disagree, and it renders a raising reference metric as
+            its own ``PYTHON_COMPUTE_FAILED`` sentinel. Swallowing the raise
+            here would have made that guard unreachable.
+
             Args:
                 inputs: The raw evaluation inputs handed to the metric.
 
