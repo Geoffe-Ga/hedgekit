@@ -257,7 +257,9 @@ def dashboard_process_server() -> Iterator[
     """Build and serve a dashboard server via `_build_dashboard_server`.
 
     No `--ledger-path` is supplied, so the status source is the documented
-    "no ledger" default (`DashboardStatus("RESEARCH", None)`).
+    "no ledger" default (`DashboardStatus("UNKNOWN", None)` since issue #447 --
+    with no ledger there is no evidence of any mode, and absent evidence must
+    never render as the healthy RESEARCH loop it used to claim).
 
     Yields:
         The built server and its bound `(host, port)` address; shuts the
@@ -289,16 +291,23 @@ def test_build_dashboard_server_binds_to_loopback_host_only(
     assert address[0] == "127.0.0.1"
 
 
-def test_build_dashboard_server_authenticated_root_shows_research_never(
+def test_build_dashboard_server_authenticated_root_shows_unknown_never(
     dashboard_process_server: tuple[http.server.ThreadingHTTPServer, tuple[str, int]],
 ) -> None:
-    """With no `--ledger-path`, `/` reports RESEARCH mode and no heartbeat yet."""
+    """With no `--ledger-path`, `/` reports an UNKNOWN mode and no heartbeat.
+
+    Issue #447: the page has seen no ledger and therefore no heartbeat, so the
+    only honest mode is "unknown". Rendering `RESEARCH` there made a dashboard
+    with no evidence at all indistinguishable from one watching a healthy
+    research-only loop -- the same lie the heartbeat's hardcoded constant told.
+    """
     _server, address = dashboard_process_server
 
     status, _headers, body = _get(address, "/", headers=_bearer(TEST_TOKEN))
 
     assert status == 200
-    assert "RESEARCH" in body
+    assert "UNKNOWN" in body
+    assert "RESEARCH" not in body
     assert "never" in body
 
 

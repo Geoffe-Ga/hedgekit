@@ -33,7 +33,11 @@ from windbreak.config import (
 from windbreak.drills.catalog import DRILL_NAMES
 from windbreak.drills.context import bind_paper_context, bind_production_context
 from windbreak.ledger import (
+    AlertEmitted as LedgerAlertEmitted,
+)
+from windbreak.ledger import (
     ChainIntegrityError,
+    ModeHeartbeat,
     SqliteLedgerStore,
     anchor_command,
     events_from_records,
@@ -49,6 +53,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
     from types import FrameType
 
+    from windbreak.alerts import AlertEmitted, LedgerWriter
     from windbreak.config import ConfigLoadEvent, ScreenerConfig, WindbreakConfig
     from windbreak.connector.interface import MarketConnector
     from windbreak.connector.live import MarketDataSource
@@ -60,9 +65,55 @@ if TYPE_CHECKING:
     from windbreak.riskkernel.verification import ReadOnlyVerifier
     from windbreak.scheduler.provider_wiring import LiveProviderHttp
 
-#: Operating mode reported in every heartbeat line. Matches the RESEARCH state
-#: of the SPEC mode machine; windbreak ships research-only for now.
+#: Operating mode reported in a heartbeat line whose beat had no tick to report
+#: a mode of. Matches the RESEARCH state of the SPEC mode machine, which is what
+#: a hook-less (or snapshot-only) pass genuinely is. A beat that *does* run a
+#: tick reports that tick's own mode instead (issue #447).
 MODE_RESEARCH = "RESEARCH"
+
+#: Heartbeat mode token for a beat whose hook raised (issue #443). Surviving a
+#: tick failure must never make the loop quieter: the one line an operator
+#: watches has to say the tick failed rather than keep claiming the RESEARCH
+#: mode of a healthy pass.
+MODE_TICK_FAILED = "TICK_FAILED"
+
+#: Mode reported where there is no evidence of any mode -- the dashboard's
+#: no-ledger and no-heartbeat defaults (issue #447). Absent evidence is not
+#: healthy evidence, so it is never rendered as a real mode.
+MODE_UNKNOWN = "UNKNOWN"
+
+#: Escalation kind recorded when a beat's hook raised. Alerts are deduplicated
+#: per *kind*, each kind's active state tracked independently, so an ongoing
+#: outage pages once but a halt arriving behind it still pages on its own --
+#: and, crucially, neither condition's arrival re-pages the other.
+_ESCALATION_BEAT_FAILED = "beat-failed"
+
+#: Escalation kind recorded when a beat reported a halted Risk Kernel.
+_ESCALATION_KERNEL_HALT = "kernel-halt"
+
+#: How many consecutive beats must *observe* an escalated condition to be gone
+#: before it re-arms and a recurrence pages again.
+#:
+#: One quiet beat is not evidence an outage ended. The failure #443 was filed
+#: against is a near-full ledger volume, which by its nature refuses some
+#: appends and accepts others; a single successful beat between two failing
+#: ones is the outage continuing, not clearing. Re-arming on it turns an
+#: intermittent fault into one page per recurrence -- at the issue's own
+#: ``--heartbeat-interval 0.01`` that is a pager storm. Three is a confirmation
+#: window (15 seconds at the default 5s interval): a condition that genuinely
+#: cleared costs at most two beats of delay before its recurrence pages.
+_ESCALATION_CLEAR_RUN_BEATS = 3
+
+#: Cap on how many times the inter-beat wait is doubled while beats keep
+#: escalating (issue #443's "continue on the next beat with backoff").
+#:
+#: A loop whose every beat fails or halts achieves nothing by retrying at full
+#: cadence: it burns the venue's rate limit and floods the log -- possibly onto
+#: the very volume that filled. The wait doubles per consecutive escalating
+#: beat and resets on the first clean one, so recovery is noticed within one
+#: backed-off wait. The cap keeps the heartbeat itself a usable liveness signal:
+#: 16x the configured interval, so 80 seconds at the 5s default.
+_MAX_ESCALATION_BACKOFF_DOUBLINGS = 4
 
 #: The four SPEC processes ``windbreak run --process`` can represent, in SPEC
 #: order. Each invocation stands in for exactly one; the chosen token is
@@ -561,6 +612,382 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@dataclass(frozen=True)
+class BeatReport:
+    """What one beat's hook reports back to the loop that ran it (issue #447).
+
+    The PAPER hook's ``TickOutcome`` is a scheduler type the heartbeat loop must
+    not depend on, so the hook projects the two facts the loop actually acts on
+    into this narrow value: what mode the tick ran in, and whether it left the
+    Risk Kernel halted. A hook with nothing to report (the snapshot pass) returns
+    ``None`` instead, which is not the same thing as reporting health.
+
+    Attributes:
+        mode: The tick's own operating mode, from ``deps.kernel.mode`` -- never
+            a hardcoded constant, which is exactly what #447 found in the
+            heartbeat line.
+        halted: Whether the Risk Kernel is in ``HALT`` after the tick
+            (``TickOutcome.kernel_halted``). A halted kernel vetoes every later
+            intent, so the loop escalates it rather than beating on quietly.
+        research_halted: Whether the tick's research stopped on a budget ceiling
+            (``TickOutcome.research_halted``). Deliberately *not* folded into
+            ``halted``: a spent research budget is an expected, self-clearing
+            daily event that leaves the kernel's mode untouched, so it is
+            reported at WARNING rather than paged as a kernel halt.
+    """
+
+    mode: str
+    halted: bool = False
+    research_halted: bool = False
+
+
+class BeatSupervisor:
+    """Run one beat's hook so a failure or a halt is survivable *and* louder.
+
+    Closes issues #443 and #447 at the same seam, and the interaction is the
+    point. #443 asks that a tick exception -- a full ledger volume, a locked
+    SQLite file, a transient venue error -- stop killing the daemon. Catching it
+    and continuing would on its own have *deepened* #447: a loop that swallows
+    every tick failure while still logging ``mode=RESEARCH heartbeat seq=N`` is
+    an unobservable failure, which is worse than a crash an operator can see.
+
+    So every condition this survives is made noisier than the crash it replaces:
+
+    * the heartbeat's mode slot carries :data:`MODE_TICK_FAILED` (or the tick's
+      real halted mode) instead of the RESEARCH constant;
+    * a CRITICAL line -- carrying the raising beat's full traceback -- is logged
+      on *every* affected beat, so an ongoing outage keeps saying so rather than
+      falling silent after the first alert;
+    * a failed beat's mode is appended to the hash-chained ledger, so the
+      dashboard's ledger-backed status source cannot keep reading the healthy
+      ``ModeHeartbeat`` the tick stamped before it failed;
+    * an alert is dispatched once per *transition* -- through the dispatcher it
+      was composed with, and thence to the ledger.
+
+    Each escalation kind's active state is tracked **independently**, and a kind
+    re-arms only after :data:`_ESCALATION_CLEAR_RUN_BEATS` consecutive beats
+    that could observe it and found it gone. A single last-escalated slot pages
+    every beat under the conjunction these two issues describe -- a persistent
+    kernel HALT behind an intermittent tick failure -- because the kind flips
+    every beat and every beat then looks like a transition. So does re-arming on
+    one quiet beat, because a near-full volume refuses some appends and accepts
+    others. Both are pager storms at the issues' own 0.01s interval.
+
+    A beat that raised is also *not* evidence about the kernel's mode: it never
+    got far enough to read one. So a failing beat leaves the kernel-halt state
+    exactly as it found it rather than clearing it.
+
+    ``KeyboardInterrupt`` and ``SystemExit`` are deliberately not caught: those
+    are shutdown requests, not tick failures.
+    """
+
+    def __init__(
+        self,
+        *,
+        component: str,
+        dispatcher: AlertDispatcher,
+        mode_writer: LedgerModeWriter | None = None,
+    ) -> None:
+        """Initialize the supervisor.
+
+        Args:
+            component: The SPEC process token stamped on every escalation log
+                record, matching the loop's own ``component``.
+            dispatcher: The alert dispatcher every escalation is delivered
+                through. :func:`_build_beat_supervisor` composes it from the
+                CLI's real alert root, so escalations reach the configured
+                sinks rather than a log-only fallback.
+            mode_writer: Where a failed beat's mode is ledgered, so the
+                dashboard stops reading the healthy row the tick stamped before
+                it raised. ``None`` (the default) ledgers nothing, which is what
+                a run without ``--ledger-path`` has to do.
+        """
+        self._component = component
+        self._dispatcher = dispatcher
+        self._mode_writer = mode_writer
+        #: Currently-escalated kinds, each mapped to how many consecutive beats
+        #: have since observed it gone. Absence means re-armed.
+        self._active: dict[str, int] = {}
+        self._escalating_beats = 0
+
+    def observe(self, seq: int, on_beat: Callable[[int], BeatReport | None]) -> str:
+        """Run one beat's hook and return the mode its heartbeat must report.
+
+        Args:
+            seq: The 1-based beat sequence number handed to the hook.
+            on_beat: The hook to run for this beat.
+
+        Returns:
+            The mode token for this beat's heartbeat line: the tick's own mode,
+            :data:`MODE_TICK_FAILED` if the hook raised, or
+            :data:`MODE_RESEARCH` when the hook reported no mode at all.
+        """
+        try:
+            report = on_beat(seq)
+        except Exception as exc:
+            self._settle(
+                {
+                    _ESCALATION_BEAT_FAILED: (
+                        f"beat seq={seq} failed: {type(exc).__name__}: {exc}"
+                    )
+                },
+                exc=exc,
+            )
+            if self._mode_writer is not None:
+                self._mode_writer.record(seq, MODE_TICK_FAILED)
+            return MODE_TICK_FAILED
+        if report is None:
+            self._settle({_ESCALATION_BEAT_FAILED: None})
+            return MODE_RESEARCH
+        if report.research_halted:
+            _LOGGER.warning(
+                "research budget halted at beat seq=%d (mode=%s)",
+                seq,
+                report.mode,
+                extra={"component": self._component},
+            )
+        halt_message = (
+            f"risk kernel HALT at beat seq={seq} (mode={report.mode})"
+            if report.halted
+            else None
+        )
+        self._settle(
+            {_ESCALATION_BEAT_FAILED: None, _ESCALATION_KERNEL_HALT: halt_message}
+        )
+        return report.mode
+
+    def wait_seconds(self, interval_seconds: float) -> float:
+        """Return how long to wait before the next beat, backing off (#443).
+
+        Args:
+            interval_seconds: The configured inter-beat interval.
+
+        Returns:
+            ``interval_seconds`` while beats are clean, doubled once per
+            consecutive escalating beat and capped at
+            ``2 ** _MAX_ESCALATION_BACKOFF_DOUBLINGS`` times it. A zero
+            interval stays zero, so a test loop is never slowed.
+        """
+        doublings = min(self._escalating_beats, _MAX_ESCALATION_BACKOFF_DOUBLINGS)
+        return interval_seconds * float(2**doublings)
+
+    def _settle(
+        self,
+        observed: Mapping[str, str | None],
+        *,
+        exc: BaseException | None = None,
+    ) -> None:
+        """Fold one beat's observations into the per-kind escalation state.
+
+        Args:
+            observed: The escalation kinds this beat was *able* to observe,
+                each mapped to its operator-facing message if the condition is
+                present or ``None`` if it is absent. A kind the beat could not
+                observe is simply omitted, leaving its state untouched.
+            exc: The exception a raising beat produced, logged as the CRITICAL
+                record's ``exc_info`` so the operator gets the traceback that
+                names the failing call site.
+        """
+        self._escalating_beats = (
+            self._escalating_beats + 1
+            if any(message is not None for message in observed.values())
+            else 0
+        )
+        for kind, message in observed.items():
+            if message is None:
+                self._clear(kind)
+            else:
+                self._escalate(kind, message, exc)
+
+    def _clear(self, kind: str) -> None:
+        """Count one beat that observed ``kind`` gone, re-arming after a run.
+
+        Args:
+            kind: The escalation kind this beat found absent.
+        """
+        streak = self._active.get(kind)
+        if streak is None:
+            return
+        if streak + 1 >= _ESCALATION_CLEAR_RUN_BEATS:
+            del self._active[kind]
+        else:
+            self._active[kind] = streak + 1
+
+    def _escalate(self, kind: str, message: str, exc: BaseException | None) -> None:
+        """Log this beat's escalation, alerting once per transition into it.
+
+        Args:
+            kind: The escalation kind, one of :data:`_ESCALATION_BEAT_FAILED`
+                or :data:`_ESCALATION_KERNEL_HALT`. Alerts deduplicate on it,
+                so a condition that persists pages once and a *different*
+                condition arriving behind it still pages.
+            message: The operator-facing line, logged and dispatched verbatim.
+            exc: The exception to render as a traceback beside ``message``, or
+                ``None`` for an escalation that had no exception (a halt).
+        """
+        _LOGGER.critical(
+            "%s", message, exc_info=exc, extra={"component": self._component}
+        )
+        first_beat = kind not in self._active
+        self._active[kind] = 0
+        if first_beat:
+            self._dispatcher.dispatch(AlertType.HALT_KILL, message)
+
+
+class LedgerAlertWriter:
+    """Persist each dispatched alert to the hash-chained ledger (issue #443).
+
+    The :class:`~windbreak.alerts.LedgerWriter` the CLI wires in place of
+    :class:`~windbreak.alerts.LoggingLedgerWriter` when ``--ledger-path`` is
+    given, so "nothing is ledgered about the cause" stops being true of a beat
+    that failed. The store is opened per record and closed again: escalations
+    are once-per-transition events, so this costs nothing measurable and leaves
+    no second long-lived connection contending with the PAPER tick's own.
+
+    A ledger write that fails is logged at CRITICAL and swallowed, for the
+    reason :func:`_append_swallowing` records.
+    """
+
+    def __init__(self, ledger_path: Path, *, component: str) -> None:
+        """Initialize the writer.
+
+        Args:
+            ledger_path: The hash-chained ledger database to append to.
+            component: The SPEC process token stamped on each appended event.
+        """
+        self._ledger_path = ledger_path
+        self._component = component
+
+    def record(self, event: AlertEmitted) -> None:
+        """Append one emitted alert to the ledger, never raising.
+
+        Args:
+            event: The dispatched alert to persist.
+        """
+        _append_swallowing(
+            self._ledger_path,
+            LedgerAlertEmitted(
+                component=self._component,
+                severity=event.severity.value,
+                message=event.message,
+            ),
+            component=self._component,
+            what="alert",
+        )
+
+
+class LedgerModeWriter:
+    """Ledger a supervised beat's own outcome mode (issue #447).
+
+    Without this the dashboard reports health straight through an outage.
+    ``run_single_tick`` appends its ``ModeHeartbeat`` *before* the stages that
+    can raise, so a beat that fails after that point has already stamped a
+    healthy ``PAPER`` row -- and
+    :func:`_build_dashboard_status_source`'s ledger-backed source reads the
+    latest row and reports exactly that, re-stamped to now, every failing beat.
+    A value re-stamped to now can never veto anything.
+
+    So the supervisor appends its own row, *after* the tick's, naming the
+    outcome the tick actually had. Only failed beats are written: a beat that
+    completed already ledgered its real mode from ``deps.kernel.mode``, and
+    duplicating that would be noise. The first clean beat after an outage
+    therefore returns the dashboard to the tick's own mode by itself.
+
+    Like :class:`LedgerAlertWriter` this opens the store per record and swallows
+    a write failure at CRITICAL. When the outage *is* the ledger volume, this
+    append fails too and the dashboard keeps its stale row -- the honest limit
+    of a ledger-backed status source on a full disk, and the reason the failure
+    is announced on the log line and the alert path as well as here.
+    """
+
+    def __init__(self, ledger_path: Path, *, component: str) -> None:
+        """Initialize the writer.
+
+        Args:
+            ledger_path: The hash-chained ledger database to append to.
+            component: The SPEC process token stamped on each appended event.
+        """
+        self._ledger_path = ledger_path
+        self._component = component
+
+    def record(self, seq: int, mode: str) -> None:
+        """Append one beat's outcome mode to the ledger, never raising.
+
+        Args:
+            seq: The 1-based beat sequence number.
+            mode: The mode token this beat's heartbeat reports.
+        """
+        _append_swallowing(
+            self._ledger_path,
+            ModeHeartbeat(component=self._component, mode=mode, beat=seq),
+            component=self._component,
+            what="beat mode",
+        )
+
+
+def _append_swallowing(
+    ledger_path: Path, event: Event, *, component: str, what: str
+) -> None:
+    """Append one event to the ledger, logging and swallowing any failure.
+
+    The deliberate order of two hazards, shared by :class:`LedgerAlertWriter`
+    and :class:`LedgerModeWriter`. The failure these exist to record is a full
+    ledger volume -- the very condition that makes appending the record fail
+    too -- so letting it raise would put the daemon back exactly where #443
+    found it. Losing the audit row is the lesser harm only because the loss is
+    announced at CRITICAL rather than passed over in silence.
+
+    Args:
+        ledger_path: The hash-chained ledger database to append to.
+        event: The event to persist.
+        component: The SPEC process token stamped on the failure log record.
+        what: What was being ledgered, named in the failure message.
+    """
+    try:
+        store = SqliteLedgerStore(ledger_path)
+        try:
+            store.append(event)
+        finally:
+            store.close()
+    except Exception as exc:
+        _LOGGER.critical(
+            "%s ledgering failed: %s: %s",
+            what,
+            type(exc).__name__,
+            exc,
+            exc_info=exc,
+            extra={"component": component},
+        )
+
+
+def _beat_stop_reason(
+    *,
+    stop_event: threading.Event,
+    state: ShutdownState | None,
+    max_beats: int | None,
+    beats_done: int,
+) -> str | None:
+    """Decide whether the heartbeat loop should stop before its next beat.
+
+    Args:
+        stop_event: The event a signal handler sets to request shutdown.
+        state: The shared shutdown state, whose ``reason`` names the delivered
+            signal when a handler recorded one.
+        max_beats: The optional beat budget.
+        beats_done: How many beats have already run.
+
+    Returns:
+        The shutdown reason to log, or ``None`` to run another beat.
+    """
+    if stop_event.is_set():
+        if state is not None and state.reason is not None:
+            return state.reason
+        return _REASON_SIGNAL
+    if max_beats is not None and beats_done >= max_beats:
+        return _REASON_MAX_BEATS
+    return None
+
+
 def run_loop(
     interval_seconds: float,
     *,
@@ -568,7 +995,8 @@ def run_loop(
     stop_event: threading.Event | None = None,
     state: ShutdownState | None = None,
     component: str = _DEFAULT_PROCESS,
-    on_beat: Callable[[int], None] | None = None,
+    on_beat: Callable[[int], BeatReport | None] | None = None,
+    supervisor: BeatSupervisor | None = None,
 ) -> None:
     """Emit heartbeats until stopped by the stop event or a beat budget.
 
@@ -587,32 +1015,55 @@ def run_loop(
             heartbeat and shutdown log record; the rendered message text is
             unchanged.
         on_beat: Optional hook invoked once per beat with the 1-based sequence
-            number, after that beat's heartbeat is logged. None (the default)
-            leaves the heartbeat behavior unchanged.
+            number, before that beat's heartbeat is logged. None (the default)
+            leaves the heartbeat behavior unchanged. Its optional
+            :class:`BeatReport` is what the heartbeat reports the mode from.
+        supervisor: Optional :class:`BeatSupervisor` running the hook and
+            setting the inter-beat backoff. Defaults to one dispatching through
+            the log-only fallback, so survival never depends on a caller
+            remembering to supply it; :func:`_build_beat_supervisor` provides
+            the configured one.
+
+    Raises:
+        BaseException: Whatever ``on_beat`` raises that is not an
+            :class:`Exception` -- ``KeyboardInterrupt`` and ``SystemExit`` are
+            shutdown requests, not tick failures, so they still stop the loop.
     """
     if stop_event is None:
         stop_event = state.stop_event if state is not None else threading.Event()
+    if supervisor is None:
+        supervisor = BeatSupervisor(
+            component=component,
+            dispatcher=AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
+        )
 
     seq = 0
     reason = _REASON_SIGNAL
     while True:
-        if stop_event.is_set():
-            if state is not None and state.reason is not None:
-                reason = state.reason
-            break
-        if max_beats is not None and seq >= max_beats:
-            reason = _REASON_MAX_BEATS
+        stop_reason = _beat_stop_reason(
+            stop_event=stop_event, state=state, max_beats=max_beats, beats_done=seq
+        )
+        if stop_reason is not None:
+            reason = stop_reason
             break
         seq += 1
+        # The beat runs *before* its heartbeat is logged: the mode the line
+        # reports is this beat's own, and a beat cannot report a mode it has
+        # not yet run (issue #447). Reporting the previous beat's mode would be
+        # a lie by one beat's lag, which on a halt is the whole defect.
+        mode = MODE_RESEARCH if on_beat is None else supervisor.observe(seq, on_beat)
         _LOGGER.info(
             "mode=%s heartbeat seq=%d",
-            MODE_RESEARCH,
+            mode,
             seq,
             extra={"component": component},
         )
-        if on_beat is not None:
-            on_beat(seq)
-        stop_event.wait(interval_seconds)
+        # Backoff, not full cadence, while beats keep escalating (issue #443's
+        # "continue on the next beat with backoff"): a loop whose every beat
+        # fails gains nothing by retrying instantly and floods a log that may
+        # be on the volume that filled. The stop event still cuts the wait
+        # short, so shutdown is never delayed by a backoff.
+        stop_event.wait(supervisor.wait_seconds(interval_seconds))
 
     _LOGGER.info("shutdown reason=%s", reason, extra={"component": component})
 
@@ -657,7 +1108,9 @@ def _load_configured(
     return load_default_config(recorder=recorder)
 
 
-def _build_alert_dispatcher(config: WindbreakConfig) -> AlertDispatcher:
+def _build_alert_dispatcher(
+    config: WindbreakConfig, *, ledger_writer: LedgerWriter | None = None
+) -> AlertDispatcher:
     """Compose the alert dispatcher from the configured sinks (issue #274).
 
     The single place the CLI turns ``alerts.sinks`` into live delivery channels,
@@ -671,6 +1124,10 @@ def _build_alert_dispatcher(config: WindbreakConfig) -> AlertDispatcher:
     Args:
         config: The loaded configuration whose alerts section supplies the
             sinks and whose whole shape supplies the egress allowlist.
+        ledger_writer: Where each emitted alert is recorded. Defaults to the
+            logging writer; :func:`_build_beat_supervisor` passes a
+            :class:`LedgerAlertWriter` so a supervised beat failure reaches the
+            hash chain as well as the sinks (issue #443).
 
     Returns:
         A dispatcher over every deliverable configured sink. With none
@@ -691,7 +1148,51 @@ def _build_alert_dispatcher(config: WindbreakConfig) -> AlertDispatcher:
             allowlist=allowlist_from_config(config),
             environ=os.environ,
         ),
-        ledger_writer=LoggingLedgerWriter(),
+        ledger_writer=(
+            LoggingLedgerWriter() if ledger_writer is None else ledger_writer
+        ),
+    )
+
+
+def _build_beat_supervisor(
+    args: argparse.Namespace, config: WindbreakConfig
+) -> BeatSupervisor:
+    """Compose the beat supervisor over the CLI's real alert root (#443/#447).
+
+    With ``--ledger-path`` the supervisor also gets a :class:`LedgerModeWriter`,
+    so a failed beat's mode reaches the same ledger the dashboard's status
+    source reads and the dashboard cannot keep reporting the healthy row the
+    tick stamped before it raised (issue #447).
+
+    Deliberately routed through :func:`_build_alert_dispatcher` rather than a
+    second, locally-built dispatcher. Issue #444 reports the PAPER loop's own
+    ``AlertDispatcher(sinks=[])`` at ``scheduler/loop.py:1741``, whose alerts can
+    only ever reach the log-only fallback; the composition root here is the one
+    place that turns ``alerts.sinks`` into live channels, so an escalation from
+    this supervisor reaches whatever the operator configured. With
+    ``--ledger-path`` the emitted alert is also appended to the hash chain.
+
+    Args:
+        args: The parsed ``run`` arguments carrying ``ledger_path`` and the
+            ``process`` token stamped on escalations.
+        config: The loaded configuration supplying the sinks and allowlist.
+
+    Returns:
+        The supervisor :func:`run_loop` runs each beat's hook through.
+
+    Raises:
+        AlertSinkConfigError: If a configured sink cannot be composed. Raised
+            here, at startup, rather than discovered at the first halt.
+    """
+    ledger_writer: LedgerWriter = LoggingLedgerWriter()
+    mode_writer: LedgerModeWriter | None = None
+    if args.ledger_path is not None:
+        ledger_writer = LedgerAlertWriter(args.ledger_path, component=args.process)
+        mode_writer = LedgerModeWriter(args.ledger_path, component=args.process)
+    return BeatSupervisor(
+        component=args.process,
+        dispatcher=_build_alert_dispatcher(config, ledger_writer=ledger_writer),
+        mode_writer=mode_writer,
     )
 
 
@@ -1278,7 +1779,7 @@ def _live_research_http(
 
 def _build_paper_on_beat(
     args: argparse.Namespace, config: WindbreakConfig
-) -> Callable[[int], None]:
+) -> Callable[[int], BeatReport]:
     """Build a per-beat hook that runs one always-on PAPER tick (issue #48).
 
     The scheduler imports are local so the RESEARCH heartbeat path never imports
@@ -1311,16 +1812,31 @@ def _build_paper_on_beat(
         provider_http=_resolve_provider_http(config),
     )
 
-    def _on_beat(seq: int) -> None:
-        """Run one PAPER tick for the given beat sequence."""
-        run_single_tick(deps, beat=seq)
+    def _on_beat(seq: int) -> BeatReport:
+        """Run one PAPER tick and report what it found (issue #447).
+
+        Args:
+            seq: The 1-based beat sequence number stamped on the tick.
+
+        Returns:
+            The tick's kernel mode and its two halt flags. The mode is read
+            from ``deps.kernel.mode`` after the tick, so a verification breach
+            that drove the kernel to ``HALT`` mid-tick is what the heartbeat
+            reports -- not the ``RESEARCH`` constant it used to print.
+        """
+        outcome = run_single_tick(deps, beat=seq)
+        return BeatReport(
+            mode=deps.kernel.mode.name,
+            halted=outcome.kernel_halted,
+            research_halted=outcome.research_halted,
+        )
 
     return _on_beat
 
 
 def _resolve_on_beat(
     args: argparse.Namespace, config: WindbreakConfig
-) -> Callable[[int], None] | None:
+) -> Callable[[int], BeatReport | None] | None:
     """Resolve the per-beat hook: the PAPER tick, a snapshot pass, or none.
 
     PAPER activation (issue #48) takes precedence when permitted and fully
@@ -1407,14 +1923,20 @@ def _build_dashboard_status_source(
     :func:`windbreak.dashboard.views.build_ledger_read_models_source`), folds the
     ``ModeHeartbeat`` rows via
     :func:`windbreak.ledger.rebuild.mode_history_read_model`, and reports the
-    latest row's mode and timestamp -- or the default RESEARCH / no-heartbeat
-    status when the history is empty. With ``None`` it always yields that
-    default. The dashboard/ledger imports are local so the RESEARCH heartbeat
-    path never imports them.
+    latest row's mode and timestamp -- or the no-evidence
+    :data:`MODE_UNKNOWN` / no-heartbeat status when the history is empty. With
+    ``None`` it always yields that default. The dashboard/ledger imports are
+    local so the RESEARCH heartbeat path never imports them.
+
+    The latest row is only as honest as what writes it, which is why
+    :class:`LedgerModeWriter` exists: ``run_single_tick`` stamps its
+    ``ModeHeartbeat`` before the stages that can raise, so without the
+    supervisor's own row a failing beat would keep re-stamping a healthy
+    ``PAPER`` here and this source would report health through an outage.
 
     Args:
         ledger_path: Path to the SQLite ledger database, or ``None`` to serve
-            the static RESEARCH / no-heartbeat default.
+            the static :data:`MODE_UNKNOWN` / no-heartbeat default.
 
     Returns:
         A zero-arg callable suitable for
@@ -1425,8 +1947,8 @@ def _build_dashboard_status_source(
     from windbreak.ledger.store import SqliteLedgerStore
 
     def _default_source() -> DashboardStatus:
-        """Report the static RESEARCH / no-heartbeat status."""
-        return DashboardStatus(mode=MODE_RESEARCH, last_heartbeat=None)
+        """Report the no-evidence status: an unknown mode, no heartbeat."""
+        return DashboardStatus(mode=MODE_UNKNOWN, last_heartbeat=None)
 
     if ledger_path is None:
         return _default_source
@@ -1576,14 +2098,30 @@ def _run_heartbeat(args: argparse.Namespace) -> int:
             ``snapshot_fixture_dir``.
 
     Returns:
-        The process exit code (0 on success, 1 on a fatal config error).
+        The process exit code (0 on success, 1 on a fatal config or alert-sink
+        error).
     """
     config = _load_and_ledger_config(args)
     if config is None:
         return 1
+    # Handlers first, and before `_resolve_on_beat`: the PAPER hook's bundle is
+    # built eagerly there -- it opens the SQLite ledger, loads the books, and
+    # builds the connector -- and a SIGTERM arriving inside that window would
+    # otherwise hit the default disposition and kill the process outright
+    # instead of unwinding through `ShutdownState`.
     state = ShutdownState()
     _install_signal_handlers(state)
     on_beat = _resolve_on_beat(args, config)
+    supervisor = None
+    if on_beat is not None:
+        # A hook is the only thing there is to supervise, and composing the
+        # dispatcher fails closed on a misconfigured sink -- at startup, rather
+        # than at the first halt, when the alert is the whole point.
+        try:
+            supervisor = _build_beat_supervisor(args, config)
+        except AlertSinkConfigError as exc:
+            _LOGGER.critical("FATAL: %s", exc)
+            return 1
     run_loop(
         args.heartbeat_interval,
         max_beats=args.max_beats,
@@ -1591,6 +2129,7 @@ def _run_heartbeat(args: argparse.Namespace) -> int:
         state=state,
         component=args.process,
         on_beat=on_beat,
+        supervisor=supervisor,
     )
     return 0
 
