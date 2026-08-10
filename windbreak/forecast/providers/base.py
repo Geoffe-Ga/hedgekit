@@ -9,7 +9,11 @@ keeps CI fully offline and deterministic.
 
 Every result crosses the seam as a frozen :class:`ProviderForecast`, and a
 rejected response crosses back as a :class:`ProviderResponseRejectedError`
-carrying only a fingerprint of the untrusted text, never the raw bytes. The
+carrying only a fingerprint of the untrusted text, never the raw bytes. Untrust
+runs in both directions: :func:`build_vote_prompt` screens the *market's own*
+free-text metadata before inlining it into the prompt's trusted scaffold and
+refuses a hostile market as a :class:`ProviderMarketMetadataRejectedError`
+(issue #265), so a forged delimiter cannot reach a model in the first place. The
 module is stdlib-only and float-free -- it sits on the probability path guarded
 by ``scripts/lint_no_floats.py`` -- and, per the SPEC S8.3 sandbox boundary,
 never imports ``windbreak.config``: an ensemble member is accepted structurally
@@ -29,6 +33,7 @@ from windbreak.forecast.sanitize import (
     RESPONSE_FAILURE_HTTP_STATUS,
     RESPONSE_FAILURE_MALFORMED_VOTE_JSON,
     RESPONSE_FAILURE_VERSION_DRIFT,
+    screen_untrusted_text,
     wrap_data_block,
 )
 from windbreak.timekeeping import require_aware
@@ -237,6 +242,13 @@ PROVIDER_FAILURE_COST_OVERRUN: Final = "provider_cost_overrun"
 #: one, and no request was ever built, so there is no body to fingerprint.
 PROVIDER_FAILURE_NOT_ROUTABLE: Final = "provider_not_routable"
 
+#: Failure code stamped when the *market's own* metadata -- the upstream-sourced
+#: text this module inlines into the trusted scaffold region of a vote prompt --
+#: fails the SPEC S8.5 untrusted-text screen (issue #265). Like a not-routable
+#: member this is refused before any request is built, so no body exists to
+#: fingerprint and nothing is billed.
+PROVIDER_FAILURE_MARKET_METADATA_REJECTED: Final = "provider_market_metadata_rejected"
+
 #: Truthful sentinel ``response_fingerprint`` for a failure where no response
 #: body ever existed (timeout, rate-limit, cost overrun). It is deliberately not
 #: a 64-char sha256 hex digest, so it can never be mistaken for -- or forged as
@@ -345,6 +357,66 @@ class ProviderResponseRejectedError(ProviderVoteError):
             f"fingerprint {response_fingerprint}",
             failure_code=failure_code,
             response_fingerprint=response_fingerprint,
+            cost_micros=0,
+        )
+
+
+class ProviderMarketMetadataRejectedError(ProviderVoteError):
+    """Raised when a market's own metadata fails the S8.5 untrusted-text screen.
+
+    :func:`build_vote_prompt` inlines ``ticker``/``title``/
+    ``resolution_criteria`` into the region of the prompt the model is told to
+    *trust*. That text is upstream-sourced and nothing between the exchange and
+    here screens it (``NormalizedMarket.__post_init__`` validates enum-shaped
+    and numeric fields only), so a market whose title forges an untrusted-data
+    delimiter could render a well-formed fake data block -- or close the real
+    one -- inside the scaffold (issue #265).
+
+    The refusal is deliberate rather than a scrub. Neutralizing the tokens would
+    silently alter the question the panel is answering, and this package already
+    *refuses* rather than repairs delimiter-bearing text bound for a prompt:
+    :func:`~windbreak.forecast.sanitize.wrap_data_block` raises on a delimiter in
+    either the URL or the quote it is handed. An unforecastable market is a
+    healthy outcome; a forecast of a question nobody asked is not.
+
+    A :class:`ProviderVoteError`, so the pipeline discards and ledgers the vote
+    through the same per-vote path as any transport or screen failure instead of
+    crashing the run. Because the refusal happens before any request is built,
+    ``response_fingerprint`` is the truthful :data:`NO_RESPONSE_FINGERPRINT`
+    sentinel -- the offending *field*'s digest lives in its own attribute, so a
+    consumer comparing response fingerprints can never be handed a metadata hash
+    wearing a response's name.
+
+    Attributes:
+        failure_code: :data:`PROVIDER_FAILURE_MARKET_METADATA_REJECTED`.
+        response_fingerprint: :data:`NO_RESPONSE_FINGERPRINT` -- no response
+            body ever existed.
+        field_name: The rejected metadata field's name.
+        screen_failure: The ``RESPONSE_FAILURE_*`` verdict
+            :func:`~windbreak.forecast.sanitize.screen_untrusted_text` returned.
+        field_fingerprint: The sha256 digest of the rejected field's value.
+            Fingerprint only: the tainted bytes never reach a log or the
+            append-only ledger, exactly as with a rejected response.
+    """
+
+    def __init__(
+        self, field_name: str, screen_failure: str, field_fingerprint: str
+    ) -> None:
+        """Store the field, the screen's verdict, and the field's fingerprint.
+
+        Args:
+            field_name: The rejected metadata field's name.
+            screen_failure: The ``RESPONSE_FAILURE_*`` code the screen returned.
+            field_fingerprint: The rejected field value's sha256 fingerprint.
+        """
+        self.field_name = field_name
+        self.screen_failure = screen_failure
+        self.field_fingerprint = field_fingerprint
+        super().__init__(
+            f"market metadata field {field_name!r} rejected by the untrusted-text "
+            f"screen ({screen_failure}); field fingerprint {field_fingerprint}",
+            failure_code=PROVIDER_FAILURE_MARKET_METADATA_REJECTED,
+            response_fingerprint=NO_RESPONSE_FINGERPRINT,
             cost_micros=0,
         )
 
@@ -612,6 +684,35 @@ def fingerprint_response(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _screen_market_metadata(market: NormalizedMarket) -> None:
+    """Screen every free-text market field bound for the trusted scaffold (S8.5).
+
+    The fields are screened in the order :func:`build_vote_prompt` interpolates
+    them, so the field a multiply-hostile market is refused on is deterministic.
+    ``close_time`` and the baseline price are rendered from a ``datetime`` and an
+    ``int``, which cannot carry a delimiter, so they are not screened.
+
+    Args:
+        market: The market whose metadata is about to be interpolated.
+
+    Raises:
+        ProviderMarketMetadataRejectedError: If any screened field forges an
+            untrusted-data delimiter or embeds a tool-call lure. The vote is
+            refused before any prompt is built; nothing is scrubbed and nothing
+            is sent.
+    """
+    for field_name, value in (
+        ("ticker", market.ticker),
+        ("title", market.title),
+        ("resolution_criteria", market.resolution_criteria),
+    ):
+        screen_failure = screen_untrusted_text(value)
+        if screen_failure is not None:
+            raise ProviderMarketMetadataRejectedError(
+                field_name, screen_failure, fingerprint_response(value)
+            )
+
+
 def build_vote_prompt(
     market: NormalizedMarket,
     baseline: BaselineQuoteSnapshot,
@@ -631,6 +732,14 @@ def build_vote_prompt(
     untrusted-data block, prefaced by a preamble that frames the blocks as data,
     never instructions, so the no-quotes scaffold stays a byte-exact prefix.
 
+    The market's own text is untrusted too (issue #265). ``ticker``, ``title``
+    and ``resolution_criteria`` land in the scaffold -- the region the model is
+    told to trust -- so each is screened first and a hostile market is refused
+    outright rather than neutralized; see
+    :class:`ProviderMarketMetadataRejectedError` for why refusing beats
+    scrubbing here. Metadata that clears the screen is still interpolated
+    byte-for-byte, so a clean market's prompt is unchanged.
+
     Args:
         market: The market under forecast.
         baseline: The baseline quote snapshot.
@@ -639,7 +748,14 @@ def build_vote_prompt(
 
     Returns:
         A deterministic prompt string.
+
+    Raises:
+        ProviderMarketMetadataRejectedError: If the market's ticker, title, or
+            resolution criteria fails the SPEC S8.5 untrusted-text screen. A
+            :class:`ProviderVoteError`, so the pipeline discards the vote
+            per-vote rather than crashing the run.
     """
+    _screen_market_metadata(market)
     scaffold = (
         f"You are ensemble vote {vote_index} in a forecasting panel "
         "estimating the resolution probability of a prediction market.\n\n"
