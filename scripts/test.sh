@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test.sh - Run tests with Pytest
 # Usage: ./scripts/test.sh [--unit|--integration|--e2e|--all] [--coverage]
-#                          [--mutation] [--verbose] [--help]
+#                          [--mutation] [--metrics] [--verbose] [--help]
 
 set -euo pipefail
 
@@ -10,12 +10,17 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 TEST_TYPE="unit"
 COVERAGE=false
+METRICS=false
 MUTATION=false
 VERBOSE=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --metrics)
+            METRICS=true
+            shift
+            ;;
         --unit)
             TEST_TYPE="unit"
             shift
@@ -57,6 +62,13 @@ OPTIONS:
     --all           Run all test types
     --coverage      Generate coverage report
     --mutation      Run mutation tests
+    --metrics       Print {"tests_total": <int>, "tests_passed": <int>,
+                    "tests_failed": <int>, "tests_skipped": <int>} as JSON on
+                    stdout and exit 0, for the quality dashboard (issue #122).
+                    Measurement, not a gate: failures are counted, never
+                    enforced, and mutation testing is never triggered (it is
+                    the manual pre-v1.0.0 gate, issue #107). Shares its pytest
+                    run with coverage.sh --metrics.
     --verbose       Show detailed output
     --help          Display this help message
 
@@ -87,6 +99,16 @@ cd "$PROJECT_ROOT"
 # exercising a different dependency set than the one this repo pins.
 TOOLCHAIN_ENV="$SCRIPT_DIR/toolchain-env.sh"
 PYTEST="$(bash "$TOOLCHAIN_ENV" --print-tool pytest)"
+
+# Dashboard measurement mode (issue #122). Dispatched before the gate below so
+# stdout carries exactly the one JSON object collect_metrics.py parses. It runs
+# the WHOLE suite (not the default `--unit` selection) because the dashboard's
+# Test Count tile counts the repository's tests, and it shares that run's
+# artifacts with coverage.sh --metrics.
+if $METRICS; then
+    METRICS_PYTHON="$(bash "$TOOLCHAIN_ENV" --print-python)"
+    exec "$METRICS_PYTHON" "$SCRIPT_DIR/metrics_probe.py" tests --pytest "$PYTEST"
+fi
 
 # Set verbosity
 if $VERBOSE; then

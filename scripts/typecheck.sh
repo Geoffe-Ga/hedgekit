@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # scripts/typecheck.sh - Run type checking with MyPy
-# Usage: ./scripts/typecheck.sh [--verbose] [--help]
+# Usage: ./scripts/typecheck.sh [--metrics] [--verbose] [--help]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+METRICS=false
 VERBOSE=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --metrics)
+            METRICS=true
+            shift
+            ;;
         --verbose)
             VERBOSE=true
             shift
@@ -23,6 +28,10 @@ Usage: $(basename "$0") [OPTIONS]
 Run type checking on the project using MyPy.
 
 OPTIONS:
+    --metrics   Print {"errors": <int>} as JSON on stdout and exit 0, for the
+                quality dashboard (issue #122). Measurement, not a gate: the
+                error count is reported, never enforced, and is null when mypy
+                neither succeeded nor printed a summary to count from.
     --verbose   Show detailed output
     --help      Display this help message
 
@@ -52,6 +61,15 @@ cd "$PROJECT_ROOT"
 # exactly the false-green this gate exists to prevent, so a missing mypy now
 # vetoes (toolchain_tool fails closed).
 MYPY="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-tool mypy)"
+
+# Dashboard measurement mode (issue #122). Dispatched before the gate below so
+# stdout carries exactly the one JSON object collect_metrics.py parses. The
+# probe creates its own throwaway MYPY_CACHE_DIR, keeping the cold-cache parity
+# this gate enforces (issue #179) without leaking the directory past `exec`.
+if $METRICS; then
+    METRICS_PYTHON="$(bash "$SCRIPT_DIR/toolchain-env.sh" --print-python)"
+    exec "$METRICS_PYTHON" "$SCRIPT_DIR/metrics_probe.py" typecheck --mypy "$MYPY"
+fi
 
 # Set verbosity
 if $VERBOSE; then

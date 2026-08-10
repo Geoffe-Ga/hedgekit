@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # scripts/complexity.sh - Code complexity analysis
-# Usage: ./scripts/complexity.sh [--verbose] [--help]
+# Usage: ./scripts/complexity.sh [--metrics] [--verbose] [--help]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+METRICS=false
 VERBOSE=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --metrics)
+            METRICS=true
+            shift
+            ;;
         --verbose)
             VERBOSE=true
             shift
@@ -28,6 +33,10 @@ Metrics:
   - Cognitive complexity
 
 OPTIONS:
+    --metrics   Print {"cyclomatic_avg": <num>, "maintainability_avg": <num>}
+                as JSON on stdout and exit 0, for the quality dashboard
+                (issue #122). Measurement, not a gate: it runs radon only and
+                deliberately skips the enforcing xenon check below.
     --verbose   Show detailed output
     --help      Display this help message
 
@@ -59,6 +68,16 @@ cd "$PROJECT_ROOT"
 TOOLCHAIN_ENV="$SCRIPT_DIR/toolchain-env.sh"
 RADON="$(bash "$TOOLCHAIN_ENV" --print-tool radon)"
 XENON="$(bash "$TOOLCHAIN_ENV" --print-tool xenon)"
+
+# Dashboard measurement mode (issue #122). Dispatched before the gate below so
+# stdout carries exactly the one JSON object collect_metrics.py parses. xenon
+# is still resolved above -- a metrics run must not report numbers from a
+# toolchain that could not have produced the gate's verdict -- but it is not
+# RUN here: measurement never enforces.
+if $METRICS; then
+    METRICS_PYTHON="$(bash "$TOOLCHAIN_ENV" --print-python)"
+    exec "$METRICS_PYTHON" "$SCRIPT_DIR/metrics_probe.py" complexity --radon "$RADON"
+fi
 
 # Set verbosity
 if $VERBOSE; then
