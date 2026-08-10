@@ -36,7 +36,7 @@ import sqlite3
 from typing import TYPE_CHECKING
 
 from tests.integration.conftest import FIXED_NOW_EPOCH_S, ledger_path_for
-from windbreak.alerts import AlertDispatcher
+from windbreak.alerts import AlertDispatcher, LoggingLedgerWriter
 from windbreak.ledger import SqliteLedgerStore
 from windbreak.main import (
     BeatReport,
@@ -147,6 +147,21 @@ class _FullVolumeStore:
         self._inner.close()
 
 
+def _log_only_dispatcher() -> AlertDispatcher:
+    """Build the sink-less dispatcher a no-sink deployment composes.
+
+    Since issue #444 the PAPER hook takes its alert root as a parameter rather
+    than hardcoding one. These scenarios patch `build_paper_deps` out entirely,
+    so the root the hook is handed never reaches a verification cycle; the
+    log-only dispatcher is the honest stand-in, and it is exactly what
+    `build_paper_deps` composes when no sink is configured.
+
+    Returns:
+        A dispatcher whose `log-only` fallback carries every alert.
+    """
+    return AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter())
+
+
 def _paper_args(tmp_path: Path, ledger_path: Path) -> argparse.Namespace:
     """Build the `run` namespace `_build_paper_on_beat` reads its flags from.
 
@@ -163,6 +178,7 @@ def _paper_args(tmp_path: Path, ledger_path: Path) -> argparse.Namespace:
         ledger_path=ledger_path,
         report_dir=tmp_path / "reports",
         paper_live_ticker=None,
+        process="pipeline",
     )
 
 
@@ -249,7 +265,9 @@ def test_a_full_volume_mid_tick_leaves_the_loop_beating_and_says_so(
         0,
         max_beats=2,
         on_beat=_build_paper_on_beat(
-            _paper_args(tmp_path, tick_ledger_path), paper_config
+            _paper_args(tmp_path, tick_ledger_path),
+            paper_config,
+            dispatcher=_log_only_dispatcher(),
         ),
         supervisor=supervisor,
     )
@@ -339,7 +357,9 @@ def test_the_same_tick_without_a_full_volume_reports_its_real_mode(
         0,
         max_beats=1,
         on_beat=_build_paper_on_beat(
-            _paper_args(tmp_path, tick_ledger_path), paper_config
+            _paper_args(tmp_path, tick_ledger_path),
+            paper_config,
+            dispatcher=_log_only_dispatcher(),
         ),
         supervisor=supervisor,
     )
@@ -434,7 +454,11 @@ def test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once(
             ledger_writer=LedgerAlertWriter(alert_ledger_path, component="pipeline"),
         ),
     )
-    hook = _build_paper_on_beat(_paper_args(tmp_path, tick_ledger_path), paper_config)
+    hook = _build_paper_on_beat(
+        _paper_args(tmp_path, tick_ledger_path),
+        paper_config,
+        dispatcher=_log_only_dispatcher(),
+    )
 
     def _on_beat(seq: int) -> BeatReport | None:
         """Trade on the venue behind the loop's back, then run the real beat.
