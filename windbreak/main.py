@@ -1154,8 +1154,64 @@ def _build_alert_dispatcher(
     )
 
 
-def _build_beat_supervisor(
+def _beat_alert_root(
     args: argparse.Namespace, config: WindbreakConfig
+) -> Callable[[], AlertDispatcher]:
+    """Return the compose-once factory for this run's single alert root (#444).
+
+    Every per-beat seam of one ``run`` -- the :class:`BeatSupervisor` that
+    escalates a failed beat or a kernel halt (issues #443/#447), and the PAPER
+    tick's own read-only verification cycle (issue #444) -- delivers through the
+    *same* :class:`AlertDispatcher` object, composed here at most once. One
+    alert root means one set of live sinks, one allowlist screen, and one place
+    that ever reads a destination out of the environment; two roots over the
+    same configuration would be a second parallel alerting path that could drift
+    from the first without anything failing.
+
+    It is a factory rather than a dispatcher because composition must not happen
+    at all on a run with no per-beat hook: a bare RESEARCH heartbeat has nothing
+    to alert about, and making it refuse to start over a sink it will never use
+    would be a new failure mode rather than a fixed one. Deferring also puts the
+    composition *ahead* of :func:`_build_paper_on_beat`'s bundle, so an
+    undeliverable sink refuses before a SQLite ledger has been created and
+    abandoned.
+
+    Args:
+        args: The parsed ``run`` arguments carrying ``ledger_path`` and the
+            ``process`` token stamped on ledgered alerts.
+        config: The loaded configuration supplying the sinks and allowlist.
+
+    Returns:
+        A zero-argument callable yielding the one composed dispatcher. Calling
+        it a second time returns the same object, never a second composition.
+    """
+    composed: list[AlertDispatcher] = []
+
+    def _root() -> AlertDispatcher:
+        """Compose the alert root on first call and return it on every later one.
+
+        Returns:
+            The single dispatcher every per-beat seam of this run shares.
+
+        Raises:
+            AlertSinkConfigError: If a configured sink cannot be composed.
+        """
+        if not composed:
+            ledger_writer: LedgerWriter = LoggingLedgerWriter()
+            if args.ledger_path is not None:
+                ledger_writer = LedgerAlertWriter(
+                    args.ledger_path, component=args.process
+                )
+            composed.append(
+                _build_alert_dispatcher(config, ledger_writer=ledger_writer)
+            )
+        return composed[0]
+
+    return _root
+
+
+def _build_beat_supervisor(
+    args: argparse.Namespace, *, dispatcher: AlertDispatcher
 ) -> BeatSupervisor:
     """Compose the beat supervisor over the CLI's real alert root (#443/#447).
 
@@ -1164,34 +1220,28 @@ def _build_beat_supervisor(
     source reads and the dashboard cannot keep reporting the healthy row the
     tick stamped before it raised (issue #447).
 
-    Deliberately routed through :func:`_build_alert_dispatcher` rather than a
-    second, locally-built dispatcher. Issue #444 reports the PAPER loop's own
-    ``AlertDispatcher(sinks=[])`` at ``scheduler/loop.py:1741``, whose alerts can
-    only ever reach the log-only fallback; the composition root here is the one
-    place that turns ``alerts.sinks`` into live channels, so an escalation from
-    this supervisor reaches whatever the operator configured. With
-    ``--ledger-path`` the emitted alert is also appended to the hash chain.
+    The ``dispatcher`` is handed in rather than composed here, and it is the
+    same object :func:`_build_paper_on_beat` threads into the PAPER loop's
+    verification cycle (issue #444). Before that, the supervisor was composed
+    from :func:`_build_alert_dispatcher` while the PAPER loop built its own
+    ``AlertDispatcher(sinks=[])``, so one of the two alerting surfaces an
+    unattended run has reached the operator and the other could not.
 
     Args:
         args: The parsed ``run`` arguments carrying ``ledger_path`` and the
             ``process`` token stamped on escalations.
-        config: The loaded configuration supplying the sinks and allowlist.
+        dispatcher: The run's single composed alert root, from
+            :func:`_beat_alert_root`.
 
     Returns:
         The supervisor :func:`run_loop` runs each beat's hook through.
-
-    Raises:
-        AlertSinkConfigError: If a configured sink cannot be composed. Raised
-            here, at startup, rather than discovered at the first halt.
     """
-    ledger_writer: LedgerWriter = LoggingLedgerWriter()
     mode_writer: LedgerModeWriter | None = None
     if args.ledger_path is not None:
-        ledger_writer = LedgerAlertWriter(args.ledger_path, component=args.process)
         mode_writer = LedgerModeWriter(args.ledger_path, component=args.process)
     return BeatSupervisor(
         component=args.process,
-        dispatcher=_build_alert_dispatcher(config, ledger_writer=ledger_writer),
+        dispatcher=dispatcher,
         mode_writer=mode_writer,
     )
 
@@ -1778,7 +1828,10 @@ def _live_research_http(
 
 
 def _build_paper_on_beat(
-    args: argparse.Namespace, config: WindbreakConfig
+    args: argparse.Namespace,
+    config: WindbreakConfig,
+    *,
+    dispatcher: AlertDispatcher,
 ) -> Callable[[int], BeatReport]:
     """Build a per-beat hook that runs one always-on PAPER tick (issue #48).
 
@@ -1792,9 +1845,20 @@ def _build_paper_on_beat(
     derive from ``--paper-live-ticker``, so this call site cannot supply half a
     live configuration (issue #343).
 
+    The ``dispatcher`` closes issue #444. ``build_paper_deps`` threads it into
+    the read-only verification cycle, whose mismatch and unknown-jurisdiction
+    alerts are the only alerting surface the loop itself has; until it was
+    passed, that cycle dispatched into a hardcoded ``sinks=[]`` and an operator
+    who had followed ``docs/RUNBOOK.md`` and declared a sink still learned
+    nothing at 3am. It is the same object :func:`_build_beat_supervisor` holds,
+    so a halt escalated by the supervisor and the breach that caused it travel
+    the same configured channels.
+
     Args:
         args: The parsed ``run`` arguments carrying the four PAPER flags.
         config: The loaded PAPER-ceilinged configuration.
+        dispatcher: The run's single composed alert root, from
+            :func:`_beat_alert_root`.
 
     Returns:
         A callable that, given the beat sequence, runs one PAPER tick.
@@ -1810,6 +1874,7 @@ def _build_paper_on_beat(
         market_data=_resolve_paper_market_data(args, config),
         live_ticker=args.paper_live_ticker,
         provider_http=_resolve_provider_http(config),
+        dispatcher=dispatcher,
     )
 
     def _on_beat(seq: int) -> BeatReport:
@@ -1835,7 +1900,10 @@ def _build_paper_on_beat(
 
 
 def _resolve_on_beat(
-    args: argparse.Namespace, config: WindbreakConfig
+    args: argparse.Namespace,
+    config: WindbreakConfig,
+    *,
+    alert_root: Callable[[], AlertDispatcher],
 ) -> Callable[[int], BeatReport | None] | None:
     """Resolve the per-beat hook: the PAPER tick, a snapshot pass, or none.
 
@@ -1844,15 +1912,28 @@ def _resolve_on_beat(
     directory is given; otherwise there is no hook and the loop is a bare
     RESEARCH heartbeat.
 
+    ``alert_root`` is called only on the PAPER branch, and *before*
+    :func:`_build_paper_on_beat` opens the ledger database (issue #444): a sink
+    that cannot be composed refuses the run while there is still nothing durable
+    to abandon. The bare-heartbeat branch never calls it at all, so a run with no
+    hook composes no sinks -- it has nothing to alert about, and refusing over an
+    unusable channel it will never reach would be a new failure, not a fixed one.
+
     Args:
         args: The parsed ``run`` arguments.
         config: The loaded configuration.
+        alert_root: The compose-once alert-root factory from
+            :func:`_beat_alert_root`.
 
     Returns:
         The resolved per-beat hook, or ``None`` for a bare heartbeat.
+
+    Raises:
+        AlertSinkConfigError: If PAPER activates and a configured sink cannot be
+            composed.
     """
     if _paper_activated(config, args):
-        return _build_paper_on_beat(args, config)
+        return _build_paper_on_beat(args, config, dispatcher=alert_root())
     if args.snapshot_fixture_dir is not None:
         return _build_snapshot_on_beat(args.snapshot_fixture_dir, config.screener)
     return None
@@ -2111,17 +2192,22 @@ def _run_heartbeat(args: argparse.Namespace) -> int:
     # instead of unwinding through `ShutdownState`.
     state = ShutdownState()
     _install_signal_handlers(state)
-    on_beat = _resolve_on_beat(args, config)
-    supervisor = None
-    if on_beat is not None:
-        # A hook is the only thing there is to supervise, and composing the
-        # dispatcher fails closed on a misconfigured sink -- at startup, rather
-        # than at the first halt, when the alert is the whole point.
-        try:
-            supervisor = _build_beat_supervisor(args, config)
-        except AlertSinkConfigError as exc:
-            _LOGGER.critical("FATAL: %s", exc)
-            return 1
+    # One alert root for the whole run, composed at most once and only if some
+    # per-beat seam actually needs it (issue #444). A hook is the only thing
+    # there is to supervise, and composing fails closed on a misconfigured sink
+    # -- at startup, rather than at the first halt, when the alert is the whole
+    # point.
+    alert_root = _beat_alert_root(args, config)
+    try:
+        on_beat = _resolve_on_beat(args, config, alert_root=alert_root)
+        supervisor = (
+            None
+            if on_beat is None
+            else _build_beat_supervisor(args, dispatcher=alert_root())
+        )
+    except AlertSinkConfigError as exc:
+        _LOGGER.critical("FATAL: %s", exc)
+        return 1
     run_loop(
         args.heartbeat_interval,
         max_beats=args.max_beats,
