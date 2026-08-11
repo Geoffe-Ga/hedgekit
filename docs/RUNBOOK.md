@@ -306,10 +306,29 @@ the re-arm procedure below). Stopping the process with a signal remains
 available, but it is not equivalent: a signal provides none of hold-positions,
 durable state, or manual re-arm.
 
-**Caveat.** The `CancelAllDirective` a kill emits is ledgered, not delivered:
-no `directive_sink` is wired on this path or on the `--process riskkernel` one,
-so resting orders are recorded as due for cancellation rather than actually
-cancelled at the venue.
+**Resting orders are cancelled, and the row says whether they were.** The
+`CancelAllDirective` a kill emits is delivered to the venue, not merely
+ledgered (issue #480): both compositions — the always-on PAPER loop and
+`--process riskkernel` — wire a `directive_sink` over their venue surface, and
+the kill cancels every resting order before it appends the audit row.
+
+Read that row's `delivery` field, not just its presence:
+
+| `delivery.outcome` | What it means |
+| --- | --- |
+| `delivered` | Every resting order was cancelled (`cancelled: 0` here means there were none). |
+| `partial` | Some were cancelled, some the venue refused. Orders are still live. |
+| `refused` | The venue refused every one. Orders are still live. |
+| `errored` | The sink failed before it could count anything. Assume orders are still live. |
+
+Anything but `delivered` also appends a clause to the `HALT_KILL` page naming
+the outcome and the counts, so an operator who reads only the page still learns
+that live instructions may be resting at the venue. A `delivery_reported:
+false` row means no sink was wired at all — on `--process riskkernel` that is
+what running without `--snapshot-fixture-dir` produces, since that process
+holds no order gateway and has no venue to cancel at. It is an *unknown*, never
+a successful cancellation. The counts never name which orders: a venue order id
+is venue-supplied text and the chain is unredactable (issue #274).
 
 ### Acknowledging a held order (LIVE_MICRO / LIVE)
 
@@ -607,8 +626,10 @@ from these rows.
   as the paper fixture books do -- can clear that check.
 - `windbreak kill`/`windbreak rearm` do stop and re-arm the PAPER loop (issue
   #441), provided `--state-dir` is the directory `config.ops.state_dir` names.
-  The cancel-all a kill emits is ledgered but not delivered to the venue, so
-  resting orders are not actually cancelled.
+  The cancel-all a kill emits is delivered to the venue, so resting orders are
+  actually cancelled (issue #480); check the `CancelAllDirective` row's
+  `delivery.outcome` — anything but `delivered` means orders may still be live,
+  and the `HALT_KILL` page says so too.
 - `windbreak run --process dashboard` boots the HTTP dashboard server directly
   (issue #79); its bearer token comes only from `WINDBREAK_DASHBOARD_TOKEN`
   and its port only from `config.dashboard.port` -- there is no `--port` or
