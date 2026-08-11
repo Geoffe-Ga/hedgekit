@@ -75,6 +75,15 @@ if TYPE_CHECKING:
     from windbreak.ledger import Event
     from windbreak.ledger.store import LedgerRecord
 
+#: The single ledgered delivery an escalation records when no sink is
+#: configured: the dispatcher's own `log-only` fallback carried the page.
+#: `fallback: True` is what stops that reading as a healthy configured channel
+#: -- it says every real channel was absent or failed, which for an unattended
+#: run is itself the finding. Since issue #488 `LedgerAlertWriter` forwards the
+#: dispatch's report rather than stamping an unqualified "no delivery
+#: evidence", so this is the evidence the escalation actually had.
+_FALLBACK_CARRIED_IT = {"sink": "log-only", "outcome": "delivered", "fallback": True}
+
 
 @dataclass
 class _RecordingSink:
@@ -1294,16 +1303,8 @@ def test_a_supervised_failure_is_appended_to_the_hash_chained_ledger(
         {
             "severity": "critical",
             "message": "beat seq=1 failed: RuntimeError: database or disk is full",
-            # Issue #413 bumped `AlertEmitted` to schema 2 so an audit can tell
-            # a delivered alert from a merely emitted one. `LedgerAlertWriter`
-            # (windbreak/main.py) does not forward the dispatch's delivery
-            # report, so its rows carry none. This is pinned as the *current*
-            # shape, not endorsed: the writer is handed the report and drops
-            # it, so an unqualified `delivery_reported: false` is a claim the
-            # dispatch contradicts. Issue #488 fixes it; `main.py` was outside
-            # this change's owned paths.
-            "deliveries": [],
-            "delivery_reported": False,
+            "deliveries": [_FALLBACK_CARRIED_IT],
+            "delivery_reported": True,
         }
     ]
 
@@ -1376,16 +1377,8 @@ def test_the_composed_supervisor_ledgers_to_the_configured_ledger_path(
         {
             "severity": "critical",
             "message": "beat seq=1 failed: RuntimeError: database or disk is full",
-            # Issue #413 bumped `AlertEmitted` to schema 2 so an audit can tell
-            # a delivered alert from a merely emitted one. `LedgerAlertWriter`
-            # (windbreak/main.py) does not forward the dispatch's delivery
-            # report, so its rows carry none. This is pinned as the *current*
-            # shape, not endorsed: the writer is handed the report and drops
-            # it, so an unqualified `delivery_reported: false` is a claim the
-            # dispatch contradicts. Issue #488 fixes it; `main.py` was outside
-            # this change's owned paths.
-            "deliveries": [],
-            "delivery_reported": False,
+            "deliveries": [_FALLBACK_CARRIED_IT],
+            "delivery_reported": True,
         }
     ]
 
