@@ -111,7 +111,10 @@ from tests.integration.conftest import (
     candidate_for,
     ledger_path_for,
 )
-from windbreak.config.schema import EnsembleMemberConfig
+from windbreak.config.schema import (
+    DEFAULT_RESEARCH_CACHE_MAX_BYTES,
+    EnsembleMemberConfig,
+)
 from windbreak.forecast.cassettes import Completion
 
 if TYPE_CHECKING:
@@ -281,6 +284,7 @@ def _build_deps_with_real_citations(
         cache_dir=tmp_path / "research-cache",
         search_transport=_FixtureSearchTransport(),
         fetch_transport=_FixtureFetchTransport(),
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
     deps = build_paper_deps(
         books_dir=books_dir,

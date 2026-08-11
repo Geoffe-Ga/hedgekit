@@ -47,6 +47,7 @@ from tests.integration.conftest import (
     read_event_type_payload_pairs,
 )
 from windbreak.config.schema import (
+    DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     PROVIDER_TRANSPORT_CASSETTE,
     PROVIDER_TRANSPORT_LIVE,
     CapitalConfig,
@@ -217,6 +218,7 @@ def _citation_producing_research_tools(tmp_path: Path) -> object:
         cache_dir=tmp_path / "research-cache",
         search_transport=_FixtureSearchTransport(),
         fetch_transport=_FixtureFetchTransport(),
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
 
 

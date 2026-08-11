@@ -200,6 +200,99 @@ windbreak run --paper-books-dir ... --cassette-path ... --ledger-path ... \
   `screener.max_candidates_per_tick`, which is derived as
   `per_day_micros // per_forecast_micros`.
 
+### Sizing the research fetch cache (issue #453)
+
+Every live fetch writes its payload to an on-disk archive under
+`<ledger directory>/research-cache`, one `<sha256-of-url>.txt` file per URL.
+Before this bound existed the archive had no size cap, no age bound, no entry
+limit and no sweep: it grew for the life of the run.
+
+**That matters because of where it lives.** In the shipped
+`deploy/docker-compose.yml`, `--ledger-path
+/var/lib/windbreak/ledger/windbreak.db` puts the cache on the **same named
+`ledger` volume** as the hash-chained ledger, which `riskkernel` and
+`order-gateway` also mount. When that volume fills, the next ledger append
+raises and takes the daemon down (issue #443) -- so an unbounded cache was a
+slow path to losing the loop, with the audit trail as collateral damage.
+
+**The bound.** `forecast.research.cache_max_bytes` is a ceiling on the
+**total bytes** the cache's own entries may hold, defaulting to `268435456`
+(256 MiB). After each write the cache deletes its **oldest entries first**
+until the total is at or below the ceiling.
+
+```yaml
+forecast:
+  research:
+    # Total bytes the on-disk research archive may hold. Oldest entries are
+    # evicted first once the total would exceed it.
+    cache_max_bytes: 67108864   # 64 MiB
+```
+
+- **What to set it to.** Budget the `ledger` volume first -- the ledger is
+  append-only and never evicts, so it must be able to grow for the whole
+  retention window -- then give the cache a slice of what is left. A useful
+  rule: no more than a quarter of the volume, and never less than
+  `forecast.research.fetch_max_bytes` (2 MB by default), since a single
+  payload larger than the whole cap can never be held.
+- **It must be positive.** `0` or a negative value is refused at composition
+  with `forecast.research.cache_max_bytes must be a positive byte count, got
+  <N>`, the same way an unrecognized `provider_transport.mode` is refused: an
+  operator error in configuration is reported, never reinterpreted.
+- **Eviction cannot change a forecast.** Nothing reads the cache back. A fetch
+  calls its transport on every call and archives the result *afterwards*, so
+  the cache is an archive of what was fetched, not a hit/miss cache in front
+  of the network. An evicted entry therefore costs **no re-fetch, no charge
+  against the daily research ceiling, and no abstention** -- only the archived
+  copy of a page. It is still announced rather than silent:
+
+  ```
+  research cache evicted 12 entries (4291719 bytes) to hold its 67108864-byte cap
+  ```
+
+  Two warnings are worth alerting on. The first means a single payload is
+  bigger than the whole cap, so the cap cannot be honoured -- raise
+  `cache_max_bytes` or lower `fetch_max_bytes`:
+
+  ```
+  research cache holds <N> bytes against its <M>-byte cap after evicting every
+  removable entry; raise forecast.research.cache_max_bytes or shrink
+  forecast.research.fetch_max_bytes
+  ```
+
+  The second means the cache directory has become unreadable or unwritable, so
+  the archive is unbounded again until you fix the volume. **The loop keeps
+  beating** -- a loop that cannot start cannot honour a kill file -- and the
+  fetch itself is unaffected:
+
+  ```
+  research cache eviction failed (PermissionError); the cache stays unbounded
+  until its directory is readable and writable
+  ```
+
+  A `research cache write failed (...)` warning is the same story one step
+  earlier: the fetch succeeded and its payload was simply not archived. Before
+  issue #453, that write failure propagated into `verify_citation` and
+  `bounded_web_research`, both of which catch `OSError` and treat it as an
+  unreachable source -- so a **full volume silently turned every forecast into
+  an abstention**, indistinguishable from every source being dead. It no
+  longer does, and it now says so.
+- **Deleting the cache by hand is safe** while the loop is stopped: nothing
+  reads it. The sweep itself will only ever delete a file directly under the
+  cache root whose name is exactly a sha256 hex digest plus `.txt` and which
+  still resolves inside that root, so foreign files, subdirectories and
+  symlinks pointing outside the root are left untouched even if the cache is
+  pointed at the wrong directory.
+- **Why the cache still shares the ledger volume.** Moving it to a separate,
+  disposable volume would decouple research growth from audit-trail durability
+  outright, and that is the better end state. It is not done here because the
+  cache root is derived from the ledger path at
+  `windbreak/scheduler/loop.py:1687` (`ledger_path.parent.joinpath(
+  "research-cache")`), which is outside this change's scope, and moving it also
+  requires a new compose volume and a matching mount in every systemd unit.
+  With the byte cap in place the co-location is bounded and safe to reason
+  about: the cache's worst-case footprint on the shared volume is exactly
+  `cache_max_bytes`.
+
 ### What one PAPER tick actually does
 
 Each beat runs one `windbreak.scheduler.loop.run_single_tick` pass over the

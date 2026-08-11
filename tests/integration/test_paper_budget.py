@@ -50,6 +50,7 @@ from tests.integration.conftest import (
     read_event_type_payload_pairs,
 )
 from windbreak.config.schema import (
+    DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     CapitalConfig,
     ForecastBudget,
     ForecastConfig,
@@ -212,6 +213,7 @@ def _offline_research_tools(tmp_path: Path, transport: object) -> object:
         cache_dir=tmp_path / "research-cache",
         search_transport=transport,
         fetch_transport=transport,
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
 
 

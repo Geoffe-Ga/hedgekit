@@ -482,6 +482,17 @@ class FutureSearchProviderSettings:
     reject_on_version_drift: bool = True
 
 
+#: The shipped ceiling on the *total* bytes the research fetch cache may hold
+#: (issue #453): 256 MiB. The cache is an archive of fetched research payloads
+#: rooted, in the shipped compose stack, on the same named volume as the
+#: hash-chained ledger -- so an unbounded cache is a path to a full ledger
+#: volume, which takes the daemon down (#443). 256 MiB is ~128 payloads at the
+#: 2 MB ``fetch_max_bytes`` ceiling and many thousands at realistic page
+#: sizes, while leaving any sanely-provisioned volume to the audit trail. An
+#: operator sizing a small volume should lower it; see docs/RUNBOOK.md.
+DEFAULT_RESEARCH_CACHE_MAX_BYTES: int = 268_435_456
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchSettings:
     """The live web-research config-schema section (issue #192).
@@ -508,6 +519,13 @@ class ResearchSettings:
         fetch_timeout_seconds: The per-fetch timeout, in whole seconds.
         fetch_max_bytes: The maximum accepted fetched-body size, in bytes.
         allowed_content_types: The response media types a live fetch accepts.
+        cache_max_bytes: The ceiling on the *total* bytes the on-disk research
+            fetch cache may hold (issue #453). Distinct from
+            ``fetch_max_bytes``, which bounds one payload: without this, N
+            bounded fetches per forecast still accumulate without limit for
+            the life of the run. Must be a positive byte count; a
+            non-positive value is refused at composition rather than
+            reinterpreted.
     """
 
     search_endpoint_url: str = UNCONFIGURED_PLACEHOLDER
@@ -516,6 +534,7 @@ class ResearchSettings:
     fetch_timeout_seconds: int = 30
     fetch_max_bytes: int = 2_000_000
     allowed_content_types: tuple[str, ...] = ("text/html",)
+    cache_max_bytes: int = DEFAULT_RESEARCH_CACHE_MAX_BYTES
 
 
 #: Transport-selection token naming the recorded offline replay cassette. The

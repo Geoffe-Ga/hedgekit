@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from windbreak.config.schema import DEFAULT_RESEARCH_CACHE_MAX_BYTES
 from windbreak.forecast.pipeline import run_pipeline
 from windbreak.forecast.records import forecast_record_to_payload
 from windbreak.forecast.sandbox import (
@@ -160,6 +161,7 @@ def _build_tools(
         cache_dir=tmp_path,
         search_transport=_StaticSearchTransport(search_url),
         fetch_transport=_StaticFetchTransport(fetch_content),
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
 
 
@@ -303,7 +305,7 @@ def test_fetch_returns_transport_content_for_allowlisted_host(tmp_path: Path) ->
 
 def test_cache_store_rejects_parent_traversal(tmp_path: Path) -> None:
     """A `..`-traversing candidate name raises `SandboxPathViolationError`."""
-    cache = ResearchCache(root=tmp_path)
+    cache = ResearchCache(root=tmp_path, max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES)
 
     with pytest.raises(SandboxPathViolationError):
         cache.store("../escape.txt", "content")
@@ -311,7 +313,7 @@ def test_cache_store_rejects_parent_traversal(tmp_path: Path) -> None:
 
 def test_cache_store_rejects_absolute_name(tmp_path: Path) -> None:
     """An absolute candidate name raises `SandboxPathViolationError`."""
-    cache = ResearchCache(root=tmp_path)
+    cache = ResearchCache(root=tmp_path, max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES)
     absolute_name = str(tmp_path.parent / "escape.txt")
 
     with pytest.raises(SandboxPathViolationError):
@@ -326,7 +328,7 @@ def test_cache_store_rejects_symlink_escape(tmp_path: Path) -> None:
     outside.mkdir()
     escape_link = root / "escape-link"
     escape_link.symlink_to(outside, target_is_directory=True)
-    cache = ResearchCache(root=root)
+    cache = ResearchCache(root=root, max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES)
 
     with pytest.raises(SandboxPathViolationError):
         cache.store("escape-link/payload.txt", "content")
@@ -344,7 +346,7 @@ def test_cache_store_rejects_name_resolving_onto_root(
     `SandboxPathViolationError` rather than an incidental `IsADirectoryError`
     or silently overwriting the root.
     """
-    cache = ResearchCache(root=tmp_path)
+    cache = ResearchCache(root=tmp_path, max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES)
 
     with pytest.raises(SandboxPathViolationError):
         cache.store(onto_root_name, "content")
@@ -352,7 +354,7 @@ def test_cache_store_rejects_name_resolving_onto_root(
 
 def test_cache_store_writes_plain_relative_name_under_root(tmp_path: Path) -> None:
     """A plain relative name lands under the cache root and the file is written."""
-    cache = ResearchCache(root=tmp_path)
+    cache = ResearchCache(root=tmp_path, max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES)
 
     result_path = cache.store("note.txt", "hello")
 
@@ -373,6 +375,7 @@ def test_allowed_fetch_persists_content_under_cache_dir(tmp_path: Path) -> None:
         cache_dir=cache_dir,
         search_transport=_StaticSearchTransport("https://research.local/x"),
         fetch_transport=_StaticFetchTransport("persisted-content"),
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
 
     tools.fetch("https://research.local/x")
@@ -427,7 +430,14 @@ def test_research_tools_instance_holds_no_privileged_module_handles(
 
 
 def test_build_research_tools_signature_has_no_privileged_parameters() -> None:
-    """`build_research_tools` accepts only allowlist/cache/transport parameters."""
+    """`build_research_tools` accepts only allowlist/cache/transport parameters.
+
+    `max_bytes` (issue #453) is the cache's byte ceiling. It arrives as a bare
+    `int`, never as a config object: the sandbox may not import
+    `windbreak.config`, so the operator's `forecast.research.cache_max_bytes`
+    is unwrapped by the scheduler's wiring and handed across as a plain
+    number, exactly as `allowed_hosts` is.
+    """
     parameter_names = set(inspect.signature(build_research_tools).parameters)
 
     assert parameter_names == {
@@ -435,6 +445,7 @@ def test_build_research_tools_signature_has_no_privileged_parameters() -> None:
         "cache_dir",
         "search_transport",
         "fetch_transport",
+        "max_bytes",
     }
 
 
