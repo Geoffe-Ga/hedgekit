@@ -77,10 +77,38 @@ checked against exchange-documented examples. Confirming the real
 two fixtures against it if the real shape differs -- is a follow-up, not
 something this offline environment can verify.
 
+## The published fee schedule itself (issue #452)
+
+* `fee_schedule_published.json` -- **not an API payload**. It is Kalshi's own
+  fee-schedule PDF transcribed into JSON: the four published formulas with
+  their quoted text and basis-point rates, and both printed fee tables (the
+  general one and the S&P500 / Nasdaq-100 one), each 21 rows of
+  `price_cents` / `fee_1_contract_cents` / `fee_100_contracts_cents`. Source
+  and effective date (`2026-02-05`) are carried as fields so no reader has to
+  re-derive the provenance. The live PDF URL sits behind a bot checkpoint that
+  refuses this environment; the copy transcribed was the Internet Archive's
+  2026-02-18 capture, also recorded in the file.
+
+  `tests/connector/kalshi/test_fee_schedule.py` replays every row against
+  `FeeModel`, so the record is load-bearing: a change to the rate, the form,
+  the scale, or the rounding direction breaks a test that cites a printed
+  number. It also asserts the finding that closes issue #452 -- **every
+  published trading fee is the same quadratic form**, so
+  `max(maker_fee_ppm, taker_fee_ppm)` is the higher *fee*, not merely the
+  higher rate. See `ACCOUNTING.md`'s "The venue's fee schedule, as published"
+  for the reasoning and for the two guards that fail closed if that ever stops
+  being true.
+
+  Note what this fixture does *not* settle: which series carry a maker fee.
+  The schedule defers that to a separate live page, so `series_KXFED.json`
+  keeps `maker_fee_bps: 0` rather than asserting a maker rate for KXFED that
+  no artifact here supports.
+
 ## Fixture inventory
 
 * `series_KXFED.json` -- see above.
 * `series_KXBAD.json` -- see above.
+* `fee_schedule_published.json` -- see above.
 * `fills.json` -- two fill records sharing one `order_id`, each with its own
   per-fill `fee`: evidence for `partial_fill_representation` and
   `fee_debit_timing`.
