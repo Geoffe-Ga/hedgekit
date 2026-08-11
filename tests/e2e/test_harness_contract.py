@@ -375,22 +375,41 @@ def test_require_runtime_fails_instead_of_skipping_when_the_flag_is_armed(
 
     The whole point of the flag, and the reason the container job is safe to
     make a required check: a required check that skips reports success while
-    verifying nothing. `Failed` is asserted by exact type because `Skipped` and
-    `Failed` share an ancestor, so an `isinstance` check here would pass
-    against the very behaviour this test exists to forbid.
+    verifying nothing.
+
+    WHY THIS IS NOT `pytest.raises(Failed)`. It was, and a mutation sweep found
+    the hole: rewriting `require_runtime`'s `pytest.fail` as `pytest.skip` --
+    precisely the regression this test exists to catch -- left the sweep green,
+    because the escaping `Skipped` skipped THIS TEST rather than failing it,
+    and a skipped test is not a red one. A guard that the mutation it guards
+    can silently switch off is not a guard. `Skipped` is therefore caught
+    explicitly and converted into a failure, and the exact type is asserted
+    besides, since `Skipped` and `Failed` share an ancestor.
 
     Args:
         monkeypatch: Used to arm the fail-closed environment variable.
     """
     monkeypatch.setenv(REQUIRE_RUNTIME_ENV_VAR, REQUIRE_RUNTIME_ENABLED_VALUE)
+    reason = "docker runtime unavailable: no `docker` CLI on PATH"
 
-    with pytest.raises(Failed) as caught:
-        require_runtime("docker runtime unavailable: no `docker` CLI on PATH")
+    try:
+        require_runtime(reason)
+    except Skipped as skipped:
+        message = (
+            "require_runtime SKIPPED while the fail-closed flag was armed "
+            f"(reason: {skipped.msg}). A required check that skips reports "
+            "success while verifying nothing."
+        )
+        raise AssertionError(message) from skipped
+    except Failed as failed:
+        outcome: BaseException = failed
+    else:
+        message = "require_runtime returned normally while armed"
+        raise AssertionError(message)
 
-    assert type(caught.value) is Failed
-    assert not isinstance(caught.value, Skipped)
-    assert REQUIRE_RUNTIME_ENV_VAR in str(caught.value)
-    assert "no `docker` CLI on PATH" in str(caught.value)
+    assert type(outcome) is Failed
+    assert REQUIRE_RUNTIME_ENV_VAR in str(outcome)
+    assert "no `docker` CLI on PATH" in str(outcome)
 
 
 @pytest.mark.parametrize("value", ["", "0", "true", "yes", "11"])
