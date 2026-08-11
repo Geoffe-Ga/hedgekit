@@ -101,6 +101,9 @@ from windbreak.connector.paper import (
     TwoSidedPositionError,
 )
 from windbreak.connector.readonly import ReadOnlyConnectorView, ReadOnlyVenueView
+from windbreak.evaluation.track_records import (
+    PROVIDER_TRACK_RECORD_FILENAME as _PROVIDER_TRACK_RECORD_FILENAME,
+)
 from windbreak.forecast.budget import (
     BUDGET_DAY_EXHAUSTED_EVENT,
     BUDGET_FORECAST_EXCEEDED_EVENT,
@@ -331,11 +334,14 @@ _CREATED_AT_FIELD = "created_at"
 
 #: The M6 per-provider track-record artifact the loop's live-eligibility gate
 #: reads, resolved inside the same ``report_dir`` every other evaluation
-#: artifact is written to (issue #305). Public because it is an operator- and
-#: test-facing convention: the file an evaluation pass must write for a provider
+#: artifact is written to (issue #305). Re-exported from the module that
+#: *writes* it (:mod:`windbreak.evaluation.track_records`, issue #440) rather
+#: than declared here, so the producer and this reader can never name two
+#: different files. Public because it is an operator- and test-facing
+#: convention: the file ``windbreak evaluate-providers`` writes for a provider
 #: to become live-eligible. Absent, the loop bootstraps fail-closed (every
 #: provider unproven); malformed, it refuses to start.
-PROVIDER_TRACK_RECORD_FILENAME: Final = "provider-track-records.json"
+PROVIDER_TRACK_RECORD_FILENAME: Final = _PROVIDER_TRACK_RECORD_FILENAME
 
 
 # --- approval seam (the load-bearing constraint) --------------------------------
