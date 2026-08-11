@@ -34,6 +34,7 @@ no `/` and no float literal anywhere in this module.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,13 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from windbreak.connector.fees import FeeModel
+from windbreak.connector.snapshot import InMemoryEventLedgerWriter
+from windbreak.connector.validation import (
+    SCHEMA_ANOMALY_EVENT,
+    SchemaAnomalyHaltError,
+    SchemaValidator,
+    kalshi_default_schema_registry,
+)
 
 #: The transcribed fee-schedule record under test.
 _SCHEDULE_PATH = (
@@ -326,3 +334,88 @@ def test_the_bound_equals_the_max_of_the_two_independently_computed_fees(
     assert bound == max(maker_fee, taker_fee)
     assert bound >= maker_fee
     assert bound >= taker_fee
+
+
+# --- the guard that fails closed if the shared-form premise ever decays --------
+#
+# The finding above -- "every published trading fee shares one quadratic form,
+# so `max(maker_ppm, taker_ppm)` is sound" -- is only safe while it stays true.
+# `ACCOUNTING.md` names the series schema's empty cosmetic allowlist as what
+# turns a venue publishing a *second* form into a halt rather than a silently
+# ignored field. That claim was prose only: widening the allowlist left the
+# whole suite green. These tests make it load-bearing.
+
+#: The recorded clean `/series/{ticker}` document, read rather than restated.
+_SERIES_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures"
+    / "exchange"
+    / "kalshi"
+    / "series_KXFED.json"
+)
+
+#: The endpoint path the series fee-schedule document is fetched from.
+_SERIES_SEGMENTS = ("series", "KXFED")
+
+
+def _series_wall_clock() -> datetime:
+    """Return a fixed UTC instant so a ledgered anomaly's `ts` is deterministic."""
+    return datetime(2026, 7, 4, 12, 0, 0, tzinfo=UTC)
+
+
+def _clean_series_payload() -> dict[str, Any]:
+    """Return the recorded, drift-free series document as a mutable mapping."""
+    with _SERIES_FIXTURE_PATH.open(encoding="utf-8") as handle:
+        loaded: dict[str, Any] = json.load(handle)
+    return loaded
+
+
+def test_the_series_fee_block_grants_no_cosmetic_fields() -> None:
+    """The series fee block tolerates *no* extra field, so none can be ignored.
+
+    A cosmetic field is one the validator only warns about. Any fee-bearing
+    field admitted there would let a new per-side fee form reach `FeeModel`
+    unread, which is precisely the understatement issue #452 is about. The
+    allowlist is read back through the public registry, so widening it by any
+    name -- not merely a name guessed here -- fails this test.
+    """
+    registry = kalshi_default_schema_registry()
+
+    series_schema = registry.schema_for(_SERIES_SEGMENTS)
+    assert series_schema is not None
+    assert series_schema.cosmetic == frozenset()
+    block_schema = series_schema.recognized["series"]
+    assert block_schema is not None
+    assert block_schema.cosmetic == frozenset()
+
+
+def test_a_per_side_fee_form_field_on_the_series_document_halts_and_ledgers() -> None:
+    """A second fee form appearing on the series document halts, not an order.
+
+    Driven through the real `SchemaValidator` and the real Kalshi registry --
+    not a hand-built schema -- so this fails if the wiring, not merely the
+    allowlist, stops fail-closing. The clean fixture is asserted to pass first,
+    so the halt below is attributable to the added field alone.
+    """
+    ledger = InMemoryEventLedgerWriter()
+    validator = SchemaValidator(
+        kalshi_default_schema_registry(), ledger, wall_clock=_series_wall_clock
+    )
+    clean = _clean_series_payload()
+    validator.validate(_SERIES_SEGMENTS, clean)
+    assert ledger.events_by_type(SCHEMA_ANOMALY_EVENT) == ()
+
+    drifted = _clean_series_payload()
+    drifted["series"]["maker_fee_type"] = "linear"
+
+    with pytest.raises(SchemaAnomalyHaltError) as excinfo:
+        validator.validate(_SERIES_SEGMENTS, drifted)
+
+    assert str(excinfo.value) == (
+        "schema 'kalshi.series.block' v1 halted on unrecognized field(s): "
+        "maker_fee_type"
+    )
+    (event,) = ledger.events_by_type(SCHEMA_ANOMALY_EVENT)
+    assert event.payload["schema_key"] == "kalshi.series.block"
+    assert event.payload["version"] == 1
+    assert tuple(event.payload["fields"]) == ("maker_fee_type",)

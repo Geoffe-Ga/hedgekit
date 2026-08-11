@@ -112,6 +112,11 @@ Two guards keep that premise from decaying silently rather than at an order:
   block no cosmetic fields, so a new per-side form discriminator appearing in
   the series document halts on schema drift instead of being ignored.
 
+Both guards are pinned by `tests/connector/kalshi/test_fee_schedule.py`, which
+drives a drifted series document through the real `SchemaValidator` and the real
+registry. Until it did, widening the fee block's cosmetic allowlist left the
+whole suite green — the guard was prose, not a test.
+
 The residual error runs the *safe* way and is worth naming: the bound charges
 the taker rate to both sides, so a resting (maker) fill is bounded at 4× its
 published fee. That overstates cost, which can refuse a marginal trade but can
