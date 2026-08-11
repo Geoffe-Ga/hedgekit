@@ -15,13 +15,14 @@ Every test here shares one book and one forecast, and varies only
 wrong as one that never does, so the boundary is pinned from **both** sides with
 exact values.
 
-Three separate haircuts are deliberately non-zero and mutually distinct -- a
-1%-of-payout settlement fee, a 2_000-ppm slippage buffer, and a 3_000-micro
-research cost. With all three at zero the four `EdgeFigures` edges collapse onto
-one number, and a gate mutated to read `gross_edge_ppm` or
-`slippage_adjusted_edge_ppm` instead of the research-cost-adjusted net edge
+Both surviving haircuts are deliberately non-zero and mutually distinct -- a
+1%-of-payout settlement fee and a 2_000-ppm slippage buffer. With both at zero
+the three `EdgeFigures` edges collapse onto one number, and a gate mutated to
+read `gross_edge_ppm` or `fee_adjusted_edge_ppm` instead of `net_edge_ppm`
 survives every test unchanged; that mutant was observed surviving before these
-haircuts were added.
+haircuts were added. (A third haircut, a 3_000-micro research cost, sat here
+until issue #483 removed the research term from the chain entirely; the
+forecast still carries the cost, and it now moves nothing.)
 
 The book -- `yes_asks = ((4_500 pips, 100 centis), (5_000 pips, 900 centis))`,
 no bids -- and the hand-derived arithmetic every assertion below rests on:
@@ -32,17 +33,16 @@ no bids -- and the hand-derived arithmetic every assertion below rests on:
         gross     = 500_000 - 450_000                 =  50_000 ppm
         fee       = ceil(10_000 * 100 / 10**6) cents  =  10_000 micros
                   -> ceil(10_000 * 100 / 100)         =  10_000 ppm
-        research  = ceil(3_000 * 100 / 100)           =   3_000 ppm
-        net       = 50_000 - 10_000 - 2_000 - 3_000   =  35_000 ppm
+        net       = 50_000 - 10_000 - 2_000           =  38_000 ppm
             -- clears every floor exercised below, so all twelve entry
                conditions pass and sizing runs.
 
     sizing (against the probe's figures)
         g(0, 200_000)                                 = 1_000_000 ppm
-        stake     = floor(1_000_000_000 * 35_000 * 100_000 * 1_000_000
+        stake     = floor(1_000_000_000 * 38_000 * 100_000 * 1_000_000
                           / ((1_000_000 - 450_000) * 10**12))
-                  = floor(7_000_000_000 / 1_100)      = 6_363_636 micros
-        raw       = floor(6_363_636 * 100 / 450_000)  =       1_414 centis
+                  = floor(7_600_000_000 / 1_100)      = 6_909_090 micros
+        raw       = floor(6_909_090 * 100 / 450_000)  =       1_535 centis
         participation clamp = floor(250_000 * 1_000 / 1_000_000) = 250 centis,
             which floors to the 200-centis whole-contract lot -- the binding cap
             is `participation`, and every notional cap (smallest: daily, 100_000
@@ -56,13 +56,11 @@ no bids -- and the hand-derived arithmetic every assertion below rests on:
         fee       = ceil(10_000 * 200 / 10**6) cents  =  20_000 micros
                   -> ceil(20_000 * 100 / 200)         =  10_000 ppm
         fee-adj   = 25_000 - 10_000                   =  15_000 ppm
-        slip-adj  = 15_000 - 2_000                    =  13_000 ppm
-        research  = ceil(3_000 * 100 / 200)           =   1_500 ppm
-        net       = 13_000 - 1_500                    =  11_500 ppm
+        net       = 15_000 - 2_000                    =  13_000 ppm
 
-The four final-size edges (25_000 / 15_000 / 13_000 / 11_500) are four different
-numbers, as are the two net edges (probe 35_000, final 11_500) and the five
-sizes in play (probe 100, raw 1_414, continuous participation 250, emitted 200,
+The three final-size edges (25_000 / 15_000 / 13_000) are three different
+numbers, as are the two net edges (probe 38_000, final 13_000) and the five
+sizes in play (probe 100, raw 1_535, continuous participation 250, emitted 200,
 book depth 1_000). No assertion below can pass by two quantities coinciding.
 """
 
@@ -94,19 +92,19 @@ _INSTANT = datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
 _PROBE_SIZE_CENTIS = 100
 
 #: The net edge the *probe* fill prices at, in ppm (see the module docstring).
-_PROBE_NET_EDGE_PPM = 35_000
+_PROBE_NET_EDGE_PPM = 38_000
 
-#: The net edge the *final*, sized fill prices at, in ppm. A third of the
-#: probe's, because the sized fill walks into the 5_000-pip level.
-_FINAL_NET_EDGE_PPM = 11_500
+#: The net edge the *final*, sized fill prices at, in ppm. Roughly a third of
+#: the probe's, because the sized fill walks into the 5_000-pip level.
+_FINAL_NET_EDGE_PPM = 13_000
 
 #: The emitted size the sizing stage settles on, in contract-centis.
 _FINAL_SIZE_CENTIS = 200
 
 #: The pinned sizing reason the emit path appends (hand-derived in the module
-#: docstring): raw 1_414 centis, full dispersion scale, participation binding.
+#: docstring): raw 1_535 centis, full dispersion scale, participation binding.
 _SIZING_REASON = (
-    "sizing: raw_centis=1414 g_ppm=1000000 binding_cap=participation final_centis=200"
+    "sizing: raw_centis=1535 g_ppm=1000000 binding_cap=participation final_centis=200"
 )
 
 #: The twelve SPEC S9.3 entry conditions plus exactly one trailing decision
@@ -240,7 +238,7 @@ def _inputs(*, min_net_edge_ppm: int) -> SelectorInputs:
     )
 
 
-def test_the_probe_and_the_sized_fill_price_at_four_distinct_edges_each() -> None:
+def test_the_probe_and_the_sized_fill_price_at_distinct_edges_each() -> None:
     """The fixture actually separates every quantity the gate could be reading.
 
     Positive control for the whole module, asserted against
@@ -250,9 +248,9 @@ def test_the_probe_and_the_sized_fill_price_at_four_distinct_edges_each() -> Non
     *different* net edges -- were they equal, every test below would pass for
     the wrong reason, the final-size gate being indistinguishable from the
     `net_edge_min` entry condition that already ran at the probe price. Second,
-    the final fill's four chained edges are four different numbers, so a gate
-    reading the gross, fee-adjusted, or slippage-adjusted figure instead of the
-    research-cost-adjusted net edge is detectable at all.
+    the final fill's three chained edges are three different numbers, so a gate
+    reading the gross or fee-adjusted figure instead of `net_edge_ppm` is
+    detectable at all.
     """
     inputs = _inputs(min_net_edge_ppm=30_000)
 
@@ -275,11 +273,11 @@ def test_the_probe_and_the_sized_fill_price_at_four_distinct_edges_each() -> Non
     assert isinstance(final, EdgeFigures)
     assert probe.executable_price_ppm == 450_000
     assert final.executable_price_ppm == 475_000
-    assert probe.research_cost_adjusted_edge_ppm == _PROBE_NET_EDGE_PPM
+    assert probe.net_edge_ppm == _PROBE_NET_EDGE_PPM
     assert final.gross_edge_ppm == 25_000
     assert final.fee_adjusted_edge_ppm == 15_000
-    assert final.slippage_adjusted_edge_ppm == 13_000
-    assert final.research_cost_adjusted_edge_ppm == _FINAL_NET_EDGE_PPM
+    assert final.net_edge_ppm == _FINAL_NET_EDGE_PPM
+    assert len({25_000, 15_000, _FINAL_NET_EDGE_PPM}) == 3
 
 
 def test_select_rejects_when_the_net_edge_does_not_survive_being_sized() -> None:
@@ -328,24 +326,24 @@ def test_select_emits_the_sized_intent_when_the_edge_exactly_meets_the_floor() -
 @pytest.mark.parametrize(
     ("min_net_edge_ppm", "expect_intent"),
     [
-        (11_499, True),
+        (12_999, True),
         (_FINAL_NET_EDGE_PPM, True),
-        (11_501, False),
+        (13_001, False),
     ],
 )
 def test_the_final_size_gate_turns_over_exactly_at_the_configured_floor(
     min_net_edge_ppm: int, expect_intent: bool
 ) -> None:
-    """The gate's verdict flips between a floor of 11_500 and 11_501 ppm and
+    """The gate's verdict flips between a floor of 13_000 and 13_001 ppm and
     nowhere else: one ppm below and one ppm at the final net edge both emit, one
     ppm above declines.
 
     A three-point sweep straddling the boundary by a single ppm, so a comparison
     mutated in either direction (`<=`, `>`, `>=`) or shifted by one changes at
-    least one row. Every floor here is far below the probe's 35_000-ppm net edge
-    and far below the final fill's other three edges (25_000 / 15_000 / 13_000),
-    so the only quantity any row can be measuring is the *post-sizing*
-    research-cost-adjusted net edge.
+    least one row. Every floor here is far below the probe's 38_000-ppm net edge
+    and below the final fill's other two edges (25_000 gross / 15_000
+    fee-adjusted), so the only quantity any row can be measuring is the
+    *post-sizing* net edge.
 
     Args:
         min_net_edge_ppm: The configured net-edge floor for this row, in ppm.

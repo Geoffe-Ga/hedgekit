@@ -72,27 +72,28 @@ that none of the five notional caps or the participation cap ever bind, so
 Kelly sizing alone determines bundle A's emitted size. Hand computation, off
 the probe-size (100-centi) figures already pinned in
 ``test_entry_conditions.py``'s bundle-A cross-reference (probability
-620_000 ppm, executable price 460_000 ppm, net edge
-`research_cost_adjusted_edge_ppm` 110_000 ppm):
+620_000 ppm, executable price 460_000 ppm, `net_edge_ppm` 135_000 ppm --
+110_000 before issue #483 removed the research haircut that had been charging
+bundle A's whole 25_000-micro research cost against a single probe contract):
 
     g = dispersion_scale(vote_dispersion_ppm=40_000, ceiling=200_000)
       = divide((200_000-40_000)*1_000_000, 200_000, floor) = 800_000
-    stake_micros = divide(100_000_000*110_000*100_000*800_000,
+    stake_micros = divide(100_000_000*135_000*100_000*800_000,
                            540_000*10**12, floor)
-                 = divide(8.8*10**23, 5.4*10**17, floor) = 1_629_629
-    raw_size_centis = divide(1_629_629*100, 460_000, floor)
-                    = divide(162_962_900, 460_000, floor) = 354
-        (460_000*354=162_840_000; remainder=122_900 < 460_000)
+                 = divide(1.08*10**24, 5.4*10**17, floor) = 2_000_000
+    raw_size_centis = divide(2_000_000*100, 460_000, floor)
+                    = divide(200_000_000, 460_000, floor) = 434
+        (460_000*434=199_640_000; remainder=360_000 < 460_000)
     No cap binds (`binding_cap=None`) -> floor-to-100 quantization takes
-    354 -> 300 -- bundle A's real, post-issue-#45 emitted size is
-    `ContractCentis(300)`, priced at the re-walked marginal 4_600 pips
-    (still within the book's now-deepened first level; unchanged from the
-    probe's own marginal price, since 300 <= 50_000).
+    434 -> 400 -- bundle A's real emitted size is `ContractCentis(400)`,
+    priced at the re-walked marginal 4_600 pips (still within the book's
+    now-deepened first level; unchanged from the probe's own marginal price,
+    since 400 <= 50_000).
 
 `bundle_a.golden` has been regenerated (via the command above) to this
-post-#45 sized shape (`intent_id` suffix `:sized`, `size=300`, thirteen
-reasons ending in the pinned ``sizing: raw_centis=354 g_ppm=800000
-binding_cap=none final_centis=300`` line), so
+sized shape (`intent_id` suffix `:sized`, `size=400`, thirteen
+reasons ending in the pinned ``sizing: raw_centis=434 g_ppm=800000
+binding_cap=none final_centis=400`` line), so
 `test_serialized_output_matches_committed_golden[bundle_a]` and
 `test_fresh_interpreter_produces_identical_bytes[bundle_a]` pass against it.
 
@@ -105,12 +106,15 @@ narrower than the 300-pip wide-spread floor, so it crosses rather than rests).
 The intent's price (4600), size (300), idempotency key, and all thirteen
 reasons are byte-unchanged; only the three sorted keys are new.
 
-`bundle_b.golden` is byte-unchanged from the #44 shape: bundle B declines at
-the entry conditions, before sizing runs, so it emits no intent and its
-serialized decision -- which carries the new execution-style fields only inside
-an emitted intent -- is identical. Regenerate either golden the same way (never
-hand-fabricate) after any change to `select`'s logic or these bundles'
-fixtures.
+`bundle_b.golden` still emits no intent -- bundle B declines at the entry
+conditions, before sizing runs -- but issue #483 did move two numbers inside
+its reasons: with the research haircut gone its net edge reads -48_000 ppm
+rather than -146_000, and the annualization of that edge -18_250_000 ppm rather
+than -55_510_417. It still fails all four of the same named conditions, which
+is the point: dropping the haircut moved the arithmetic, not the verdict, on a
+market that genuinely does not clear the bar. Regenerate either golden the same
+way (never hand-fabricate) after any change to `select`'s logic or these
+bundles' fixtures.
 """
 
 from __future__ import annotations

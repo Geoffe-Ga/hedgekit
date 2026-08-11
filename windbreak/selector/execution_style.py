@@ -109,17 +109,20 @@ def _net_edge_at_price_ppm(
 ) -> int:
     """Return the net edge at a resting price, in ppm-of-$1 (SPEC S9.2/S9.7).
 
-    Charges the resting price the identical worst-case fee, slippage buffer, and
-    amortized research haircut the entry edge charges its executable fill (SPEC
-    S9.2), reusing :mod:`windbreak.selector.edge`'s helpers so the two figures
-    stay consistent. The ``rest_price`` pip price is converted to ppm via
-    :data:`_PPM_PER_PIP` (1 pip == 100 ppm).
+    Charges the resting price the identical worst-case fee and slippage buffer
+    the entry edge charges its executable fill (SPEC S9.2), reusing
+    :mod:`windbreak.selector.edge`'s helpers so the two figures stay consistent.
+    Since issue #483 that chain carries no research haircut on either side; had
+    only one side dropped it, a rest price would be judged against a
+    systematically harsher edge than the cross price it is compared with, and
+    ``rest_inside_spread`` would quietly stop being reachable. The ``rest_price``
+    pip price is converted to ppm via :data:`_PPM_PER_PIP` (1 pip == 100 ppm).
 
     Args:
-        inputs: The selector inputs supplying probability, fee model, slippage
-            buffer, and research cost.
+        inputs: The selector inputs supplying probability, fee model, and
+            slippage buffer.
         rest_price: The passive rest price to evaluate the edge at, in pips.
-        size: The fill size the fee/research haircuts amortize over, in centis.
+        size: The fill size the fee haircut amortizes over, in centis.
 
     Returns:
         The net edge at ``rest_price``, in ppm-of-$1 (may be negative).
@@ -127,13 +130,11 @@ def _net_edge_at_price_ppm(
     fee_ppm = _per_contract_ppm(
         _fee_micros(inputs.fee_model, rest_price.value, size.value), size.value
     )
-    research_ppm = _per_contract_ppm(inputs.forecast.research_cost_micros, size.value)
     return (
         inputs.forecast.probability_ppm
         - rest_price.value * _PPM_PER_PIP
         - fee_ppm
         - inputs.slippage_model.per_contract_buffer_ppm
-        - research_ppm
     )
 
 
