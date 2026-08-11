@@ -25,14 +25,30 @@ test of the mechanism would stay green with the wiring deleted, which is this
 repository's most common trap -- every seam tested, the composition unreachable.
 So the workflow file is read and the wiring asserted, from the same constants
 the harness uses.
+
+The third half -- and it is the one that was missing when this module was first
+written -- runs that argument out to its end. A job can exist, select the tier
+and arm the flag, and still not matter: a workflow job that is not a REQUIRED
+status check is advisory. It may go red and the pull request merges anyway.
+Issue #467's AC1 ("gates the build") and #468's AC2 ("merge-gating") are that
+one repository setting and nothing else, and no file in this tree can assert
+it -- which is precisely why it went unasserted while three tests happily
+checked the wiring underneath it. :func:`_required_status_check_contexts`
+reads the live setting, so the claim is checked against GitHub rather than
+against a comment restating it.
 """
 
 from __future__ import annotations
 
+import ast
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from tests.e2e.harness import (
@@ -51,6 +67,28 @@ CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 #: Key of the container-tier job inside that workflow's `jobs:` mapping.
 CONTAINER_JOB_ID = "container"
+
+#: Directories holding the tier's own test modules.
+TIER_DIRECTORIES = (REPO_ROOT / "tests" / "e2e", REPO_ROOT / "tests" / "deploy")
+
+#: Module that DEFINES the runtime gate, so it is not one of its callers.
+RUNTIME_GATE_MODULE = "harness.py"
+
+#: Probes whose answer must be handed to `require_runtime`, not to `pytest.skip`.
+#:
+#: Each returns ``None`` or a reason string. Deciding what a reason MEANS is
+#: `require_runtime`'s job alone -- skip on a developer machine, fail in the
+#: container job, which is a required status check where a skip would report
+#: success over nothing. A module that probes and then skips on its own answer
+#: opts out of that decision silently, which is what
+#: `tests/deploy/test_deployment_cli_contract.py` did with systemd.
+RUNTIME_PROBE_HELPERS = ("docker_skip_reason", "systemd_skip_reason")
+
+#: Branch whose protection settings are the merge gate.
+PROTECTED_BRANCH = "main"
+
+#: Seconds allowed for the branch-protection query before it is killed.
+PROTECTION_QUERY_TIMEOUT_SECONDS = 30.0
 
 #: Matches a `-m "<expression>"` argument in the script's pytest invocation.
 _MARKER_ARGUMENT = re.compile(r'-m\s+"([^"]*)"')
@@ -182,4 +220,189 @@ def test_the_container_job_builds_the_wheel_the_tier_installs() -> None:
     assert any("python -m build" in line for line in run_lines), (
         f"no step in the `{CONTAINER_JOB_ID}` job runs `python -m build`, so "
         "dist/ is empty when the wheel tier runs"
+    )
+
+
+def _referenced_names(source: str) -> set[str]:
+    """Collect the identifiers a module actually references in code.
+
+    Parsed rather than grepped. `tests/e2e/conftest.py` *names* both probes in
+    its module docstring, explaining where runtime gating lives; a substring
+    scan reads that prose as a call and reports a module that gates nothing.
+    An identifier bound or used in code is the only evidence that counts.
+
+    Args:
+        source: The module's source text.
+
+    Returns:
+        Every name imported, called or otherwise referenced by the module.
+    """
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.name for alias in node.names)
+    return names
+
+
+def _modules_probing_a_runtime() -> list[tuple[Path, set[str]]]:
+    """Find every tier module that asks whether a runtime is present.
+
+    Returns:
+        ``(path, referenced_names)`` for each module referencing a probe from
+        :data:`RUNTIME_PROBE_HELPERS`, excluding the module that defines them.
+    """
+    found = []
+    for directory in TIER_DIRECTORIES:
+        for path in sorted(directory.glob("*.py")):
+            if path.name == RUNTIME_GATE_MODULE:
+                continue
+            names = _referenced_names(path.read_text(encoding="utf-8"))
+            if names & set(RUNTIME_PROBE_HELPERS):
+                found.append((path, names))
+    return found
+
+
+def test_the_scan_finds_modules_probing_a_runtime() -> None:
+    """The probe scan matches something, so the guard below can fail.
+
+    Trap #7 again, and the reason it is worth repeating: the guard underneath
+    iterates over whatever this finds. Rename a helper, or move the tier's
+    modules, and it would iterate over nothing and pass forever.
+    """
+    probing = _modules_probing_a_runtime()
+
+    assert probing != [], (
+        f"no module under {[str(d) for d in TIER_DIRECTORIES]} names any of "
+        f"{RUNTIME_PROBE_HELPERS}. Either the helpers were renamed or the scan "
+        "is broken; either way the guard below is checking an empty set."
+    )
+
+
+def test_every_module_probing_a_runtime_gates_on_require_runtime() -> None:
+    """A module that probes a runtime must let `require_runtime` judge it.
+
+    The probes return a reason; they do not decide what a reason means. That
+    decision belongs to `require_runtime` alone, because it is the one place
+    that knows the answer is environment-dependent: SKIP on a developer
+    machine without a docker daemon, FAIL in the container job, where
+    ``WINDBREAK_E2E_REQUIRE_RUNTIME=1`` is set because the job is a required
+    status check and a required check that skips reports success.
+
+    `tests/deploy/test_deployment_cli_contract.py` probed systemd and called
+    `pytest.skip` on the answer itself, so its four `systemd-analyze verify`
+    assertions over the shipped unit files would have vanished silently on a
+    runner that lost systemd -- while `harness.py` documented the flag as
+    making exactly that impossible. The claim was false for as long as one
+    call site opted out, which is why this is asserted over every module
+    rather than reviewed once.
+    """
+    ungated = [
+        str(path.relative_to(REPO_ROOT))
+        for path, names in _modules_probing_a_runtime()
+        if "require_runtime" not in names
+    ]
+
+    assert ungated == [], (
+        f"{ungated} probe for a runtime without importing `require_runtime`, "
+        "so they decide for themselves what a missing runtime means. A "
+        "`pytest.skip` there reports SUCCESS for a required check that "
+        "verified nothing. Hand the probe's result to `require_runtime` "
+        "instead."
+    )
+
+
+def _required_status_check_contexts() -> list[str]:
+    """Read the status-check contexts branch protection requires on `main`.
+
+    Queries GitHub rather than any file in this tree, because the setting is
+    not in this tree. The read is deliberately allowed to *skip* -- never to
+    pass -- when it cannot be performed: the endpoint needs an administrative
+    token, which a CI runner's default `GITHUB_TOKEN` is not, so on a runner
+    this reports SKIPPED with the refusal quoted rather than inventing an
+    answer. A silent pass here would be the same defect the caller exists to
+    catch, one level up.
+
+    Returns:
+        The required context names, exactly as GitHub records them.
+    """
+    if shutil.which("gh") is None:
+        pytest.skip(
+            "cannot verify branch protection: no `gh` CLI on PATH. The "
+            "required-status-check set lives on the repository, not in this "
+            "tree, so there is nothing local to fall back to."
+        )
+    completed = subprocess.run(
+        [
+            "gh",
+            "api",
+            f"repos/{{owner}}/{{repo}}/branches/{PROTECTED_BRANCH}/protection",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=PROTECTION_QUERY_TIMEOUT_SECONDS,
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(
+            "cannot verify branch protection: `gh api "
+            f"repos/.../branches/{PROTECTED_BRANCH}/protection` exited "
+            f"{completed.returncode}. Reading protection needs an admin-scoped "
+            "token, which a CI runner's default GITHUB_TOKEN is not. "
+            f"stderr: {completed.stderr.strip()}"
+        )
+    protection = json.loads(completed.stdout)
+    checks = protection.get("required_status_checks") or {}
+    return [str(context) for context in checks.get("contexts", [])]
+
+
+def test_the_container_job_is_a_required_status_check() -> None:
+    """`main` does not merge unless the container tier reported success.
+
+    The three tests above prove the job exists, selects the tier and arms the
+    fail-closed flag. None of them proves the job *matters*: a workflow job
+    that is not a required status check is advisory, free to go red while the
+    pull request merges anyway. That is this module's own opening complaint --
+    every seam tested, the composition unreachable -- aimed at the last seam,
+    and it is the one that stayed unasserted longest.
+
+    Issue #467's AC1 ("gates the build") and #468's AC2 ("merge-gating") ARE
+    this setting. It is a property of the repository, so it can neither be
+    changed by a pull request nor asserted from a file; the only honest check
+    is a live read.
+
+    The context GitHub matches on is the job's `name:`, not its key in `jobs:`,
+    so the expected value is read out of the workflow. Rename the job without
+    renaming the protection context and `main` blocks forever on a context
+    nothing will ever report -- caught here rather than on the first pull
+    request unlucky enough to hit it.
+
+    THIS TEST FOUND THAT EXACT STATE ON ITS FIRST RUN. The job's name was an
+    unquoted YAML scalar ending `(epic #465)`, so ` #465)` parsed as a comment
+    and GitHub reported the check run as `End-to-End Container Tier (epic`
+    while protection required the full string. Every pull request would have
+    blocked on a context no job produces. The fix -- quoting the scalar -- is
+    in `ci.yml` beside the name, and this assertion is what holds it.
+    """
+    expected = str(_container_job()["name"])
+    contexts = _required_status_check_contexts()
+
+    assert contexts != [], (
+        f"branch protection on `{PROTECTED_BRANCH}` requires NO status checks "
+        "at all. Every gate in this repository is advisory in that state, so "
+        "the membership assertion below would pass over an empty set and "
+        "report success while verifying nothing."
+    )
+    assert expected in contexts, (
+        f"`{expected}` is not among the status checks branch protection "
+        f"requires on `{PROTECTED_BRANCH}` ({contexts}). The container tier "
+        "runs but does not gate merge, so a red tier merges anyway -- issue "
+        "#467 AC1 and #468 AC2 are unmet in that state. Either the protection "
+        "setting was removed, or the job's `name:` in "
+        f"{CI_WORKFLOW.name} changed without the context being renamed to "
+        "match."
     )

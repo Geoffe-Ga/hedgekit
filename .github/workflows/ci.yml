@@ -135,6 +135,28 @@ jobs:
         run: pytest -m chaos --no-cov -v
 
   container:
+    # THE NAME BELOW IS TRUNCATED ON PURPOSE, AND MUST NOT BE "FIXED" ALONE.
+    #
+    # In YAML a `#` preceded by whitespace opens a comment inside an unquoted
+    # scalar, so `End-to-End Container Tier (epic #465)` parses as
+    # `End-to-End Container Tier (epic`. Measured, not inferred: `gh api
+    # .../actions/runs/<id>/jobs` reports the check run under the truncated
+    # string, and `job.name` is what GitHub matches required status checks
+    # against. Branch protection therefore requires the truncated context,
+    # because that is the only context this job will ever report.
+    #
+    # Quoting the scalar here -- the obvious tidy-up -- silently renames the
+    # check run. The required context would then be one no job produces, and
+    # EVERY pull request on this repository would block forever on a check
+    # that simply never appears. Both halves have to move together, and the
+    # protection setting is not editable from a pull request, so the only safe
+    # order is: (1) the repo owner drops the container context from branch
+    # protection, (2) the quoting change merges, (3) the owner re-adds the
+    # context under the full quoted name.
+    #
+    # tests/e2e/test_tier_selection_contract.py reads this name and the live
+    # protection contexts and fails if they ever disagree, in either
+    # direction. That guard is what makes the truncation safe to leave.
     name: End-to-End Container Tier (epic #465)
     runs-on: ubuntu-latest
     steps:

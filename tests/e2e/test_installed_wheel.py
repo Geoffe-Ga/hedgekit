@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from setuptools import find_namespace_packages, find_packages
 
 from tests.e2e.harness import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -190,6 +191,20 @@ def clean_venv(built_wheel: Path, tmp_path_factory: pytest.TempPathFactory) -> P
     up importable got there because the wheel asked for it, which is exactly
     the claim under test.
 
+    PIP RUNS WITH ``PYTHONPATH`` STRIPPED, and that is not hygiene. pip treats
+    an importable ``windbreak.egg-info`` on ``PYTHONPATH`` as the requirement
+    already being satisfied: it then installs the *dependencies* only, exits 0,
+    and leaves a venv with requests and pyyaml in it and no ``windbreak`` at
+    all. ``PYTHONPATH=<repo>`` is a common CI convention, so this fixture --
+    the one that builds the subject of every other test here -- was the single
+    place in the module that could still see the checkout, while
+    :func:`_run_in_venv` and :func:`_run_console_script` already stripped it.
+
+    A zero exit therefore proves nothing on its own, and is not what is
+    asserted: the version is read back out of the venv's own metadata and
+    compared with the declaration, so "pip succeeded" and "the package is
+    installed" stop being the same claim.
+
     Args:
         built_wheel: The wheel to install.
         tmp_path_factory: pytest's session-scoped temporary directory factory.
@@ -203,11 +218,13 @@ def clean_venv(built_wheel: Path, tmp_path_factory: pytest.TempPathFactory) -> P
         capture_output=True,
         text=True,
         timeout=DEFAULT_TIMEOUT_SECONDS,
+        env=_outside_repo_env(),
         check=True,
     )
+    venv_python = venv_dir / "bin" / "python"
     installed = subprocess.run(
         [
-            str(venv_dir / "bin" / "python"),
+            str(venv_python),
             "-m",
             "pip",
             "install",
@@ -218,12 +235,30 @@ def clean_venv(built_wheel: Path, tmp_path_factory: pytest.TempPathFactory) -> P
         capture_output=True,
         text=True,
         timeout=INSTALL_TIMEOUT_SECONDS,
+        env=_outside_repo_env(),
         check=False,
     )
     assert installed.returncode == 0, (
         f"installing {built_wheel.name} into a clean venv failed -- the wheel "
         "cannot satisfy its own declared dependencies:\n"
         f"{installed.stdout}\n{installed.stderr}"
+    )
+    resolved = _run_in_venv(
+        venv_python,
+        "import importlib.metadata as metadata\n"
+        f"print(metadata.version({DISTRIBUTION_NAME!r}))",
+        cwd=venv_dir,
+    )
+
+    assert resolved.returncode == 0, (
+        f"pip exited 0 but {DISTRIBUTION_NAME} is not installed in the venv it "
+        f"claims to have installed into:\n{resolved.stderr}"
+    )
+    assert resolved.stdout.strip() == _declared_version(), (
+        f"the venv reports {DISTRIBUTION_NAME} "
+        f"{resolved.stdout.strip()!r}, but pyproject.toml declares "
+        f"{_declared_version()!r} -- the installed distribution is not the one "
+        "built from this tree"
     )
     return venv_dir
 
@@ -627,6 +662,129 @@ def test_the_wheel_ships_every_subpackage_in_the_source_tree(
     )
 
 
+def _declared_packages() -> list[str]:
+    """Compute the package set `pyproject.toml` currently declares.
+
+    Asks setuptools the same question the build backend asks it, with the
+    same `[tool.setuptools.packages.find]` arguments, rather than restating
+    the answer or re-implementing the glob semantics.
+
+    Returns:
+        The declared package names, sorted.
+    """
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        parsed = tomllib.load(handle)
+    config = parsed["tool"]["setuptools"]["packages"]["find"]
+    discover = (
+        find_namespace_packages if config.get("namespaces", True) else find_packages
+    )
+    declared: set[str] = set()
+    for where in config.get("where", ["."]):
+        declared |= set(
+            discover(
+                where=str(REPO_ROOT / where),
+                include=config.get("include", ["*"]),
+                exclude=config.get("exclude", []),
+            )
+        )
+    return sorted(declared)
+
+
+def test_the_wheel_ships_exactly_the_packages_pyproject_declares(
+    built_wheel: Path,
+) -> None:
+    """The wheel's package set matches the CURRENT build configuration.
+
+    THE ARTIFACT IS NOT TIED TO THE TREE BY ITS FILENAME.
+    :func:`_wheel_skip_reason` asks only that ``dist/`` hold exactly one
+    ``windbreak-*.whl``; nothing there notices that the wheel predates the
+    `pyproject.toml` sitting beside it. Reproduced, not hypothesised: with a
+    stale ``build/`` directory present, ``python -m build`` re-emitted a wheel
+    still containing ``windbreak/dashboard/**`` after that package had been
+    excluded from `[tool.setuptools.packages.find]`, and this tier reported 11
+    passed against it. The proof-of-failure procedure this pull request
+    mandates would have read as "the break did not go red".
+
+    The other direction is already covered --
+    :func:`test_the_wheel_ships_every_subpackage_in_the_source_tree` catches a
+    package dropped from the wheel. It cannot catch a package the wheel keeps
+    after the configuration stopped asking for it, because the source
+    directory is still there. Only the declaration knows, so the declaration
+    is what this compares against.
+
+    Args:
+        built_wheel: The wheel under test.
+    """
+    declared = _declared_packages()
+
+    assert declared != [], (
+        "setuptools discovered no packages from pyproject.toml's find "
+        "configuration, so the comparison below would be between two empty "
+        "sets and could not fail"
+    )
+    with zipfile.ZipFile(built_wheel) as archive:
+        shipped = sorted(
+            name.rsplit("/", 1)[0].replace("/", ".")
+            for name in archive.namelist()
+            if name.endswith("/__init__.py")
+        )
+
+    assert shipped == declared, (
+        f"{built_wheel.name} does not match the build configuration it sits "
+        f"beside. Only in the wheel: {sorted(set(shipped) - set(declared))}. "
+        f"Only in pyproject.toml: {sorted(set(declared) - set(shipped))}. The "
+        "wheel is stale -- rebuild it after clearing `build/`, which caches "
+        "the previous configuration's file list."
+    )
+
+
+def test_every_module_in_the_wheel_matches_the_source_it_was_built_from(
+    built_wheel: Path,
+) -> None:
+    """Each `.py` the wheel ships is byte-identical to the tree's copy.
+
+    The package-set comparison above catches a wheel built under a different
+    *configuration*. This catches one built from different *content*: same
+    packages, same filenames, an edit made since. Both are the same defect --
+    a tier certifying an artifact that is not the tree under review -- and
+    neither is visible from the wheel's filename, which carries only a version
+    that changes once a release.
+
+    Args:
+        built_wheel: The wheel under test.
+    """
+    with zipfile.ZipFile(built_wheel) as archive:
+        shipped = sorted(
+            name
+            for name in archive.namelist()
+            if name.startswith(f"{DISTRIBUTION_NAME}/") and name.endswith(".py")
+        )
+        source_files = sorted(
+            str(path.relative_to(REPO_ROOT))
+            for path in PACKAGE_DIR.rglob("*.py")
+            if path.is_file()
+        )
+
+        assert shipped == source_files, (
+            f"{built_wheel.name} ships a different set of modules than the "
+            f"source tree holds. Only in the wheel: "
+            f"{sorted(set(shipped) - set(source_files))}. Only in the tree: "
+            f"{sorted(set(source_files) - set(shipped))}."
+        )
+        differing = [
+            name
+            for name in shipped
+            if archive.read(name) != (REPO_ROOT / name).read_bytes()
+        ]
+
+    assert differing == [], (
+        f"{len(differing)} module(s) in {built_wheel.name} differ from the "
+        f"source they were supposedly built from: {differing}. The wheel is "
+        "stale; every assertion in this tier is being made against code that "
+        "is not under review. Clear `build/` and `dist/` and rebuild."
+    )
+
+
 def test_every_shipped_subpackage_imports_from_the_wheel(
     venv_python: Path,
     run_root: RunRoot,
@@ -645,21 +803,38 @@ def test_every_shipped_subpackage_imports_from_the_wheel(
     expected = _source_subpackages()
 
     assert expected, "the package walk found nothing -- the walk itself is broken"
+    # `imported` collects each module's OWN `__name__`, read back off the
+    # imported object. The obvious formulation -- reporting `len(packages)` --
+    # cannot fail: the probe embeds the parent's list literally, so the count
+    # is that list's length by construction, whatever importing did. Comparing
+    # a count where an identity was meant is a assertion-shaped no-op, and this
+    # was one until review of PR #508 named it.
     probe = (
-        "import importlib, json, sys\n"
+        "import importlib, json\n"
         f"packages = {expected!r}\n"
         "failures = {}\n"
+        "imported = []\n"
         "for name in packages:\n"
         "    try:\n"
-        "        importlib.import_module(name)\n"
+        "        module = importlib.import_module(name)\n"
         "    except Exception as exc:\n"
         "        failures[name] = f'{type(exc).__name__}: {exc}'\n"
-        "print(json.dumps({'imported': len(packages), 'failures': failures}))"
+        "    else:\n"
+        "        imported.append(module.__name__)\n"
+        "print(json.dumps({'imported': imported, 'failures': failures}))"
     )
 
     completed = _run_in_venv(venv_python, probe, cwd=run_root.root)
 
     assert completed.returncode == 0, completed.stderr
     observed = json.loads(completed.stdout)
-    assert observed["imported"] == len(expected)
-    assert observed["failures"] == {}
+    assert observed["failures"] == {}, (
+        f"{len(observed['failures'])} package(s) are in the wheel but do not "
+        f"import from it: {observed['failures']}"
+    )
+    assert observed["imported"] == expected, (
+        "the modules that imported are not the modules that were asked for. "
+        f"Asked for {expected}, imported {observed['imported']} -- a name "
+        "resolved to a module calling itself something else, which means the "
+        "wheel's package layout does not match the source tree's."
+    )

@@ -88,7 +88,18 @@ _SYSTEMD_RUNTIME_MARKER = Path("/run/systemd/system")
 #: deleted. In CI the runtime is provisioned deliberately, so a skip means the
 #: provisioning broke and the gate silently stopped gating. Setting this to
 #: ``1`` (the CI job does, in `.github/workflows/ci.yml`) makes that
-#: impossible: every gate below fails loudly instead of skipping.
+#: impossible: every gate in the tier fails loudly instead of skipping.
+#:
+#: THAT LAST SENTENCE IS A UNIVERSAL, AND IT IS ONLY TRUE WHILE EVERY RUNTIME
+#: PROBE IS ROUTED THROUGH :func:`require_runtime`. It was false when first
+#: written: `tests/deploy/test_deployment_cli_contract.py` probed systemd and
+#: called `pytest.skip` on the answer itself, so its four `systemd-analyze
+#: verify` assertions over the shipped unit files would have vanished silently
+#: on a runner that lost systemd -- while this comment promised they could
+#: not. One opted-out call site is enough to make the promise a lie, so the
+#: quantifier is enforced rather than asserted here:
+#: `tests/e2e/test_tier_selection_contract.py` fails if any module in the tier
+#: probes a runtime without importing this gate.
 REQUIRE_RUNTIME_ENV_VAR = "WINDBREAK_E2E_REQUIRE_RUNTIME"
 
 #: Value :data:`REQUIRE_RUNTIME_ENV_VAR` must hold to arm the fail-closed mode.
