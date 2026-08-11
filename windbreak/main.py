@@ -21,7 +21,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from windbreak.alerts import AlertDispatcher, AlertType, LoggingLedgerWriter, cli_token
+from windbreak.alerts import (
+    AlertDispatcher,
+    AlertType,
+    LoggingLedgerWriter,
+    cli_token,
+    ledger_deliveries,
+)
 from windbreak.alerts.factory import AlertSinkConfigError, build_sinks
 from windbreak.config import (
     ConfigError,
@@ -1083,6 +1089,28 @@ class LedgerAlertWriter:
 
     A ledger write that fails is logged at CRITICAL and swallowed, for the
     reason :func:`_append_swallowing` records.
+
+    **Two rows, one dispatch, and no order of precedence (issue #488).** A kill
+    appends *two* ``AlertEmitted`` rows to the one chain: this writer's, under
+    the run's ``--process`` token, and
+    :meth:`~windbreak.riskkernel.kill.KillSwitch.kill`'s own tamper-evident
+    audit row under ``riskkernel``, appended only after every fail-safe effect
+    has landed (issue #287). Neither is removable. Dropping this one would
+    un-ledger every *other* alert the run dispatches, which is the whole of
+    #443; dropping the kill switch's would surrender the ordering guarantee
+    that its row cannot precede the ``KILL`` file.
+
+    So both stay -- and the reader is given the only rule that needs no
+    convention: **they carry identical payloads**. Both project the same
+    dispatched :class:`~windbreak.alerts.AlertEmitted` through
+    :func:`~windbreak.alerts.ledger_deliveries`, so either row is authoritative
+    and ``component`` records *provenance*, never precedence. Until #488 that
+    was false in the worst direction: this writer was handed the dispatch and
+    kept only its severity and body, so its schema-2 row stamped
+    ``delivery_reported: false`` -- an explicit denial of evidence its own
+    parameter held, which an auditor scanning by ``event_type`` rather than by
+    ``component`` reads as a false negative for a page that was delivered. A
+    schema-1 row made no claim; this one made a wrong one, permanently.
     """
 
     def __init__(self, ledger_path: Path, *, component: str) -> None:
@@ -1096,10 +1124,26 @@ class LedgerAlertWriter:
         self._component = component
 
     def record(self, event: AlertEmitted) -> None:
-        """Append one emitted alert to the ledger, never raising.
+        """Append one emitted alert, and its delivery evidence, never raising.
+
+        ``delivery_reported`` is unconditionally ``True``: this seam is reached
+        only from :meth:`~windbreak.alerts.AlertDispatcher.dispatch`, which
+        hands over the concrete ``AlertEmitted`` it just built, so the report
+        is never absent here and a fail-closed "unknown" would be a second
+        false claim in place of the first.
+
+        The delivery rows come from
+        :func:`~windbreak.alerts.ledger_deliveries` rather than from
+        ``event.outcomes``, and that is the security-relevant half: it is the
+        single producer of ledgered delivery evidence, emitting only a screened
+        sink identity, an enumerated outcome and a fallback flag.
+        ``SinkOutcome.detail`` is ``str(exc)`` from an arbitrary sink -- the
+        shape that leaked whole token-bearing URLs in issue #274 -- and this
+        chain can never be redacted, so it must not be reachable from here.
 
         Args:
-            event: The dispatched alert to persist.
+            event: The dispatched alert to persist, carrying the per-sink
+                outcomes of the dispatch that produced it.
         """
         _append_swallowing(
             self._ledger_path,
@@ -1107,6 +1151,8 @@ class LedgerAlertWriter:
                 component=self._component,
                 severity=event.severity.value,
                 message=event.message,
+                deliveries=ledger_deliveries(event),
+                delivery_reported=True,
             ),
             component=self._component,
             what="alert",
