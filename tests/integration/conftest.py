@@ -37,6 +37,7 @@ from pathlib import Path
 import pytest
 
 from windbreak.config.schema import (
+    DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     CapitalConfig,
     HorizonDays,
     OpsConfig,
@@ -233,6 +234,7 @@ def research_tools_factory(tmp_path: Path):
             cache_dir=cache_dir,
             search_transport=NullSearchTransport(),
             fetch_transport=NullSearchTransport(),  # never called; see module docstring
+            max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
         )
 
     return _build

@@ -130,6 +130,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from windbreak.config.schema import (
+    DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     CorrelationConfig,
     CorrelationTagConfig,
     ForecastBudget,
@@ -348,6 +349,7 @@ def _finding_research_tools(cache_dir: Path) -> ResearchTools:
         cache_dir=cache_dir,
         search_transport=transport,
         fetch_transport=transport,
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
 
 

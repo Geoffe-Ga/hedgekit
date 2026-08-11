@@ -34,13 +34,17 @@ Three seams enforce the boundary:
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
+
+_LOGGER = logging.getLogger(__name__)
 
 #: The only URL schemes egress is ever permitted for (SPEC S8.3): plain
 #: http(s), never ``file://``, ``ftp://``, or any other privileged scheme.
@@ -58,6 +62,19 @@ _DEL_ORD = 0x7F
 #: Suffix stamped on every cached fetch payload; the stem is a sha256 digest of
 #: the source URL, so distinct URLs cache to distinct, collision-free files.
 _CACHE_FILE_SUFFIX = ".txt"
+
+#: Length of a sha256 hex digest, derived from the hash rather than restated,
+#: so the eviction sweep's notion of "a file this cache wrote" cannot drift
+#: from :func:`_cache_filename`'s notion of what it writes.
+_DIGEST_HEX_LENGTH = hashlib.sha256().digest_size * 2
+
+#: The exact shape of a name this cache is willing to delete: a full sha256 hex
+#: digest plus the cache suffix, and nothing else. An eviction routine pointed
+#: at a misconfigured directory is a data-loss hazard, so the sweep never
+#: touches a name it cannot prove it wrote itself.
+_CACHE_ENTRY_PATTERN = re.compile(
+    f"^[0-9a-f]{{{_DIGEST_HEX_LENGTH}}}{re.escape(_CACHE_FILE_SUFFIX)}$"
+)
 
 
 class EgressDeniedError(Exception):
@@ -135,24 +152,80 @@ def _cache_filename(url: str) -> str:
     return f"{digest}{_CACHE_FILE_SUFFIX}"
 
 
+class _CacheEntry(NamedTuple):
+    """One evictable cache entry, with the two keys the sweep needs.
+
+    Attributes:
+        mtime_ns: Last-modification time in integer nanoseconds since the
+            epoch -- the eviction ordering key. Nanoseconds since the epoch
+            are an absolute instant, so this ordering is identical in every
+            process timezone; and being an ``int``, it keeps this module clear
+            of the no-float money-path lint that ``datetime.timestamp()``
+            would trip.
+        name: The entry's filename, the deterministic tiebreak when two
+            entries share a modification time.
+        size: The entry's size in bytes.
+        path: The entry's full path, already proven inside the jail.
+    """
+
+    mtime_ns: int
+    name: str
+    size: int
+    path: Path
+
+
 class ResearchCache:
-    """A write-jailed cache for fetched research payloads.
+    """A byte-bounded, write-jailed cache for fetched research payloads.
 
     Every write is confined to ``root``: names are resolved (following any
     symlinks) and rejected with :class:`SandboxPathViolationError` unless the
     resolved candidate is inside the resolved root, so absolute names, ``..``
     traversal, and symlink escapes all fail closed.
+
+    Every write is also *bounded* (issue #453). The cache's own entries may
+    hold at most ``max_bytes`` in total; each store sweeps oldest-first until
+    that holds again. Before the bound existed the cache was a write-only
+    store with no cap, no sweep and no ceiling of any kind, sharing the
+    shipped compose stack's ``ledger`` volume with the hash-chained ledger --
+    so it grew until the volume filled and the next ledger append took the
+    daemon down (#443).
+
+    Eviction cannot change a forecast. Nothing ever reads an entry back:
+    :meth:`ResearchTools.fetch` calls its transport on every call and stores
+    the result afterwards, so the cache is an archive of what was fetched, not
+    a hit/miss cache in front of the network. An evicted entry therefore costs
+    no re-fetch, no research budget, and no abstention -- only the archived
+    copy of a payload -- and that loss is logged rather than silent.
     """
 
-    __slots__ = ("_root",)
+    __slots__ = ("_max_bytes", "_root")
 
-    def __init__(self, root: Path) -> None:
-        """Initialize the cache over its jail root.
+    def __init__(self, root: Path, *, max_bytes: int) -> None:
+        """Initialize the cache over its jail root and byte ceiling.
 
         Args:
             root: The directory every stored file must live under.
+            max_bytes: The ceiling on the total bytes the cache's own entries
+                may hold. Keyword-only and *required*: a defaulted bound would
+                let a wiring change silently drop the operator's configured
+                value while every test stayed green.
+
+        Raises:
+            ValueError: If ``max_bytes`` is not a positive byte count. A cap of
+                zero is a cache that evicts everything it writes; a negative
+                cap is meaningless. Either is an operator error in
+                configuration, reported the way
+                :func:`windbreak.scheduler.provider_wiring.is_live_mode`
+                reports an unrecognized transport mode rather than quietly
+                reinterpreted.
         """
+        if max_bytes < 1:
+            raise ValueError(
+                "forecast.research.cache_max_bytes must be a positive byte "
+                f"count, got {max_bytes}"
+            )
         self._root = root
+        self._max_bytes = max_bytes
 
     def _is_within_root(self, candidate: Path) -> bool:
         """Return whether ``candidate`` resolves to a path *strictly* inside the root.
@@ -205,7 +278,115 @@ class ResearchCache:
             )
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(content, encoding="utf-8")
+        self._evict_to_cap(keep=candidate)
         return candidate
+
+    def _evictable_entries(self) -> list[_CacheEntry]:
+        """Return every entry this cache may delete, unordered.
+
+        An entry qualifies only if all four of these hold, which together mean
+        "a file this cache itself wrote, still inside its jail":
+
+        1. it sits *directly* under the root (a nested tree is not this
+           cache's, and is left whole);
+        2. its name is exactly a sha256 hex digest plus the cache suffix, the
+           shape :func:`_cache_filename` produces;
+        3. it is a regular file (a *directory* wearing an entry's name is not
+           an entry, and unlinking it would raise); and
+        4. it still resolves strictly inside the resolved root -- the same
+           :meth:`_is_within_root` jail the write path uses. This is what
+           refuses an entry-shaped **symlink** pointing outside the cache: such
+           a link is neither counted nor unlinked, because treating it as an
+           entry is the first step toward destroying whatever it aims at.
+
+        Everything else -- foreign files, subdirectories, escaping links -- is
+        invisible to the sweep: not deleted, and not counted against the cap
+        either. Counting bytes that cannot be reclaimed would make the sweep
+        evict the whole cache chasing a total it can never reach.
+
+        Returns:
+            The evictable entries.
+        """
+        return [
+            _CacheEntry(
+                mtime_ns=child.stat().st_mtime_ns,
+                name=child.name,
+                size=child.stat().st_size,
+                path=child,
+            )
+            for child in self._root.iterdir()
+            if _CACHE_ENTRY_PATTERN.match(child.name)
+            and child.is_file()
+            and self._is_within_root(child)
+        ]
+
+    def _evict_to_cap(self, *, keep: Path) -> None:
+        """Delete entries oldest-first until the cache holds its byte cap.
+
+        Fails closed on the *capability*, never on the process: any
+        :class:`OSError` from listing, stating or unlinking (an unreadable,
+        unwritable or full cache directory) is caught, announced, and
+        swallowed. A loop that cannot start cannot honour a kill file, so an
+        undeletable cache degrades the archive loudly rather than stopping the
+        beat.
+
+        Args:
+            keep: The entry the current fetch just wrote. It is never the
+                victim -- it is the one entry a caller in the current forecast
+                still holds a path to -- so a payload larger than the whole cap
+                leaves the cap unhonourable rather than deleting itself.
+        """
+        try:
+            entries = self._evictable_entries()
+            total = sum(entry.size for entry in entries)
+            evicted = 0
+            reclaimed = 0
+            for entry in sorted(entries):
+                if total <= self._max_bytes:
+                    break
+                if entry.path == keep:
+                    continue
+                entry.path.unlink()
+                total -= entry.size
+                evicted += 1
+                reclaimed += entry.size
+        except OSError as error:
+            _LOGGER.warning(
+                "research cache eviction failed (%s); the cache stays "
+                "unbounded until its directory is readable and writable",
+                type(error).__name__,
+            )
+            return
+        self._report_sweep(evicted=evicted, reclaimed=reclaimed, total=total)
+
+    def _report_sweep(self, *, evicted: int, reclaimed: int, total: int) -> None:
+        """Announce what a completed sweep discarded, and any unheld cap.
+
+        Neither record carries a path, a URL or a digest: a cache path or a
+        fetched URL can carry credentials, and the log stream is not a place to
+        find out. Counts and byte totals are enough to size the volume.
+
+        Args:
+            evicted: How many entries the sweep deleted.
+            reclaimed: How many bytes those entries held.
+            total: The cache's total bytes once the sweep finished.
+        """
+        if evicted:
+            _LOGGER.info(
+                "research cache evicted %d entries (%d bytes) to hold its %d-byte cap",
+                evicted,
+                reclaimed,
+                self._max_bytes,
+            )
+        if total > self._max_bytes:
+            _LOGGER.warning(
+                "research cache holds %d bytes against its %d-byte cap after "
+                "evicting every removable entry; raise "
+                "forecast.research.cache_max_bytes or shrink "
+                "forecast.research.fetch_max_bytes",
+                total,
+                self._max_bytes,
+            )
 
 
 class ResearchTools:
@@ -291,8 +472,40 @@ class ResearchTools:
         if host not in self._allowed_hosts:
             raise EgressDeniedError(f"egress denied: host {host!r} is not allowlisted")
         content = self._fetch_transport.fetch(url)
-        self._cache.store(_cache_filename(url), content)
+        self._archive(url, content)
         return content
+
+    def _archive(self, url: str, content: str) -> None:
+        """Persist ``content`` to the cache, tolerating an unwritable cache.
+
+        Archiving is a *capability*, not the fetch. A full or read-only volume
+        used to make :meth:`ResearchCache.store` raise :class:`OSError` out of
+        :meth:`fetch` -- and both callers of ``fetch``
+        (:func:`windbreak.forecast.citations.verify_citation` and
+        :func:`windbreak.forecast.pipeline.bounded_web_research`) catch
+        ``OSError`` and treat it as an unreachable source. A full disk
+        therefore turned every forecast into an abstention on zero verified
+        citations, indistinguishable from every source being dead. The fetch is
+        now insulated from its own archival, and the degradation is announced
+        instead of inferred.
+
+        :class:`SandboxPathViolationError` is deliberately *not* an
+        ``OSError`` and so is deliberately *not* caught here: a jail escape is
+        a security boundary, not a degraded volume, and must still reach the
+        caller.
+
+        Args:
+            url: The URL whose payload is being archived.
+            content: The fetched payload.
+        """
+        try:
+            self._cache.store(_cache_filename(url), content)
+        except OSError as error:
+            _LOGGER.warning(
+                "research cache write failed (%s); the fetch succeeded and "
+                "its payload was not archived",
+                type(error).__name__,
+            )
 
 
 def tool_registry(tools: ResearchTools) -> Mapping[str, Callable[..., object]]:
@@ -321,6 +534,7 @@ def build_research_tools(
     cache_dir: Path,
     search_transport: SearchTransport,
     fetch_transport: FetchTransport,
+    max_bytes: int,
 ) -> ResearchTools:
     """Assemble a sandboxed :class:`ResearchTools` from its collaborators.
 
@@ -330,12 +544,21 @@ def build_research_tools(
         cache_dir: The root the fetch cache is jailed to.
         search_transport: The seam returning candidate URLs for a query.
         fetch_transport: The seam returning content for an allowed URL.
+        max_bytes: The ceiling on the total bytes the fetch cache may hold
+            (issue #453). Required, not defaulted: the bound belongs to the
+            operator's ``forecast.research.cache_max_bytes``, and a module
+            default here would let that plumbing be deleted without a single
+            test noticing.
 
     Returns:
         A capability-closed :class:`ResearchTools` over the given seams.
+
+    Raises:
+        ValueError: If ``max_bytes`` is not a positive byte count; see
+            :class:`ResearchCache`.
     """
     normalized_hosts = frozenset(host.lower() for host in allowed_hosts)
-    cache = ResearchCache(root=cache_dir)
+    cache = ResearchCache(root=cache_dir, max_bytes=max_bytes)
     return ResearchTools(
         allowed_hosts=normalized_hosts,
         search_transport=search_transport,

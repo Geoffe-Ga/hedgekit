@@ -52,6 +52,7 @@ def test_research_settings_construction_preserves_its_fields() -> None:
         fetch_timeout_seconds=15,
         fetch_max_bytes=500_000,
         allowed_content_types=("text/html",),
+        cache_max_bytes=64_000_000,
     )
 
     assert settings.search_endpoint_url == "https://search.example/v1/search"
@@ -60,6 +61,7 @@ def test_research_settings_construction_preserves_its_fields() -> None:
     assert settings.fetch_timeout_seconds == 15
     assert settings.fetch_max_bytes == 500_000
     assert settings.allowed_content_types == ("text/html",)
+    assert settings.cache_max_bytes == 64_000_000
 
 
 def test_research_settings_is_frozen() -> None:
@@ -85,8 +87,10 @@ def test_research_settings_defaults_are_fail_closed_operator_placeholders() -> N
     assert settings.allowed_research_hosts == ()
     assert isinstance(settings.fetch_timeout_seconds, int)
     assert isinstance(settings.fetch_max_bytes, int)
+    assert isinstance(settings.cache_max_bytes, int)
     assert settings.fetch_timeout_seconds > 0
     assert settings.fetch_max_bytes > 0
+    assert settings.cache_max_bytes > settings.fetch_max_bytes
     assert isinstance(settings.allowed_content_types, tuple)
 
 
@@ -140,6 +144,7 @@ def test_load_config_parses_research_block_from_yaml(
                     "fetch_timeout_seconds": 12,
                     "fetch_max_bytes": 750_000,
                     "allowed_content_types": ["text/html", "text/plain"],
+                    "cache_max_bytes": 33_554_432,
                 }
             }
         },
@@ -154,6 +159,7 @@ def test_load_config_parses_research_block_from_yaml(
         fetch_timeout_seconds=12,
         fetch_max_bytes=750_000,
         allowed_content_types=("text/html", "text/plain"),
+        cache_max_bytes=33_554_432,
     )
     assert isinstance(config.forecast.research, ResearchSettings)
 

@@ -76,6 +76,7 @@ from tests.forecast.injection.conftest import (
 # module docstring above): a missing-pipeline-symbol `ImportError` and a
 # missing-module `ModuleNotFoundError` are equally valid failure signatures
 # for this issue, and either one blocks collection of every test below.
+from windbreak.config.schema import DEFAULT_RESEARCH_CACHE_MAX_BYTES
 from windbreak.forecast import (
     ForecastEvent,
     InMemoryForecastLedger,
@@ -266,6 +267,7 @@ def _run_page(
         cache_dir=cache_dir,
         search_transport=search_log,
         fetch_transport=fetch_log,
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
     record = run_pipeline(
         market,
@@ -692,6 +694,7 @@ def test_mixed_scenario_one_poisoned_source_stays_full_but_live_ineligible(
         cache_dir=tmp_path,
         search_transport=search,
         fetch_transport=fetch_log,
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
 
     record = run_pipeline(
