@@ -347,11 +347,18 @@ def test_eviction_refuses_to_delete_through_a_symlink_escaping_the_root(
     deleting the thing it points at, so it is excluded from the sweep
     entirely. The genuine entries around it are still evicted, which is the
     positive control proving the sweep ran at all.
+
+    The link's target is backdated to be **older than every genuine entry**, so
+    an implementation missing the jail re-check would reach it *first* rather
+    than never. A guard the eviction order can never arrive at is an inert
+    guard, and this test would not notice.
     """
     root = tmp_path / "research-cache"
     _write_corpus(root)
     outside = tmp_path / "precious.txt"
     outside.write_text("do not delete me", encoding="utf-8")
+    oldest_ns = _BASE_MTIME_NS - _AGE_STEP_NS
+    os.utime(outside, ns=(oldest_ns, oldest_ns))
     escape_link = root.joinpath(_entry_name("escape"))
     escape_link.symlink_to(outside)
     cache = ResearchCache(root=root, max_bytes=350)
