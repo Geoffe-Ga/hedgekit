@@ -143,6 +143,32 @@ and both fail *closed*:
   eligibility, but it would silently discard an operator's evaluation output —
   a broken pass and a genuinely empty one must not look alike from outside.
 
+**The evaluation pass that writes it (issue #440).** Until #440 the "bootstrap"
+above was *terminal*, not transient: no code path in the repository wrote
+`provider-track-records.json`, so every provider was unproven forever and
+`min_resolved` was unreachable by construction. `windbreak evaluate-providers`
+(`windbreak.evaluation.track_records`) is that pass. It folds one ledger —
+`ForecastCreated` for the probability and the executable-price baseline,
+`ProviderVoteRecorded` for which providers' surviving votes backed each
+forecast, and the `MarketResolved` rows an operator ingested (issue #439) for
+the ground truth — gates the forecasts for temporal integrity through the same
+`gate_evaluation_inputs` the weekly report uses, and scores each provider's
+backed forecasts with the same `brier_skill`. It is an operator verb rather
+than a tick stage because its only input is an operator verb: with no venue
+settlement feed, a market's outcome is known to the loop exactly when someone
+ingests it, so a per-tick pass would re-derive the same answer from the same
+evidence while adding a failure surface to the always-on loop.
+
+Two things it deliberately does **not** claim. A provider's `brier_skill_ppm`
+is the skill of *the forecasts it backed*, scored on the aggregate probability
+those forecasts carried — the ledger records no per-member probability, so this
+is not the provider's isolated calibration, and SPEC §19 forbids pretending
+otherwise. And a provider with no admitted resolved forecast, or an undefined
+skill, is **omitted** rather than written with a placeholder: absent reads as
+unproven, whereas a fabricated `0` would be promoted by any bar at or below
+zero. A provider with real-but-insufficient evidence is written with its exact
+values, so it is the bars — not the artifact's absence — that hold it.
+
 Each hold lands in the tick's durable ledger as one `ProviderGateHeld` row
 (component `scheduler`), carrying the tick's `forecast_id` and `market_ticker`
 alongside the comma-joined `unproven_providers`, their `unproven_count`, and
