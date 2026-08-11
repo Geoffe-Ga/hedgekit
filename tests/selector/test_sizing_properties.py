@@ -540,10 +540,7 @@ def test_emitted_intent_is_never_negative_ev_after_fees(inputs: SelectorInputs) 
     )
 
     assert isinstance(figures, EdgeFigures)
-    assert (
-        figures.research_cost_adjusted_edge_ppm
-        >= inputs.risk_config.config.min_net_edge_ppm
-    )
+    assert figures.net_edge_ppm >= inputs.risk_config.config.min_net_edge_ppm
 
 
 @given(

@@ -79,7 +79,9 @@ Money and equity fields are scaled integers (micros/centis/pips), never floats
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -102,6 +104,7 @@ from windbreak.connector.readonly import ReadOnlyConnectorView, ReadOnlyVenueVie
 from windbreak.forecast.budget import (
     BUDGET_DAY_EXHAUSTED_EVENT,
     BUDGET_FORECAST_EXCEEDED_EVENT,
+    BUDGET_SPEND_RECORDED_EVENT,
     DailyBudgetExhaustedError,
     PerForecastBudgetExceededError,
     ResearchBudget,
@@ -193,6 +196,11 @@ from windbreak.scheduler.provider_wiring import (
     is_live_mode,
     offline_research_tools,
 )
+from windbreak.scheduler.research_spend import (
+    ResearchSpendRecorded,
+    effective_per_day_micros,
+    spend_by_day_from_records,
+)
 from windbreak.scheduler.screening import (
     ScreenLedgerWriter,
     require_candidate_bound,
@@ -212,7 +220,7 @@ from windbreak.selector.types import (
 from windbreak.timekeeping import require_aware
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
     from datetime import date
 
     from windbreak.config.schema import WindbreakConfig
@@ -235,8 +243,18 @@ if TYPE_CHECKING:
     from windbreak.scheduler.screening import MarketCandidate
     from windbreak.tokens.verify import SignedApprovalToken
 
+#: The scheduler's structured logger, installed by ``windbreak run``'s
+#: :func:`windbreak.logging_setup.configure_logging`.
+_LOGGER = logging.getLogger("windbreak.scheduler")
+
 #: The component label stamped on every scheduler-authored ledger event.
 _COMPONENT = "scheduler"
+
+#: The per-UTC-day research ceiling a budget opens with when this ledger's
+#: research rows cannot be folded. Zero, so every market halts on the budget
+#: and no research money is spent, while the loop itself keeps beating. See
+#: :func:`_research_ledger_state`.
+_UNREADABLE_LEDGER_CEILING_MICROS: Final = 0
 
 #: The calibration-map version tag echoed into every selector decision.
 _CALIBRATION_MAP_VERSION = "v0"
@@ -426,7 +444,14 @@ class _SqliteBudgetLedgerWriter:
     different shape from a ledger :class:`~windbreak.ledger.events.Event`, so
     this writer is the translation seam between them. Translation is *total*:
     each of the two breach kinds maps onto a typed ``ResearchBudgetHalted`` row,
-    and any other kind raises rather than silently dropping an audit row.
+    every successful charge maps onto a typed ``ResearchSpendRecorded`` row, and
+    any other kind raises rather than silently dropping an audit row.
+
+    Those ``ResearchSpendRecorded`` rows are what makes the daily ceiling
+    survive a restart (issue #442): :func:`_build_research_budget` folds them
+    back into the day counter the next process opens with. Before them the
+    ledger recorded only breaches, so a restarted loop had nothing to read and
+    began every day at zero however much the day had already cost.
     """
 
     def __init__(self, store: SqliteLedgerStore) -> None:
@@ -438,22 +463,33 @@ class _SqliteBudgetLedgerWriter:
         self._store = store
 
     def record(self, event: BudgetEvent) -> None:
-        """Append a budget breach to the ledger as a typed halt event.
+        """Append a budget event to the ledger as a typed row.
 
         Payload keys are read by subscript, never ``.get`` with a default, so a
         payload-shape drift surfaces as a loud ``KeyError`` rather than a
-        silently zeroed audit row. Note the two kinds name the spent amount
-        differently: the per-day payload carries ``spent_micros`` (the day's
-        cumulative spend) while the per-forecast payload carries ``cost_micros``
-        (the single breaching forecast's cost).
+        silently zeroed audit row. Note the three kinds name the spent amount
+        differently: the per-day breach payload carries ``spent_micros`` (the
+        day's cumulative spend) while the per-forecast breach and the successful
+        charge both carry ``cost_micros`` (that forecast's, or that charge's,
+        own cost).
 
         Args:
             event: The budget event to persist.
 
         Raises:
-            ValueError: If ``event`` is neither of the two breach kinds.
+            ValueError: If ``event`` is none of the three known kinds.
         """
         payload = event.payload
+        if event.event_type == BUDGET_SPEND_RECORDED_EVENT:
+            self._store.append(
+                ResearchSpendRecorded(
+                    component=_COMPONENT,
+                    utc_day=cast("str", payload["utc_day"]),
+                    market_ticker=cast("str", payload["market_ticker"]),
+                    cost_micros=cast("int", payload["cost_micros"]),
+                )
+            )
+            return
         if event.event_type == BUDGET_DAY_EXHAUSTED_EVENT:
             self._store.append(
                 ResearchBudgetHalted(
@@ -1980,34 +2016,112 @@ def _build_gateway(
     return gateway
 
 
+def _research_ledger_state(
+    records: tuple[LedgerRecord, ...], *, configured_micros: int
+) -> tuple[int, Mapping[str, int]]:
+    """Fold this ledger's research rows, failing closed *on the spend* (#442).
+
+    Both folds refuse a row they cannot read rather than skipping it, because a
+    skipped charge would undercount the day and re-open a ceiling that should be
+    shut. What that refusal must not do is take the process with it. A malformed
+    row can arrive from a schema migration or an external tool, it cannot be
+    removed from an append-only hash-chained ledger, and
+    :func:`_build_research_budget` is called from :func:`build_paper_deps` -- so
+    letting the ``ValueError`` escape would stop the loop from *composing*: no
+    heartbeat, no equity sample, no reconciliation, and no kill handling, under
+    a ``restart: on-failure`` supervisor that would retry it forever. A loop
+    that cannot start cannot honour a kill file; a loop that runs with research
+    disabled can.
+
+    So the refusal is caught here and turned into the strictest budget there is:
+    a :data:`_UNREADABLE_LEDGER_CEILING_MICROS` (zero) ceiling opening on an
+    empty day counter. Every market then halts on the budget and ledgers a
+    ``ResearchBudgetHalted`` row saying so, no research money is spent, and the
+    rest of the tick keeps running. The cause is logged as a ``CRITICAL`` on
+    every rebuild -- at startup and at the head of every tick -- because a loop
+    that cannot read its own spend history is an incident, not a mode.
+
+    Args:
+        records: This ledger's rows, in append order.
+        configured_micros: The ceiling from configuration, used when the ledger
+            carries no cap row (keyword-only).
+
+    Returns:
+        The ``(per_day_micros, spend_by_day)`` pair a budget opens with.
+    """
+    try:
+        return (
+            effective_per_day_micros(records, configured_micros=configured_micros),
+            spend_by_day_from_records(records),
+        )
+    except ValueError as exc:
+        _LOGGER.critical(
+            "research spend history unreadable, opening a zero ceiling: %s",
+            exc,
+            extra={"component": _COMPONENT},
+        )
+        return (_UNREADABLE_LEDGER_CEILING_MICROS, {})
+
+
 def _build_research_budget(
     store: SqliteLedgerStore, config: WindbreakConfig
 ) -> ResearchBudget:
-    """Build the loop's one research spend guard from configuration.
+    """Build the loop's research spend guard from configuration *and the ledger*.
 
-    Config is the single source of the three ceilings, and there is deliberately
+    Config supplies the per-forecast and page ceilings, and there is deliberately
     no way to inject a budget from outside: that is what makes an unlimited or
-    absent budget unrepresentable rather than merely discouraged. All three
-    ceilings are already scaled integers on the config, so they pass through
-    untouched -- no arithmetic, and therefore no float, enters this path.
+    absent budget unrepresentable rather than merely discouraged. All ceilings
+    are already scaled integers, so they pass through untouched -- no arithmetic,
+    and therefore no float, enters this path.
+
+    Two things come off the **ledger** rather than the config, and both are
+    issue #442 (see :mod:`windbreak.scheduler.research_spend`):
+
+    * **The day's spend so far.** Folded from this ledger's
+      ``ResearchSpendRecorded`` rows, so a process that restarts mid-day resumes
+      on the day's real total. Without it the per-UTC-day ceiling was a
+      per-process ceiling, and ``restart: on-failure`` makes the process count
+      per day unbounded.
+    * **The per-UTC-day ceiling itself**, when an operator has changed it at
+      runtime with ``windbreak set-research-budget``. The configured value --
+      itself overridable at startup by ``windbreak run
+      --research-per-day-micros`` -- is the fallback, so a deployment that never
+      runs the verb is unaffected.
+
+    Called by :func:`build_paper_deps` at startup *and* by
+    :func:`_refreshed_budget` at the head of every tick, so both facts are
+    re-read while the loop runs rather than frozen at process start.
+
+    An unreadable ``ResearchSpendRecorded`` / ``ResearchBudgetCapSet`` row does
+    **not** propagate: :func:`_research_ledger_state` turns it into a zero
+    ceiling on an empty counter, so the loop composes, beats, and refuses to
+    spend rather than failing to start. A negative *configured* ceiling still
+    aborts, below -- that is an operator's own YAML, correctable without
+    touching an append-only ledger, and a loop that cannot determine its ceiling
+    at all must not run.
 
     Args:
-        store: The ledger store a fail-closed halt is recorded to.
-        config: The active configuration supplying the three ceilings.
+        store: The ledger store a charge or a fail-closed halt is recorded to,
+            and the durable state both are folded back out of.
+        config: The active configuration supplying the ceilings.
 
     Returns:
-        The process-lived research budget.
+        A research budget opened on the ledger's own day counter and ceiling.
 
     Raises:
-        ValueError: If any configured ceiling is negative -- aborting startup
-            rather than degrading to an unenforceable budget.
+        ValueError: If any configured ceiling is negative -- aborting rather
+            than degrading to an unenforceable budget.
     """
     caps = config.forecast.budget
+    per_day_micros, opening_spend_by_day = _research_ledger_state(
+        tuple(store.read_all()), configured_micros=caps.per_day_micros
+    )
     return ResearchBudget(
         per_forecast_micros=caps.per_forecast_micros,
-        per_day_micros=caps.per_day_micros,
+        per_day_micros=per_day_micros,
         max_pages=caps.max_pages,
         ledger=_SqliteBudgetLedgerWriter(store),
+        opening_spend_by_day=opening_spend_by_day,
     )
 
 
@@ -3417,6 +3531,40 @@ def _run_universe(
     )
 
 
+def _refreshed_budget(deps: PaperTickDeps) -> PaperTickDeps:
+    """Re-read the research budget off the ledger before the tick spends (#442).
+
+    The budget is rebuilt rather than mutated, from the same
+    :func:`_build_research_budget` the composition root uses, so exactly one
+    function decides what a budget opens with and the startup path and the
+    per-tick path cannot drift apart.
+
+    Rebuilding here -- rather than only at process start -- is what makes the
+    ceiling both **durable** and **live**:
+
+    * A sibling process, or this process before its last crash, has its spend
+      folded back in, so the day's ceiling holds across the unbounded restart
+      count ``restart: on-failure`` permits.
+    * An operator's ``windbreak set-research-budget`` row is picked up on the
+      *next tick*, with no restart, which is what "adjustable on the fly"
+      requires.
+
+    The ledger read is one full scan per tick, the same cost
+    :func:`windbreak.scheduler.weekly_data.weekly_report_body` already pays on
+    every tick, so it adds a constant factor rather than a new order of work.
+
+    Args:
+        deps: The wired dependency bundle whose budget is being refreshed.
+
+    Returns:
+        A bundle identical to ``deps`` but for a budget opened on the ledger's
+        current day counter and ceiling.
+    """
+    return dataclasses.replace(
+        deps, budget=_build_research_budget(deps.store, deps.config)
+    )
+
+
 def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     """Drive one PAPER tick end to end, ledgering every stage (SPEC S5.3).
 
@@ -3550,6 +3698,7 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     Returns:
         A :class:`TickOutcome` summarizing the tick.
     """
+    deps = _refreshed_budget(deps)
     now_epoch_s = deps.clock()
     created_at = datetime.fromtimestamp(now_epoch_s, UTC)
     _kill_stage(deps)

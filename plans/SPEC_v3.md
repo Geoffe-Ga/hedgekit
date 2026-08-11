@@ -358,7 +358,12 @@ A pure, credentialless function from `(ForecastRecord, calibration map version, 
 
 ### 9.2 Fee-aware executable edge
 
-The selector walks the actual book to the proposed size — midpoint assumptions are forbidden — and computes `gross_edge`, `fee_adjusted_edge`, `slippage_adjusted_edge`, `research_cost_adjusted_edge`, and `annualized_expected_return`. The annualization hurdle is compared against the configured idle-cash yield (`idle_cash_apr_ppm`, set from actual exchange cash-interest terms), so trades must beat *parked capital*, not zero.
+The selector walks the actual book to the proposed size — midpoint assumptions are forbidden — and computes `gross_edge`, `fee_adjusted_edge`, `net_edge`, `annualized_expected_return`.
+The `net_edge` figure is the fee-adjusted edge less the slippage buffer. The annualization hurdle is compared against the configured idle-cash yield (`idle_cash_apr_ppm`, set from actual exchange cash-interest terms), so trades must beat *parked capital*, not zero.
+
+The chain carried a fifth figure, `research_cost_adjusted_edge`, until the owner's 2026-08-10 decision (issue #483). The selector prices its entry probe at a fixed 1.00 contract, so at the gate that figure subtracted a forecast's *whole* research charge from a *per-contract* return: a binary contract's gross edge over one contract cannot exceed 1 000 000 ppm and the charge is 3 000 000 micros, so `net_edge ≥ min_net_edge` was arithmetically unreachable for every market at every price. Research spend is governed instead by the configurable per-UTC-day ceiling of §16 (`forecast.budget.per_day_micros`), which bounds total spend — the quantity that actually needs bounding — and is durable across restarts and adjustable at runtime. `ForecastRecord.research_cost_micros` is still recorded, ledgered and reported.
+
+`tests/selector/test_edge.py::test_spec_9_2_names_exactly_the_figures_the_chain_computes` reads the figure list in the paragraph above and compares it against `EdgeFigures`' own fields, so this section and the code cannot drift apart silently again.
 
 ### 9.3 Entry conditions (all required)
 

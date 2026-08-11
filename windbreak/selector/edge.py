@@ -2,14 +2,36 @@
 
 :func:`compute_executable_edge` walks a market's ``yes_asks`` best-first to the
 requested size, prices the fill at its *executable* (size-weighted) cost -- never
-the midpoint or a single level's quote -- and chains SPEC S9.2's five signed
-ppm-of-$1-per-contract edge figures off it: gross, fee-adjusted, slippage-
-adjusted, research-cost-adjusted, and the annualized expected return. When the
-book cannot fill the size it returns :class:`InsufficientDepth` naming the
-shortfall rather than raising, and when a fill prices but cannot be annualized
-(a 0-pip price or a zero-hour forecast horizon would zero the annualization
-denominator) it returns :class:`NonAnnualizable` -- so both a shallow book and
-an undecidable fill are decidable non-entries, not crashes.
+the midpoint or a single level's quote -- and chains the signed
+ppm-of-$1-per-contract edge figures off it: gross, fee-adjusted, net (the
+fee-adjusted edge less the slippage buffer), and the annualized expected return.
+When the book cannot fill the size it returns :class:`InsufficientDepth` naming
+the shortfall rather than raising, and when a fill prices but cannot be
+annualized (a 0-pip price or a zero-hour forecast horizon would zero the
+annualization denominator) it returns :class:`NonAnnualizable` -- so both a
+shallow book and an undecidable fill are decidable non-entries, not crashes.
+
+NO RESEARCH TERM (issue #483, owner decision 2026-08-10)
+
+The chain used to carry a fifth figure, ``research_cost_adjusted_edge_ppm``:
+the forecast's whole ``research_cost_micros`` amortized over the priced size.
+:func:`windbreak.selector.select` prices its entry probe at a fixed **1.00
+contract**, so at the gate that haircut was the entire per-forecast charge --
+3 000 000 ppm at the shipped
+:data:`~windbreak.forecast.budget.FULL_PIPELINE_RESEARCH_COST_MICROS`. A binary
+contract's gross edge over one contract cannot exceed 1 000 000 ppm, so the net
+edge was at most -2 000 000 ppm for **every** market, at every price, with any
+capital, and ``net_edge_min`` (30 000) was arithmetically unreachable.
+
+That is a category error rather than a calibration one: research cost is
+incurred once per *forecast* and the edge is a per-*contract* return, so no
+value of the charge makes the comparison mean anything at a one-contract probe.
+Governance of research spend moved to the configurable per-UTC-day ceiling
+(:class:`windbreak.forecast.budget.ResearchBudget`), which bounds the quantity
+that actually needs bounding -- total spend -- and leaves this module to judge a
+fill on its own economics. ``ForecastRecord.research_cost_micros`` is still
+recorded, ledgered and reported; it is simply no longer subtracted from a
+per-contract edge.
 
 Unit bridge (the one place scales cross): a price is in pips (1e-4 $/contract)
 and a size in centis (1e-2 contracts), so ``price.value * count.value`` is an
@@ -134,15 +156,17 @@ class NonAnnualizable:
 class EdgeFigures:
     """The SPEC S9.2 executable-edge figures for one priced fill.
 
-    The five ``*_edge_ppm`` / ``*_return_ppm`` figures are signed ppm-of-$1 per
+    The ``*_edge_ppm`` / ``*_return_ppm`` figures are signed ppm-of-$1 per
     contract, chained conservatively off the executable (size-weighted) fill
     price. The three unit-typed fields carry the fill's raw cost and prices.
 
     Attributes:
         gross_edge_ppm: Forecast probability minus executable price, in ppm.
         fee_adjusted_edge_ppm: Gross edge less the per-contract fee, in ppm.
-        slippage_adjusted_edge_ppm: Fee-adjusted edge less the slippage buffer.
-        research_cost_adjusted_edge_ppm: The net edge, less amortized research.
+        net_edge_ppm: The net edge: fee-adjusted less the slippage buffer, and
+            the last link in the chain since issue #483 removed the research
+            haircut (see this module's docstring). This is the figure
+            ``net_edge_min`` gates on and Kelly sizes against.
         annualized_expected_return_ppm: The net edge annualized over the
             forecast horizon (floored toward negative infinity).
         executable_price_ppm: The size-weighted fill price, in ppm-of-$1
@@ -157,8 +181,7 @@ class EdgeFigures:
 
     gross_edge_ppm: int
     fee_adjusted_edge_ppm: int
-    slippage_adjusted_edge_ppm: int
-    research_cost_adjusted_edge_ppm: int
+    net_edge_ppm: int
     annualized_expected_return_ppm: int
     executable_price_ppm: int
     executable_price_pips: PricePips
@@ -285,21 +308,22 @@ def compute_executable_edge(
     fee_model: FeeModelInput,
     slippage_model: SlippageModelInput,
 ) -> EdgeFigures | InsufficientDepth | NonAnnualizable:
-    """Price a fill and chain SPEC S9.2's five executable-edge figures off it.
+    """Price a fill and chain the executable-edge figures off it (SPEC S9.2).
 
     Walks ``order_book.yes_asks`` best-first to ``size`` (SPEC S9.2): the
     executable price is the size-weighted cost of the actual fill, so a two-level
     ``(4500@10_000, 4700@10_000)`` walk over ``15_000`` prices at the VWAP
-    ``4567``, not the ``4600`` midpoint. Fees, the slippage buffer, and amortized
-    research are then subtracted in ppm, and the net edge is annualized over the
-    forecast horizon. All arithmetic is integer with conservative rounding (costs
-    up, the annualized return floored); the unit bridge is documented on the
-    module.
+    ``4567``, not the ``4600`` midpoint. Fees and the slippage buffer are then
+    subtracted in ppm, and the resulting net edge is annualized over the
+    forecast horizon. The forecast's ``research_cost_micros`` is deliberately
+    *not* subtracted -- see this module's docstring and issue #483. All
+    arithmetic is integer with conservative rounding (costs up, the annualized
+    return floored); the unit bridge is documented on the module.
 
     Args:
         order_book: The market's order-book snapshot to fill against.
         size: The size to price, in contract-centis (positive).
-        forecast: The forecast supplying probability, research cost, and horizon.
+        forecast: The forecast supplying probability and horizon.
         fee_model: The fee schedule carrier to charge the fill with.
         slippage_model: The per-contract slippage buffer to subtract.
 
@@ -335,19 +359,14 @@ def compute_executable_edge(
         _fee_micros(fee_model, executable_price_pips.value, size_centis), size_centis
     )
     fee_adjusted_edge_ppm = gross_edge_ppm - fee_ppm
-    slippage_adjusted_edge_ppm = (
-        fee_adjusted_edge_ppm - slippage_model.per_contract_buffer_ppm
-    )
-    research_ppm = _per_contract_ppm(forecast.research_cost_micros, size_centis)
-    research_cost_adjusted_edge_ppm = slippage_adjusted_edge_ppm - research_ppm
+    net_edge_ppm = fee_adjusted_edge_ppm - slippage_model.per_contract_buffer_ppm
 
     return EdgeFigures(
         gross_edge_ppm=gross_edge_ppm,
         fee_adjusted_edge_ppm=fee_adjusted_edge_ppm,
-        slippage_adjusted_edge_ppm=slippage_adjusted_edge_ppm,
-        research_cost_adjusted_edge_ppm=research_cost_adjusted_edge_ppm,
+        net_edge_ppm=net_edge_ppm,
         annualized_expected_return_ppm=_annualize(
-            research_cost_adjusted_edge_ppm,
+            net_edge_ppm,
             executable_price_ppm,
             horizon_hours,
         ),

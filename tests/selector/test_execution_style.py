@@ -37,6 +37,7 @@ from datetime import UTC, datetime
 from windbreak.config.schema import RiskConfig
 from windbreak.connector.fees import FeeModel
 from windbreak.connector.models import OrderBookLevel, OrderBookSnapshot
+from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
 from windbreak.forecast.records import Citation, ForecastRecord
 from windbreak.numeric import ContractCentis, MoneyMicros, PricePips
 from windbreak.selector import SelectorInputs, select
@@ -418,6 +419,40 @@ def test_decide_cross_when_net_edge_at_rest_is_one_ppm_below_the_floor() -> None
 
     assert decision.style == "cross"
     assert decision.resting_price_pips is None
+
+
+def test_the_rest_price_edge_carries_no_research_haircut() -> None:
+    """`research_cost_micros` moves the rest/cross decision by exactly nothing.
+
+    Issue #483 removed the research term from the entry edge
+    (`windbreak.selector.edge`). `_net_edge_at_price_ppm` charges the resting
+    price the *same* haircuts, so it had to lose the term too -- had only one
+    side dropped it, a rest price would be judged against a systematically
+    harsher edge than the cross price it is compared with, and
+    `rest_inside_spread` would quietly stop being reachable at the boundary.
+
+    The scenario is the exact row-4/row-5 boundary above: a net edge of 30_000
+    ppm against the default `min_net_edge_ppm` of 30_000. Any haircut at all --
+    the shipped charge amortized over this size is 3_000_000 ppm, but even one
+    micro would do -- pushes it strictly below the floor and flips the verdict
+    to `cross`. So this pins the absence of the term at the one point where its
+    presence is detectable, rather than at a comfortable distance from any
+    boundary.
+    """
+    charged = _inputs(
+        forecast=_forecast(
+            probability_ppm=440_000,
+            research_cost_micros=FULL_PIPELINE_RESEARCH_COST_MICROS,
+        )
+    )
+    free = _inputs(forecast=_forecast(probability_ppm=440_000))
+
+    decision = decide_execution_style(charged, _TEST_SIZE)
+
+    assert FULL_PIPELINE_RESEARCH_COST_MICROS > 0
+    assert decision.style == "rest_inside_spread"
+    assert decision.resting_price_pips == PricePips(4_100)
+    assert decision == decide_execution_style(free, _TEST_SIZE)
 
 
 # --- Row 5: happy path, with config threading ----------------------------------
