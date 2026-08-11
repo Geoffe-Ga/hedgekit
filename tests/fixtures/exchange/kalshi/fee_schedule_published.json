@@ -1,0 +1,76 @@
+{
+  "_comment": "Kalshi's published fee schedule, transcribed verbatim from the exchange's own PDF. NOT an API payload: this is the citable primary source that windbreak.connector.fees.FeeModel is checked against. See tests/connector/kalshi/test_fee_schedule.py and ACCOUNTING.md.",
+  "source_url": "https://kalshi.com/docs/kalshi-fee-schedule.pdf",
+  "archived_url": "https://web.archive.org/web/20260218003606if_/https://kalshi.com/docs/kalshi-fee-schedule.pdf",
+  "effective_date": "2026-02-05",
+  "captured_date": "2026-02-18",
+  "formulas": {
+    "taker": {
+      "quoted": "fees = round up(0.07 x C x P x (1-P))",
+      "form": "quadratic",
+      "rate_bps": 700
+    },
+    "maker": {
+      "quoted": "fees = round up(0.0175 x C x P x (1-P))",
+      "form": "quadratic",
+      "rate_bps": 175
+    },
+    "index": {
+      "quoted": "fees = round up(0.035 x C x P x (1-P))",
+      "form": "quadratic",
+      "rate_bps": 350
+    },
+    "settlement": {
+      "quoted": "There is no settlement fee.",
+      "form": "none",
+      "rate_bps": 0
+    }
+  },
+  "rounding": "round up = rounds to the next cent",
+  "general_trading_fees_table": [
+    {"price_cents": 1, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 7},
+    {"price_cents": 5, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 34},
+    {"price_cents": 10, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 63},
+    {"price_cents": 15, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 90},
+    {"price_cents": 20, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 112},
+    {"price_cents": 25, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 132},
+    {"price_cents": 30, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 147},
+    {"price_cents": 35, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 160},
+    {"price_cents": 40, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 168},
+    {"price_cents": 45, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 174},
+    {"price_cents": 50, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 175},
+    {"price_cents": 55, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 174},
+    {"price_cents": 60, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 168},
+    {"price_cents": 65, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 160},
+    {"price_cents": 70, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 147},
+    {"price_cents": 75, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 132},
+    {"price_cents": 80, "fee_1_contract_cents": 2, "fee_100_contracts_cents": 112},
+    {"price_cents": 85, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 90},
+    {"price_cents": 90, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 63},
+    {"price_cents": 95, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 34},
+    {"price_cents": 99, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 7}
+  ],
+  "index_trading_fees_table": [
+    {"price_cents": 1, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 4},
+    {"price_cents": 5, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 17},
+    {"price_cents": 10, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 32},
+    {"price_cents": 15, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 45},
+    {"price_cents": 20, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 56},
+    {"price_cents": 25, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 66},
+    {"price_cents": 30, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 74},
+    {"price_cents": 35, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 80},
+    {"price_cents": 40, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 84},
+    {"price_cents": 45, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 87},
+    {"price_cents": 50, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 88},
+    {"price_cents": 55, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 87},
+    {"price_cents": 60, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 84},
+    {"price_cents": 65, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 80},
+    {"price_cents": 70, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 74},
+    {"price_cents": 75, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 66},
+    {"price_cents": 80, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 56},
+    {"price_cents": 85, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 45},
+    {"price_cents": 90, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 32},
+    {"price_cents": 95, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 17},
+    {"price_cents": 99, "fee_1_contract_cents": 1, "fee_100_contracts_cents": 4}
+  ]
+}

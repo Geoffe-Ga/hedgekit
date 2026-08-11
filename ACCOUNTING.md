@@ -65,6 +65,58 @@ its own read-only balance call against the ledger every cycle; a mismatch
 beyond tolerance halts the system rather than proceeding on an unreconciled
 number.
 
+## The venue's fee schedule, as published (issue #452)
+
+`max_trading_fee` above comes from `windbreak.connector.fees.FeeModel`, which
+applies **one** quadratic form, `round up(rate × C × P × (1−P))`, to whichever
+of `maker_fee_ppm` / `taker_fee_ppm` is higher. That is only a sound upper
+bound if the venue's two fees share that form; if a venue charged a linear
+maker fee alongside a quadratic taker fee, the higher *rate* would not produce
+the higher *fee*, and the bound would understate cost — the fail-open
+direction, since `max_trading_fee` is subtracted inside `worst_case_cost`.
+
+Kalshi's published schedule was therefore read and recorded, so the model is
+checked against a citable artifact rather than against memory. The transcription
+lives at `tests/fixtures/exchange/kalshi/fee_schedule_published.json` and is
+replayed row by row against `FeeModel` by
+`tests/connector/kalshi/test_fee_schedule.py`.
+
+**Source**: <https://kalshi.com/docs/kalshi-fee-schedule.pdf>, "Last updated and
+effective: **Feb 5, 2026**". The live URL sits behind a bot checkpoint that
+refuses this environment (and the Internet Archive's crawler); the copy read
+was the Archive's 2026-02-18 capture,
+<https://web.archive.org/web/20260218003606if_/https://kalshi.com/docs/kalshi-fee-schedule.pdf>.
+
+| Fee | Published formula | Rate | In `FeeModel` |
+|---|---|---|---|
+| Trading (taker) | `fees = round up(0.07 × C × P × (1-P))` | 700 bps | `taker_fee_ppm = 70_000` |
+| Maker | `fees = round up(0.0175 × C × P × (1-P))` | 175 bps | `maker_fee_ppm = 17_500` |
+| S&P500 / Nasdaq-100 markets | `fees = round up(0.035 × C × P × (1-P))` | 350 bps | `taker_fee_ppm = 35_000` |
+| Settlement | "There is no settlement fee." | — | `settlement_fee_ppm = 0` |
+
+`P` is the contract price in dollars, `C` the number of contracts, and "round
+up" is to the next whole cent — exactly `FeeModel`'s form, scale, and rounding
+direction. `FeeModel` reproduces every fee the schedule prints, at all 21
+tabulated prices in both the general and the index table and in both the
+1-contract and the 100-contract column.
+
+**Every trading fee on this schedule shares the one quadratic form**; maker and
+taker differ only in rate. Because the form is monotone in the rate, the fee of
+the higher rate *is* the higher fee, so `max(maker_fee_ppm, taker_fee_ppm)`
+bounds both sides correctly and issue #452's understatement cannot arise here.
+Two guards keep that premise from decaying silently rather than at an order:
+
+- `windbreak/connector/kalshi/adapter.py` accepts only `fee_type == "quadratic"`
+  and fails closed with `UnknownFeeModelError` on anything else;
+- `_SERIES_BLOCK_SCHEMA` in `windbreak/connector/validation.py` grants the fee
+  block no cosmetic fields, so a new per-side form discriminator appearing in
+  the series document halts on schema drift instead of being ignored.
+
+The residual error runs the *safe* way and is worth naming: the bound charges
+the taker rate to both sides, so a resting (maker) fill is bounded at 4× its
+published fee. That overstates cost, which can refuse a marginal trade but can
+never approve one it should veto.
+
 ## Balance-semantics contract (SPEC §7.3)
 
 Before live trading, an exchange adapter must publish a machine-readable
