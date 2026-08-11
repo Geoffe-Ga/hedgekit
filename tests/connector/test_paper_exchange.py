@@ -1911,6 +1911,91 @@ class TestPaperExchangeWithholdsRestingOrderCollateral:
         )
 
 
+class TestPaperExchangeReportsWhatOneRestingOrderWithholds:
+    """`resting_collateral_micros` states this venue's own reservation (#423).
+
+    Issue #362 made `available` really withhold resting collateral. Nothing then
+    *said* how much any one order withheld, so the ledgered reconciliation
+    expectation had no way to account for it and the cash dimension breached the
+    moment an order rested. The venue is the only thing that knows its own
+    convention and its own fee schedule, so the venue reports the figure -- the
+    same role `fill_cash_micros` plays for an execution (issue #365).
+    """
+
+    def test_the_reported_reservation_is_exactly_what_available_lost(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """The reported figure is the drop in `available`, to the micro.
+
+        Measured against the balance rather than against a restated formula: a
+        booking layer that re-derived book-cost-plus-fee itself would drift from
+        this class the first time either rounding rule moved, and a bookkeeping
+        drift is indistinguishable from the venue divergence reconciliation
+        exists to catch.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "resting_full_consume"
+        )
+
+        _rest_one_hundred_at_4200(exchange)
+
+        (order,) = exchange.get_open_orders()
+        withheld = _OPENING_BALANCE_MICROS - exchange.get_balances().available.value
+        assert withheld == _FULLCONSUME_COLLATERAL_MICROS
+        assert exchange.resting_collateral_micros(order) == MoneyMicros(withheld)
+
+    def test_a_no_side_order_is_reported_at_its_own_no_price(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """A NO order reports its NO-frame reservation, not the complement.
+
+        The same frame trap `get_balances` has to avoid: reserving the 5800-pip
+        complement would report the wrong money withheld on every NO order, and
+        the expectation would then reconcile against a number the venue never
+        set aside.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(
+            books_fixture_dir / "no_side_resting"
+        )
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-NORESTING", "no", PricePips(4200), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+
+        (order,) = exchange.get_open_orders()
+
+        assert exchange.resting_collateral_micros(order) == MoneyMicros(
+            _NO_SIDE_COLLATERAL_MICROS
+        )
+
+    def test_the_arrival_log_entry_reports_the_size_that_actually_rested(
+        self, books_fixture_dir: Path
+    ) -> None:
+        """A partially crossing order reserves for its *remainder*, not its size.
+
+        The booking layer reads `get_rested_orders`, whose entries carry the
+        quantity that came to rest, so this is the figure a booked arrival
+        carries. Reserving the whole 1000-centi intent would over-withhold by
+        the 300 centis that filled outright and never rested at all.
+        """
+        exchange = paper.PaperExchange.from_fixture_dir(books_fixture_dir / "deep_walk")
+        exchange.place_order(
+            paper.PaperOrderIntent(
+                "MKT-DEEP", "yes", PricePips(4700), ContractCentis(1000)
+            ),
+            approval_token=object(),
+        )
+
+        (rested,) = exchange.get_rested_orders()
+
+        assert rested.quantity == ContractCentis(700)
+        assert exchange.resting_collateral_micros(rested) == MoneyMicros(
+            _DEEP_WALK_COLLATERAL_MICROS
+        )
+
+
 # --- Issue #369: the replay carries an anchored timeline, not a read-time stamp ---
 #
 # `quote_freshness` (SPEC S7.3) exists to stop the kernel pricing an order off a

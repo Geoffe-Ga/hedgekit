@@ -75,7 +75,7 @@ import pytest
 from tests.integration.conftest import FIXED_NOW_EPOCH_S, ledger_path_for
 from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.alerts.registry import AlertSeverity, AlertType
-from windbreak.numeric.types import ContractCentis, PricePips
+from windbreak.numeric.types import MoneyMicros
 from windbreak.riskkernel.modes import Mode
 
 if TYPE_CHECKING:
@@ -85,8 +85,10 @@ if TYPE_CHECKING:
     from windbreak.config.schema import WindbreakConfig
     from windbreak.scheduler.loop import PaperTickDeps
 
-#: The single ticker in the shared `deep_walk` books fixture.
-_TICKER = "MKT-DEEP"
+#: Cash removed from the paper account with no execution behind it -- the one
+#: venue movement fill accounting genuinely cannot explain, and therefore the
+#: only reliable way to drive a reconciliation breach.
+_UNEXPLAINED_CASH_MICROS = 7_000_000
 
 #: The exact body `windbreak.riskkernel.kill` dispatches and ledgers on a kill.
 #: Compared in full rather than by substring, because a substring assertion
@@ -278,27 +280,26 @@ def _count_of(deps: PaperTickDeps, event_type: str) -> int:
 
 
 def _move_the_venue_behind_the_loops_back(deps: PaperTickDeps) -> None:
-    """Rest an order on the exchange the loop's ledger cannot explain.
+    """Take cash off the exchange with no execution behind it.
 
     The same divergence `tests/integration/test_paper_verification.py` uses to
-    drive a breach: trading directly on the exchange, so the venue's own
-    aggregate moves without a booked entry to account for it. The divergence
-    *persists*, so every later verification cycle grades `BREACH` -- which is
-    what makes a run of consecutive mismatches drivable at all.
+    drive a breach, and the only kind that still is one. *Trading* directly on
+    the exchange is not: the bookkeeper reads the venue's own fill and arrival
+    logs, so it books whatever landed there regardless of who placed it, and
+    since issue #423 booked the resting-order collateral too, the whole
+    movement reconciles. Cash that simply left explains nothing. It is taken off
+    the opening balance every later reading derives from, so the divergence
+    *persists* and every later cycle grades `BREACH` -- which is what makes a
+    run of consecutive mismatches drivable at all.
 
     Args:
         deps: The wired bundle whose exchange is moved.
     """
-    from windbreak.connector.paper import PaperOrderIntent
-
-    deps.exchange.place_order(
-        PaperOrderIntent(
-            ticker=_TICKER,
-            side="yes",
-            price=PricePips(4600),
-            quantity=ContractCentis(100),
-        ),
-        None,
+    opening = deps.exchange.balances
+    deps.exchange.balances = type(opening)(
+        total=MoneyMicros(opening.total.value - _UNEXPLAINED_CASH_MICROS),
+        available=MoneyMicros(opening.available.value - _UNEXPLAINED_CASH_MICROS),
+        fetched_at=opening.fetched_at,
     )
 
 

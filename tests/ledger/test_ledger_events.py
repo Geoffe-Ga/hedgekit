@@ -442,15 +442,37 @@ def test_resting_order_accounted_books_an_arrival() -> None:
         venue_order_id="paper-order-1",
         ticker="MKT-DEEP",
         resting_quantity_centis=250,
+        reserved_collateral_micros=3_420_000,
     )
 
     assert event.event_type == "RestingOrderAccounted"
-    assert event.payload_schema_version == 1
+    assert event.payload_schema_version == 2
     assert event.payload == {
         "venue_order_id": "paper-order-1",
         "ticker": "MKT-DEEP",
         "resting_quantity_centis": 250,
+        "reserved_collateral_micros": 3_420_000,
     }
+
+
+def test_resting_order_accounted_defaults_to_withholding_nothing() -> None:
+    """An arrival booked without a reservation carries an explicit zero (#423).
+
+    Zero is the fail-closed default in both directions it has to serve. A venue
+    whose ``OrderCollateralInAvailable`` is not ``DEDUCTED_FROM_AVAILABLE``
+    genuinely withholds nothing, and a v1 row booked before this leaf existed
+    said nothing about collateral at all -- crediting either one with a
+    reservation would advance the cash expectation past money the venue never
+    set aside.
+    """
+    event = RestingOrderAccounted(
+        component="scheduler",
+        venue_order_id="paper-order-1",
+        ticker="MKT-DEEP",
+        resting_quantity_centis=250,
+    )
+
+    assert event.payload["reserved_collateral_micros"] == 0
 
 
 def test_resting_order_accounted_round_trips_through_its_envelope() -> None:
@@ -460,6 +482,7 @@ def test_resting_order_accounted_round_trips_through_its_envelope() -> None:
         venue_order_id="paper-order-1",
         ticker="MKT-DEEP",
         resting_quantity_centis=250,
+        reserved_collateral_micros=3_420_000,
     )
     envelope = json.loads(event.envelope_json)
 
