@@ -112,6 +112,29 @@ the kill-file watcher at a per-test directory instead of the shipped
 default would let a ``KILL`` file a developer created by hand silently kill
 these ticks.
 
+What this scenario cannot distinguish
+-------------------------------------
+
+Two of the twenty-four pass for reasons a single in-band, opening, outright
+order cannot separate from their alternatives, and recording that is part of
+being honest about *why* the fill is reached:
+
+* ``reduce_only_provable`` -- an **equivalence**. The intent is an open, and
+  ``_is_derisking_close`` returns ``False`` on an opening action before it ever
+  reads ``context.market.open_position``, which is the only place any check
+  reads it. So the open position ``_approve_stage`` threads (issue #373) cannot
+  change any verdict on this path; replacing it with ``None`` leaves every
+  assertion below green because it genuinely decides nothing here.
+* ``quote_freshness`` -- a **gap, not an equivalence**. The book's own
+  ``fetched_at`` and the approval stage's second clock read are the same instant
+  under an injected fixed clock, so ``_approve_stage`` threading the book's
+  epoch (issue #369) rather than its own ``now_epoch_s`` is unobservable here.
+  ``_approve_stage``'s docstring calls that substitution the thing that made the
+  check "incapable of ever vetoing", and nothing in this module falsifies it.
+  Separating the two needs a clock that advances between the exchange's replay
+  anchor and the approval stage, which is issue #369's scenario rather than
+  #450's; it is reported rather than quietly absorbed.
+
 What the golden sequence is allowed to say
 ------------------------------------------
 
