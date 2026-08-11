@@ -121,7 +121,7 @@ from windbreak.evaluation.preregistration import build_gate_plan, register_gate_
 from windbreak.ledger.events import KillEngaged, KillReArmed
 from windbreak.ledger.store import SqliteLedgerStore, events_from_records
 from windbreak.main import _build_risk_kernel, main
-from windbreak.numeric.types import MoneyMicros
+from windbreak.numeric.types import ContractCentis, MoneyMicros, PricePips
 from windbreak.riskkernel.kill import KILL_FILENAME, KillTrigger
 from windbreak.riskkernel.modes import Mode
 from windbreak.riskkernel.promotion import GateEvidence, GatePlanUnavailableError
@@ -1175,3 +1175,126 @@ def test_run_process_riskkernel_fails_closed_on_a_missing_snapshot_fixture_dir(
         for payload in payloads
     )
     assert not any("heartbeat" in str(payload.get("msg", "")) for payload in payloads)
+
+
+# --- issue #480: the kill-path cancel-all is delivered, not merely ledgered ----
+
+#: The two resting orders `_RestingOrderConnector` starts with. Two, at
+#: different sizes, because one order cannot distinguish "cancelled the order I
+#: named" from "cancelled whatever happened to be there".
+_RESTING_ORDER_IDS = ("venue-order-480-a", "venue-order-480-b")
+
+
+@dataclass
+class _RestingOrderConnector:
+    """A `MarketConnector` double recording every cancellation it receives.
+
+    The venue side of issue #480's assertion: a kill must be observable *here*,
+    at the connector, and not only in the `CancelAllDirective` row the chain
+    already carried while nothing consumed it.
+
+    Attributes:
+        cancelled: The venue order ids cancelled through this connector, in
+            call order.
+    """
+
+    cancelled: list[str] = field(default_factory=list)
+
+    def get_open_orders(self) -> tuple[OpenOrder, ...]:
+        """Return the resting orders not yet cancelled through this connector."""
+        return tuple(
+            OpenOrder(
+                id=order_id,
+                ticker="MKT-480",
+                side="yes",
+                price=PricePips(4_400 + index),
+                quantity=ContractCentis(100 + index),
+            )
+            for index, order_id in enumerate(_RESTING_ORDER_IDS)
+            if order_id not in self.cancelled
+        )
+
+    def cancel_order(self, order_id: str) -> None:
+        """Record one cancellation.
+
+        Args:
+            order_id: The venue order id being cancelled.
+        """
+        self.cancelled.append(order_id)
+
+    def get_balances(self) -> BalanceSnapshot:
+        """Return a flat balance; cash is not this double's dimension."""
+        return BalanceSnapshot(
+            total=MoneyMicros(0), available=MoneyMicros(0), fetched_at=_FIXED_DATETIME
+        )
+
+    def get_positions(self) -> tuple[Position, ...]:
+        """Return no positions, ever."""
+        return ()
+
+    def get_balance_semantics(self) -> BalanceSemantics:
+        """Return a fully-known `BalanceSemantics` (irrelevant to this test)."""
+        return _FULLY_KNOWN_SEMANTICS
+
+    def list_markets(self) -> tuple[NormalizedMarket, ...]:
+        """Return no markets; never called by the kill path."""
+        return ()
+
+    def get_market(self, ticker: str) -> NormalizedMarket:
+        """Raise; never called by the kill path."""
+        raise UnknownMarketError(ticker)
+
+    def get_order_book(self, ticker: str) -> OrderBookSnapshot:
+        """Raise; never called by the kill path."""
+        raise NotImplementedError(ticker)
+
+    def get_exchange_status(self) -> ExchangeStatus:
+        """Raise; never called by the kill path."""
+        raise NotImplementedError
+
+    def get_exchange_time(self) -> datetime:
+        """Raise; never called by the kill path."""
+        raise NotImplementedError
+
+    def get_fills(self, since: datetime) -> tuple[Fill, ...]:
+        """Return no fills; never called by the kill path."""
+        del since
+        return ()
+
+    def get_fee_model(self, market_or_series: str) -> FeeModel:
+        """Raise; never called by the kill path."""
+        raise NotImplementedError(market_or_series)
+
+    def place_order(self, normalized_intent: object, approval_token: object) -> object:
+        """Raise; the kill path never places orders."""
+        raise NotImplementedError
+
+
+def test_build_risk_kernel_delivers_the_cancel_all_to_the_venue_connector(
+    tmp_path: Path,
+) -> None:
+    """A kill on the `--process riskkernel` composition reaches the venue (#480).
+
+    The second of the two paths. A fix to the PAPER loop alone would leave this
+    one silently broken, which is exactly how issue #441 arose out of #144: the
+    CLI's *other* kernel was wired, declared done, and the loop that actually
+    traded went on honouring nothing.
+
+    Asserted against the connector double's own record of what it was told to
+    cancel -- never against the ledgered `CancelAllDirective`, which said
+    "cancel everything" throughout the entire period in which nothing did.
+
+    Args:
+        tmp_path: The per-test scratch directory rooting `ops.state_dir`.
+    """
+    connector = _RestingOrderConnector()
+    _kernel, integration = _build_risk_kernel(
+        _config_with_state_dir(tmp_path / "state"),
+        verification_connector=connector,
+    )
+
+    integration.switch.kill(KillTrigger.CLI)
+
+    assert integration.switch.mode is Mode.KILLED
+    assert tuple(connector.cancelled) == _RESTING_ORDER_IDS
+    assert connector.get_open_orders() == ()

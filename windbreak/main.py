@@ -3046,6 +3046,22 @@ def _build_risk_kernel(
     verifier is ``None`` and the composition is byte-identical to its
     pre-issue-#236 shape.
 
+    That same connector is, since issue #480, also the kill switch's
+    ``directive_sink``, via a
+    :class:`~windbreak.order_gateway.cancel_all.VenueCancelAllSink`. Until then
+    the one :class:`~windbreak.ledger.events.CancelAllDirective` a kill writes
+    was consumed by nothing on this path *or* on the PAPER loop's, so resting
+    orders survived a kill as live instructions that could still fill after the
+    operator had walked away. The sink is deliberately built over the raw
+    connector rather than the read-only projection the verifier gets: cancelling
+    is the capability being exercised, and the read-only views elsewhere exist
+    to keep *other* stages away from precisely it. Note the asymmetry with the
+    PAPER loop: this process holds no order gateway and never places an order,
+    so its venue surface is whatever ``--snapshot-fixture-dir`` supplies. With
+    no connector at all no sink is wired, and the kill's directive row records
+    ``delivery_reported: false`` -- the fail-closed unknown, never a claimed
+    cancellation.
+
     The kernel imports are local (mirroring :func:`_run_drill` /
     :func:`_build_paper_on_beat`) so the RESEARCH heartbeat path never imports
     the kernel eagerly. ``ops.state_dir`` is created up front, fail-closed: a
@@ -3080,6 +3096,7 @@ def _build_risk_kernel(
             work -- the kernel refuses to start rather than run the money path
             believing it can page an operator when it cannot.
     """
+    from windbreak.order_gateway.cancel_all import VenueCancelAllSink
     from windbreak.riskkernel.kill import (
         KillFileWatcher,
         KillIntegration,
@@ -3107,8 +3124,22 @@ def _build_risk_kernel(
     # verification connector is wired) the verifier's mismatch/jurisdiction
     # alerts, so both fan out through the same configured sinks (issue #274).
     dispatcher = _build_alert_dispatcher(config)
+    # The cancel-all directive is delivered to the one venue surface this
+    # process has (issue #480). With no connector there is nothing to deliver
+    # to, and the kill's `CancelAllDirective` row says so with
+    # `delivery_reported: false` -- an honest unknown, never a claimed cancel.
+    directive_sink = (
+        None
+        if verification_connector is None
+        else VenueCancelAllSink(verification_connector)
+    )
     switch = KillSwitch.from_events(
-        history, machine, writer, dispatcher, state_dir=state_dir
+        history,
+        machine,
+        writer,
+        dispatcher,
+        directive_sink=directive_sink,
+        state_dir=state_dir,
     )
     watcher = KillFileWatcher(switch, state_dir)
     monitor = ReconciliationMismatchMonitor(

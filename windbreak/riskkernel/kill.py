@@ -20,6 +20,21 @@ having merely been attempted. The switch **holds positions by design**: it
 only cancels resting orders and releases capital reservations, and no string it
 ever ledgers names a sell/close/submit/dump action.
 
+**Emission is not delivery, for the directive either (issue #480).** The
+``CancelAllDirective`` row is written *after* the directive has been handed to
+the wired :class:`DirectiveSink`, and carries a closed
+:class:`~windbreak.ledger.directives.DirectiveDelivery` record of what the
+venue did with it -- so an audit can tell a kill that actually cleared the book
+from one whose cancellations were refused, and from one where no sink was wired
+to answer at all. A cancel-all that did not fully land is also named on the
+``HALT_KILL`` page, because ``windbreak kill`` is what an operator reaches for
+when something is already wrong, and silent partial execution of a fail-safe is
+worse than a fail-safe that announces its limits. The seam stays data-only
+(SPEC S5): nothing in this package imports or names a connector type; the
+order-gateway-side
+:class:`~windbreak.order_gateway.cancel_all.VenueCancelAllSink` is what turns
+the directive into venue calls.
+
 The trigger adapters (:class:`KillFileWatcher`,
 :class:`ReconciliationMismatchMonitor`, :class:`DashboardKillStub`) are all
 poll- or event-driven with no unbounded waits: the fleet drives them one beat
@@ -93,6 +108,7 @@ sequence numbers are ``int`` only.
 from __future__ import annotations
 
 import enum
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -100,6 +116,10 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from windbreak.alerts.dispatch import ledger_deliveries
 from windbreak.alerts.registry import AlertType, get_registration
+from windbreak.ledger.directives import (
+    DirectiveDelivery,
+    ledger_directive_delivery,
+)
 from windbreak.ledger.events import (
     AlertEmitted,
     CancelAllDirective,
@@ -141,6 +161,25 @@ _RELEASE_REASON = "kill_switch_engaged"
 #: The ``HALT_KILL`` alert body. Also hold-only wording (no action token).
 _HALT_KILL_MESSAGE = "kill switch engaged; trading halted, positions held"
 
+#: Appended to the ``HALT_KILL`` body when a wired directive sink did *not*
+#: take the whole cancel-all (issue #480). The one page an operator is
+#: guaranteed to read is where a fail-safe announces what it could not do:
+#: silent partial execution of a kill is worse than a kill that says so. The
+#: counts are ints the code owns; no venue-supplied text is ever interpolated
+#: here, because this body is ledgered onto an unredactable chain (issue #274).
+#: Hold-only wording, like everything else on this path: no sell/close/submit/
+#: dump token appears in it.
+_CANCEL_ALL_UNDELIVERED_NOTICE = (
+    "resting-order cancellation NOT confirmed at the venue"
+    " (outcome={outcome}, cancelled={cancelled}, failed={failed})"
+)
+
+#: Logger for the kill path's one non-fatal warning: a directive sink that
+#: raised. The exception text is logged (a log line may hold it) and never
+#: ledgered (a hash chain may not) -- the same split issue #413 drew for alert
+#: sink detail.
+_LOGGER = logging.getLogger("windbreak.riskkernel.kill")
+
 #: The severity the ledgered :class:`AlertEmitted` carries, read once from the
 #: alert registry so the audit row can never disagree with the severity the
 #: operator was actually paged at. Resolved at import (the registry is a frozen
@@ -173,6 +212,41 @@ def _default_clock() -> int:
         The current time, in whole epoch seconds.
     """
     return int(time.time())
+
+
+def _halt_kill_message(delivery: DirectiveDelivery | None) -> str:
+    """Return the ``HALT_KILL`` body, naming a cancel-all that did not land.
+
+    A kill whose cancel-all was refused, partially taken, or errored has left
+    live instructions resting at a venue the operator has just walked away
+    from. That cannot read as a clean kill, so it is named on the one page the
+    operator is guaranteed to see -- and, because the same string is ledgered
+    as :attr:`~windbreak.ledger.events.AlertEmitted.message`, in the chain too.
+
+    A ``None`` delivery -- no sink wired at all -- deliberately does *not* add
+    the notice. It is an unknown rather than a failure, and it is already
+    recorded as one by the ``delivery_reported: false`` on the
+    :class:`~windbreak.ledger.events.CancelAllDirective` row; the base body
+    never claims a cancellation happened, so its silence asserts nothing false.
+
+    Args:
+        delivery: What the wired sink reported, or ``None`` when none is wired.
+
+    Returns:
+        The base body, plus the undelivered notice when a wired sink did not
+        take the whole instruction.
+    """
+    if delivery is None or delivery.fully_delivered:
+        return _HALT_KILL_MESSAGE
+    return (
+        _HALT_KILL_MESSAGE
+        + "; "
+        + _CANCEL_ALL_UNDELIVERED_NOTICE.format(
+            outcome=delivery.outcome.value,
+            cancelled=delivery.cancelled,
+            failed=delivery.failed,
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,14 +358,29 @@ class DirectiveSink(Protocol):
     """The seam a :class:`CancelAllDirective` is delivered to (order gateway).
 
     Structural, so the kill switch can hand its one cancel-all directive to the
-    order-gateway-facing boundary without importing it.
+    order-gateway-facing boundary without importing it. The directive crosses
+    this seam as **data**: nothing here names a connector, and no connector call
+    is ever made from inside the Risk Kernel (SPEC S5).
     """
 
-    def submit(self, directive: CancelAllDirective) -> None:
-        """Submit a cancel-all directive for delivery.
+    def submit(self, directive: CancelAllDirective) -> DirectiveDelivery | None:
+        """Submit a cancel-all directive for delivery, reporting what happened.
+
+        Narrowed from ``None`` by issue #480, exactly as issue #413 narrowed
+        :meth:`AlertDispatcherProtocol.dispatch`: the kill switch now ledgers
+        *what the venue did* with the directive, so the seam has to carry that
+        back. The narrowing is deliberately to
+        :class:`~windbreak.ledger.directives.DirectiveDelivery`, which has no
+        free-form field at all, so mypy -- not just a test -- keeps venue order
+        ids and rejection text out of the append-only chain.
 
         Args:
             directive: The directive to deliver downstream.
+
+        Returns:
+            What the sink did with it, or ``None`` from a sink that reports no
+            delivery evidence. ``None`` is recorded as *unreported* and never
+            as delivered: absent evidence must never read as healthy.
         """
         ...
 
@@ -465,17 +554,16 @@ class KillSwitch:
                 epoch=self._clock(),
             )
         )
-        self._emit_cancel_all()
+        delivery = self._emit_cancel_all()
         self._release_reservations()
-        report = self._alert_dispatcher.dispatch(
-            AlertType.HALT_KILL, _HALT_KILL_MESSAGE
-        )
+        message = _halt_kill_message(delivery)
+        report = self._alert_dispatcher.dispatch(AlertType.HALT_KILL, message)
         self._write_kill_file()
         self._ledger_writer.record(
             AlertEmitted(
                 component=_COMPONENT,
                 severity=_HALT_KILL_SEVERITY,
-                message=_HALT_KILL_MESSAGE,
+                message=message,
                 deliveries=ledger_deliveries(report),
                 delivery_reported=report is not None,
             )
@@ -524,12 +612,63 @@ class KillSwitch:
             KillReArmed(component=_COMPONENT, kill_sequence=self._kill_sequence)
         )
 
-    def _emit_cancel_all(self) -> None:
-        """Ledger the one cancel-all directive and hand it to any wired sink."""
+    def _emit_cancel_all(self) -> DirectiveDelivery | None:
+        """Deliver the one cancel-all directive, *then* ledger what happened.
+
+        The order is the point (issue #480, following PR #412's rule). The
+        directive is handed to the sink first, because that is the fail-safe
+        *effect*; the audit append comes after it, carrying what the venue
+        actually did. Ledgering first -- as this method did until issue #480 --
+        put the record of an effect ahead of the effect, so a failing append
+        could skip the cancellation entirely, and the row it wrote claimed
+        nothing about whether the venue was ever told.
+
+        Returns:
+            What the wired sink reported, or ``None`` when no sink is wired --
+            the fail-closed *unknown* the ledger records as unreported.
+        """
         directive = CancelAllDirective(component=_COMPONENT, scope=_CANCEL_ALL_SCOPE)
-        self._ledger_writer.record(directive)
-        if self._directive_sink is not None:
-            self._directive_sink.submit(directive)
+        delivery = self._deliver(directive)
+        self._ledger_writer.record(
+            CancelAllDirective(
+                component=_COMPONENT,
+                scope=_CANCEL_ALL_SCOPE,
+                delivery=ledger_directive_delivery(delivery),
+                delivery_reported=delivery is not None,
+            )
+        )
+        return delivery
+
+    def _deliver(self, directive: CancelAllDirective) -> DirectiveDelivery | None:
+        """Hand the directive to any wired sink, never letting it raise.
+
+        A :class:`DirectiveSink` is a structural seam, so an arbitrary
+        implementation may raise. It must not be able to skip the fail-safe
+        effects that follow it -- the reservation release, the page, the
+        ``KILL`` file -- so the failure is converted into an errored delivery
+        rather than propagated. That is not swallowing it: the errored outcome
+        is ledgered *and* named on the operator's page, and the exception text
+        goes to the log, which may hold venue-supplied detail as the chain may
+        not (issue #274).
+
+        Args:
+            directive: The directive to hand across the seam.
+
+        Returns:
+            The sink's report, an errored :class:`DirectiveDelivery` when the
+            sink raised, or ``None`` when no sink is wired.
+        """
+        if self._directive_sink is None:
+            return None
+        try:
+            return self._directive_sink.submit(directive)
+        except Exception as exc:
+            _LOGGER.critical(
+                "cancel-all directive sink failed: %s",
+                exc,
+                extra={"component": _COMPONENT},
+            )
+            return DirectiveDelivery(errored=True)
 
     def _release_reservations(self) -> None:
         """Release every active reservation when a reservation ledger is wired."""
