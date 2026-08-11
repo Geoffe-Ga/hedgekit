@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-11T02:42:34.292928+00:00",
+  "timestamp": "2026-08-11T15:42:56.733772+00:00",
   "project": "windbreak",
   "thresholds": {
     "coverage": 90,
@@ -13,13 +13,13 @@
     "type_errors": 0
   },
   "metrics": {
-    "coverage": 95.18,
+    "coverage": 95.19,
     "coverage_status": "pass",
-    "branch_coverage": 92.53,
+    "branch_coverage": 92.55,
     "branch_coverage_status": "pass",
     "complexity_avg": 2.08,
     "complexity_status": "pass",
-    "maintainability_avg": 68.54,
+    "maintainability_avg": 68.49,
     "maintainability_status": "pass",
     "docs_coverage": 100.0,
     "docs_status": "pass",
@@ -31,10 +31,10 @@
     "lint_status": "pass",
     "type_errors": 0,
     "typecheck_status": "pass",
-    "tests_total": 5823,
-    "tests_passed": 5823,
+    "tests_total": 5842,
+    "tests_passed": 5840,
     "tests_failed": 0,
-    "tests_skipped": 0,
+    "tests_skipped": 2,
     "tests_status": "pass",
     "precommit_status": {
       "total_hooks": 26,
@@ -43,11 +43,11 @@
       "status": "passing"
     },
     "ci_status": {
-      "total_jobs": 0,
-      "passing_jobs": 0,
-      "percentage": 0.0,
-      "status": "unknown",
-      "run_url": "https://github.com/Geoffe-Ga/windbreak/actions/runs/31452677498"
+      "total_jobs": 1,
+      "passing_jobs": 1,
+      "percentage": 100.0,
+      "status": "passing",
+      "run_url": "https://github.com/Geoffe-Ga/windbreak/actions/runs/31506914357"
     }
   }
 }
