@@ -452,6 +452,95 @@ def test_a_ledger_with_no_deployment_marker_credits_nobody(
     assert provider_track_records(records) == ()
 
 
+def test_a_restart_does_not_retroactively_void_the_evidence_before_it(
+    tmp_path: Path,
+) -> None:
+    """Deployment is the *earliest* marker, so a restart keeps prior evidence.
+
+    A long-running loop writes one `ConfigLoaded` row per start, so a ledger
+    that has been restarted carries several. Dating deployment from the latest
+    of them would move the pre-deployment cutoff forward on every restart,
+    silently voiding every forecast made before it -- a provider would lose its
+    earned track record for no reason but an operator bouncing the process.
+    Taking the earliest keeps the cutoff where the evidence actually begins.
+    """
+    ledger = _ScriptedLedger(tmp_path / "ledger.db")
+    try:
+        ledger.append(_config_loaded())
+        ledger.append(_forecast(forecast_id="f1", market_ticker="M1"))
+        ledger.append(
+            _vote(forecast_id="f1", market_ticker="M1", provider=_PROVEN_PROVIDER)
+        )
+        # The loop is restarted, writing a second deployment marker *after* the
+        # forecast that has already been made.
+        ledger.append(_config_loaded())
+        ledger.append(
+            _resolved(
+                market_ticker="M1",
+                resolved_at=_instant_at(5),
+                outcome=ResolutionOutcome.NO,
+            )
+        )
+        records = ledger.read_all()
+    finally:
+        ledger.close()
+    markers = [record for record in records if record.event_type == "ConfigLoaded"]
+    assert len(markers) == 2
+    assert provider_track_records(records) == (
+        ProviderTrackRecord(
+            provider=_PROVEN_PROVIDER,
+            resolved_count=1,
+            brier_skill_ppm=_ONE_FORECAST_SKILL_PPM,
+        ),
+    )
+
+
+def test_two_forecasts_on_one_market_count_once_not_twice(
+    tmp_path: Path,
+) -> None:
+    """A re-forecast market is one resolved observation, not two.
+
+    A loop that revisits a market produces several `ForecastCreated` rows for
+    it, and exactly one of them settles -- the market resolves once. Counting
+    each row would let a provider clear `min_resolved` by re-forecasting a
+    handful of markets rather than by being measured against many, which is the
+    fail-open direction the bar exists to prevent. The producer resolves the
+    headline observation window (`LATEST_BEFORE_CLOSE`) first, so each market
+    contributes its single last-before-close observation.
+    """
+    ledger = _ScriptedLedger(tmp_path / "ledger.db")
+    try:
+        ledger.append(_config_loaded())
+        for forecast_id in ("f1", "f2"):
+            ledger.append(_forecast(forecast_id=forecast_id, market_ticker="M1"))
+            ledger.append(
+                _vote(
+                    forecast_id=forecast_id,
+                    market_ticker="M1",
+                    provider=_PROVEN_PROVIDER,
+                )
+            )
+        ledger.append(
+            _resolved(
+                market_ticker="M1",
+                resolved_at=_instant_at(6),
+                outcome=ResolutionOutcome.NO,
+            )
+        )
+        records = ledger.read_all()
+    finally:
+        ledger.close()
+    forecasts = [record for record in records if record.event_type == "ForecastCreated"]
+    assert len(forecasts) == 2
+    assert provider_track_records(records) == (
+        ProviderTrackRecord(
+            provider=_PROVEN_PROVIDER,
+            resolved_count=1,
+            brier_skill_ppm=_ONE_FORECAST_SKILL_PPM,
+        ),
+    )
+
+
 def test_an_unparseable_created_at_is_refused_by_row_rather_than_guessed(
     tmp_path: Path,
 ) -> None:
