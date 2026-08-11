@@ -1294,6 +1294,13 @@ def test_a_supervised_failure_is_appended_to_the_hash_chained_ledger(
         {
             "severity": "critical",
             "message": "beat seq=1 failed: RuntimeError: database or disk is full",
+            # Issue #413 bumped `AlertEmitted` to schema 2 so an audit can tell
+            # a delivered alert from a merely emitted one. `LedgerAlertWriter`
+            # (windbreak/main.py) does not yet forward the dispatch's delivery
+            # report, so its rows say so explicitly: unreported, never
+            # delivered. Absent evidence reads as absent, which is the point.
+            "deliveries": [],
+            "delivery_reported": False,
         }
     ]
 
@@ -1366,6 +1373,13 @@ def test_the_composed_supervisor_ledgers_to_the_configured_ledger_path(
         {
             "severity": "critical",
             "message": "beat seq=1 failed: RuntimeError: database or disk is full",
+            # Issue #413 bumped `AlertEmitted` to schema 2 so an audit can tell
+            # a delivered alert from a merely emitted one. `LedgerAlertWriter`
+            # (windbreak/main.py) does not yet forward the dispatch's delivery
+            # report, so its rows say so explicitly: unreported, never
+            # delivered. Absent evidence reads as absent, which is the point.
+            "deliveries": [],
+            "delivery_reported": False,
         }
     ]
 

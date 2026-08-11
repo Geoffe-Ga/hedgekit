@@ -313,13 +313,64 @@ def test_mode_heartbeat_populates_event_type_schema_version_and_payload() -> Non
 
 
 def test_alert_emitted_populates_event_type_schema_version_and_payload() -> None:
-    """AlertEmitted's ergonomic constructor derives the full Event contract."""
+    """AlertEmitted's ergonomic constructor derives the full Event contract.
+
+    Schema 2, not 1: issue #413 added the two delivery keys, and a v1 row --
+    which carries neither -- can only ever prove the alert was emitted.
+    """
     event = AlertEmitted(component="alerts", severity="high", message="disk full")
 
     assert event.event_type == "AlertEmitted"
     assert event.component == "alerts"
-    assert event.payload_schema_version == 1
-    assert event.payload == {"severity": "high", "message": "disk full"}
+    assert event.payload_schema_version == 2
+    assert event.payload == {
+        "severity": "high",
+        "message": "disk full",
+        "deliveries": [],
+        "delivery_reported": False,
+    }
+
+
+def test_alert_emitted_omitting_delivery_evidence_never_reads_as_delivered() -> None:
+    """A writer that reports nothing produces an explicitly *unreported* row.
+
+    Fail closed: the absent-evidence row is distinguishable from every row that
+    records a real delivery, so a reader can never mistake silence for success.
+    """
+    silent = AlertEmitted(component="alerts", severity="high", message="disk full")
+    delivered = AlertEmitted(
+        component="alerts",
+        severity="high",
+        message="disk full",
+        deliveries=[{"sink": "webhook", "outcome": "delivered", "fallback": False}],
+        delivery_reported=True,
+    )
+
+    assert silent.payload["delivery_reported"] is False
+    assert silent.payload["deliveries"] == []
+    assert silent.payload != delivered.payload
+    assert delivered.envelope_json != silent.envelope_json
+
+
+def test_alert_emitted_round_trips_its_delivery_evidence_through_the_envelope() -> None:
+    """A persisted delivery-bearing row rebuilds identically via EVENT_TYPES."""
+    event = AlertEmitted(
+        component="riskkernel",
+        severity="critical",
+        message="kill switch engaged; trading halted, positions held",
+        deliveries=[
+            {"sink": "webhook", "outcome": "errored", "fallback": False},
+            {"sink": "log-only", "outcome": "delivered", "fallback": True},
+        ],
+        delivery_reported=True,
+    )
+    envelope = json.loads(event.envelope_json)
+
+    rebuilt = EVENT_TYPES[event.event_type](
+        component=envelope["component"], **envelope["data"]
+    )
+
+    assert rebuilt == event
 
 
 def test_config_loaded_envelope_json_matches_canonical_envelope() -> None:

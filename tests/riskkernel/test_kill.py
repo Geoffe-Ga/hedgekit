@@ -1833,8 +1833,11 @@ def test_kill_alert_row_names_no_action_and_smuggles_no_sink_detail() -> None:
     A hash chain is append-only, so anything written into it is unredactable.
     Sink-delivery detail is `str(exc)` from an arbitrary sink -- exactly the
     shape that leaked whole token-bearing URLs in issue #274 -- so it must not
-    reach the chain, and the payload must stay the closed two-key shape the
-    registered `AlertEmitted` schema declares.
+    reach the chain, and the payload must stay the closed shape the registered
+    `AlertEmitted` schema declares: since issue #413 that is four keys, the two
+    original ones plus a *closed* delivery record. `detail` is still not among
+    them, and `tests/riskkernel/test_kill_delivery.py` proves no substring of a
+    token-bearing sink URL reaches the chain through the new keys.
     """
     switch, writer, _machine, _sink = _build_switch()
 
@@ -1843,7 +1846,12 @@ def test_kill_alert_row_names_no_action_and_smuggles_no_sink_detail() -> None:
     alert_event = next(
         event for event in writer.events if event.event_type == "AlertEmitted"
     )
-    assert set(alert_event.payload) == {"severity", "message"}
+    assert set(alert_event.payload) == {
+        "severity",
+        "message",
+        "deliveries",
+        "delivery_reported",
+    }
     body = str(alert_event.payload["message"])
     assert not any(token in body.lower() for token in _FORBIDDEN_ACTION_TOKENS)
     assert "://" not in body

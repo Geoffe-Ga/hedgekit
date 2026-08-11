@@ -42,6 +42,7 @@ from windbreak.alerts import (
     LoggingLedgerWriter,
     SinkOutcome,
 )
+from windbreak.alerts.delivery import DeliveryOutcome
 from windbreak.alerts.registry import AlertSeverity, AlertType, get_registration
 from windbreak.alerts.sinks import LogOnlySink
 
@@ -115,8 +116,8 @@ def test_dispatch_happy_path_records_ok_outcomes_and_ledger_event(
     assert event.severity == get_registration(alert_type).severity
     assert event.message == "hello"
     assert event.outcomes == (
-        SinkOutcome(sink="a", ok=True, detail=None),
-        SinkOutcome(sink="b", ok=True, detail=None),
+        SinkOutcome(sink="a", outcome=DeliveryOutcome.DELIVERED),
+        SinkOutcome(sink="b", outcome=DeliveryOutcome.DELIVERED),
     )
     assert ledger.recorded == [event]
 
@@ -178,7 +179,9 @@ def test_dispatch_empty_sink_list_fires_the_fallback() -> None:
 
     event = dispatcher.dispatch(AlertType.SCHEMA_ANOMALY, "schema drift")
 
-    assert event.outcomes == (SinkOutcome(sink="fallback", ok=True, detail=None),)
+    assert event.outcomes == (
+        SinkOutcome(sink="fallback", outcome=DeliveryOutcome.DELIVERED, fallback=True),
+    )
     assert fallback.calls == [
         (
             AlertType.SCHEMA_ANOMALY,
@@ -211,7 +214,7 @@ def test_dispatch_ledger_writer_raising_does_not_propagate(
 
     event = dispatcher.dispatch(AlertType.VETO, "vetoed")
 
-    assert event.outcomes == (SinkOutcome(sink="a", ok=True, detail=None),)
+    assert event.outcomes == (SinkOutcome(sink="a", outcome=DeliveryOutcome.DELIVERED),)
     assert any("ledger" in record.getMessage().lower() for record in caplog.records)
 
 
@@ -236,7 +239,7 @@ def test_logging_ledger_writer_records_event_as_a_structured_line(
         alert_type=AlertType.VETO,
         severity=AlertSeverity.WARNING,
         message="vetoed",
-        outcomes=(SinkOutcome(sink="a", ok=True, detail=None),),
+        outcomes=(SinkOutcome(sink="a", outcome=DeliveryOutcome.DELIVERED),),
         ts="2026-01-01T00:00:00.000000Z",
     )
 
@@ -250,17 +253,17 @@ def test_logging_ledger_writer_records_event_as_a_structured_line(
 
 def test_sink_outcome_detail_defaults_to_none() -> None:
     """`SinkOutcome.detail` is optional and defaults to `None`."""
-    outcome = SinkOutcome(sink="a", ok=True)
+    outcome = SinkOutcome(sink="a", outcome=DeliveryOutcome.DELIVERED)
 
     assert outcome.detail is None
 
 
 def test_sink_outcome_is_frozen() -> None:
     """`SinkOutcome` instances cannot be mutated after construction."""
-    outcome = SinkOutcome(sink="a", ok=True)
+    outcome = SinkOutcome(sink="a", outcome=DeliveryOutcome.DELIVERED)
 
     with pytest.raises(dataclasses.FrozenInstanceError):
-        outcome.ok = False  # type: ignore[misc]
+        outcome.sink = "b"  # type: ignore[misc]
 
 
 def test_alert_emitted_is_frozen() -> None:

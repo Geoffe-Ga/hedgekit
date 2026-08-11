@@ -13,11 +13,12 @@ records the closed kill-effect surface -- one :class:`KillEngaged`, one
 :class:`CancelAllDirective`, and one ``ReservationReleased`` per active
 reservation -- dispatches one ``HALT_KILL`` alert, drops a ``KILL`` file, and
 finally ledgers one :class:`AlertEmitted` recording that the alert fired
-(issue #287), so the single most consequential operator page the system ever
-sends is tamper-evident and survives log rotation rather than existing only as
-a log line. The switch **holds positions by design**: it only cancels resting
-orders and releases capital reservations, and no string it ever ledgers names a
-sell/close/submit/dump action.
+(issue #287) *and which sinks accepted it* (issue #413), so the single most
+consequential operator page the system ever sends is tamper-evident, survives
+log rotation, and can be shown to have actually reached somebody rather than
+having merely been attempted. The switch **holds positions by design**: it
+only cancels resting orders and releases capital reservations, and no string it
+ever ledgers names a sell/close/submit/dump action.
 
 The trigger adapters (:class:`KillFileWatcher`,
 :class:`ReconciliationMismatchMonitor`, :class:`DashboardKillStub`) are all
@@ -97,6 +98,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, cast
 
+from windbreak.alerts.dispatch import ledger_deliveries
 from windbreak.alerts.registry import AlertType, get_registration
 from windbreak.ledger.events import (
     AlertEmitted,
@@ -112,6 +114,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
     from pathlib import Path
 
+    from windbreak.alerts.dispatch import AlertDeliveryReport
     from windbreak.ledger.events import Event
     from windbreak.riskkernel.modes import ModeStateMachine
     from windbreak.riskkernel.process import KernelLedgerWriter
@@ -250,19 +253,29 @@ class AlertDispatcherProtocol(Protocol):
     without inheritance.
     """
 
-    def dispatch(self, alert_type: AlertType, message: str) -> object:
-        """Dispatch one operator alert.
+    def dispatch(
+        self, alert_type: AlertType, message: str
+    ) -> AlertDeliveryReport | None:
+        """Dispatch one operator alert and report what the sinks did with it.
+
+        Narrowed from ``object`` by issue #413: the kill switch now ledgers
+        *which* sinks accepted the page, so the seam has to carry that back.
+        The narrowing is deliberately to
+        :class:`~windbreak.alerts.dispatch.AlertDeliveryReport` and not to the
+        full ``AlertEmitted``, because a report exposes only the closed
+        :class:`~windbreak.alerts.dispatch.SinkDelivery` projection --
+        ``SinkOutcome.detail`` (``str(exc)`` from an arbitrary sink) is not
+        reachable through this type at all, so mypy, not just a test, keeps
+        unredactable text out of the append-only chain.
 
         Args:
             alert_type: The alert type to fire.
             message: The human-readable alert body.
 
         Returns:
-            An implementation-defined value the kill switch ignores. Typed
-            ``object`` so both the real
-            :class:`~windbreak.alerts.dispatch.AlertDispatcher` (which returns
-            an ``AlertEmitted`` record) and a ``None``-returning test double
-            structurally satisfy this seam.
+            The dispatch's delivery report, or ``None`` from a dispatcher that
+            reports no delivery evidence. ``None`` is recorded as *unreported*
+            and never as delivered: absent evidence must never read as healthy.
         """
         ...
 
@@ -414,6 +427,13 @@ class KillSwitch:
         release, no alert, no raise -- so a persistent ``KILL`` file or a
         repeated trigger kills exactly once.
 
+        The audit row records *delivery*, not merely emission (issue #413): it
+        carries one closed ``{sink, outcome, fallback}`` entry per attempted
+        sink, so a reader with only the ledger can tell an all-sinks-failed
+        kill from an all-sinks-succeeded one. A dispatcher that reports nothing
+        ledgers ``delivery_reported: false`` with no entries -- unknown, never
+        delivered.
+
         The one :class:`AlertEmitted` audit row is written **last**, after every
         fail-safe effect including the ``KILL`` file (issue #287). Ordering is
         load-bearing: a ledger append that fails must never be able to skip the
@@ -447,13 +467,17 @@ class KillSwitch:
         )
         self._emit_cancel_all()
         self._release_reservations()
-        self._alert_dispatcher.dispatch(AlertType.HALT_KILL, _HALT_KILL_MESSAGE)
+        report = self._alert_dispatcher.dispatch(
+            AlertType.HALT_KILL, _HALT_KILL_MESSAGE
+        )
         self._write_kill_file()
         self._ledger_writer.record(
             AlertEmitted(
                 component=_COMPONENT,
                 severity=_HALT_KILL_SEVERITY,
                 message=_HALT_KILL_MESSAGE,
+                deliveries=ledger_deliveries(report),
+                delivery_reported=report is not None,
             )
         )
 

@@ -31,6 +31,7 @@ from email.message import EmailMessage
 from typing import TYPE_CHECKING, Final, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
+from windbreak.alerts.delivery import DeliveryOutcome
 from windbreak.alerts.registry import AlertSeverity
 
 if TYPE_CHECKING:
@@ -54,8 +55,77 @@ _NTFY_PRIORITY: Final[Mapping[AlertSeverity, str]] = {
 }
 
 
+def classify_transport_failure(exc: BaseException) -> DeliveryOutcome:
+    """Map a raw transport exception onto the closed delivery vocabulary.
+
+    Classification is by exception *type* alone, never by parsing the
+    exception's message: a message is arbitrary sink-supplied text (issue #274)
+    and must never become the thing a fail-closed audit record depends on.
+
+    Args:
+        exc: The exception a transport raised.
+
+    Returns:
+        :attr:`DeliveryOutcome.TIMED_OUT` for a timeout,
+        :attr:`DeliveryOutcome.REFUSED` for a refused connection, and
+        :attr:`DeliveryOutcome.ERRORED` for everything else -- the fail-closed
+        default, since an unrecognized failure is still a failure.
+    """
+    if isinstance(exc, TimeoutError):
+        return DeliveryOutcome.TIMED_OUT
+    if isinstance(exc, ConnectionRefusedError):
+        return DeliveryOutcome.REFUSED
+    return DeliveryOutcome.ERRORED
+
+
+def registered_sink_names() -> frozenset[str]:
+    """Return the closed set of sink names this module defines.
+
+    Derived by introspecting the module rather than hand-restated, so a sink
+    class added here joins the vocabulary without anyone remembering to update
+    a list -- the drift a mirrored tuple invites. A class qualifies when it is
+    defined in this module and carries both a string ``name`` and a callable
+    ``send``; :class:`AlertSink` itself is excluded because its ``name`` is an
+    annotation with no value.
+
+    Returns:
+        Every concrete sink's ``name``, as the vocabulary a chain-facing sink
+        identity is screened against.
+    """
+    names: set[str] = set()
+    for obj in list(globals().values()):
+        if not isinstance(obj, type) or obj.__module__ != __name__:
+            continue
+        name = getattr(obj, "name", None)
+        if isinstance(name, str) and callable(getattr(obj, "send", None)):
+            names.add(name)
+    return frozenset(names)
+
+
 class SinkSendError(Exception):
-    """Raised when an alert sink fails to deliver a message."""
+    """Raised when an alert sink fails to deliver a message.
+
+    Attributes:
+        outcome: The closed :class:`DeliveryOutcome` this failure is recorded
+            as. Carried on the exception -- rather than inferred later from its
+            message -- so the one description of the failure that reaches the
+            append-only ledger is chosen by the code that knows what happened.
+    """
+
+    def __init__(
+        self, message: str, *, outcome: DeliveryOutcome = DeliveryOutcome.ERRORED
+    ) -> None:
+        """Initialize the error with its message and closed outcome.
+
+        Args:
+            message: The human-readable failure detail. May contain arbitrary
+                transport text, including a full destination URL, so it is
+                never persisted to the hash-chained ledger.
+            outcome: The closed outcome this failure is recorded as. Defaults
+                to :attr:`DeliveryOutcome.ERRORED`, the fail-closed choice.
+        """
+        super().__init__(message)
+        self.outcome = outcome
 
 
 class AlertSink(Protocol):
@@ -215,14 +285,21 @@ def _send_http(
         headers: The request headers.
 
     Raises:
-        SinkSendError: If the transport raises or returns a non-2xx status.
+        SinkSendError: If the transport raises or returns a non-2xx status,
+            carrying the closed :class:`DeliveryOutcome` the failure is
+            recorded as -- ``REFUSED`` when the destination answered and
+            declined, otherwise whatever the raised exception's *type*
+            classifies to.
     """
     try:
         status = transport(url, body, headers)
     except Exception as exc:
-        raise SinkSendError(str(exc)) from exc
+        raise SinkSendError(str(exc), outcome=classify_transport_failure(exc)) from exc
     if not _HTTP_OK_MIN <= status < _HTTP_OK_EXCLUSIVE_MAX:
-        raise SinkSendError(f"transport for {url!r} returned status {status}")
+        raise SinkSendError(
+            f"transport for {url!r} returned status {status}",
+            outcome=DeliveryOutcome.REFUSED,
+        )
 
 
 #: The real HTTPS transport every network sink defaults to. Exposed under a
@@ -399,7 +476,9 @@ class SmtpSink:
         try:
             self._transport(self._config, email)
         except Exception as exc:
-            raise SinkSendError(str(exc)) from exc
+            raise SinkSendError(
+                str(exc), outcome=classify_transport_failure(exc)
+            ) from exc
 
     def _build_message(
         self, alert_type: AlertType, severity: AlertSeverity, message: str
