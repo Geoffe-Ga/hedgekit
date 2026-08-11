@@ -533,6 +533,75 @@ def test_an_unreadable_usage_block_charges_the_fail_closed_bound(
     assert result.cost_micros != _LIST_PRICE_MICROS
 
 
+def test_a_negative_reported_token_count_is_refused_at_construction() -> None:
+    """A negative token count is not a small bill -- it is a broken one.
+
+    `TokenUsage` is the only structural guard between a hostile or corrupt
+    envelope and the money path: a ``-1_000_000``-token response would other-
+    wise *subtract* a dollar from the day's spend, which is worse than free.
+    The exact message is asserted so the guard cannot be satisfied by a
+    same-typed error raised for a different reason.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        TokenUsage(input_tokens=-1, output_tokens=0)
+
+    assert type(excinfo.value) is ValueError
+    assert str(excinfo.value) == "input_tokens must be non-negative, got -1"
+
+
+def test_a_negative_output_token_count_is_refused_too() -> None:
+    """The output leg carries the same guard, named for its own field."""
+    with pytest.raises(ValueError) as excinfo:
+        TokenUsage(input_tokens=0, output_tokens=-7)
+
+    assert type(excinfo.value) is ValueError
+    assert str(excinfo.value) == "output_tokens must be non-negative, got -7"
+
+
+def test_a_boolean_cannot_masquerade_as_a_token_count() -> None:
+    """``bool`` is an ``int`` subclass and must never pass for a count."""
+    with pytest.raises(TypeError) as excinfo:
+        TokenUsage(input_tokens=True, output_tokens=0)
+
+    assert type(excinfo.value) is TypeError
+    assert str(excinfo.value) == "input_tokens must be a non-bool int, got bool"
+
+
+def test_a_cassette_recording_a_negative_count_fails_the_load(
+    tmp_path: Path,
+) -> None:
+    """The structural guard holds through the real replay path too.
+
+    `_recorded_usage` deliberately does not restate the non-negativity check --
+    it constructs a `TokenUsage`, and that type is where the rule lives. This
+    proves the rule actually reaches a cassette load rather than being a claim
+    only the constructor's own unit test can see.
+    """
+    cassette_path = tmp_path / "cassette.json"
+    cassette_path.write_text(
+        json.dumps(
+            {
+                "some-hash": {
+                    "request": {
+                        "provider": "openai",
+                        "model_version": "m",
+                        "prompt": "p",
+                    },
+                    "response": _VOTE_JSON,
+                    "usage": {"input_tokens": -4_000, "output_tokens": 500},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        ReplayCassette.from_path(cassette_path)
+
+    assert type(excinfo.value) is ValueError
+    assert str(excinfo.value) == "input_tokens must be non-negative, got -4000"
+
+
 def test_a_response_from_an_unrated_model_charges_the_fail_closed_bound(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
