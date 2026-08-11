@@ -42,6 +42,11 @@ from windbreak.evaluation.ingest import (
     resolutions_conflict,
 )
 from windbreak.evaluation.resolution import ResolutionOutcome
+from windbreak.evaluation.track_records import (
+    PROVIDER_TRACK_RECORD_FILENAME,
+    provider_track_records,
+    write_provider_track_records,
+)
 from windbreak.ledger import (
     AlertEmitted as LedgerAlertEmitted,
 )
@@ -74,6 +79,7 @@ if TYPE_CHECKING:
     from windbreak.connector.interface import MarketConnector
     from windbreak.connector.live import MarketDataSource
     from windbreak.dashboard.app import DashboardStatus
+    from windbreak.forecast.providers.track_record import ProviderTrackRecord
     from windbreak.ledger import Event, LedgerStore
     from windbreak.net.live_http import LiveHttpTransport
     from windbreak.riskkernel.kill import KillIntegration
@@ -580,6 +586,36 @@ def _add_set_research_budget_arguments(
     )
 
 
+def _add_evaluate_providers_arguments(
+    evaluate_parser: argparse.ArgumentParser,
+) -> None:
+    """Register the ``evaluate-providers`` subcommand's options (issue #440).
+
+    Both options are required and neither is created if missing. The verb's
+    whole job is to publish the artifact a *particular* loop's gate reads, so a
+    defaulted ledger or report directory would let it write a confident,
+    exit-0 track record that the running loop never reads.
+
+    Args:
+        evaluate_parser: The ``evaluate-providers`` subparser to populate.
+    """
+    evaluate_parser.add_argument(
+        "--ledger-path",
+        type=Path,
+        required=True,
+        help="Path to the existing SQLite ledger database to score.",
+    )
+    evaluate_parser.add_argument(
+        "--report-dir",
+        type=Path,
+        required=True,
+        help=(
+            "The existing evaluation-artifact directory the loop reads its "
+            f"{PROVIDER_TRACK_RECORD_FILENAME} from (the loop's --report-dir)."
+        ),
+    )
+
+
 def _add_kill_arguments(kill_parser: argparse.ArgumentParser) -> None:
     """Register the ``kill`` subcommand's options on its subparser.
 
@@ -708,7 +744,10 @@ def build_parser() -> argparse.ArgumentParser:
         anchor file); an ``ingest-resolution`` subcommand exposing
         ``--ledger-path``, ``--market-ticker``, ``--outcome``, ``--resolved-at``
         and ``--source`` (record that a market settled, so forecasts on it can
-        be scored); a ``set-research-budget`` subcommand exposing
+        be scored); an ``evaluate-providers`` subcommand exposing
+        ``--ledger-path`` and ``--report-dir`` (score each provider's resolved
+        forecasts into the live-eligibility gate's artifact, issue #440); a
+        ``set-research-budget`` subcommand exposing
         ``--ledger-path``, ``--per-day-micros`` and ``--note`` (change the
         per-UTC-day research spend ceiling on a running loop, issues #442/#483);
         ``kill`` and ``rearm`` subcommands exposing
@@ -752,6 +791,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers.add_parser(
             "set-research-budget",
             help="Change the per-UTC-day research spend ceiling, from now on.",
+        )
+    )
+    _add_evaluate_providers_arguments(
+        subparsers.add_parser(
+            "evaluate-providers",
+            help="Score each provider's resolved forecasts into the gate's artifact.",
         )
     )
     _add_kill_arguments(
@@ -1711,6 +1756,122 @@ def _run_ingest_resolution(args: argparse.Namespace) -> int:
         sequence_number,
     )
     return 0
+
+
+def _evaluate_providers_refusal(ledger_path: Path, report_dir: Path) -> str | None:
+    """Return why the provider-scoring pass cannot run, or ``None``.
+
+    Both refusals guard the same fail-open shape, in opposite directions.
+
+    An absent ``--ledger-path`` would be *created* empty by
+    :class:`~windbreak.ledger.store.SqliteLedgerStore`, fold to zero providers,
+    and exit 0 having written ``{}`` -- shutting a gate the operator believed
+    they were opening, on evidence from a ledger that is not the loop's.
+
+    An absent ``--report-dir`` would be a directory the loop never reads, so the
+    operator would be told a provider was proven while the running loop's gate
+    stayed in bootstrap forever. Neither is created here: creating one is
+    exactly how a typo becomes a confident, invisible success.
+
+    Args:
+        ledger_path: The ``--ledger-path`` value to check.
+        report_dir: The ``--report-dir`` value to check.
+
+    Returns:
+        The operator-facing refusal, or ``None`` when both paths are usable.
+    """
+    if ledger_path.is_dir():
+        return f"--ledger-path is a directory, not a ledger database: {ledger_path}"
+    if not ledger_path.exists():
+        return (
+            f"no ledger database at {ledger_path}: refusing to create one. An "
+            "empty ledger scores no provider at all, which would publish an "
+            "empty track record over whatever the loop's gate reads today."
+        )
+    if not report_dir.is_dir():
+        return (
+            f"no report directory at {report_dir}: refusing to create one. The "
+            "gate reads its artifact from the directory the loop was started "
+            "with, so a track record written anywhere else is never read."
+        )
+    return None
+
+
+def _run_evaluate_providers(args: argparse.Namespace) -> int:
+    """Score each provider's resolved forecasts into the provider gate's artifact.
+
+    The evaluation pass ``docs/RUNBOOK.md`` and ``EVALUATION.md`` have always
+    described and no code performed (issue #440). Until this verb existed,
+    ``provider-track-records.json`` was written by nothing at all, so
+    :func:`windbreak.scheduler.loop._build_provider_gate`'s documented
+    "bootstrap" -- every provider unproven -- was terminal rather than
+    transient, and no run of any length could ever lift the hold.
+
+    It reads the same hash-chained ledger the loop writes, folds the
+    ``MarketResolved`` rows an operator ingested through ``ingest-resolution``
+    against the ``ForecastCreated`` rows their markets settled, attributes each
+    forecast to the providers whose votes survived to back it, and writes the
+    strict-integer document the gate parses. Nothing optimistic is ever
+    written: a provider with no admitted resolved forecast, or an undefined
+    skill, is omitted, and omitted reads as unproven.
+
+    The gate is built once per process, so the loop picks the new artifact up
+    on its **next start** -- see ``docs/RUNBOOK.md``, "Prove a provider before
+    it can back a live order".
+
+    Args:
+        args: Parsed ``evaluate-providers`` arguments carrying ``ledger_path``
+            and ``report_dir``.
+
+    Returns:
+        The process exit code: 0 once the artifact is published, 1 on a refused
+        path or a ledger that cannot be folded (with the reason logged as a
+        ``FATAL`` critical, and nothing written).
+    """
+    refusal = _evaluate_providers_refusal(args.ledger_path, args.report_dir)
+    if refusal is not None:
+        _LOGGER.critical("FATAL: %s", refusal)
+        return 1
+    store = SqliteLedgerStore(args.ledger_path)
+    try:
+        records = provider_track_records(store.read_all())
+    except ValueError as exc:
+        _LOGGER.critical(
+            "FATAL: refusing to publish a track record from %s: %s Nothing was "
+            "written.",
+            args.ledger_path,
+            exc,
+        )
+        return 1
+    finally:
+        store.close()
+    artifact = write_provider_track_records(args.report_dir, records)
+    _LOGGER.info(
+        "provider track records published path=%s providers=%d summary=%s",
+        artifact,
+        len(records),
+        _track_record_summary(records),
+    )
+    return 0
+
+
+def _track_record_summary(records: tuple[ProviderTrackRecord, ...]) -> str:
+    """Render the published records for the verb's own log line.
+
+    Args:
+        records: The published track records, in document order.
+
+    Returns:
+        A ``provider=resolved/skill`` fragment per record, or an explicit
+        ``none`` -- never an empty string, which would read as a formatting
+        slip rather than as "no provider earned a record".
+    """
+    if not records:
+        return "none"
+    return " ".join(
+        f"{record.provider}={record.resolved_count}/{record.brier_skill_ppm}ppm"
+        for record in records
+    )
 
 
 def _existing_ledger_refusal(ledger_path: Path) -> str | None:
@@ -3232,6 +3393,7 @@ _COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "anchor": anchor_command,
     "verify": verify_command,
     "ingest-resolution": _run_ingest_resolution,
+    "evaluate-providers": _run_evaluate_providers,
     "set-research-budget": _run_set_research_budget,
     "kill": _run_kill,
     "ack": _run_ack,
