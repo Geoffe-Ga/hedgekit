@@ -602,6 +602,27 @@ def test_a_cassette_recording_a_negative_count_fails_the_load(
     assert str(excinfo.value) == "input_tokens must be non-negative, got -4000"
 
 
+def test_a_response_billing_only_output_tokens_is_still_metered(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """Zero on *one* leg is a measurement, not a missing one.
+
+    The unmeasurable rule is about a usage block reporting no tokens *at all*.
+    A block reporting zero input and real output has told us what it consumed,
+    so it is charged for it -- failing closed here would overcharge a response
+    that did in fact account for itself. Pins that the zero check reads the
+    summed count rather than either leg alone.
+    """
+    provider = _openai_vote(
+        _openai_body({"prompt_tokens": 0, "completion_tokens": 500})
+    )
+
+    result = provider.forecast(market, baseline, 0, ())
+
+    assert result.cost_micros == 5_000
+    assert result.cost_micros != _UNMETERED_MICROS
+
+
 def test_a_response_from_an_unrated_model_charges_the_fail_closed_bound(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
