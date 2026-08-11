@@ -55,6 +55,17 @@ What each test pins, and why it is shaped that way:
    rebuilt bundle over the same hash chain comes back `KILLED` even after the
    file is gone, and re-arms only on the phrase for the *replayed* kill
    sequence.
+7. `test_a_composed_kill_ledgers_the_same_delivery_evidence_on_both_alert_rows`
+   -- the two `AlertEmitted` rows one kill writes are payload-*identical*
+   (issue #488), so neither denies a delivery the other reports and an auditor
+   needs no undocumented convention to pick between them. Read back through a
+   second connection to the file, chain verified, because that is what an
+   auditor gets rather than the handle the run left open.
+8. `test_a_composed_kill_whose_sink_fails_ledgers_the_fallback_not_its_text` --
+   the same rule on the unhappy path, where a `deliveries: []` row would be
+   indistinguishable from the truth, plus the closure guarantee: the raised
+   `str(exc)` never reaches `ledger.db` or its WAL sidecar and the delivery
+   mappings carry no fourth key.
 
 Deliberately not covered here, and stated so the omission is a decision rather
 than an oversight: the one `CancelAllDirective` a kill ledgers is not delivered
@@ -75,6 +86,7 @@ import pytest
 from tests.integration.conftest import FIXED_NOW_EPOCH_S, ledger_path_for
 from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.alerts.registry import AlertSeverity, AlertType
+from windbreak.ledger.store import SqliteLedgerStore
 from windbreak.numeric.types import MoneyMicros
 from windbreak.riskkernel.modes import Mode
 
@@ -98,6 +110,39 @@ _KILL_MESSAGE = "kill switch engaged; trading halted, positions held"
 #: The exact scope the one kill-path `CancelAllDirective` carries: resting
 #: orders only, never open positions (the SPEC S10.12 position-hold invariant).
 _CANCEL_ALL_SCOPE = "all_open_orders"
+
+#: The credential-bearing text an exploding sink raises, standing in for the
+#: whole category issue #274 leaked: an ntfy destination URL whose topic
+#: segment *is* the capability to page this deployment. `SinkOutcome.detail` is
+#: `str(exc)`, so this is exactly the string a careless ledger projection would
+#: hash into an unredactable chain.
+_SINK_FAILURE_DETAIL = "POST https://ntfy.example/s3kr1t-488-topic refused"
+
+#: The screened identity a sink whose `name` is not one this codebase defines
+#: is recorded under. The suite's doubles are named `recording`, which is not a
+#: registered sink, so every configured-sink row here reads as this token.
+_UNREGISTERED = "unregistered"
+
+#: The one delivery a kill's dispatch records when its single configured sink
+#: accepts the page: screened identity, enumerated outcome, not the fallback.
+_DELIVERED_BY_CONFIGURED_SINK = {
+    "sink": _UNREGISTERED,
+    "outcome": "delivered",
+    "fallback": False,
+}
+
+#: The two deliveries a kill's dispatch records when its single configured sink
+#: raises: the configured sink's classified failure, then the `log-only`
+#: fallback that carried the page instead. `fallback: True` is the difference
+#: between "the operator configured log-only" and "every real channel failed".
+_DELIVERIES_AFTER_A_FAILED_SINK = [
+    {"sink": _UNREGISTERED, "outcome": "errored", "fallback": False},
+    {"sink": "log-only", "outcome": "delivered", "fallback": True},
+]
+
+#: The exact key set a ledgered delivery mapping may carry. There is no fourth
+#: key, and in particular no `detail` (issues #274/#413).
+_DELIVERY_KEYS = {"sink", "outcome", "fallback"}
 
 
 @dataclass
@@ -124,6 +169,41 @@ class _RecordingSink:
             message: The alert body.
         """
         self.delivered.append((alert_type, severity, message))
+
+
+@dataclass
+class _ExplodingSink:
+    """An `AlertSink` double that always raises token-bearing text.
+
+    The unhappy half of the delivery record. Its exception message is the
+    `str(exc)` that becomes `SinkOutcome.detail`, so it is simultaneously the
+    thing the ledger must *summarise* (as an enumerated `errored`) and the
+    thing the ledger must never *contain*.
+
+    Attributes:
+        name: The sink's identifier, as the `AlertSink` protocol requires.
+        attempts: One `(type, severity, message)` triple per attempt, so a sink
+            that was never reached is distinguishable from one that failed.
+    """
+
+    name: str = "recording"
+    attempts: list[tuple[AlertType, AlertSeverity, str]] = field(default_factory=list)
+
+    def send(
+        self, alert_type: AlertType, severity: AlertSeverity, message: str
+    ) -> None:
+        """Record the attempt, then fail it with credential-bearing detail.
+
+        Args:
+            alert_type: The dispatched alert type.
+            severity: The alert's severity.
+            message: The alert body.
+
+        Raises:
+            RuntimeError: Always, carrying :data:`_SINK_FAILURE_DETAIL`.
+        """
+        self.attempts.append((alert_type, severity, message))
+        raise RuntimeError(_SINK_FAILURE_DETAIL)
 
 
 def _fixed_clock() -> int:
@@ -264,6 +344,57 @@ def _alert_rows(deps: PaperTickDeps) -> list[tuple[str, str, str]]:
         for record in deps.store.read_all()
         if record.event_type == "AlertEmitted"
     ]
+
+
+def _alert_rows_off_disk(ledger_path: Path) -> list[tuple[str, dict[str, Any]]]:
+    """Reopen the ledger *file* and return every `AlertEmitted` row, in order.
+
+    Deliberately a second connection rather than `deps.store`: the assertion an
+    auditor's reading has to survive is the one made against the database on
+    disk, not against the handle the run happened to leave open. The chain is
+    verified before anything is read, so a row that was appended out of chain
+    fails here rather than being quietly projected.
+
+    Args:
+        ledger_path: The ledger database the run was given.
+
+    Returns:
+        One `(component, payload-data)` pair per `AlertEmitted` row, in ledger
+        order. The component is kept because it is the *only* field the two
+        rows one kill writes differ by.
+    """
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        store.verify_chain()
+        records = store.read_all()
+    finally:
+        store.close()
+    return [
+        (str(record.component), dict(json.loads(record.payload_json)["data"]))
+        for record in records
+        if record.event_type == "AlertEmitted"
+    ]
+
+
+def _ledger_file_bytes(ledger_path: Path) -> bytes:
+    """Return every byte of the ledger database *and* its SQLite sidecars.
+
+    The store is WAL-journaled, so a freshly appended row lives in
+    `ledger.db-wal` and not yet in `ledger.db`. A sweep that read only the
+    latter would scan a file the new rows are not in and pass forever -- the
+    false green a secrets test hit in PR #474.
+
+    Args:
+        ledger_path: The ledger database the run was given.
+
+    Returns:
+        The concatenation of `ledger.db` and every `ledger.db*` sidecar, in
+        sorted name order.
+    """
+    return b"".join(
+        path.read_bytes()
+        for path in sorted(ledger_path.parent.glob(f"{ledger_path.name}*"))
+    )
 
 
 def _count_of(deps: PaperTickDeps, event_type: str) -> int:
@@ -871,3 +1002,180 @@ def test_an_engaged_kill_survives_a_restart_with_the_kill_file_deleted(
     assert captured_deps[1].kernel.mode is Mode.PAUSED
     assert _payloads_of(captured_deps[1], "KillReArmed") == [{"kill_sequence": 1}]
     assert _count_of(captured_deps[1], "MarketSnapshotRecorded") == 2
+
+
+def test_a_composed_kill_ledgers_the_same_delivery_evidence_on_both_alert_rows(
+    books_dir: Path,
+    captured_deps: list[PaperTickDeps],
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Neither `AlertEmitted` row a kill writes denies the delivery (issue #488).
+
+    One kill appends *two* `AlertEmitted` rows to the one chain, and both are
+    load-bearing: the run's alert root ledgers the dispatch under the
+    `--process` token, and `KillSwitch.kill` ledgers its own tamper-evident
+    audit row under `riskkernel` after every fail-safe effect has landed
+    (issue #287). Removing either would regress a landed guarantee, so two rows
+    stay -- and the reader therefore needs a rule for which one to believe.
+
+    The rule pinned here is the strongest available and the only one that needs
+    no convention at all: **the two rows carry byte-identical payloads**, so
+    either is authoritative and `component` records provenance rather than
+    precedence. That holds by construction -- both project the *same*
+    `AlertEmitted` object through `ledger_deliveries`, the single producer of
+    ledgered delivery evidence -- and it is asserted here rather than merely
+    documented, because a convention an auditor has to be told is not a rule
+    the chain enforces.
+
+    Before issue #488, `LedgerAlertWriter` dropped the report it was handed and
+    stamped `deliveries: []`, `delivery_reported: false` -- not the silence a
+    schema-1 row kept, but an explicit denial of evidence that was sitting in
+    its own parameter. An auditor scanning by `event_type` rather than by
+    `component` read a false negative for the very page that was delivered.
+
+    Read off disk through a second connection, chain verified, because that is
+    what an auditor gets.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        captured_deps: Captures the bundle the composition root builds.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used to make `build_sinks` yield the recording sink.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory.
+        state_dir: The kill/re-arm state directory `paper_config` points at.
+        tmp_path: The per-test scratch directory.
+    """
+    from windbreak.main import main
+
+    sink = _RecordingSink()
+    monkeypatch.setattr("windbreak.main.build_sinks", lambda *_a, **_k: (sink,))
+    ledger_path = ledger_path_for(tmp_path)
+    args = _paper_args(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path,
+        report_dir=report_dir,
+    )
+
+    def _operator_kills(seq: int) -> None:
+        """Run the real `windbreak kill` CLI once, after the first beat.
+
+        Args:
+            seq: The just-finished beat's sequence number.
+        """
+        if seq == 1:
+            assert main(["kill", "--state-dir", str(state_dir)]) == 0
+
+    modes = _run_beats(args, paper_config, beats=2, between_beats=_operator_kills)
+
+    delivered_payload = {
+        "severity": AlertSeverity.CRITICAL.value,
+        "message": _KILL_MESSAGE,
+        "deliveries": [_DELIVERED_BY_CONFIGURED_SINK],
+        "delivery_reported": True,
+    }
+    rows = _alert_rows_off_disk(ledger_path)
+    assert modes == ["PAPER", "KILLED"]
+    assert captured_deps[0].kernel.mode is Mode.KILLED
+    assert sink.delivered == [
+        (AlertType.HALT_KILL, AlertSeverity.CRITICAL, _KILL_MESSAGE)
+    ]
+    assert rows == [
+        ("pipeline", delivered_payload),
+        ("riskkernel", delivered_payload),
+    ]
+
+
+def test_a_composed_kill_whose_sink_fails_ledgers_the_fallback_not_its_text(
+    books_dir: Path,
+    captured_deps: list[PaperTickDeps],
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """The page that reached nobody real says so, in the closed vocabulary.
+
+    The auditor's case that actually matters, and the one a `deliveries: []`
+    row is indistinguishable from. The single configured sink raises, so the
+    `log-only` fallback carries the kill page instead; both rows must record
+    that -- `errored` for the configured sink, `delivered`/`fallback: true` for
+    the fallback -- and both must record it *identically*, so the two-row
+    reading rule holds on the unhappy path too and not only when everything
+    worked.
+
+    It is also the proof that forwarding the report did not widen what reaches
+    the chain. `SinkOutcome.detail` is `str(exc)`, the shape that leaked whole
+    token-bearing URLs in issue #274, and a hash chain can never be redacted.
+    So the raised text is swept for across `ledger.db` *and* its WAL sidecar,
+    and every delivery mapping's key set is pinned closed -- no `detail`, no
+    fourth key. The sweep carries its own positive control: the kill message is
+    asserted *present* in the same bytes, so a sweep that was scanning an empty
+    or wrong corpus fails rather than passing forever.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        captured_deps: Captures the bundle the composition root builds.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used to make `build_sinks` yield the exploding sink.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory.
+        state_dir: The kill/re-arm state directory `paper_config` points at.
+        tmp_path: The per-test scratch directory.
+    """
+    from windbreak.main import main
+
+    sink = _ExplodingSink()
+    monkeypatch.setattr("windbreak.main.build_sinks", lambda *_a, **_k: (sink,))
+    ledger_path = ledger_path_for(tmp_path)
+    args = _paper_args(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path,
+        report_dir=report_dir,
+    )
+
+    def _operator_kills(seq: int) -> None:
+        """Run the real `windbreak kill` CLI once, after the first beat.
+
+        Args:
+            seq: The just-finished beat's sequence number.
+        """
+        if seq == 1:
+            assert main(["kill", "--state-dir", str(state_dir)]) == 0
+
+    modes = _run_beats(args, paper_config, beats=2, between_beats=_operator_kills)
+
+    failed_payload = {
+        "severity": AlertSeverity.CRITICAL.value,
+        "message": _KILL_MESSAGE,
+        "deliveries": _DELIVERIES_AFTER_A_FAILED_SINK,
+        "delivery_reported": True,
+    }
+    rows = _alert_rows_off_disk(ledger_path)
+    on_disk = _ledger_file_bytes(ledger_path)
+    assert modes == ["PAPER", "KILLED"]
+    assert captured_deps[0].kernel.mode is Mode.KILLED
+    assert sink.attempts == [
+        (AlertType.HALT_KILL, AlertSeverity.CRITICAL, _KILL_MESSAGE)
+    ]
+    assert rows == [
+        ("pipeline", failed_payload),
+        ("riskkernel", failed_payload),
+    ]
+    assert [
+        set(delivery)
+        for _component, payload in rows
+        for delivery in payload["deliveries"]
+    ] == [_DELIVERY_KEYS, _DELIVERY_KEYS, _DELIVERY_KEYS, _DELIVERY_KEYS]
+    assert _KILL_MESSAGE.encode() in on_disk
+    assert _SINK_FAILURE_DETAIL.encode() not in on_disk
+    assert b"s3kr1t-488" not in on_disk
