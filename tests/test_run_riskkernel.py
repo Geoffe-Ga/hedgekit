@@ -1298,3 +1298,58 @@ def test_build_risk_kernel_delivers_the_cancel_all_to_the_venue_connector(
     assert integration.switch.mode is Mode.KILLED
     assert tuple(connector.cancelled) == _RESTING_ORDER_IDS
     assert connector.get_open_orders() == ()
+
+
+def test_build_risk_kernel_with_no_connector_ledgers_an_unknown_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    """No venue surface is an *unknown* cancel-all, never a failed one (#480).
+
+    `windbreak run --process riskkernel` holds no order gateway and never
+    places an order, so without `--snapshot-fixture-dir` it has nothing to
+    deliver a cancel-all *to*. The honest record of that is
+    `delivery_reported: false` with an empty `delivery` -- the fail-closed
+    unknown issue #413 established for alerts -- and an unchanged `HALT_KILL`
+    body, because the base body never claims a cancellation happened and so its
+    silence asserts nothing false.
+
+    The distinction this pins is not cosmetic. Wiring a sink over a `None`
+    connector unconditionally would produce an `errored` outcome and a page
+    announcing a failed cancellation on every single kill of every deployment
+    that runs without a fixture dir -- crying wolf on the one page an operator
+    must be able to trust, for a venue that was never there.
+
+    Args:
+        tmp_path: The per-test scratch directory rooting the ledger and state
+            dir.
+    """
+    ledger_path = tmp_path / "ledger.db"
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        _kernel, integration = _build_risk_kernel(
+            _config_with_state_dir(tmp_path / "state"), ledger_store=store
+        )
+        integration.switch.kill(KillTrigger.CLI)
+    finally:
+        store.close()
+
+    reopened = SqliteLedgerStore(ledger_path)
+    try:
+        reopened.verify_chain()
+        records = reopened.read_all()
+    finally:
+        reopened.close()
+    payloads = [
+        json.loads(record.payload_json)["data"]
+        for record in records
+        if record.event_type == "CancelAllDirective"
+    ]
+    alert_bodies = [
+        json.loads(record.payload_json)["data"]["message"]
+        for record in records
+        if record.event_type == "AlertEmitted"
+    ]
+    assert payloads == [
+        {"scope": "all_open_orders", "delivery": {}, "delivery_reported": False}
+    ]
+    assert alert_bodies == ["kill switch engaged; trading halted, positions held"]
