@@ -37,10 +37,17 @@ the live branch is the only place a live transport is ever constructed, and it
 always wraps. That is load-bearing for cost correctness, not just for retries.
 The wrapped :class:`~windbreak.forecast.providers.fixture.FixtureVoteProvider`
 reports ``cost_micros == 0`` -- truthfully for a replay, which spends nothing,
-and unavoidably for a live call, since ``LlmTransport.complete`` returns bare
-completion text carrying no token accounting to price from. The retry wrapper
-is therefore the *only* layer that can book a live vote's cost, and a live
-provider built without it would book every successful vote at zero.
+and by design for a live call, since that provider *measures* (it threads the
+transport's reported token usage onto the forecast) but never prices. The retry
+wrapper is therefore the only layer that turns a live vote into money, and a
+live provider built without it would book every successful vote at zero.
+
+Since issue #451 that wrapper needs two tables, not one, and
+:func:`build_provider_factory` supplies both:
+:func:`price_table_from_config` for the per-attempt affordability estimate the
+pre-gate runs on, and :func:`rate_table_from_config` for the per-model token
+rates a completed vote's reported usage is actually charged at. Wiring only the
+first would restore the flat per-attempt charge issue #451 removed.
 
 This module is on the money path (``scripts/lint_no_floats.py`` guards
 ``windbreak/scheduler``), so it is float-free: the retry schedule is whole
@@ -59,7 +66,11 @@ from windbreak.config.schema import (
     PROVIDER_TRANSPORT_CASSETTE,
     PROVIDER_TRANSPORT_LIVE,
 )
-from windbreak.forecast.budget import ProviderPriceTable
+from windbreak.forecast.budget import (
+    ModelRateTable,
+    ModelTokenRate,
+    ProviderPriceTable,
+)
 from windbreak.forecast.providers import (
     ANTHROPIC_MESSAGES_ENDPOINT,
     OPENAI_CHAT_ENDPOINT,
@@ -423,6 +434,35 @@ def price_table_from_config(config: WindbreakConfig) -> ProviderPriceTable:
     )
 
 
+def rate_table_from_config(config: WindbreakConfig) -> ModelRateTable:
+    """Build the fail-closed per-model metered-cost table from config (#451).
+
+    Args:
+        config: The active configuration supplying the token rates.
+
+    Returns:
+        The configured :class:`~windbreak.forecast.budget.ModelRateTable`.
+
+    Raises:
+        ValueError: If any configured token rate, or the unmetered fallback, is
+            below one micro -- a zero-rated model would bill nothing however
+            many tokens it consumed, which is the unbounded-spend hole metering
+            exists to close.
+    """
+    transport = config.forecast.provider_transport
+    return ModelRateTable(
+        rates={
+            price.model_version: ModelTokenRate(
+                model_version=price.model_version,
+                input_micros_per_million_tokens=price.input_micros_per_million_tokens,
+                output_micros_per_million_tokens=price.output_micros_per_million_tokens,
+            )
+            for price in transport.token_prices
+        },
+        unmetered_micros=transport.unmetered_response_micros,
+    )
+
+
 def build_provider_factory(config: WindbreakConfig, *, live: bool) -> ProviderFactory:
     """Build the per-member vote-provider factory the pipeline drives.
 
@@ -431,9 +471,10 @@ def build_provider_factory(config: WindbreakConfig, *, live: bool) -> ProviderFa
     pipeline would have built for itself, so the offline path stays
     byte-identical. In live mode every member is additionally wrapped in a
     :class:`~windbreak.forecast.providers.retry.RetryingProvider` carrying the
-    configured policy, the configured price table, and the real
-    integer-millisecond clock/sleep pair -- see this module's docstring for why
-    the wrap is deliberately live-only.
+    configured policy, the configured price table, the configured per-model
+    token rate table (issue #451), and the real integer-millisecond clock/sleep
+    pair -- see this module's docstring for why the wrap is deliberately
+    live-only.
 
     The completion transport is taken *per call* rather than captured here, so
     the factory stays a policy ("how a vote is wrapped") rather than a closure
@@ -454,6 +495,7 @@ def build_provider_factory(config: WindbreakConfig, *, live: bool) -> ProviderFa
         return lambda transport, member: FixtureVoteProvider(transport, member)
     policy = retry_policy_from_config(config)
     price_table = price_table_from_config(config)
+    rate_table = rate_table_from_config(config)
 
     def _live_provider(
         transport: LlmTransport, member: EnsembleMemberLike
@@ -472,6 +514,7 @@ def build_provider_factory(config: WindbreakConfig, *, live: bool) -> ProviderFa
             provider_name=member.provider,
             policy=policy,
             price_table=price_table,
+            rate_table=rate_table,
             monotonic_ms=monotonic_ms,
             sleep_ms=sleep_ms,
         )

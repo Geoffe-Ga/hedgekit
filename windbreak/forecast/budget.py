@@ -235,6 +235,170 @@ class ProviderPriceTable:
 #: priced high, never free, so an unpriced provider cannot evade its budget.
 DEFAULT_UNKNOWN_PROVIDER_PRICE_MICROS: Final = 1_000_000
 
+
+@dataclass(frozen=True, slots=True)
+class TokenUsage:
+    """One response's provider-reported token accounting (issue #451).
+
+    The measured quantity a metered charge is derived from, carried verbatim
+    from the provider's own ``usage`` block. Both counts are whole tokens --
+    every provider reports them as integers, so nothing on this path needs a
+    float, and a fractional count would be evidence the envelope was
+    misparsed rather than a quantity to round.
+
+    Absence is modelled by the *absence of this object* (a ``None`` usage), not
+    by a zero-filled one: a response whose usage cannot be read is unpriceable
+    and must fail closed to :attr:`ModelRateTable.unmetered_micros`, whereas a
+    ``TokenUsage(0, 0)`` would otherwise price it at nothing.
+
+    Attributes:
+        input_tokens: Prompt (input) tokens the provider reported billing.
+        output_tokens: Completion (output) tokens the provider reported billing.
+    """
+
+    input_tokens: int
+    output_tokens: int
+
+    def __post_init__(self) -> None:
+        """Validate both counts are non-negative, non-``bool`` integers.
+
+        Raises:
+            TypeError: If either count is a ``bool`` or not an ``int``. A
+                ``bool`` is an ``int`` subclass and must never masquerade as a
+                token count.
+            ValueError: If either count is negative.
+        """
+        for field_name, value in (
+            ("input_tokens", self.input_tokens),
+            ("output_tokens", self.output_tokens),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                msg = f"{field_name} must be a non-bool int, got {type(value).__name__}"
+                raise TypeError(msg)
+            _require_non_negative(value, field_name)
+
+    @property
+    def total_tokens(self) -> int:
+        """Return the summed input and output token counts."""
+        return self.input_tokens + self.output_tokens
+
+
+#: The denominator every per-token rate is quoted over. Rates are expressed as
+#: *micros per million tokens* rather than micros per token because that is the
+#: unit vendors publish and, decisively, the only one that stays an exact
+#: integer: OpenAI's ``$1.25 / 1M`` input rate is ``1.25`` micros per token --
+#: unrepresentable on this fixed-point money path -- but exactly ``1_250_000``
+#: micros per million tokens.
+MICROS_PER_MILLION_TOKENS_DENOMINATOR: Final = 1_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTokenRate:
+    """One model's published input/output token rates (issue #451).
+
+    Both rates are validated strictly positive for the same fail-closed reason
+    :func:`_require_positive_micros` exists: a zero-rated model would bill
+    nothing however many tokens it consumed, which is precisely the
+    unbounded-spend hole a metered charge exists to close.
+
+    Attributes:
+        model_version: The pinned model version these rates price.
+        input_micros_per_million_tokens: The input (prompt) token rate, in
+            micros per million tokens.
+        output_micros_per_million_tokens: The output (completion) token rate, in
+            micros per million tokens.
+    """
+
+    model_version: str
+    input_micros_per_million_tokens: int
+    output_micros_per_million_tokens: int
+
+    def __post_init__(self) -> None:
+        """Validate both rates are strictly positive.
+
+        Raises:
+            ValueError: If either rate is below ``1`` micro per million tokens.
+        """
+        _require_positive_micros(
+            self.input_micros_per_million_tokens,
+            f"input_micros_per_million_tokens[{self.model_version!r}]",
+        )
+        _require_positive_micros(
+            self.output_micros_per_million_tokens,
+            f"output_micros_per_million_tokens[{self.model_version!r}]",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRateTable:
+    """A fail-closed per-model metered-cost table (issue #451).
+
+    Turns a response's reported :class:`TokenUsage` into micros at the rates
+    configured for the model that produced it. Three distinct situations are
+    all "this response's cost is not knowable", and all three charge
+    :attr:`unmetered_micros` rather than anything derived:
+
+    * the response carried no usage block, or one that could not be parsed
+      (``usage is None``);
+    * the producing model has no configured rate;
+    * the usage block parsed but reports **zero** total tokens. A completion
+      that billed no tokens at all did not happen; treating that as a free
+      call would hand any provider a one-field way to bill nothing.
+
+    :attr:`unmetered_micros` is deliberately *not* the provider's list price
+    (that would restore exactly the flat charge issue #451 removed) and
+    deliberately never zero.
+
+    Attributes:
+        rates: The per-model-version token rates.
+        unmetered_micros: The fail-closed charge for a response whose cost
+            cannot be derived, in micros.
+    """
+
+    rates: Mapping[str, ModelTokenRate]
+    unmetered_micros: int
+
+    def __post_init__(self) -> None:
+        """Validate the fail-closed charge is positive.
+
+        Each :class:`ModelTokenRate` validates its own rates at construction,
+        so this checks only the table-level fallback.
+
+        Raises:
+            ValueError: If ``unmetered_micros`` is below ``1`` micro.
+        """
+        _require_positive_micros(self.unmetered_micros, "unmetered_micros")
+
+    def micros_for(self, *, model_version: str, usage: TokenUsage | None) -> int:
+        """Return what one response cost, in micros.
+
+        The single rounding decision on this path is a ceiling
+        (:attr:`~windbreak.numeric.rounding.RoundingDirection.OVERSTATE_COST`)
+        over the *summed* token value, so a partial micro is resolved against
+        the operator and in favour of the guard: the budget can only ever
+        believe a vote cost slightly more than it did, never less, and the
+        ceiling therefore binds a hair early rather than a hair late.
+
+        Args:
+            model_version: The producing model's pinned version (keyword-only).
+            usage: The response's reported token accounting, or ``None`` when
+                the response carried none (keyword-only).
+
+        Returns:
+            The metered cost in micros, or :attr:`unmetered_micros` when the
+            cost cannot be derived.
+        """
+        rate = self.rates.get(model_version)
+        if usage is None or rate is None or usage.total_tokens == 0:
+            return self.unmetered_micros
+        return divide(
+            usage.input_tokens * rate.input_micros_per_million_tokens
+            + usage.output_tokens * rate.output_micros_per_million_tokens,
+            MICROS_PER_MILLION_TOKENS_DENOMINATOR,
+            rounding=RoundingDirection.OVERSTATE_COST,
+        )
+
+
 #: Per-attempt list price for the OpenAI provider, in micros.
 _OPENAI_PROVIDER_PRICE_MICROS: Final = 200_000
 
@@ -259,6 +423,51 @@ DEFAULT_PROVIDER_PRICE_TABLE: Final[ProviderPriceTable] = ProviderPriceTable(
         "futuresearch": _FUTURESEARCH_PROVIDER_PRICE_MICROS,
     },
     unknown_provider_price_micros=DEFAULT_UNKNOWN_PROVIDER_PRICE_MICROS,
+)
+
+#: The fail-closed charge for a response whose cost cannot be derived, in
+#: micros. Derived rather than invented: it is exactly
+#: :data:`DEFAULT_PER_MEMBER_VOTE_CEILING_MICROS`, the whole retry allowance one
+#: ensemble member may spend. If a response will not say what it cost, the only
+#: honest assumption is that it spent everything the member was allowed to --
+#: which is also what makes the failure *recoverable* rather than fatal: one
+#: unmetered vote is affordable and books its full allowance, a second attempt
+#: on the same member is refused by the affordability pre-gate, and configuring
+#: the model's rates restores normal metering. It is deliberately unequal to any
+#: per-attempt list price, so a fail-closed charge can never be mistaken for a
+#: metered one.
+DEFAULT_UNMETERED_RESPONSE_MICROS: Final = DEFAULT_PER_MEMBER_VOTE_CEILING_MICROS
+
+#: The pinned default per-model token rates, covering exactly the three models
+#: :data:`windbreak.forecast.providers.DEFAULT_VOTE_ENSEMBLE` pins, at their
+#: vendors' published list rates in micros per million tokens. A model absent
+#: from this table is not free: it charges
+#: :data:`DEFAULT_UNMETERED_RESPONSE_MICROS`.
+#:
+#: NOTE: sourcing these rates from ``windbreak.config`` is the composition
+#: root's job (``windbreak.scheduler.provider_wiring.rate_table_from_config``);
+#: it is deliberately NOT wired to ``config.schema`` here, exactly as with
+#: :data:`DEFAULT_PROVIDER_PRICE_TABLE` (SPEC S8.3 keeps the forecast engine
+#: free of any config import).
+DEFAULT_MODEL_RATE_TABLE: Final[ModelRateTable] = ModelRateTable(
+    rates={
+        "gpt-5-2025-08-07": ModelTokenRate(
+            model_version="gpt-5-2025-08-07",
+            input_micros_per_million_tokens=1_250_000,
+            output_micros_per_million_tokens=10_000_000,
+        ),
+        "gpt-5-mini-2025-08-07": ModelTokenRate(
+            model_version="gpt-5-mini-2025-08-07",
+            input_micros_per_million_tokens=250_000,
+            output_micros_per_million_tokens=2_000_000,
+        ),
+        "claude-sonnet-4-5-20250929": ModelTokenRate(
+            model_version="claude-sonnet-4-5-20250929",
+            input_micros_per_million_tokens=3_000_000,
+            output_micros_per_million_tokens=15_000_000,
+        ),
+    },
+    unmetered_micros=DEFAULT_UNMETERED_RESPONSE_MICROS,
 )
 
 

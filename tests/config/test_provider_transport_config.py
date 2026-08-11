@@ -34,7 +34,10 @@ from windbreak.config.schema import (
     WindbreakConfig,
 )
 from windbreak.config.versioning import flatten
-from windbreak.forecast.budget import DEFAULT_PROVIDER_PRICE_TABLE
+from windbreak.forecast.budget import (
+    DEFAULT_MODEL_RATE_TABLE,
+    DEFAULT_PROVIDER_PRICE_TABLE,
+)
 from windbreak.forecast.providers.retry import (
     DEFAULT_BACKOFF_BASE_MS,
     DEFAULT_MAX_ATTEMPTS,
@@ -86,6 +89,74 @@ def test_price_defaults_cover_exactly_the_live_routable_providers() -> None:
     configured = {price.provider for price in ProviderTransportConfig().prices}
 
     assert configured == routable_live_providers()
+
+
+def test_token_rate_defaults_mirror_the_engines_own_rate_table() -> None:
+    """The config-sourced per-model token rates equal the engine's own (#451).
+
+    Derived from both tables rather than restated, so a model added to either
+    one cannot slip past this comparison.
+    """
+    configured = {
+        price.model_version: (
+            price.input_micros_per_million_tokens,
+            price.output_micros_per_million_tokens,
+        )
+        for price in ProviderTransportConfig().token_prices
+    }
+    engine = {
+        model_version: (
+            rate.input_micros_per_million_tokens,
+            rate.output_micros_per_million_tokens,
+        )
+        for model_version, rate in DEFAULT_MODEL_RATE_TABLE.rates.items()
+    }
+
+    assert configured == engine
+
+
+def test_token_rate_defaults_cover_every_default_ensemble_model() -> None:
+    """Every pinned vote model ships with a rate, so none is unmeasurable.
+
+    A model absent here is charged the fail-closed ``unmetered_response_micros``
+    on every vote -- correct, but it would make an out-of-the-box live run
+    expensive for a reason no operator asked for.
+    """
+    from windbreak.config.schema import ForecastConfig
+
+    rated = {price.model_version for price in ProviderTransportConfig().token_prices}
+    ensemble = {member.model_version for member in ForecastConfig().vote_ensemble}
+
+    assert ensemble != set()
+    assert ensemble <= rated
+
+
+def test_the_unmetered_response_charge_mirrors_the_engines_own() -> None:
+    """An unmeasurable response stays conservatively charged, never free."""
+    assert (
+        ProviderTransportConfig().unmetered_response_micros
+        == DEFAULT_MODEL_RATE_TABLE.unmetered_micros
+    )
+
+
+def test_every_configured_token_rate_is_strictly_positive() -> None:
+    """A zero-rated model would bill nothing however many tokens it burned."""
+    for price in ProviderTransportConfig().token_prices:
+        assert price.input_micros_per_million_tokens > 0
+        assert price.output_micros_per_million_tokens > 0
+
+
+def test_the_unmetered_charge_is_no_configured_list_price() -> None:
+    """The fail-closed charge must not be mistakable for a metered one.
+
+    Issue #451's criterion 3 says an unmeasurable response charges neither zero
+    nor the flat list price. Equality with a list price would make the two
+    indistinguishable in any ledger row.
+    """
+    transport = ProviderTransportConfig()
+    list_prices = {price.price_micros for price in transport.prices}
+
+    assert transport.unmetered_response_micros not in list_prices
 
 
 def test_unknown_provider_fallback_price_mirrors_the_engines_own() -> None:

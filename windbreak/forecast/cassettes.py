@@ -18,6 +18,23 @@ the three modes the tests exercise:
 Request hashing uses the ledger's canonical JSON form (sorted keys, no-space
 separators) over sha256, re-implemented here with only the standard library
 so this module stays dependency-free and float-free.
+
+THE SEAM CARRIES TOKEN ACCOUNTING (issue #451)
+
+:meth:`LlmTransport.complete` returns a :class:`Completion` -- the response text
+*and* the provider's reported :class:`~windbreak.forecast.budget.TokenUsage` --
+rather than bare text. It returned bare text until issue #451, and that was the
+structural reason a live vote could only ever be charged a flat per-attempt list
+price: no layer above the transport had a token count to price from, so the
+budget's ceilings bounded a count of attempts rather than spend.
+
+Usage rides through record/replay for the same reason the response text does.
+:class:`RecordingCassette` writes the reported counts into each cassette entry
+and :class:`ReplayCassette` serves them back, so a replayed run reproduces the
+recorded run's cost exactly instead of the meter being special-cased offline.
+An entry recorded before this field existed (or one whose provider reported no
+usage) replays with ``usage=None``, which the rate table charges its fail-closed
+unmetered figure -- never zero.
 """
 
 from __future__ import annotations
@@ -27,8 +44,18 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Protocol
 
+from windbreak.forecast.budget import TokenUsage
+
 if TYPE_CHECKING:
     from pathlib import Path
+
+#: Cassette-entry keys. ``response`` is the pre-#451 text leaf, kept verbatim so
+#: an older cassette loads unchanged; ``usage`` is the optional sibling issue
+#: #451 adds.
+_RESPONSE_KEY = "response"
+_USAGE_KEY = "usage"
+_INPUT_TOKENS_KEY = "input_tokens"
+_OUTPUT_TOKENS_KEY = "output_tokens"
 
 
 class CassetteMissError(Exception):
@@ -89,17 +116,35 @@ class LlmRequest:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class Completion:
+    """One LLM completion: its text plus what the provider says it cost.
+
+    Attributes:
+        text: The completion response text, verbatim.
+        usage: The provider's reported token accounting, or ``None`` when the
+            response carried none, carried none in a readable form, or came
+            from a transport that has no billing to report (a replayed
+            cassette recorded before issue #451). ``None`` means *unknown*, and
+            :meth:`windbreak.forecast.budget.ModelRateTable.micros_for` charges
+            it the fail-closed unmetered figure rather than zero.
+    """
+
+    text: str
+    usage: TokenUsage | None = None
+
+
 class LlmTransport(Protocol):
     """The seam through which a single LLM completion is obtained."""
 
-    def complete(self, request: LlmRequest) -> str:
-        """Return the completion text for ``request``.
+    def complete(self, request: LlmRequest) -> Completion:
+        """Return the completion for ``request``.
 
         Args:
             request: The completion request.
 
         Returns:
-            The completion response text.
+            The completion text paired with any reported token usage.
         """
         ...
 
@@ -141,30 +186,41 @@ class RecordingCassette:
         self._path = path
         self._entries: dict[str, dict[str, object]] = {}
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Delegate to the transport, record the pair, and persist to disk.
+
+        The reported token usage is recorded alongside the response text, and
+        omitted entirely when the transport reported none -- so a replayed run
+        reproduces the recorded run's metered cost, and an unmetered recording
+        stays honestly unmetered rather than being written down as zero tokens
+        (issue #451).
 
         Args:
             request: The completion request.
 
         Returns:
-            The response returned by the underlying transport.
+            The completion returned by the underlying transport.
         """
-        response = self._transport.complete(request)
+        completion = self._transport.complete(request)
         entry: dict[str, object] = {
             "request": {
                 "provider": request.provider,
                 "model_version": request.model_version,
                 "prompt": request.prompt,
             },
-            "response": response,
+            _RESPONSE_KEY: completion.text,
         }
+        if completion.usage is not None:
+            entry[_USAGE_KEY] = {
+                _INPUT_TOKENS_KEY: completion.usage.input_tokens,
+                _OUTPUT_TOKENS_KEY: completion.usage.output_tokens,
+            }
         self._entries[request.request_hash()] = entry
         self._path.write_text(
             json.dumps(self._entries, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        return response
+        return completion
 
 
 def _reject_float(raw: str) -> NoReturn:
@@ -183,14 +239,52 @@ def _reject_float(raw: str) -> NoReturn:
     raise ValueError(f"float leaf is banned in cassettes, got {raw!r}")
 
 
+def _recorded_usage(entry: dict[str, object], key: str) -> TokenUsage | None:
+    """Read one cassette entry's recorded token usage, if it has any.
+
+    A missing ``usage`` block is not an error: cassettes recorded before issue
+    #451, and recordings of providers that report no accounting, legitimately
+    have none, and ``None`` is the honest answer for both -- it charges the
+    fail-closed unmetered figure downstream rather than zero. A *present* block
+    that is not two non-negative integers is a different thing entirely: it is a
+    corrupt recording, and it fails the load loudly instead of silently
+    degrading a real recorded cost into "unknown".
+
+    Args:
+        entry: One parsed cassette entry.
+        key: The entry's request-hash key, named in any error.
+
+    Returns:
+        The recorded usage, or ``None`` when the entry recorded none.
+
+    Raises:
+        ValueError: If the entry carries a ``usage`` block that is not an
+            object of two integer token counts.
+    """
+    raw = entry.get(_USAGE_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        msg = f"cassette entry {key!r} has a non-object {_USAGE_KEY} block"
+        raise ValueError(msg)
+    counts: list[int] = []
+    for token_key in (_INPUT_TOKENS_KEY, _OUTPUT_TOKENS_KEY):
+        value = raw.get(token_key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            msg = f"cassette entry {key!r} has a non-integer {_USAGE_KEY}.{token_key}"
+            raise ValueError(msg)
+        counts.append(value)
+    return TokenUsage(input_tokens=counts[0], output_tokens=counts[1])
+
+
 class ReplayCassette:
     """An :class:`LlmTransport` that serves recorded responses, fail-closed."""
 
-    def __init__(self, entries: dict[str, str]) -> None:
+    def __init__(self, entries: dict[str, Completion]) -> None:
         """Initialize the replayer.
 
         Args:
-            entries: A mapping of request hash to recorded response text.
+            entries: A mapping of request hash to recorded completion.
         """
         self._entries = entries
 
@@ -200,29 +294,36 @@ class ReplayCassette:
 
         The file is parsed with a float-rejecting hook, so any float leaf
         raises :class:`ValueError`. Each top-level key is used verbatim as the
-        replay lookup key, paired with its entry's ``response`` text.
+        replay lookup key, paired with its entry's ``response`` text and any
+        recorded ``usage`` block (issue #451).
 
         Args:
             path: The cassette file to load.
 
         Returns:
-            A replayer serving the file's recorded responses.
+            A replayer serving the file's recorded completions.
 
         Raises:
-            ValueError: If the cassette contains a float leaf.
+            ValueError: If the cassette contains a float leaf, or an entry
+                carries a malformed ``usage`` block.
         """
         raw = json.loads(path.read_text(encoding="utf-8"), parse_float=_reject_float)
-        entries = {key: entry["response"] for key, entry in raw.items()}
+        entries = {
+            key: Completion(
+                text=entry[_RESPONSE_KEY], usage=_recorded_usage(entry, key)
+            )
+            for key, entry in raw.items()
+        }
         return cls(entries)
 
-    def complete(self, request: LlmRequest) -> str:
-        """Return the recorded response for ``request`` or fail closed.
+    def complete(self, request: LlmRequest) -> Completion:
+        """Return the recorded completion for ``request`` or fail closed.
 
         Args:
             request: The completion request.
 
         Returns:
-            The recorded response text.
+            The recorded completion, token usage included when recorded.
 
         Raises:
             CassetteMissError: If ``request`` has no recorded response.
