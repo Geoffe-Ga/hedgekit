@@ -1169,3 +1169,39 @@ def test_an_over_consuming_fill_releases_the_reservation_once_and_no_more() -> N
 
     assert exhausted.expected_available_cash == MoneyMicros(98_000_000)
     assert exhausted.expected_open_order_ids == frozenset()
+
+
+def test_a_zero_quantity_startup_capture_releases_nothing_and_does_not_raise() -> None:
+    """The pro-rata denominator can be zero, and it must not take the kernel out.
+
+    Nothing narrows what `get_open_orders` reports: a venue is free to hand back
+    a resting order of zero size, and that quantity becomes the denominator every
+    later release divides by. Such an order always carries `_NO_RESERVATION` --
+    it was captured, not booked -- so the release is answered as zero before any
+    division happens. Without that the fill folding it would raise
+    `ZeroDivisionError` straight out of `get_expectations`, and a reconciliation
+    cycle that *crashes* is strictly worse than one that breaches: a breach HALTs
+    the kernel deliberately, an exception takes it down through a path nobody
+    graded.
+    """
+    venue = _MutableVenue(
+        available=MoneyMicros(100_000_000),
+        open_orders=(_resting("zero-sized-1", 0),),
+    )
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_fill(
+                    cash_delta_micros=-2_000_000,
+                    position_delta_centis=500,
+                    venue_order_id="zero-sized-1",
+                ),
+            )
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    expectations = source.get_expectations()
+
+    assert expectations.expected_available_cash == MoneyMicros(98_000_000)
+    assert expectations.expected_open_order_ids == frozenset()
