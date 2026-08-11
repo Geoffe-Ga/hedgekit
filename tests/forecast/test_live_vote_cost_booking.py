@@ -16,14 +16,16 @@ and per-day ceilings are checked against what was *booked*, so a run whose
 providers all succeed spent real money, booked none of it, and could not trip
 its own ceiling however expensive it got.
 
-The fix charges the price table's per-attempt list price for *every* attempt
-the wrapper makes, successful or not. Pricing from the table (rather than from
-parsed token usage) is issue #399's own sanctioned fallback, and it cannot
-book zero: :class:`~windbreak.forecast.budget.ProviderPriceTable` validates
-every mapped price strictly positive and falls back to a positive
-``unknown_provider_price_micros`` for an unmapped provider, so an unpriced
-live provider fails closed at a conservative ceiling instead of reading as
-free.
+The fix charges every attempt the wrapper makes, successful or not. Issue #451
+then replaced *what* a successful attempt is charged: the list price was issue
+#399's own sanctioned stopgap, and metering the response's reported token usage
+at the model's configured rates is what finally makes the ceilings bound spend
+rather than a count of attempts. Failed attempts -- which produce no response
+and so no usage -- are still charged their list price. Neither figure can be
+zero, so a live vote can never read as free: every mapped price and every rate
+is validated strictly positive, an unmapped provider falls back to a positive
+``unknown_provider_price_micros``, and an unmeasurable response falls back to a
+positive ``unmetered_micros``.
 
 Every test below is written against the public seams only. The two the issue
 names as mandatory -- the per-forecast ceiling tripping on an all-*success*
@@ -47,9 +49,12 @@ import pytest
 from windbreak.forecast.budget import (
     DailyBudgetExhaustedError,
     InMemoryBudgetLedger,
+    ModelRateTable,
+    ModelTokenRate,
     PerForecastBudgetExceededError,
     ProviderPriceTable,
     ResearchBudget,
+    TokenUsage,
 )
 from windbreak.forecast.cassettes import ForbiddenLiveTransport
 from windbreak.forecast.pipeline import run_pipeline
@@ -57,7 +62,10 @@ from windbreak.forecast.providers import (
     DEFAULT_VOTE_ENSEMBLE,
     ProviderForecast,
 )
-from windbreak.forecast.providers.base import ProviderTimeoutError
+from windbreak.forecast.providers.base import (
+    ProviderCostOverrunError,
+    ProviderTimeoutError,
+)
 from windbreak.forecast.providers.retry import RetryingProvider, RetryPolicy
 
 if TYPE_CHECKING:
@@ -92,13 +100,54 @@ _ANTHROPIC_PRICE_MICROS = 300_000
 #: live vote for an unpriced provider must book this, never zero.
 _UNKNOWN_PRICE_MICROS = 1_000_000
 
-#: The price table every test here prices attempts through.
+#: The price table every test here gates attempts through.
 _PRICE_TABLE = ProviderPriceTable(
     prices_micros={
         "openai": _OPENAI_PRICE_MICROS,
         "anthropic": _ANTHROPIC_PRICE_MICROS,
     },
     unknown_provider_price_micros=_UNKNOWN_PRICE_MICROS,
+)
+
+#: The token usage every successful vote double below reports.
+_VOTE_USAGE = TokenUsage(input_tokens=20_000, output_tokens=800)
+
+#: What `_RATE_TABLE` charges `_VOTE_USAGE` for a `_MEMBER_A`/`_MEMBER_C`
+#: (OpenAI) vote: ``20_000 * 2_000_000 + 800 * 20_000_000`` over a million.
+#: Deliberately unequal to `_OPENAI_PRICE_MICROS` so a test cannot pass by
+#: charging the pre-gate estimate instead of the meter.
+_OPENAI_METERED_MICROS = 56_000
+
+#: The same for the `_MEMBER_B` (Anthropic) vote, at that model's own rates:
+#: ``20_000 * 4_000_000 + 800 * 25_000_000``. Distinct from the OpenAI figure,
+#: so a run's total is only correct if each vote is metered at its own model's
+#: rates rather than one flat figure.
+_ANTHROPIC_METERED_MICROS = 100_000
+
+#: The fail-closed charge for a vote whose cost cannot be derived. Distinct
+#: from every price and every metered figure above.
+_UNMETERED_MICROS = 900_000
+
+#: The rate table every test here meters successful votes through.
+_RATE_TABLE = ModelRateTable(
+    rates={
+        DEFAULT_VOTE_ENSEMBLE[0].model_version: ModelTokenRate(
+            model_version=DEFAULT_VOTE_ENSEMBLE[0].model_version,
+            input_micros_per_million_tokens=2_000_000,
+            output_micros_per_million_tokens=20_000_000,
+        ),
+        DEFAULT_VOTE_ENSEMBLE[1].model_version: ModelTokenRate(
+            model_version=DEFAULT_VOTE_ENSEMBLE[1].model_version,
+            input_micros_per_million_tokens=4_000_000,
+            output_micros_per_million_tokens=25_000_000,
+        ),
+        DEFAULT_VOTE_ENSEMBLE[2].model_version: ModelTokenRate(
+            model_version=DEFAULT_VOTE_ENSEMBLE[2].model_version,
+            input_micros_per_million_tokens=2_000_000,
+            output_micros_per_million_tokens=20_000_000,
+        ),
+    },
+    unmetered_micros=_UNMETERED_MICROS,
 )
 
 #: The three pinned default ensemble members (SPEC S6.3), indexed rather than
@@ -159,13 +208,18 @@ class _ZeroCostProvider:
     it parses no token accounting from the response envelope.
     """
 
-    def __init__(self, member: EnsembleMemberLike) -> None:
+    def __init__(
+        self, member: EnsembleMemberLike, *, usage: TokenUsage | None = _VOTE_USAGE
+    ) -> None:
         """Store the member whose provenance stamps every returned forecast.
 
         Args:
             member: The ensemble member this provider votes for.
+            usage: The token accounting every returned forecast reports
+                (keyword-only); `None` models a response that reported none.
         """
         self._member = member
+        self._usage = usage
         self.calls = 0
 
     def forecast(
@@ -199,6 +253,7 @@ class _ZeroCostProvider:
             response_fingerprint=hashlib.sha256(
                 self._member.model_version.encode("utf-8")
             ).hexdigest(),
+            usage=self._usage,
         )
 
 
@@ -254,6 +309,7 @@ def _live_wrapped(
     *,
     provider_name: str,
     price_table: ProviderPriceTable | None = None,
+    rate_table: ModelRateTable | None = None,
 ) -> RetryingProvider:
     """Wrap `inner` exactly as the live composition root wraps a vote provider.
 
@@ -261,6 +317,8 @@ def _live_wrapped(
         inner: The wrapped provider double.
         provider_name: The name priced against the table (keyword-only).
         price_table: The price table, defaulting to `_PRICE_TABLE`
+            (keyword-only).
+        rate_table: The per-model rate table, defaulting to `_RATE_TABLE`
             (keyword-only).
 
     Returns:
@@ -272,6 +330,7 @@ def _live_wrapped(
         provider_name=provider_name,
         policy=_policy(),
         price_table=price_table if price_table is not None else _PRICE_TABLE,
+        rate_table=rate_table if rate_table is not None else _RATE_TABLE,
         monotonic_ms=clock.monotonic_ms,
         sleep_ms=clock.sleep_ms,
     )
@@ -341,14 +400,15 @@ def _mixed_routes() -> dict[str, ForecastProvider]:
 # --- Unit level: one successful vote books its price ------------------------------
 
 
-def test_a_successful_live_vote_books_its_list_price_not_zero(
+def test_a_successful_live_vote_books_its_metered_cost_not_zero(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
-    """A first-attempt success books the successful attempt's list price.
+    """A first-attempt success books the successful attempt's metered cost.
 
     The regression this issue exists for: the inner provider reports a zero
-    cost (it parses no token accounting), so the wrapper is the only thing
-    that can price the call. Booking zero would make the vote read as free.
+    cost (it measures but never prices), so the wrapper is the only thing that
+    can turn the call into money. Booking zero would make the vote read as
+    free.
     """
     inner = _ZeroCostProvider(_MEMBER_A)
     retrying = _live_wrapped(inner, provider_name="openai")
@@ -356,44 +416,81 @@ def test_a_successful_live_vote_books_its_list_price_not_zero(
     result = retrying.forecast(market, baseline, 0, ())
 
     assert inner.calls == 1
-    assert result.cost_micros == _OPENAI_PRICE_MICROS
+    assert result.cost_micros == _OPENAI_METERED_MICROS
 
 
-def test_a_successful_live_vote_is_priced_by_its_own_provider(
+def test_a_successful_live_vote_is_metered_at_its_own_models_rates(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
-    """Each provider's success books that provider's own list price."""
+    """Each model's success books that model's own metered cost."""
     retrying = _live_wrapped(_ZeroCostProvider(_MEMBER_B), provider_name="anthropic")
 
     result = retrying.forecast(market, baseline, 0, ())
 
-    assert result.cost_micros == _ANTHROPIC_PRICE_MICROS
+    assert result.cost_micros == _ANTHROPIC_METERED_MICROS
 
 
-def test_a_successful_live_vote_for_an_unpriced_provider_fails_closed(
+def test_a_successful_live_vote_reporting_no_usage_fails_closed(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
-    """An unmapped provider books the conservative fallback, never zero.
+    """A response with no reported usage books the conservative fallback.
 
-    This is issue #399's fail-closed clause: where a provider's cost is not
-    knowable from the table, the vote is priced high rather than free.
+    Issue #399's fail-closed clause, carried forward to the metered path: where
+    a vote's cost is not knowable, the vote is charged high rather than free --
+    and, since issue #451, not at the list price either.
     """
     retrying = _live_wrapped(
-        _ZeroCostProvider(_MEMBER_A), provider_name="a-provider-with-no-price"
+        _ZeroCostProvider(_MEMBER_A, usage=None), provider_name="openai"
     )
 
     result = retrying.forecast(market, baseline, 0, ())
 
-    assert result.cost_micros == _UNKNOWN_PRICE_MICROS
+    assert result.cost_micros == _UNMETERED_MICROS
+
+
+def test_an_unpriced_provider_is_still_gated_at_the_conservative_estimate(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """An unmapped provider's attempt is pre-gated at the high fallback.
+
+    The property issue #399 established and issue #451 must not lose: the
+    affordability pre-gate runs on the list price, and an unpriced provider
+    gets `unknown_provider_price_micros` there -- so a member whose ceiling is
+    one micro below that fallback cannot make even one attempt, and the inner
+    provider is never called.
+    """
+    inner = _ZeroCostProvider(_MEMBER_A)
+    clock = _FakeClock()
+    retrying = RetryingProvider(
+        inner,
+        provider_name="a-provider-with-no-price",
+        policy=RetryPolicy(
+            max_attempts=_MAX_ATTEMPTS,
+            total_deadline_ms=_TOTAL_DEADLINE_MS,
+            backoff_base_ms=_BACKOFF_BASE_MS,
+            max_cost_micros=_UNKNOWN_PRICE_MICROS - 1,
+        ),
+        price_table=_PRICE_TABLE,
+        rate_table=_RATE_TABLE,
+        monotonic_ms=clock.monotonic_ms,
+        sleep_ms=clock.sleep_ms,
+    )
+
+    with pytest.raises(ProviderCostOverrunError) as excinfo:
+        retrying.forecast(market, baseline, 0, ())
+
+    assert inner.calls == 0
+    assert excinfo.value.ceiling_micros == _UNKNOWN_PRICE_MICROS - 1
 
 
 def test_a_success_after_one_retry_books_every_attempt_it_made(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
-    """Two attempts (one timeout, one success) book two attempts' price.
+    """Two attempts (one timeout, one success) book one of each charge.
 
     Pins that fixing the success path did not double-count the failure path:
-    the total is exactly one price per attempt actually made.
+    the total is exactly one list price for the attempt that failed plus one
+    metered charge for the attempt that returned a response.
     """
 
     class _FlakyProvider:
@@ -437,7 +534,7 @@ def test_a_success_after_one_retry_books_every_attempt_it_made(
     result = retrying.forecast(market, baseline, 0, ())
 
     assert inner.calls == 2
-    assert result.cost_micros == 2 * _OPENAI_PRICE_MICROS
+    assert result.cost_micros == _OPENAI_PRICE_MICROS + _OPENAI_METERED_MICROS
 
 
 # --- Issue #399 acceptance criterion 3: the ceiling trips on successes -------------
@@ -462,9 +559,9 @@ def test_the_per_forecast_ceiling_trips_on_a_run_of_successful_votes(
     """
     expected_charge = (
         _FULL_RUN_RESEARCH_COST_MICROS
-        + _OPENAI_PRICE_MICROS
-        + _ANTHROPIC_PRICE_MICROS
-        + _OPENAI_PRICE_MICROS
+        + _OPENAI_METERED_MICROS
+        + _ANTHROPIC_METERED_MICROS
+        + _OPENAI_METERED_MICROS
     )
     budget = ResearchBudget(
         per_forecast_micros=expected_charge - 1, ledger=InMemoryBudgetLedger()
@@ -499,9 +596,9 @@ def test_a_run_of_successful_votes_books_more_than_the_research_stub(
     """
     expected_charge = (
         _FULL_RUN_RESEARCH_COST_MICROS
-        + _OPENAI_PRICE_MICROS
-        + _ANTHROPIC_PRICE_MICROS
-        + _OPENAI_PRICE_MICROS
+        + _OPENAI_METERED_MICROS
+        + _ANTHROPIC_METERED_MICROS
+        + _OPENAI_METERED_MICROS
     )
     budget = ResearchBudget(
         per_forecast_micros=_PERMISSIVE_PER_FORECAST_MICROS,
@@ -544,7 +641,7 @@ def test_the_day_bucket_totals_actual_charges_across_a_mixed_run(
     Before the fix the two successes contributed nothing, so the day bucket
     drifted below actual spend by exactly their price.
     """
-    successes_micros = _OPENAI_PRICE_MICROS + _OPENAI_PRICE_MICROS
+    successes_micros = _OPENAI_METERED_MICROS + _OPENAI_METERED_MICROS
     failure_micros = _MAX_ATTEMPTS * _ANTHROPIC_PRICE_MICROS
     expected_total = _FULL_RUN_RESEARCH_COST_MICROS + successes_micros + failure_micros
     budget = ResearchBudget(

@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import requests
 
-from windbreak.forecast.cassettes import LlmRequest
+from windbreak.forecast.cassettes import Completion, LlmRequest
 from windbreak.forecast.providers import (
     HttpRequest,
     ProviderNotRoutableError,
@@ -334,17 +334,17 @@ class _StubLlmTransport:
         """
         self._text = text
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Return the fixed completion text.
 
         Args:
             request: The (unused) completion request.
 
         Returns:
-            The fixed text.
+            The fixed text, as an unmetered `Completion`.
         """
         del request
-        return self._text
+        return Completion(text=self._text)
 
 
 def _llm_request(provider: str) -> LlmRequest:
@@ -365,8 +365,8 @@ def test_each_request_routes_to_its_own_providers_adapter() -> None:
         {"anthropic": _StubLlmTransport("A"), "openai": _StubLlmTransport("O")}
     )
 
-    assert router.complete(_llm_request("anthropic")) == "A"
-    assert router.complete(_llm_request("openai")) == "O"
+    assert router.complete(_llm_request("anthropic")) == Completion(text="A")
+    assert router.complete(_llm_request("openai")) == Completion(text="O")
 
 
 def test_an_unrouted_provider_fails_closed() -> None:

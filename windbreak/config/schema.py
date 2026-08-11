@@ -615,6 +615,55 @@ def _default_provider_prices() -> tuple[ProviderPrice, ...]:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelTokenPrice:
+    """One model's per-token rates, in micros per million tokens (issue #451).
+
+    A structural triple backing one entry of
+    :attr:`windbreak.forecast.budget.ModelRateTable.rates`. Modeled as a tuple
+    of records rather than a mapping for the same reason
+    :class:`ProviderPrice` is: every config leaf must flatten deterministically
+    into the hash-chained ledger.
+
+    Rates are quoted *per million tokens* because that is the only denominator
+    that keeps them exact integers on the SPEC S6.1 fixed-point money path --
+    ``$1.25 / 1M`` input tokens is ``1.25`` micros per token, which this
+    codebase cannot represent, and exactly ``1_250_000`` micros per million.
+
+    Attributes:
+        model_version: The pinned model version these rates price.
+        input_micros_per_million_tokens: The prompt-token rate, in micros per
+            million tokens.
+        output_micros_per_million_tokens: The completion-token rate, in micros
+            per million tokens.
+    """
+
+    model_version: str
+    input_micros_per_million_tokens: int
+    output_micros_per_million_tokens: int
+
+
+def _default_model_token_prices() -> tuple[ModelTokenPrice, ...]:
+    """Return the default per-model token rates (issue #451).
+
+    Covers exactly the three models :attr:`ForecastConfig.vote_ensemble` pins,
+    at their vendors' published list rates. Mirror-equal to the forecast
+    engine's own ``DEFAULT_MODEL_RATE_TABLE``, pinned by test -- the same
+    arrangement ``prices`` has with ``DEFAULT_PROVIDER_PRICE_TABLE``.
+
+    A model absent from this tuple is not free: it charges
+    :attr:`ProviderTransportConfig.unmetered_response_micros`.
+
+    Returns:
+        The default per-model token rates.
+    """
+    return (
+        ModelTokenPrice("gpt-5-2025-08-07", 1_250_000, 10_000_000),
+        ModelTokenPrice("gpt-5-mini-2025-08-07", 250_000, 2_000_000),
+        ModelTokenPrice("claude-sonnet-4-5-20250929", 3_000_000, 15_000_000),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderTransportConfig:
     """Which forecast provider transport the composition root wires (issue #344).
 
@@ -643,10 +692,23 @@ class ProviderTransportConfig:
         openai_api_key_env: The environment variable the OpenAI key is read
             from -- the variable's *name*, never the key.
         retry: The bounded-retry policy each provider vote runs under.
-        prices: The per-provider per-attempt list prices, in micros.
+        prices: The per-provider per-attempt list prices, in micros. Since issue
+            #451 these are the *affordability estimate* the retry layer gates an
+            attempt on before making it, not what a completed vote is charged --
+            a call's real cost is unknowable until it returns.
         unknown_provider_price_micros: The fallback price charged for a provider
             absent from :attr:`prices`. Deliberately high, never zero, so an
             unpriced provider cannot evade its budget.
+        token_prices: The per-model token rates a completed vote's reported
+            usage is charged at (issue #451). This is what makes the budget's
+            ceilings bound *spend* rather than a count of attempts multiplied
+            by a constant.
+        unmetered_response_micros: The fail-closed charge for a response whose
+            cost cannot be derived -- it reported no readable usage, or came
+            from a model absent from :attr:`token_prices`. Deliberately high,
+            never zero, and deliberately unequal to any per-attempt list price,
+            so an unmeasurable response can neither read as free nor be
+            mistaken for a metered charge.
     """
 
     mode: str = PROVIDER_TRANSPORT_CASSETTE
@@ -656,6 +718,10 @@ class ProviderTransportConfig:
     retry: ProviderRetryConfig = field(default_factory=ProviderRetryConfig)
     prices: tuple[ProviderPrice, ...] = field(default_factory=_default_provider_prices)
     unknown_provider_price_micros: int = 1_000_000
+    token_prices: tuple[ModelTokenPrice, ...] = field(
+        default_factory=_default_model_token_prices
+    )
+    unmetered_response_micros: int = 1_000_000
 
 
 @dataclass(frozen=True, slots=True)

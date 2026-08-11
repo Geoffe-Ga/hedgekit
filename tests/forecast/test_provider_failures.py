@@ -63,9 +63,12 @@ from windbreak.forecast.budget import (
     DEFAULT_PROVIDER_PRICE_TABLE,
     DEFAULT_UNKNOWN_PROVIDER_PRICE_MICROS,
     InMemoryBudgetLedger,
+    ModelRateTable,
+    ModelTokenRate,
     PerForecastBudgetExceededError,
     ProviderPriceTable,
     ResearchBudget,
+    TokenUsage,
 )
 from windbreak.forecast.cassettes import ForbiddenLiveTransport
 from windbreak.forecast.pipeline import (
@@ -351,6 +354,39 @@ class _SucceedingProvider:
         return self._forecast
 
 
+#: The model version `_provider_forecast` stamps, and the one `_TEST_RATE_TABLE`
+#: rates. A forecast built with any other model version is unrated, and charges
+#: `_TEST_UNMETERED_MICROS`.
+_TEST_MODEL_VERSION = "gpt-5-forecast"
+
+#: The token usage `_provider_forecast` reports by default.
+_TEST_METERED_USAGE = TokenUsage(input_tokens=40_000, output_tokens=1_000)
+
+#: What `_TEST_RATE_TABLE` charges `_TEST_METERED_USAGE`:
+#: ``40_000 * 1_250_000 + 1_000 * 10_000_000`` micro-token-units over
+#: ``1_000_000`` tokens-per-million. Deliberately unequal to
+#: `_TEST_PRICE_MICROS`, `_TEST_UNMETERED_MICROS`, and the table's
+#: unknown-provider fallback, so no assertion below can be satisfied by the
+#: wrong figure (issue #451).
+_TEST_METERED_MICROS = 60_000
+
+#: The fail-closed charge for a response that reported no usage, or one from an
+#: unrated model. Distinct from every other figure here for the same reason.
+_TEST_UNMETERED_MICROS = 777_000
+
+#: The per-model rate table every retry unit test meters through.
+_TEST_RATE_TABLE = ModelRateTable(
+    rates={
+        _TEST_MODEL_VERSION: ModelTokenRate(
+            model_version=_TEST_MODEL_VERSION,
+            input_micros_per_million_tokens=1_250_000,
+            output_micros_per_million_tokens=10_000_000,
+        )
+    },
+    unmetered_micros=_TEST_UNMETERED_MICROS,
+)
+
+
 def _provider_forecast(
     *,
     probability_ppm: int = 500_000,
@@ -361,6 +397,7 @@ def _provider_forecast(
     model_version: str = "gpt-5-forecast",
     training_cutoff: str = "2024-06-01",
     response_fingerprint: str = "f" * 64,
+    usage: TokenUsage | None = _TEST_METERED_USAGE,
 ) -> ProviderForecast:
     """Build a valid `ProviderForecast`, defaulting every field.
 
@@ -373,6 +410,10 @@ def _provider_forecast(
         model_version: The producing model's pinned version string.
         training_cutoff: The producing model's declared training cutoff.
         response_fingerprint: The sha256 fingerprint of the raw response.
+        usage: The provider-reported token accounting; defaults to
+            `_TEST_METERED_USAGE`, which `_TEST_RATE_TABLE` prices at
+            `_TEST_METERED_MICROS`. Pass `None` for a response that reported
+            none, which is charged `_TEST_UNMETERED_MICROS` instead.
 
     Returns:
         A valid `ProviderForecast` built from the given (or defaulted) fields.
@@ -386,6 +427,7 @@ def _provider_forecast(
         model_version=model_version,
         training_cutoff=training_cutoff,
         response_fingerprint=response_fingerprint,
+        usage=usage,
     )
 
 
@@ -440,6 +482,7 @@ def _retrying_provider(
     provider_name: str = _TEST_PROVIDER_NAME,
     policy: RetryPolicy | None = None,
     price_table: ProviderPriceTable | None = None,
+    rate_table: ModelRateTable | None = None,
 ) -> RetryingProvider:
     """Build a `RetryingProvider` wired to `clock`'s deterministic ms clock.
 
@@ -450,6 +493,8 @@ def _retrying_provider(
         policy: The retry policy; defaults to a large-permissive one.
         price_table: The per-attempt price table; defaults to
             `_TEST_PRICE_TABLE`.
+        rate_table: The per-model token rate table; defaults to
+            `_TEST_RATE_TABLE`.
 
     Returns:
         A constructed `RetryingProvider`.
@@ -459,6 +504,7 @@ def _retrying_provider(
         provider_name=provider_name,
         policy=policy if policy is not None else _retry_policy(),
         price_table=price_table if price_table is not None else _TEST_PRICE_TABLE,
+        rate_table=rate_table if rate_table is not None else _TEST_RATE_TABLE,
         monotonic_ms=clock.monotonic_ms,
         sleep_ms=clock.sleep_ms,
     )
@@ -541,8 +587,9 @@ def test_retrying_provider_recovers_after_one_timeout(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
     """One timeout then a successful response yields the inner forecast with
-    `cost_micros` bumped by *both* attempts' accrued price -- the failed one
-    and the successful one (issue #399) -- after exactly two inner calls.
+    `cost_micros` bumped by the failed attempt's list price *and* the
+    successful attempt's metered charge (issues #399, #451) -- after exactly
+    two inner calls.
     """
     forecast = _provider_forecast(cost_micros=5_000)
     inner = _FlakyProvider([ProviderTimeoutError(), forecast])
@@ -553,7 +600,8 @@ def test_retrying_provider_recovers_after_one_timeout(
 
     assert inner.calls == 2
     assert result == dataclasses.replace(
-        forecast, cost_micros=forecast.cost_micros + 2 * _TEST_PRICE_MICROS
+        forecast,
+        cost_micros=forecast.cost_micros + _TEST_PRICE_MICROS + _TEST_METERED_MICROS,
     )
 
 
@@ -625,7 +673,8 @@ def test_retrying_provider_retries_http_503(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
     """A 5xx `ProviderHTTPError` is retryable: one 503 then success yields
-    the inner forecast after exactly two inner calls, priced for both.
+    the inner forecast after exactly two inner calls -- the failed one at its
+    list price, the successful one at its metered charge.
     """
     forecast = _provider_forecast()
     inner = _FlakyProvider([ProviderHTTPError(503, "a" * 64), forecast])
@@ -635,7 +684,10 @@ def test_retrying_provider_retries_http_503(
     result = retrying.forecast(market, baseline, 0, ())
 
     assert inner.calls == 2
-    assert result.cost_micros == forecast.cost_micros + 2 * _TEST_PRICE_MICROS
+    assert (
+        result.cost_micros
+        == forecast.cost_micros + _TEST_PRICE_MICROS + _TEST_METERED_MICROS
+    )
 
 
 def test_retrying_provider_retries_http_429_using_backoff_not_retry_after(
@@ -802,17 +854,20 @@ def test_retrying_provider_prices_unknown_provider_at_the_ceiling(
     assert error.cost_micros == 250_000
 
 
-def test_retrying_provider_clean_success_books_exactly_one_list_price(
+def test_retrying_provider_clean_success_books_its_metered_charge(
     market: NormalizedMarket, baseline: BaselineQuoteSnapshot
 ) -> None:
     """A zero-failed-attempts success returns the inner forecast with its
-    ``cost_micros`` raised by exactly one list price, and is otherwise
+    ``cost_micros`` raised by exactly its own metered charge, and is otherwise
     byte-equal to it.
 
     The wrapper is deliberately *not* invisible on the happy path: issue #399
     was exactly that invisibility, which booked a successful live vote at zero
-    and left the research budget unable to bound a healthy run. Nothing but
-    the cost changes, and no retry is scheduled.
+    and left the research budget unable to bound a healthy run. Since issue
+    #451 the figure it books is what the response says it consumed rather than
+    the flat list price the attempt was gated at -- and the two are distinct
+    numbers here, so this assertion can tell them apart. Nothing but the cost
+    changes, and no retry is scheduled.
     """
     forecast = _provider_forecast(cost_micros=42)
     inner = _SucceedingProvider(forecast)
@@ -822,10 +877,51 @@ def test_retrying_provider_clean_success_books_exactly_one_list_price(
     result = retrying.forecast(market, baseline, 0, ())
 
     assert result == dataclasses.replace(
-        forecast, cost_micros=forecast.cost_micros + _TEST_PRICE_MICROS
+        forecast, cost_micros=forecast.cost_micros + _TEST_METERED_MICROS
     )
     assert inner.calls == 1
     assert clock.waits == []
+
+
+def test_retrying_provider_success_with_no_reported_usage_fails_closed(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """A success whose response reported no usage books the unmetered bound.
+
+    Issue #451's fail-closed arm. An unparseable or absent usage block must
+    never become free research, and must not quietly fall back to the flat
+    list price either -- the assertion names all three figures so it cannot
+    pass on the wrong one.
+    """
+    forecast = _provider_forecast(cost_micros=0, usage=None)
+    inner = _SucceedingProvider(forecast)
+    clock = _FakeClock()
+    retrying = _retrying_provider(inner, clock=clock)
+
+    result = retrying.forecast(market, baseline, 0, ())
+
+    assert result.cost_micros == _TEST_UNMETERED_MICROS
+    assert result.cost_micros != _TEST_PRICE_MICROS
+    assert result.cost_micros != _TEST_METERED_MICROS
+
+
+def test_retrying_provider_success_from_an_unrated_model_fails_closed(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """A success from a model with no configured rate books the same bound.
+
+    The sibling of the unpriced-*provider* fallback: a model the operator
+    never rated is unmeasurable, so it is charged high rather than free, even
+    though its response reported a perfectly readable token count.
+    """
+    forecast = _provider_forecast(cost_micros=0, model_version="an-unrated-model")
+    inner = _SucceedingProvider(forecast)
+    clock = _FakeClock()
+    retrying = _retrying_provider(inner, clock=clock)
+
+    result = retrying.forecast(market, baseline, 0, ())
+
+    assert result.cost_micros == _TEST_UNMETERED_MICROS
 
 
 def test_retrying_provider_propagates_non_taxonomy_exception_untouched(

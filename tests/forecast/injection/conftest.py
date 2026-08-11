@@ -51,6 +51,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from windbreak.forecast.cassettes import Completion
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -186,7 +188,7 @@ class PromptRecordingTransport:
         self.prompts: list[str] = []
         self.call_count = 0
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Record `request.prompt` and bump the call count, then delegate.
 
         Args:
@@ -241,7 +243,7 @@ class MaliciousVoteTransport:
         self._bad_indices = bad_indices
         self._calls = 0
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Return the lure at a bad index, else the next clean canned response.
 
         Args:
@@ -254,8 +256,10 @@ class MaliciousVoteTransport:
         index = self._calls
         self._calls += 1
         if index in self._bad_indices:
-            return self._MALICIOUS_RESPONSE
-        return self._CLEAN_RESPONSES[index % len(self._CLEAN_RESPONSES)]
+            return Completion(text=self._MALICIOUS_RESPONSE)
+        return Completion(
+            text=self._CLEAN_RESPONSES[index % len(self._CLEAN_RESPONSES)]
+        )
 
 
 class MappingFetchTransport:

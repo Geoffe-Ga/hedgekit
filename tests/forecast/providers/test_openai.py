@@ -153,7 +153,7 @@ def test_complete_happy_path_returns_the_exact_embedded_completion_text() -> Non
 
     result = transport.complete(_request())
 
-    assert result == "the exact completion text"
+    assert result.text == "the exact completion text"
 
 
 # --- Request body: canonical, deterministic, integer temperature -----------------

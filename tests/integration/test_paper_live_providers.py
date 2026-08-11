@@ -500,7 +500,7 @@ def test_live_mode_wires_a_transport_that_reaches_the_live_adapters(
         LlmRequest(provider=_ANTHROPIC, model_version="pinned", prompt="p")
     )
 
-    assert json.loads(completion)["probability_ppm"] == _LIVE_VOTE_PPM
+    assert json.loads(completion.text)["probability_ppm"] == _LIVE_VOTE_PPM
 
 
 def test_each_provider_routes_to_its_own_live_transport(

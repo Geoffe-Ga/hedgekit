@@ -140,7 +140,7 @@ from windbreak.config.schema import (
 )
 from windbreak.connector.paper import PaperExchange
 from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
-from windbreak.forecast.cassettes import CassetteMissError, LlmRequest
+from windbreak.forecast.cassettes import CassetteMissError, Completion, LlmRequest
 from windbreak.forecast.providers.base import build_vote_prompt
 from windbreak.forecast.records import BaselineQuoteSnapshot
 from windbreak.forecast.sandbox import build_research_tools
@@ -320,17 +320,17 @@ class _FindingResearchTransport:
 class _NearCertainVoteTransport:
     """An ``LlmTransport`` answering every prompt with the near-certain vote."""
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Return :data:`NEAR_CERTAIN_VOTE` for any request.
 
         Args:
             request: The (unused) completion request.
 
         Returns:
-            The canned vote JSON.
+            The canned vote JSON, as an unmetered `Completion`.
         """
         del request
-        return NEAR_CERTAIN_VOTE
+        return Completion(text=NEAR_CERTAIN_VOTE)
 
 
 def _finding_research_tools(cache_dir: Path) -> ResearchTools:

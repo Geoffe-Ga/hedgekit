@@ -76,6 +76,7 @@ from windbreak.forecast.budget import (
 )
 from windbreak.forecast.cassettes import (
     CassetteMissError,
+    Completion,
     ForbiddenLiveTransport,
     RecordingCassette,
     ReplayCassette,
@@ -159,14 +160,14 @@ class _CountingTransport:
         self._transport = transport
         self.call_count = 0
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Record one call, then delegate to the wrapped transport.
 
         Args:
             request: The completion request to forward unchanged.
 
         Returns:
-            The wrapped transport's response.
+            The wrapped transport's completion.
         """
         self.call_count += 1
         return self._transport.complete(request)
@@ -191,17 +192,17 @@ class _RequestRecordingTransport:
         self._response = response
         self.calls: list[LlmRequest] = []
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Record `request`, then return the fixed canned response.
 
         Args:
             request: The completion request to record.
 
         Returns:
-            The fixed response text.
+            The fixed response text, as an unmetered `Completion`.
         """
         self.calls.append(request)
-        return self._response
+        return Completion(text=self._response)
 
 
 # --- Constants: SPEC-mandated exact values ---------------------------------------
