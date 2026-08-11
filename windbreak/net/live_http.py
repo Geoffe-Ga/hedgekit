@@ -54,7 +54,7 @@ from windbreak.forecast.providers.http_cassettes import HttpResponse
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-    from windbreak.forecast.cassettes import LlmRequest, LlmTransport
+    from windbreak.forecast.cassettes import Completion, LlmRequest, LlmTransport
     from windbreak.forecast.providers.http_cassettes import HttpRequest
     from windbreak.net.allowlist import OutboundAllowlist
 
@@ -188,14 +188,15 @@ class RoutingLlmTransport:
         """
         self._adapters = dict(adapters)
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Forward ``request`` to the adapter for its provider.
 
         Args:
             request: The completion request to route.
 
         Returns:
-            The routed adapter's completion text.
+            The routed adapter's completion -- its text and the token usage
+            that adapter read off the vendor's envelope (issue #451).
 
         Raises:
             ProviderNotRoutableError: If no adapter is registered for the

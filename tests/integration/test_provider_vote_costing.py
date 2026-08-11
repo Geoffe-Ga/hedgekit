@@ -112,6 +112,7 @@ from tests.integration.conftest import (
     ledger_path_for,
 )
 from windbreak.config.schema import EnsembleMemberConfig
+from windbreak.forecast.cassettes import Completion
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -227,19 +228,19 @@ class _FakeVoteTransport:
         """Reset the call counter."""
         self._calls = 0
 
-    def complete(self, request: object) -> str:
+    def complete(self, request: object) -> Completion:
         """Return the next canned response, ignoring `request`'s contents.
 
         Args:
             request: The (unused) `LlmRequest`-shaped call.
 
         Returns:
-            The next canned response, cycling by call index.
+            The next canned completion, cycling by call index.
         """
         del request
         response = _CANNED_VOTE_RESPONSES[self._calls % len(_CANNED_VOTE_RESPONSES)]
         self._calls += 1
-        return response
+        return Completion(text=response)
 
 
 def _build_deps_with_real_citations(

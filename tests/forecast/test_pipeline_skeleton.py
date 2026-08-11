@@ -39,6 +39,7 @@ import pytest
 
 from windbreak.forecast.cassettes import (
     CassetteMissError,
+    Completion,
     ForbiddenLiveTransport,
     LiveCallForbiddenError,
     LlmRequest,
@@ -495,14 +496,14 @@ class _CountingTransport:
         self._transport = transport
         self.call_count = 0
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Record one call, then delegate to the wrapped transport.
 
         Args:
             request: The completion request to forward unchanged.
 
         Returns:
-            The wrapped transport's response.
+            The wrapped transport's completion.
         """
         self.call_count += 1
         return self._transport.complete(request)  # type: ignore[attr-defined]

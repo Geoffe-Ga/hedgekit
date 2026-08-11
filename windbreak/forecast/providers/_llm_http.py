@@ -21,6 +21,7 @@ import json
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final, NamedTuple, NoReturn
 
+from windbreak.forecast.budget import TokenUsage
 from windbreak.forecast.providers.base import (
     ProviderHTTPError,
     ProviderMalformedResponseError,
@@ -31,6 +32,9 @@ from windbreak.forecast.providers.http_cassettes import HttpRequest
 if TYPE_CHECKING:
     from windbreak.forecast.cassettes import LlmRequest
     from windbreak.forecast.providers.http_cassettes import HttpTransport
+
+#: The response-envelope key both vendors report token accounting under.
+_USAGE_KEY = "usage"
 
 #: The HTTP method every chat-completion request uses.
 _REQUEST_METHOD = "POST"
@@ -218,6 +222,49 @@ def require_object(value: object, fingerprint: str) -> dict[str, object]:
     if not isinstance(value, dict):
         reject_malformed(fingerprint)
     return value
+
+
+def extract_usage(
+    payload: dict[str, object], *, input_key: str, output_key: str
+) -> TokenUsage | None:
+    """Extract a response's reported token accounting, or ``None`` (issue #451).
+
+    Deliberately **not** a rejection path. An envelope the vendor shipped
+    without a readable ``usage`` block is a perfectly parseable *vote* -- the
+    forecast is usable and discarding it would trade a real answer for a
+    missing invoice line. What must never happen is the vote reading as free,
+    and it cannot: ``None`` means "cost unknown", which
+    :meth:`~windbreak.forecast.budget.ModelRateTable.micros_for` charges its
+    fail-closed unmetered figure.
+
+    Every way the block can fail to be two whole token counts collapses to
+    ``None``: absent, not an object, a missing count, a ``bool`` (an ``int``
+    subclass that must never pass for a count), a negative count, or a
+    :class:`~decimal.Decimal` -- which is what
+    :func:`fetch_envelope`'s float-free parser turns ``"input_tokens": 12.5``
+    into, and a fractional token count is evidence the envelope was misread,
+    not a quantity to round.
+
+    Args:
+        payload: The parsed response object.
+        input_key: The vendor's key for prompt/input tokens (keyword-only).
+        output_key: The vendor's key for completion/output tokens
+            (keyword-only).
+
+    Returns:
+        The reported usage, or ``None`` when it cannot be read as two
+        non-negative integer token counts.
+    """
+    block = payload.get(_USAGE_KEY)
+    if not isinstance(block, dict):
+        return None
+    counts: list[int] = []
+    for key in (input_key, output_key):
+        value = block.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        counts.append(value)
+    return TokenUsage(input_tokens=counts[0], output_tokens=counts[1])
 
 
 def require_text(value: object, fingerprint: str) -> str:

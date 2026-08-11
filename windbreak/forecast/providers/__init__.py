@@ -24,8 +24,12 @@ an ensemble member is accepted structurally via :class:`EnsembleMemberLike`.
 from __future__ import annotations
 
 from windbreak.forecast.budget import (
+    DEFAULT_MODEL_RATE_TABLE,
     DEFAULT_PROVIDER_PRICE_TABLE,
+    ModelRateTable,
+    ModelTokenRate,
     ProviderPriceTable,
+    TokenUsage,
 )
 from windbreak.forecast.providers.anthropic import (
     ANTHROPIC_MESSAGES_ENDPOINT,
@@ -87,6 +91,7 @@ from windbreak.forecast.providers.search_live import (
 
 __all__ = [
     "ANTHROPIC_MESSAGES_ENDPOINT",
+    "DEFAULT_MODEL_RATE_TABLE",
     "DEFAULT_PROVIDER_PRICE_TABLE",
     "DEFAULT_VOTE_ENSEMBLE",
     "OPENAI_CHAT_ENDPOINT",
@@ -107,6 +112,8 @@ __all__ = [
     "LiveFetchTransport",
     "LiveSearchConfig",
     "LiveSearchTransport",
+    "ModelRateTable",
+    "ModelTokenRate",
     "OpenAiChatTransport",
     "ProviderCitation",
     "ProviderCostOverrunError",
@@ -125,6 +132,7 @@ __all__ = [
     "ReplayHttpCassette",
     "RetryPolicy",
     "RetryingProvider",
+    "TokenUsage",
     "UnreachableUrlError",
     "build_vote_prompt",
     "fingerprint_response",

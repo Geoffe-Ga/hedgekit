@@ -17,24 +17,45 @@ four bounded guards:
   ``policy.max_cost_micros``; an unaffordable attempt raises
   :class:`~windbreak.forecast.providers.base.ProviderCostOverrunError` *without*
   ever calling the inner provider.
-* **Per-attempt pricing** -- every attempt the wrapper actually makes is
-  charged its provider's list price, the *successful* one included.
+* **Metered charging** -- the attempt that succeeds is charged what its own
+  response says it consumed, at the model's configured token rates.
 
 That last guard is why this wrapper, and not the inner provider, is where a
 live vote's cost is booked (issue #399). The inner provider on the live path is
 a :class:`~windbreak.forecast.providers.fixture.FixtureVoteProvider`, whose
-``cost_micros`` is a truthful ``0`` for a network-free cassette replay, and
-``LlmTransport.complete`` hands back bare completion text carrying no token
-accounting -- so nothing beneath this layer can price a call. Charging only the
+``cost_micros`` is a truthful ``0`` for a network-free cassette replay, so
+nothing beneath this layer converts a call into money. Charging only the
 *failed* attempts, as this module originally did, meant a first-attempt success
 booked ``cost_micros == 0``: real money spent, none of it booked, and a
 :class:`~windbreak.forecast.budget.ResearchBudget` ceiling that could not fire
-on the healthy path however expensive that path became. Pricing from the table
-cannot book zero --
-:class:`~windbreak.forecast.budget.ProviderPriceTable` validates every mapped
-price strictly positive and charges a positive fallback for an unmapped
-provider -- so an unpriced live provider fails closed at a conservative
-ceiling rather than reading as free.
+on the healthy path however expensive that path became.
+
+TWO PRICES, TWO JOBS (issue #451)
+
+Issue #399's fix charged every attempt the provider's flat per-attempt *list
+price*. That bounded the number of attempts, not the spend: a vote over a long
+research context can cost a multiple of its list price while the meter records
+exactly the list price, so no ceiling could fire on the overage. The two
+figures now do two different jobs, and only one of them is money:
+
+* :class:`~windbreak.forecast.budget.ProviderPriceTable` supplies the
+  **pre-gate estimate**. A call's real cost is unknowable until it returns, so
+  the affordability check before each attempt necessarily runs on an estimate,
+  and the list price is exactly that. Its fail-closed property is what makes
+  the estimate safe: every mapped price is validated strictly positive and an
+  unmapped provider gets a deliberately high ``unknown_provider_price_micros``,
+  so an unpriced provider is gated *conservatively* rather than waved through.
+* :class:`~windbreak.forecast.budget.ModelRateTable` supplies the **charge**
+  for the attempt that actually returned a response, from that response's own
+  reported token counts. A response with no readable usage, or from a model
+  with no configured rate, charges the table's fail-closed
+  ``unmetered_micros`` -- never zero and never the list price.
+
+A *failed* attempt is still charged the list price it was gated at: it produced
+no response and therefore no usage to meter, and charging it the unmetered
+upper bound would let three transient timeouts exhaust a member's whole
+allowance. Neither figure can be zero, so no arrangement of successes and
+failures books a free vote.
 
 Only a
 :class:`~windbreak.forecast.providers.base.ProviderVoteError` is caught: a
@@ -63,7 +84,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from windbreak.connector.models import NormalizedMarket
-    from windbreak.forecast.budget import ProviderPriceTable
+    from windbreak.forecast.budget import ModelRateTable, ProviderPriceTable
     from windbreak.forecast.providers.base import ForecastProvider, ProviderForecast
     from windbreak.forecast.records import BaselineQuoteSnapshot
     from windbreak.forecast.sanitize import ResearchQuote
@@ -168,16 +189,17 @@ class RetryPolicy:
 
 
 class RetryingProvider:
-    """A :class:`ForecastProvider` decorator adding bounded retries and pricing.
+    """A :class:`ForecastProvider` decorator adding bounded retries and metering.
 
     Wraps an inner provider, retrying transient transport faults with
     exponential backoff (or an honored ``Retry-After`` hint) up to a bounded
-    attempt count and total deadline, while charging each attempt's list price
-    against an affordability ceiling. Every attempt made is priced, so even a
-    clean first-attempt success returns a forecast whose ``cost_micros`` is the
-    inner provider's own cost plus exactly one list price -- the wrapper is
-    deliberately *not* invisible on the happy path, because that invisibility
-    was issue #399's fail-open.
+    attempt count and total deadline, gating each attempt against an
+    affordability ceiling at its provider's list price and charging the attempt
+    that succeeds at its own reported token usage. Every attempt made costs
+    something, so even a clean first-attempt success returns a forecast whose
+    ``cost_micros`` is strictly positive -- the wrapper is deliberately *not*
+    invisible on the happy path, because that invisibility was issue #399's
+    fail-open.
     """
 
     def __init__(
@@ -187,17 +209,28 @@ class RetryingProvider:
         provider_name: str,
         policy: RetryPolicy,
         price_table: ProviderPriceTable,
+        rate_table: ModelRateTable,
         monotonic_ms: Callable[[], int],
         sleep_ms: Callable[[int], None],
     ) -> None:
-        """Wire the wrapped provider, policy, pricing, and injected clock.
+        """Wire the wrapped provider, policy, pricing, metering, and clock.
+
+        ``rate_table`` is required rather than defaulted. A default would let a
+        composition root forget to wire real rates and still meter *something*,
+        which is precisely the silent-fallback shape issue #451 exists to
+        remove: a caller that has not decided how its models are priced must
+        say so out loud by passing
+        :data:`~windbreak.forecast.budget.DEFAULT_MODEL_RATE_TABLE`.
 
         Args:
             inner: The wrapped provider whose ``forecast`` is retried.
-            provider_name: The name priced against ``price_table`` per attempt
-                (keyword-only).
+            provider_name: The name priced against ``price_table`` for the
+                per-attempt affordability estimate (keyword-only).
             policy: The bounded-retry policy to enforce (keyword-only).
-            price_table: The per-attempt price table (keyword-only).
+            price_table: The per-attempt list prices the affordability pre-gate
+                estimates from (keyword-only).
+            rate_table: The per-model token rates a successful attempt's
+                reported usage is charged at (keyword-only).
             monotonic_ms: An injected monotonic clock returning milliseconds
                 (keyword-only); no real clock default -- the caller owns time.
             sleep_ms: An injected sleep taking a millisecond wait (keyword-only);
@@ -207,6 +240,7 @@ class RetryingProvider:
         self._provider_name = provider_name
         self._policy = policy
         self._price_table = price_table
+        self._rate_table = rate_table
         self._monotonic_ms = monotonic_ms
         self._sleep_ms = sleep_ms
 
@@ -234,9 +268,10 @@ class RetryingProvider:
             quotes: The sanitized web quotes threaded into the vote prompt.
 
         Returns:
-            The inner forecast, its ``cost_micros`` bumped by the accrued price
-            of *every* attempt made -- the successful one included, so a live
-            vote is never booked as free (issue #399).
+            The inner forecast, its ``cost_micros`` bumped by each failed
+            attempt's list price plus the successful attempt's *metered* cost --
+            so a live vote is never booked as free (issue #399) and never
+            booked at a flat constant (issue #451).
 
         Raises:
             ProviderCostOverrunError: If an attempt (or the successful total)
@@ -251,10 +286,10 @@ class RetryingProvider:
         while True:
             attempt += 1
             self._ensure_affordable(accrued, price)
-            accrued += price
             try:
                 forecast = self._inner.forecast(market, baseline, vote_index, quotes)
             except ProviderVoteError as error:
+                accrued += price
                 if not self._retry_after_failure(error, attempt, deadline):
                     error.cost_micros = accrued
                     raise
@@ -330,21 +365,31 @@ class RetryingProvider:
     def _finalize_success(
         self, forecast: ProviderForecast, accrued: int
     ) -> ProviderForecast:
-        """Fold the accrued attempt cost into a successful forecast.
+        """Charge the successful attempt at its metered cost and total the vote.
+
+        The successful attempt is priced from its *own* response -- the token
+        counts the provider reported, at the rates configured for the model
+        that produced them. A response carrying no readable usage, or produced
+        by a model with no configured rate, is charged the rate table's
+        fail-closed ``unmetered_micros`` instead; it is never free, and never
+        the list price the pre-gate estimated from.
 
         Args:
             forecast: The inner provider's successful forecast.
-            accrued: The spend accrued across every attempt made, in micros --
-                always at least one list price, since the successful attempt is
-                itself priced.
+            accrued: The spend accrued across the *failed* attempts that
+                preceded it, in micros; zero on a first-attempt success.
 
         Returns:
-            ``forecast`` with ``cost_micros`` increased by ``accrued``.
+            ``forecast`` with ``cost_micros`` increased by ``accrued`` plus the
+            successful attempt's metered cost.
 
         Raises:
             ProviderCostOverrunError: If the combined total breaches the ceiling.
         """
-        total = forecast.cost_micros + accrued
+        metered = self._rate_table.micros_for(
+            model_version=forecast.model_version, usage=forecast.usage
+        )
+        total = forecast.cost_micros + accrued + metered
         if total > self._policy.max_cost_micros:
             raise ProviderCostOverrunError(
                 cost_micros=total, ceiling_micros=self._policy.max_cost_micros

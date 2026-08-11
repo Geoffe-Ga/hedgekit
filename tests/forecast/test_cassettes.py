@@ -23,8 +23,10 @@ from pathlib import Path
 
 import pytest
 
+from windbreak.forecast.budget import TokenUsage
 from windbreak.forecast.cassettes import (
     CassetteMissError,
+    Completion,
     ForbiddenLiveTransport,
     LiveCallForbiddenError,
     LlmRequest,
@@ -48,14 +50,15 @@ def _request(**overrides: object) -> LlmRequest:
 class _FakeTransport:
     """A minimal deterministic transport returning one fixed canned response."""
 
-    def __init__(self, response: str) -> None:
+    def __init__(self, response: str, *, usage: TokenUsage | None = None) -> None:
         self._response = response
+        self._usage = usage
         self.calls: list[LlmRequest] = []
 
-    def complete(self, request: LlmRequest) -> str:
-        """Record the call and return the fixed canned response."""
+    def complete(self, request: LlmRequest) -> Completion:
+        """Record the call and return the fixed canned completion."""
         self.calls.append(request)
-        return self._response
+        return Completion(text=self._response, usage=self._usage)
 
 
 # --- LlmRequest.request_hash(): determinism --------------------------------------
@@ -121,7 +124,7 @@ def test_recording_cassette_delegates_to_transport_and_returns_response(
 
     result = cassette.complete(_request())
 
-    assert result == "recorded-response-1"
+    assert result == Completion(text="recorded-response-1")
     assert len(transport.calls) == 1
 
 
@@ -134,6 +137,59 @@ def test_recording_cassette_persists_to_disk(tmp_path: Path) -> None:
 
     assert cassette_path.exists()
     json.loads(cassette_path.read_text(encoding="utf-8"))
+
+
+def test_recording_cassette_persists_the_reported_token_usage(
+    tmp_path: Path,
+) -> None:
+    """The recorded entry carries the exact token counts the transport reported.
+
+    The cassette is what makes a replayed run's *cost* reproducible (issue
+    #451); a recording that dropped the counts would replay every vote as
+    unknown-cost.
+    """
+    cassette_path = tmp_path / "cassette.json"
+    usage = TokenUsage(input_tokens=4_000, output_tokens=500)
+    cassette = RecordingCassette(
+        transport=_FakeTransport("r1", usage=usage), path=cassette_path
+    )
+
+    cassette.complete(_request())
+
+    entry = next(iter(json.loads(cassette_path.read_text(encoding="utf-8")).values()))
+    assert entry["usage"] == {"input_tokens": 4_000, "output_tokens": 500}
+
+
+def test_recording_cassette_omits_usage_when_none_was_reported(
+    tmp_path: Path,
+) -> None:
+    """A transport that reported no usage records no usage block at all.
+
+    Writing ``{"input_tokens": 0, "output_tokens": 0}`` instead would turn "we
+    do not know what this cost" into "this cost nothing", which is the exact
+    fail-open issue #451 closes.
+    """
+    cassette_path = tmp_path / "cassette.json"
+    cassette = RecordingCassette(transport=_FakeTransport("r1"), path=cassette_path)
+
+    cassette.complete(_request())
+
+    entry = next(iter(json.loads(cassette_path.read_text(encoding="utf-8")).values()))
+    assert "usage" not in entry
+
+
+def test_replay_cassette_serves_the_recorded_token_usage(tmp_path: Path) -> None:
+    """A replayed completion carries the usage the recording captured."""
+    cassette_path = tmp_path / "cassette.json"
+    usage = TokenUsage(input_tokens=4_000, output_tokens=500)
+    request = _request(prompt="a specific, recorded prompt")
+    RecordingCassette(
+        transport=_FakeTransport("r2", usage=usage), path=cassette_path
+    ).complete(request)
+
+    replayed = ReplayCassette.from_path(cassette_path).complete(request)
+
+    assert replayed == Completion(text="r2", usage=usage)
 
 
 def test_recording_cassette_round_trips_through_replay_cassette(
@@ -149,7 +205,7 @@ def test_recording_cassette_round_trips_through_replay_cassette(
 
     replay = ReplayCassette.from_path(cassette_path)
 
-    assert replay.complete(request) == "recorded-response-2"
+    assert replay.complete(request) == Completion(text="recorded-response-2")
 
 
 def test_replay_cassette_miss_raises_cassette_miss_error(tmp_path: Path) -> None:

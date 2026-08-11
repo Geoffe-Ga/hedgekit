@@ -27,8 +27,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from windbreak.forecast.cassettes import Completion
 from windbreak.forecast.providers._llm_http import (
     build_chat_request_body,
+    extract_usage,
     fetch_envelope,
     reject_malformed,
     require_first_element,
@@ -51,6 +53,10 @@ _CONTENT_KEY = "content"
 _TYPE_KEY = "type"
 _TEXT_KEY = "text"
 _TEXT_TYPE = "text"
+
+#: Anthropic's ``usage`` block keys for billed input and output tokens.
+_INPUT_TOKENS_KEY = "input_tokens"
+_OUTPUT_TOKENS_KEY = "output_tokens"
 
 
 def _extract_completion_text(payload: dict[str, object], fingerprint: str) -> str:
@@ -98,14 +104,18 @@ class AnthropicMessagesTransport:
         self._endpoint_url = endpoint_url
         self._max_tokens = max_tokens
 
-    def complete(self, request: LlmRequest) -> str:
-        """Send one completion request and return the model's text response.
+    def complete(self, request: LlmRequest) -> Completion:
+        """Send one completion request and return the model's response.
 
         Args:
             request: The completion request whose prompt/model drive the call.
 
         Returns:
-            The extracted ``content[0]["text"]`` completion text, verbatim.
+            The extracted ``content[0]["text"]`` completion text, verbatim,
+            paired with the envelope's reported ``usage`` token counts -- or
+            ``None`` usage when the envelope reported none readably, which
+            costs the fail-closed unmetered figure rather than nothing
+            (issue #451).
 
         Raises:
             ProviderHTTPError: On a non-2xx status, carrying that status code.
@@ -117,4 +127,11 @@ class AnthropicMessagesTransport:
         envelope = fetch_envelope(
             self._http, endpoint_url=self._endpoint_url, body=body
         )
-        return _extract_completion_text(envelope.payload, envelope.fingerprint)
+        return Completion(
+            text=_extract_completion_text(envelope.payload, envelope.fingerprint),
+            usage=extract_usage(
+                envelope.payload,
+                input_key=_INPUT_TOKENS_KEY,
+                output_key=_OUTPUT_TOKENS_KEY,
+            ),
+        )

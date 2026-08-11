@@ -13,6 +13,7 @@ Nothing here reaches a network.
 from __future__ import annotations
 
 import dataclasses
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -22,13 +23,18 @@ from windbreak.config.schema import (
     PROVIDER_TRANSPORT_LIVE,
     EnsembleMemberConfig,
     ForecastConfig,
+    ModelTokenPrice,
     ProviderPrice,
     ProviderRetryConfig,
     ProviderTransportConfig,
     ResearchSettings,
     WindbreakConfig,
 )
+from windbreak.connector.models import NormalizedMarket
+from windbreak.forecast.budget import TokenUsage
+from windbreak.forecast.cassettes import Completion
 from windbreak.forecast.providers import FixtureVoteProvider, RetryingProvider
+from windbreak.forecast.records import BaselineQuoteSnapshot
 from windbreak.scheduler.provider_wiring import (
     LiveProviderHttp,
     OfflineResearchTransport,
@@ -38,6 +44,7 @@ from windbreak.scheduler.provider_wiring import (
     is_live_mode,
     offline_research_tools,
     price_table_from_config,
+    rate_table_from_config,
     retry_policy_from_config,
 )
 
@@ -81,20 +88,78 @@ class _StubMember:
         self.training_cutoff = "2025-01-01"
 
 
+#: A schema-valid vote body the metered wiring tests drive a real vote through.
+_VOTE_JSON = (
+    '{"probability_ppm": 500000, "rationale_summary": "steady", "abstain": false}'
+)
+
+
 class _StubLlmTransport:
     """An `LlmTransport` double returning a fixed completion."""
 
-    def complete(self, request: object) -> str:
+    def __init__(
+        self, *, response: str = "{}", usage: TokenUsage | None = None
+    ) -> None:
+        """Store the canned completion text and its reported token usage.
+
+        Args:
+            response: The completion text every call returns (keyword-only).
+            usage: The token accounting every completion reports, or `None` for
+                a response that reported none (keyword-only).
+        """
+        self._response = response
+        self._usage = usage
+
+    def complete(self, request: object) -> Completion:
         """Return a fixed completion.
 
         Args:
             request: The (unused) completion request.
 
         Returns:
-            A fixed string.
+            The stored `Completion`.
         """
         del request
-        return "{}"
+        return Completion(text=self._response, usage=self._usage)
+
+
+def _market() -> NormalizedMarket:
+    """Build a minimal, valid market for a wiring-level vote.
+
+    Returns:
+        A `NormalizedMarket` the vote prompt builder accepts.
+    """
+    return NormalizedMarket(
+        exchange="fake-exchange",
+        ticker="KXWIRE-01",
+        event_ticker="KXWIRE",
+        title="Does the configured rate reach the meter?",
+        resolution_criteria="Resolves YES if it does.",
+        category="economics",
+        close_time=datetime(2024, 12, 18, 19, tzinfo=UTC),
+        expected_resolution_time=None,
+        market_type="fully_collateralized_binary",
+        price_tick_pips=100,
+        min_order_contract_centis=100,
+        fractional_trading_enabled=False,
+        mutually_exclusive_group_id=None,
+        jurisdiction_status="eligible",
+        raw_exchange_payload_hash="sha256:abc123",
+        volume_24h_micros=0,
+    )
+
+
+def _baseline() -> BaselineQuoteSnapshot:
+    """Build the baseline quote snapshot the vote prompt renders.
+
+    Returns:
+        A `BaselineQuoteSnapshot` for `_market`.
+    """
+    return BaselineQuoteSnapshot(
+        snapshot_id="snap-wiring-0001",
+        price_pips=4500,
+        fetched_at=datetime(2024, 12, 10, 12, tzinfo=UTC),
+    )
 
 
 def _config(**transport: object) -> WindbreakConfig:
@@ -220,6 +285,69 @@ def test_a_zero_price_refuses_to_start() -> None:
         price_table_from_config(_config(prices=(ProviderPrice("anthropic", 0),)))
 
 
+# --- Metered rate table (issue #451) ------------------------------------------------
+
+
+def test_the_rate_table_carries_every_configured_token_rate() -> None:
+    """Operator token rates reach the metered table verbatim."""
+    table = rate_table_from_config(
+        _config(
+            token_prices=(
+                ModelTokenPrice("model-a", 3_000_000, 15_000_000),
+                ModelTokenPrice("model-b", 1_000_000, 4_000_000),
+            ),
+            unmetered_response_micros=888,
+        )
+    )
+
+    assert (
+        table.micros_for(
+            model_version="model-a",
+            usage=TokenUsage(input_tokens=1_000, output_tokens=100),
+        )
+        == 4_500
+    )
+    assert (
+        table.micros_for(
+            model_version="model-b",
+            usage=TokenUsage(input_tokens=1_000, output_tokens=100),
+        )
+        == 1_400
+    )
+
+
+def test_an_unrated_model_falls_back_to_the_configured_unmetered_charge() -> None:
+    """A model the operator never rated is charged high, never free."""
+    table = rate_table_from_config(
+        _config(
+            token_prices=(ModelTokenPrice("model-a", 3_000_000, 15_000_000),),
+            unmetered_response_micros=888,
+        )
+    )
+
+    assert (
+        table.micros_for(
+            model_version="a-model-nobody-rated",
+            usage=TokenUsage(input_tokens=1_000, output_tokens=100),
+        )
+        == 888
+    )
+
+
+def test_a_zero_token_rate_refuses_to_start() -> None:
+    """A zero-rated model would bill nothing however many tokens it burned."""
+    with pytest.raises(ValueError):
+        rate_table_from_config(
+            _config(token_prices=(ModelTokenPrice("model-a", 0, 15_000_000),))
+        )
+
+
+def test_a_zero_unmetered_charge_refuses_to_start() -> None:
+    """A zero fail-closed charge would make every unmeasurable vote free."""
+    with pytest.raises(ValueError):
+        rate_table_from_config(_config(unmetered_response_micros=0))
+
+
 # --- Provider factory ---------------------------------------------------------------
 
 
@@ -239,6 +367,58 @@ def test_the_live_factory_wraps_in_a_retrying_provider() -> None:
     provider = factory(_StubLlmTransport(), _StubMember("openai"))
 
     assert isinstance(provider, RetryingProvider)
+
+
+def test_the_live_factory_meters_a_vote_at_the_configured_token_rates() -> None:
+    """The configured rate table actually reaches the vote that is charged.
+
+    The wiring test, not a table test: it drives a real vote through the
+    factory the composition root returns and asserts the *charge*, so deleting
+    the ``rate_table=`` argument in ``build_provider_factory`` fails here even
+    though every table-level test above still passes. The configured rate is
+    deliberately unlike the configured list price, so the assertion cannot be
+    satisfied by the pre-gate estimate.
+    """
+    factory = build_provider_factory(
+        _config(
+            mode=PROVIDER_TRANSPORT_LIVE,
+            prices=(ProviderPrice("openai", 200_000),),
+            token_prices=(ModelTokenPrice("pinned-for-test", 3_000_000, 15_000_000),),
+            unmetered_response_micros=888_000,
+        ),
+        live=True,
+    )
+    transport = _StubLlmTransport(
+        response=_VOTE_JSON, usage=TokenUsage(input_tokens=1_000, output_tokens=100)
+    )
+
+    provider = factory(transport, _StubMember("openai"))
+    result = provider.forecast(_market(), _baseline(), 0, ())
+
+    assert result.cost_micros == 4_500
+
+
+def test_the_live_factory_fails_closed_on_a_vote_reporting_no_usage() -> None:
+    """A live vote whose response reported no usage books the configured bound.
+
+    Proves the fail-closed figure is wired too, not merely the rates: without
+    it a response with no token accounting would be charged nothing.
+    """
+    factory = build_provider_factory(
+        _config(
+            mode=PROVIDER_TRANSPORT_LIVE,
+            prices=(ProviderPrice("openai", 200_000),),
+            token_prices=(ModelTokenPrice("pinned-for-test", 3_000_000, 15_000_000),),
+            unmetered_response_micros=888_000,
+        ),
+        live=True,
+    )
+    transport = _StubLlmTransport(response=_VOTE_JSON)
+
+    provider = factory(transport, _StubMember("openai"))
+    result = provider.forecast(_market(), _baseline(), 0, ())
+
+    assert result.cost_micros == 888_000
 
 
 def test_the_factory_takes_the_transport_per_call() -> None:
