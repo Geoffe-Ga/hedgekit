@@ -674,9 +674,13 @@ Alerts reach you only through the sinks `config.alerts` declares. Until you
 declare one, every alert falls back to the log-only sink: it appears on stderr
 as a JSON `AlertEmitted` line and **nowhere else** you can be paged from. (The
 one exception is the kill switch's `HALT_KILL` alert, which since issue #287
-*also* appends an `AlertEmitted` row to the hash-chained ledger — an audit
-record, not a delivery channel: it proves after the fact that the page fired,
-and it cannot page you.) The log-only fallback is the shipped default
+*also* appends an `AlertEmitted` row to the hash-chained ledger. That row is
+still an audit record and not a delivery channel — it cannot page you — but
+since issue #413 it records *delivery*, not merely emission: it carries one
+closed `{sink, outcome, fallback}` entry per attempted sink, so after the fact
+you can tell a page every sink accepted from one every sink dropped. See
+"Read a kill page off the ledger" below.) The log-only fallback is the shipped
+default
 (`alerts.sinks` holds one ntfy entry whose `topic_env` is still the
 `configured-by-operator` placeholder), so treat configuring a real sink as a
 prerequisite for any unattended run.
@@ -743,6 +747,40 @@ empty, targets a host missing from `allowed_hosts`, or cannot deliver as
 configured — a half-wired alerting path is never silently downgraded.
 A sink you have not finished filling in is skipped with a WARNING naming its
 type only; no topic or webhook URL is ever logged.
+
+### Read a kill page off the ledger
+
+After a kill, the `AlertEmitted` row for `HALT_KILL` answers *was anyone told?*
+— not just *did we try?* (issue #413). Its payload carries `deliveries`, one
+entry per attempted sink in attempt order:
+
+```json
+{"deliveries": [{"sink": "webhook", "outcome": "refused", "fallback": false},
+                {"sink": "log-only", "outcome": "delivered", "fallback": true}],
+ "delivery_reported": true}
+```
+
+- `outcome` is one of exactly four values. `delivered` — the sink accepted it.
+  `refused` — the destination answered and declined: a non-2xx HTTPS response,
+  or a refused connection. It is up and saying no, so check its quota, auth and
+  status page. `timed_out` — no answer inside the transport timeout.
+  `errored` — anything else, the fail-closed default for a failure the code
+  could not classify.
+- `fallback: true` marks the log-only fallback, which fires only when no
+  configured sink accepted. **A row whose only `delivered` entry has
+  `fallback: true` means nobody was paged** — the alert reached a log file and
+  stopped there. That is the case this row exists to make visible; before #413
+  it was byte-identical to a fully delivered page.
+- `delivery_reported: false` with an empty `deliveries` means the dispatcher on
+  that path records no delivery evidence at all — *unknown*, never *delivered*.
+  Read it as no evidence, not as good news.
+
+There is deliberately no free-form field here: no exception text, no URL, no
+sink-supplied string. A sink name the codebase does not define is recorded as
+`unregistered`. The chain is append-only, so nothing written into it could ever
+be redacted, and a bearer-token-bearing webhook URL in a failure message is
+exactly the disclosure issue #274 found (see SECURITY.md). The unredacted detail
+stays on the log line only.
 
 ## Provider operations
 
