@@ -57,8 +57,9 @@ is rather than pretending otherwise:
 
 Only a product change -- a fixture-backed research/vote transport selectable
 from the CLI -- would let a fill cross a real process boundary, so the gap is
-**filed, not papered over**: the issue this module references reports it with
-this reproduction rather than fixing it inside a test-tier change.
+**filed, not papered over**: issue #510 carries this reproduction and the
+acceptance criteria for closing it, rather than the fix landing inside a
+test-tier change.
 
 What *is* reachable is a genuine decision the pipeline process computed and no
 other process could have: a ``SelectorDecisionRecorded`` naming the market and
@@ -83,6 +84,20 @@ threshold: ``ScreenerConfig``'s production defaults are untouched and no
 ``screener`` key is written to any config file here. What varies run to run is a
 timestamp; what is asserted is decision content, which does not.
 
+What running the real topology found
+------------------------------------
+
+Two product defects, both reported rather than repaired here, since this is a
+test-tier change:
+
+* **#328** -- opening the shared ledger is itself a write and no ``busy_timeout``
+  is set, so a process started while a sibling holds the write lock dies on an
+  unhandled ``sqlite3.OperationalError`` before it exists. This is how this
+  module first went red;
+  :func:`test_a_process_opening_a_write_locked_ledger_dies_unhandled` now pins it
+  deterministically, and :func:`_start_topology` documents the ordering it forces.
+* **#510** -- the abstention gap above.
+
 Waiting is bounded and always on a real condition (:func:`wait_until`); there is
 no sleep in this module.
 """
@@ -94,6 +109,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -106,6 +122,7 @@ from tests.e2e.harness import (
     pid_alive,
     port_is_serving,
     read_ledger_records,
+    run_windbreak,
     verify_ledger_chain,
     wait_until,
 )
@@ -145,7 +162,7 @@ FUNDED_CASH_MICROS = 10_000_000_000
 
 #: Seconds between pipeline/gateway beats. Fast enough that liveness shows up
 #: promptly, slow enough that the tier is not a spin loop.
-PIPELINE_BEAT_INTERVAL = "0.2"
+PIPELINE_BEAT_INTERVAL = "1"
 GATEWAY_BEAT_INTERVAL = "0.05"
 
 #: The Risk Kernel is float-free, so ``_kernel_heartbeat_interval`` takes the
@@ -655,7 +672,19 @@ def assert_four_distinct_live_processes(spawned: tuple[LiveProcess, ...]) -> Non
 def _start_topology(
     launcher: ProcessLauncher, run_root: RunRoot, books: Path, port: int
 ) -> tuple[SpawnedProcess, ...]:
-    """Start all four processes against one shared ledger.
+    """Start all four processes against one shared ledger, one at a time.
+
+    **The start order and the waiting between are not style.** Opening the ledger
+    is itself a write -- ``SqliteLedgerStore.__init__`` issues ``PRAGMA
+    journal_mode=WAL`` and a ``CREATE TABLE`` -- and no ``busy_timeout`` is set
+    (issue #328), so a process that opens the shared ledger while a sibling holds
+    the write lock dies at once with an unhandled ``sqlite3.OperationalError``.
+    That is a defect of the shipped product, not of this test:
+    :func:`test_a_process_opening_a_write_locked_ledger_dies_unhandled` pins it
+    deterministically, and it is reported rather than worked around in the
+    product. Starting the readers and light writers before the pipeline -- the
+    only heavy writer -- and waiting for each to land its own row keeps this
+    module from *racing* a defect it has already pinned.
 
     Args:
         launcher: The launcher that reaps every child.
@@ -667,35 +696,34 @@ def _start_topology(
         The four processes, in :data:`windbreak.main.PROCESS_CHOICES` order.
     """
     ledger_path = run_root.ledger_path
-    return (
-        _spawn_pipeline(
-            launcher, run_root, books, ledger_path=ledger_path, max_beats=LONG_RUN_BEATS
-        ),
-        _spawn_riskkernel(launcher, run_root, ledger_path=ledger_path),
-        _spawn_order_gateway(launcher, run_root, ledger_path=ledger_path),
-        _spawn_dashboard(launcher, run_root, ledger_path=ledger_path, port=port),
+    dashboard = _spawn_dashboard(launcher, run_root, ledger_path=ledger_path, port=port)
+    _await_component_on_the_ledger(ledger_path, "dashboard")
+    order_gateway = _spawn_order_gateway(launcher, run_root, ledger_path=ledger_path)
+    _await_component_on_the_ledger(ledger_path, "order_gateway")
+    riskkernel = _spawn_riskkernel(launcher, run_root, ledger_path=ledger_path)
+    _await_component_on_the_ledger(ledger_path, "riskkernel")
+    pipeline = _spawn_pipeline(
+        launcher, run_root, books, ledger_path=ledger_path, max_beats=LONG_RUN_BEATS
     )
+    _await_component_on_the_ledger(ledger_path, "pipeline")
+    return (pipeline, riskkernel, order_gateway, dashboard)
 
 
-def _await_every_process_on_the_ledger(ledger_path: Path) -> None:
-    """Block until all four processes have written their own config-load row.
+def _await_component_on_the_ledger(ledger_path: Path, component: str) -> None:
+    """Block until one process has recorded its own config load on the ledger.
+
+    The startup handshake: a ``ConfigLoaded`` row stamped with this process's
+    ``--process`` token is the first durable evidence the process exists, opened
+    the shared volume, and got its own configuration.
 
     Args:
         ledger_path: The shared ledger.
+        component: The ``--process`` token to wait for.
     """
     wait_until(
-        lambda: (
-            len(
-                {
-                    record.component
-                    for record in read_ledger_records(ledger_path)
-                    if record.event_type == CONFIG_LOADED_EVENT
-                }
-            )
-            == len(PROCESS_CHOICES)
-        ),
+        lambda: len(_payloads(ledger_path, CONFIG_LOADED_EVENT, component)) == 1,
         timeout=STARTUP_TIMEOUT_SECONDS,
-        description="all four processes to record their own config load",
+        description=f"the {component} process to record its own config load",
     )
 
 
@@ -722,7 +750,6 @@ def test_the_four_process_tokens_run_as_four_distinct_operating_system_processes
     port = free_port()
 
     spawned = _start_topology(launcher, run_root, books, port)
-    _await_every_process_on_the_ledger(run_root.ledger_path)
 
     assert_four_distinct_live_processes(spawned)
     assert tuple(process.name for process in spawned) == PROCESS_CHOICES
@@ -806,11 +833,11 @@ def test_a_decision_one_process_recorded_is_served_by_another_over_loopback(
     pipeline = _spawn_pipeline(
         launcher, run_root, books, ledger_path=run_root.ledger_path, max_beats=ONE_BEAT
     )
+
+    assert pipeline.wait(timeout=EXIT_TIMEOUT_SECONDS) == 0
     dashboard = _spawn_dashboard(
         launcher, run_root, ledger_path=run_root.ledger_path, port=port
     )
-
-    assert pipeline.wait(timeout=EXIT_TIMEOUT_SECONDS) == 0
     _await_dashboard(dashboard, port)
 
     assert pipeline.pid != dashboard.pid
@@ -851,11 +878,11 @@ def test_a_dashboard_on_its_own_ledger_cannot_see_that_decision(
     pipeline = _spawn_pipeline(
         launcher, run_root, books, ledger_path=run_root.ledger_path, max_beats=ONE_BEAT
     )
+
+    assert pipeline.wait(timeout=EXIT_TIMEOUT_SECONDS) == 0
     dashboard = _spawn_dashboard(
         launcher, run_root, ledger_path=private_ledger, port=port
     )
-
-    assert pipeline.wait(timeout=EXIT_TIMEOUT_SECONDS) == 0
     _await_dashboard(dashboard, port)
 
     assert private_ledger != run_root.ledger_path
@@ -896,7 +923,6 @@ def test_killing_the_pipeline_leaves_the_other_three_alive_and_still_working(
     pipeline, riskkernel, order_gateway, dashboard = _start_topology(
         launcher, run_root, books, port
     )
-    _await_every_process_on_the_ledger(run_root.ledger_path)
     _await_dashboard(dashboard, port)
     wait_until(
         lambda: _kernel_heartbeat_count(run_root.ledger_path) > 0,
@@ -943,3 +969,63 @@ def test_killing_the_pipeline_leaves_the_other_three_alive_and_still_working(
     status, _ = _get(port, "/decisions", token=DASHBOARD_TOKEN)
     assert status == 200
     verify_ledger_chain(run_root.ledger_path)
+
+
+def test_a_process_opening_a_write_locked_ledger_dies_unhandled(
+    run_root: RunRoot,
+) -> None:
+    """The defect this tier found: the shared volume is not safely shared (#328).
+
+    Opening the ledger is a *write*: ``SqliteLedgerStore.__init__``
+    (``windbreak/ledger/store.py:370``) connects and immediately issues ``PRAGMA
+    journal_mode=WAL``, and no ``busy_timeout`` is ever set, so SQLite's default
+    of zero applies. A ``windbreak run`` given ``--ledger-path`` while any
+    sibling holds the write lock therefore does not wait, does not retry, and
+    does not fail closed with the ``FATAL`` line every other startup error gets:
+    it dies on an unhandled ``sqlite3.OperationalError`` before the process
+    exists at all.
+
+    That is not a hypothetical. It is how this module first went red, when the
+    dashboard was started while the pipeline was mid-tick. It matters far beyond
+    the tests: ``deploy/docker-compose.yml`` starts all four services at once
+    under ``restart: on-failure``, so on a busy ledger the shipped stack
+    crash-loops -- three of "four isolated processes sharing only the ledger
+    volume" taken down by the fourth merely *writing*, which is the same
+    ``ARCHITECTURE.md:10`` claim this module tests, failing from the other
+    direction.
+
+    Pinned here rather than worked around, and reported rather than fixed: this
+    is a test-tier change, and the repair belongs in
+    ``windbreak/ledger/store.py``. The lock is held by an ordinary second
+    connection -- exactly what a sibling process is -- so nothing about this
+    reproduction is special to a test.
+
+    Args:
+        run_root: This test's isolated run root.
+    """
+    ledger_path = run_root.ledger_path
+    holder = sqlite3.connect(ledger_path, isolation_level=None)
+    try:
+        holder.execute("PRAGMA journal_mode=WAL")
+        holder.execute("BEGIN IMMEDIATE")
+        completed = run_windbreak(
+            "run",
+            "--process",
+            "order_gateway",
+            "--ledger-path",
+            str(ledger_path),
+            "--max-beats",
+            ONE_BEAT,
+            "--heartbeat-interval",
+            GATEWAY_BEAT_INTERVAL,
+        )
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert completed.returncode == 1
+    assert completed.stderr.rstrip().endswith(
+        "sqlite3.OperationalError: database is locked"
+    )
+    assert "FATAL" not in completed.stderr
+    assert read_ledger_records(ledger_path) == []
