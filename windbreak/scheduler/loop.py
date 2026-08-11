@@ -145,6 +145,7 @@ from windbreak.ledger.store import (
     events_from_records,
 )
 from windbreak.numeric import ContractCentis, MoneyMicros, PricePips
+from windbreak.order_gateway.cancel_all import VenueCancelAllSink
 from windbreak.order_gateway.gateway import OrderGateway, PaperSubmitter
 from windbreak.order_gateway.ledger_writer import SqliteGatewayLedgerWriter
 from windbreak.order_gateway.reconciler import Reconciler
@@ -159,6 +160,7 @@ from windbreak.riskkernel.context import (
     RiskLimits,
 )
 from windbreak.riskkernel.kill import (
+    DirectiveSink,
     KillFileWatcher,
     KillIntegration,
     KillSwitch,
@@ -1836,6 +1838,7 @@ def _build_kill_integration(
     clock: Callable[[], int],
     dispatcher: AlertDispatcher,
     reservations: ReservationLedger,
+    directive_sink: DirectiveSink,
 ) -> KillIntegration:
     """Compose the always-on PAPER loop's kill switch and triggers (issue #441).
 
@@ -1874,12 +1877,20 @@ def _build_kill_integration(
     * **The reservation ledger is wired.** A killed loop must hold no live
       capital reservation, so the switch is handed the very ledger the approval
       pipeline reserves against and releases every active one on kill.
-    * **No directive sink.** The one :class:`CancelAllDirective` is ledgered but
-      not delivered to the gateway, matching ``_build_risk_kernel``'s live
-      composition exactly: the gateway is built *after* this seam and exposes no
-      ``submit(directive)``. Resting-order cancellation on kill is therefore
-      still an audit record rather than an effect, on this path and the LIVE one
-      alike.
+    * **The directive sink is wired** (issue #480). Until it was, the one
+      :class:`CancelAllDirective` a kill wrote was consumed by nothing here or
+      in ``_build_risk_kernel``, so resting-order cancellation on kill was an
+      audit record rather than an effect -- and an order resting on the book is
+      not a held position, it is a live instruction that can still fill after
+      the operator has killed the system and walked away. The seam looked
+      blocked because the *gateway* is built after this point and exposes no
+      ``submit(directive)``; the resolution is that it never needed to. What a
+      cancel-all needs is the venue, and :func:`build_paper_deps` builds the
+      exchange *before* the kernel, so a
+      :class:`~windbreak.order_gateway.cancel_all.VenueCancelAllSink` over it
+      can be handed in here with no late binding and no mutable holder. The
+      directive still crosses the kernel's seam as data (SPEC S5): nothing in
+      ``windbreak/riskkernel/`` names a connector type.
 
     Args:
         config: The configuration supplying ``ops.state_dir`` and the
@@ -1895,6 +1906,8 @@ def _build_kill_integration(
             configured rather than a second, log-only path.
         reservations: The capital ledger whose active reservations a kill
             releases.
+        directive_sink: The order-gateway-side consumer that turns the kill's
+            one cancel-all directive into venue cancellations (issue #480).
 
     Returns:
         The composed :class:`~windbreak.riskkernel.kill.KillIntegration`.
@@ -1906,6 +1919,7 @@ def _build_kill_integration(
         writer,
         dispatcher,
         reservation_ledger=reservations,
+        directive_sink=directive_sink,
         state_dir=state_dir,
         clock=clock,
     )
@@ -1925,6 +1939,7 @@ def _build_approval(
     view: ReadOnlyVenueView,
     clock: Callable[[], int],
     dispatcher: AlertDispatcher,
+    directive_sink: DirectiveSink,
 ) -> tuple[KernelApproval, RiskKernel]:
     """Wire the real kernel + approval pipeline into a `KernelApproval` seam.
 
@@ -1956,6 +1971,9 @@ def _build_approval(
             its snapshots at.
         dispatcher: The composed alert root the verification cycle's alerts are
             delivered through (issue #444).
+        directive_sink: The order-gateway-side consumer a kill's cancel-all
+            directive is delivered through (issue #480), forwarded to
+            :func:`_build_kill_integration`.
 
     Returns:
         The composed :class:`KernelApproval` seam and the kernel inside it, so
@@ -1975,7 +1993,14 @@ def _build_approval(
         clock=clock,
         gate_plan_store=store,
         kill_integration=_build_kill_integration(
-            config, history, mode_machine, writer, clock, dispatcher, ledger
+            config,
+            history,
+            mode_machine,
+            writer,
+            clock,
+            dispatcher,
+            ledger,
+            directive_sink,
         ),
     )
     issuer = TokenIssuer.from_key_material(key)
@@ -2412,6 +2437,10 @@ def build_paper_deps(
         verification_view,
         resolved_clock,
         _resolved_dispatcher(dispatcher),
+        # The kill path gets the raw exchange, not `verification_view`: the
+        # view exists to keep the read-only cycle away from `cancel_order`,
+        # and cancelling resting orders is this seam's entire purpose (#480).
+        VenueCancelAllSink(exchange),
     )
     gateway = _build_gateway(exchange, store, key, resolved_clock, ledger_path)
     reconciler = Reconciler(

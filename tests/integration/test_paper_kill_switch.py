@@ -67,11 +67,25 @@ What each test pins, and why it is shaped that way:
    `str(exc)` never reaches `ledger.db` or its WAL sidecar and the delivery
    mappings carry no fourth key.
 
-Deliberately not covered here, and stated so the omission is a decision rather
-than an oversight: the one `CancelAllDirective` a kill ledgers is not delivered
-to the order gateway, because no `directive_sink` is wired -- on this path or on
-`windbreak/main.py`'s LIVE one. Resting-order cancellation on kill is an audit
-record, not yet an effect.
+9. `test_a_kill_cancels_the_running_paper_loops_resting_orders_at_the_venue`
+   -- issue #480. The `CancelAllDirective` a kill writes is now *delivered*,
+   not merely ledgered. Asserted at the venue the loop actually trades on, and
+   corroborated by the withheld collateral the paper venue returns on
+   cancellation (issue #362), never by the ledger row -- which claimed "cancel
+   everything" throughout the entire period in which nothing did.
+10. `test_a_kill_whose_venue_refuses_the_cancel_all_says_so_and_leaks_nothing`
+   -- the unhappy half. A refusing venue cannot read as a clean kill: the row
+   records `refused` with counts, the operator's page names it, and the venue
+   client's `str(exc)` reaches neither `ledger.db` nor its WAL sidecar.
+
+What is deliberately *not* covered here, stated so the omission is a decision
+rather than an oversight: the delivered cancel-all does not retire the Order
+Gateway's own tracked-order state or write the `REQUEST_CANCEL`/`CANCEL`
+lifecycle rows. That ledger dance is the Sweeper's and the Reconciler's
+(issue #41), which already adjudicate a resting order that has vanished from
+the venue; doing it from inside the kill path would put a multi-row ledger
+sequence in the middle of a fail-safe, which is exactly the ordering hazard
+PR #412 exists to prevent.
 """
 
 from __future__ import annotations
@@ -111,12 +125,30 @@ _KILL_MESSAGE = "kill switch engaged; trading halted, positions held"
 #: orders only, never open positions (the SPEC S10.12 position-hold invariant).
 _CANCEL_ALL_SCOPE = "all_open_orders"
 
+#: The whole `CancelAllDirective` payload a kill writes when the composed sink
+#: found nothing resting (issue #480). `delivery_reported: True` with zero
+#: counts is the load-bearing part: it says a sink was wired and *asked*, which
+#: is what distinguishes this from the pre-#480 row that was written while
+#: nothing consumed the directive at all. The offline fixture places no orders,
+#: so this is the shape every scenario here but the resting-order one produces.
+_CANCEL_ALL_NOTHING_RESTING = {
+    "scope": _CANCEL_ALL_SCOPE,
+    "delivery": {"cancelled": 0, "failed": 0, "outcome": "delivered"},
+    "delivery_reported": True,
+}
+
 #: The credential-bearing text an exploding sink raises, standing in for the
 #: whole category issue #274 leaked: an ntfy destination URL whose topic
 #: segment *is* the capability to page this deployment. `SinkOutcome.detail` is
 #: `str(exc)`, so this is exactly the string a careless ledger projection would
 #: hash into an unredactable chain.
 _SINK_FAILURE_DETAIL = "POST https://ntfy.example/s3kr1t-488-topic refused"
+
+#: Credential-bearing text a *venue* client raises when it refuses a
+#: cancellation (issue #480): a URL whose path segment is itself a capability.
+#: `str(exc)` from an arbitrary third-party client is the same shape issue #274
+#: leaked through alert sinks, and the chain is equally unredactable here.
+_VENUE_FAILURE_DETAIL = "POST https://venue.example/v1/s3kr1t-480-token/cancel 403"
 
 #: The screened identity a sink whose `name` is not one this codebase defines
 #: is recorded under. The suite's doubles are named `recording`, which is not a
@@ -204,6 +236,31 @@ class _ExplodingSink:
         """
         self.attempts.append((alert_type, severity, message))
         raise RuntimeError(_SINK_FAILURE_DETAIL)
+
+
+class _NothingRestingVenue:
+    """A `RestingOrderVenue` double with an empty book, for the seam tests.
+
+    Used only where a test drives `_build_kill_integration` directly and cares
+    about some *other* effect of the kill; a venue that never had an order is
+    the honest stand-in there. Its `cancel_order` raises rather than passing,
+    so a test that reaches it by accident fails instead of quietly agreeing.
+    """
+
+    def get_open_orders(self) -> tuple[Any, ...]:
+        """Return no resting orders, ever."""
+        return ()
+
+    def cancel_order(self, order_id: str) -> None:
+        """Raise; nothing is resting, so nothing can be cancelled.
+
+        Args:
+            order_id: The order id that was unexpectedly cancelled.
+
+        Raises:
+            AssertionError: Always -- reaching this is itself a test bug.
+        """
+        raise AssertionError(f"unexpected cancel of {order_id!r} on an empty book")
 
 
 def _fixed_clock() -> int:
@@ -559,7 +616,7 @@ def test_the_operators_kill_file_stops_the_running_paper_loop(
     assert _payloads_of(deps, "KillEngaged") == [
         {"trigger": "KILL_FILE", "kill_sequence": 1, "epoch": FIXED_NOW_EPOCH_S}
     ]
-    assert _payloads_of(deps, "CancelAllDirective") == [{"scope": _CANCEL_ALL_SCOPE}]
+    assert _payloads_of(deps, "CancelAllDirective") == [_CANCEL_ALL_NOTHING_RESTING]
     assert _alert_rows(deps) == [
         ("pipeline", AlertSeverity.CRITICAL.value, _KILL_MESSAGE),
         ("riskkernel", AlertSeverity.CRITICAL.value, _KILL_MESSAGE),
@@ -881,6 +938,7 @@ def test_a_kill_releases_the_paper_loops_active_capital_reservations(
         paper_config: The PAPER-ceilinged configuration.
     """
     from windbreak.numeric import MoneyMicros
+    from windbreak.order_gateway.cancel_all import VenueCancelAllSink
     from windbreak.riskkernel.kill import KillTrigger
     from windbreak.riskkernel.modes import ModeStateMachine
     from windbreak.riskkernel.process import InMemoryKernelLedgerWriter
@@ -903,6 +961,7 @@ def test_a_kill_releases_the_paper_loops_active_capital_reservations(
         _fixed_clock,
         AlertDispatcher(sinks=[], ledger_writer=LoggingLedgerWriter()),
         reservations,
+        VenueCancelAllSink(_NothingRestingVenue()),
     )
 
     integration.switch.kill(KillTrigger.CLI)
@@ -1179,3 +1238,219 @@ def test_a_composed_kill_whose_sink_fails_ledgers_the_fallback_not_its_text(
     assert _KILL_MESSAGE.encode() in on_disk
     assert _SINK_FAILURE_DETAIL.encode() not in on_disk
     assert b"s3kr1t-488" not in on_disk
+
+
+def _rest_two_orders(deps: PaperTickDeps) -> tuple[str, ...]:
+    """Rest two non-crossing YES limit orders on the loop's own exchange.
+
+    Both limits sit strictly below the fixture's 4600-pip best ask, so neither
+    crosses and both come to rest whole. Two orders at *different* sizes are
+    deliberate: a single resting order makes "cancelled the one I meant" and
+    "cancelled whatever was there" the same observation, and the sizes differ
+    so the withheld collateral each one holds differs too.
+
+    Args:
+        deps: The wired bundle whose exchange the orders are rested on.
+
+    Returns:
+        The two venue order ids, in placement order.
+    """
+    from windbreak.connector.paper import PaperOrderIntent
+    from windbreak.numeric.types import ContractCentis, PricePips
+
+    ids: list[str] = []
+    for price, quantity in ((4400, 100), (4300, 200)):
+        placement = deps.exchange.place_order(
+            PaperOrderIntent(
+                ticker="MKT-DEEP",
+                side="yes",
+                price=PricePips(price),
+                quantity=ContractCentis(quantity),
+            ),
+            None,
+        )
+        assert placement.fills == ()
+        assert placement.resting_order is not None
+        ids.append(placement.resting_order.id)
+    return tuple(ids)
+
+
+def test_a_kill_cancels_the_running_paper_loops_resting_orders_at_the_venue(
+    books_dir: Path,
+    captured_deps: list[PaperTickDeps],
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """`windbreak kill` reaches the venue, not just the chain (issue #480).
+
+    The kill switch's contract is "halt trading, hold positions". Positions are
+    held by construction, but an order resting on the book is not a held
+    position: it is a live instruction that can still fill after the operator
+    has killed the system and walked away. Until issue #480 the one
+    `CancelAllDirective` a kill writes was consumed by nothing -- no
+    `directive_sink` was wired on this path or on `--process riskkernel` -- so
+    resting orders were an audit record rather than an effect.
+
+    Asserted against the venue the loop actually trades on, never against the
+    ledger row: the row said "cancel everything" the whole time it was untrue.
+    The two orders are rested *between* beats, which is the operator's real
+    scenario (a kill arriving at a loop that already has orders on the book),
+    and the collateral assertion is the second, independent witness -- the
+    paper venue withholds a resting order's collateral and returns it on
+    cancellation (issue #362), so an unreleased order and a released one report
+    different available cash.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        captured_deps: Captures the bundle the composition root builds.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used to make `build_sinks` yield the recording sink.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory.
+        state_dir: The kill/re-arm state directory `paper_config` points at.
+        tmp_path: The per-test scratch directory.
+    """
+    from windbreak.main import main
+
+    sink = _RecordingSink()
+    monkeypatch.setattr("windbreak.main.build_sinks", lambda *_a, **_k: (sink,))
+    args = _paper_args(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+    )
+    observed: dict[str, object] = {}
+
+    def _rest_orders_then_kill(seq: int) -> None:
+        """Rest two orders and run the real `windbreak kill`, after beat 1.
+
+        Args:
+            seq: The just-finished beat's sequence number.
+        """
+        if seq != 1:
+            return
+        deps = captured_deps[0]
+        observed["available_before"] = deps.exchange.get_balances().available
+        observed["order_ids"] = _rest_two_orders(deps)
+        observed["resting_before"] = tuple(
+            order.id for order in deps.exchange.get_open_orders()
+        )
+        observed["available_while_resting"] = deps.exchange.get_balances().available
+        assert main(["kill", "--state-dir", str(state_dir)]) == 0
+
+    modes = _run_beats(
+        args, paper_config, beats=2, between_beats=_rest_orders_then_kill
+    )
+
+    exchange = captured_deps[0].exchange
+    assert modes == ["PAPER", "KILLED"]
+    assert observed["resting_before"] == observed["order_ids"]
+    assert observed["available_while_resting"] != observed["available_before"]
+    assert exchange.get_open_orders() == ()
+    assert exchange.get_balances().available == observed["available_before"]
+
+
+def test_a_kill_whose_venue_refuses_the_cancel_all_says_so_and_leaks_nothing(
+    books_dir: Path,
+    captured_deps: list[PaperTickDeps],
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """A venue that refuses the cancel-all cannot read as a clean kill (#480).
+
+    The unhappy half of the delivery record, and the one that matters most:
+    `windbreak kill` is what an operator reaches for when something is *already*
+    wrong, so a venue refusing the cancellation is exactly the moment the
+    fail-safe must announce what it could not do. Three assertions carry that:
+    the orders are still resting (the truth), the directive row records
+    `refused` with counts rather than a bare scope (the audit), and the page the
+    operator receives names it (the alarm).
+
+    The closure guarantee rides along, because a venue client's rejection is
+    `str(exc)` from an arbitrary third party -- the shape that leaked whole
+    token-bearing URLs in issue #274 -- and a hash chain can never be redacted.
+    Swept over `ledger.db` *and* its WAL sidecar, since a freshly appended row
+    lives in the sidecar and a `ledger.db`-only read is the false green of
+    PR #474; with the kill's own body asserted present as the positive control,
+    so an empty or wrong corpus fails rather than passing forever.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        captured_deps: Captures the bundle the composition root builds.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used to make `build_sinks` yield the recording sink.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory.
+        state_dir: The kill/re-arm state directory `paper_config` points at.
+        tmp_path: The per-test scratch directory.
+    """
+    from windbreak.main import main
+
+    sink = _RecordingSink()
+    monkeypatch.setattr("windbreak.main.build_sinks", lambda *_a, **_k: (sink,))
+    ledger_path = ledger_path_for(tmp_path)
+    args = _paper_args(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path,
+        report_dir=report_dir,
+    )
+
+    def _refuse(order_id: str) -> None:
+        """Refuse one cancellation with credential-bearing text.
+
+        Args:
+            order_id: The order id whose cancellation is refused.
+
+        Raises:
+            RuntimeError: Always, carrying :data:`_VENUE_FAILURE_DETAIL`.
+        """
+        del order_id
+        raise RuntimeError(_VENUE_FAILURE_DETAIL)
+
+    def _rest_orders_then_kill(seq: int) -> None:
+        """Rest two orders against a refusing venue, then kill, after beat 1.
+
+        Args:
+            seq: The just-finished beat's sequence number.
+        """
+        if seq != 1:
+            return
+        deps = captured_deps[0]
+        _rest_two_orders(deps)
+        monkeypatch.setattr(deps.exchange, "cancel_order", _refuse)
+        assert main(["kill", "--state-dir", str(state_dir)]) == 0
+
+    modes = _run_beats(
+        args, paper_config, beats=2, between_beats=_rest_orders_then_kill
+    )
+
+    expected_message = (
+        _KILL_MESSAGE + "; resting-order cancellation NOT confirmed at the venue"
+        " (outcome=refused, cancelled=0, failed=2)"
+    )
+    on_disk = _ledger_file_bytes(ledger_path)
+    assert modes == ["PAPER", "KILLED"]
+    assert len(captured_deps[0].exchange.get_open_orders()) == 2
+    assert _payloads_of(captured_deps[0], "CancelAllDirective") == [
+        {
+            "scope": _CANCEL_ALL_SCOPE,
+            "delivery": {"cancelled": 0, "failed": 2, "outcome": "refused"},
+            "delivery_reported": True,
+        }
+    ]
+    assert sink.delivered == [
+        (AlertType.HALT_KILL, AlertSeverity.CRITICAL, expected_message)
+    ]
+    assert expected_message.encode() in on_disk
+    assert _VENUE_FAILURE_DETAIL.encode() not in on_disk
+    assert b"s3kr1t-480-token" not in on_disk

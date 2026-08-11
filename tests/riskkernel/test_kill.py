@@ -41,6 +41,7 @@ already landed) whatever the rest of this file's imports pin.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +54,7 @@ from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.alerts.registry import AlertType
 from windbreak.config import RiskConfig
 from windbreak.connector.fake import FakeExchange
+from windbreak.ledger.directives import DirectiveDelivery
 from windbreak.ledger.events import (
     EVENT_TYPES,
     AlertEmitted,
@@ -267,13 +269,44 @@ class _FakeDirectiveSink:
         """Initialize with an empty received-directives log."""
         self.received: list[CancelAllDirective] = []
 
-    def submit(self, directive: CancelAllDirective) -> None:
-        """Record a submitted cancel-all directive.
+    def submit(self, directive: CancelAllDirective) -> DirectiveDelivery:
+        """Record a submitted cancel-all directive, reporting a clean delivery.
+
+        Reports a real `DirectiveDelivery` since issue #480 rather than
+        `None`: `None` means *no evidence*, and a double that reported it would
+        make every test built on this helper exercise the fail-closed unknown
+        branch instead of the ordinary delivered one.
 
         Args:
             directive: The directive submitted for delivery.
+
+        Returns:
+            A delivery reporting one cancelled resting order and no failures.
         """
         self.received.append(directive)
+        return DirectiveDelivery(cancelled=1)
+
+
+def _payload_strings(payload: Mapping[str, object]) -> Iterator[str]:
+    """Yield every string reachable in a ledgered payload, at any depth.
+
+    Recursive since issue #480: `CancelAllDirective.delivery` is a *nested*
+    mapping, and a one-level walk would have declared the closed-vocabulary
+    invariant proven while never looking inside it -- a sweep that cannot fail
+    over the very keys most recently added to the chain.
+
+    Args:
+        payload: The payload mapping to walk.
+
+    Yields:
+        Each string key, and each string value, at every nesting depth.
+    """
+    for key, value in payload.items():
+        yield str(key)
+        if isinstance(value, Mapping):
+            yield from _payload_strings(value)
+        elif isinstance(value, str):
+            yield value
 
 
 def _build_switch(
@@ -359,11 +392,22 @@ def test_cancel_all_directive_event_type_equals_its_class_name_and_is_registered
 ):
     """`CancelAllDirective.event_type` is `"CancelAllDirective"`, its payload
     carries `scope="all_open_orders"`, and the class is registered.
+
+    Constructed with no delivery evidence -- the shape a caller that knows
+    nothing about what the venue did produces -- so the defaults are pinned as
+    the fail-closed *unknown* they are meant to be (issue #480): an empty
+    `delivery` and `delivery_reported: false`. Defaulting either the other way
+    would let a row that proves nothing read as a delivered cancellation.
     """
     event = CancelAllDirective(component="riskkernel", scope="all_open_orders")
 
     assert event.event_type == "CancelAllDirective"
-    assert event.payload == {"scope": "all_open_orders"}
+    assert event.payload == {
+        "scope": "all_open_orders",
+        "delivery": {},
+        "delivery_reported": False,
+    }
+    assert event.payload_schema_version == 2
     assert EVENT_TYPES["CancelAllDirective"] is CancelAllDirective
 
 
@@ -1220,16 +1264,20 @@ def test_kill_path_event_surface_never_carries_a_sell_close_submit_or_dump_actio
 
     switch.kill(KillTrigger.CLI)
 
+    swept: list[str] = []
     for event in writer.events[events_before_kill:]:
         assert event.event_type in _CLOSED_KILL_EVENT_TYPES
-        for key, value in event.payload.items():
-            key_lower = str(key).lower()
-            assert not any(token in key_lower for token in _FORBIDDEN_ACTION_TOKENS)
-            if isinstance(value, str):
-                value_lower = value.lower()
-                assert not any(
-                    token in value_lower for token in _FORBIDDEN_ACTION_TOKENS
-                )
+        swept.extend(_payload_strings(event.payload))
+
+    # Two positive controls: a sweep that walked nothing would pass forever.
+    # The scope proves the top level was walked; the delivery outcome lives
+    # inside `CancelAllDirective.delivery`, a nested mapping, so its presence
+    # proves the *recursion* ran rather than stopping at depth one.
+    assert "all_open_orders" in swept
+    assert "delivered" in swept
+    for text in swept:
+        lowered = text.lower()
+        assert not any(token in lowered for token in _FORBIDDEN_ACTION_TOKENS)
 
 
 # --- Kill drill (SPEC S10.12): open reservations, mid-run kill, then re-arm ----

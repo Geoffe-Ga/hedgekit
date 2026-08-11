@@ -73,6 +73,17 @@ _ALERT_EMITTED_SCHEMA_VERSION = 2
 #: nothing" distinguishable from "nobody recorded whether it did".
 _RESTING_ORDER_ACCOUNTED_SCHEMA_VERSION = 2
 
+#: ``CancelAllDirective``'s payload version. Issue #480 added ``delivery`` and
+#: ``delivery_reported`` so an audit can tell a cancel-all the venue actually
+#: took from one that was merely written down, which changes the payload's
+#: shape: a v1 row carries neither key, and every v1 row in existence was
+#: written while *nothing consumed the directive at all*, so it can only ever
+#: prove emission. A v2 row always carries both. Stamping them apart keeps
+#: "written before delivery was recorded" distinguishable from "written after,
+#: and the venue took nothing" -- the difference between an unknown and an
+#: incident.
+_CANCEL_ALL_DIRECTIVE_SCHEMA_VERSION = 2
+
 
 def canonical_json(obj: dict[str, object]) -> str:
     """Serialize a mapping to deterministic, whitespace-free JSON.
@@ -151,11 +162,15 @@ def _derive_typed_event(
         payload: The type-specific payload assembled by the subclass.
         schema_version: The payload schema version to stamp; defaults to the
             module-wide :data:`_SCHEMA_VERSION`. Only an event whose payload
-            shape has diverged from its v1 form supplies an override. Three do:
+            shape has diverged from its v1 form supplies an override. Five do:
             ``ForecastCreated``
             (:data:`_FORECAST_CREATED_SCHEMA_VERSION`, #188), ``FillAccounted``
-            (:data:`_FILL_ACCOUNTED_SCHEMA_VERSION`, #390) and ``AlertEmitted``
-            (:data:`_ALERT_EMITTED_SCHEMA_VERSION`, #413). Each override
+            (:data:`_FILL_ACCOUNTED_SCHEMA_VERSION`, #390), ``AlertEmitted``
+            (:data:`_ALERT_EMITTED_SCHEMA_VERSION`, #413),
+            ``RestingOrderAccounted``
+            (:data:`_RESTING_ORDER_ACCOUNTED_SCHEMA_VERSION`, #423) and
+            ``CancelAllDirective``
+            (:data:`_CANCEL_ALL_DIRECTIVE_SCHEMA_VERSION`, #480). Each override
             constant carries the reason its shape diverged.
     """
     object.__setattr__(event, "event_type", type(event).__name__)
@@ -387,25 +402,54 @@ class KillEngaged(Event):
 
 @dataclass(frozen=True)
 class CancelAllDirective(Event):
-    """Records the kill switch's one cancel-all-open-orders directive (issue #35).
+    """Records the kill switch's one cancel-all-open-orders directive, and its
+    delivery (issue #35, issue #480).
 
     The kill switch cancels resting orders; it never closes or sells the
     positions those orders would have touched (SPEC position-hold invariant),
     so the scope names only open *orders*.
 
+    Emission is not delivery (issue #480). A row carrying only the scope proves
+    the directive was written; it looks identical whether the venue cancelled
+    every resting order or was never told at all -- which is precisely the state
+    this event spent its whole life in, ledgered on every kill and consumed by
+    nothing. ``delivery`` closes that gap.
+
+    Everything in ``delivery`` must come from a vocabulary the *code* controls:
+    :func:`windbreak.ledger.directives.ledger_directive_delivery` is the
+    intended producer, and it emits only two counts and an enumerated outcome.
+    Never pass venue-supplied text -- an order id, a rejection message, a URL --
+    through here: this payload is hashed into an append-only chain and can never
+    be redacted (issue #274).
+
     Attributes:
         scope: The cancellation scope (always ``"all_open_orders"``).
+        delivery: The closed ``{cancelled, failed, outcome}`` record of what the
+            wired directive sink did with this directive. Empty means the
+            emitting component reported no delivery evidence, never that the
+            directive was delivered.
+        delivery_reported: Whether a directive sink was wired to report
+            anything at all. False with an empty ``delivery`` is the fail-closed
+            "unknown" state; it must never read as healthy.
     """
 
     scope: str
+    delivery: dict[str, object] = field(default_factory=dict)
+    delivery_reported: bool = False
     event_type: str = field(init=False)
     payload_schema_version: int = field(init=False)
     payload: dict[str, object] = field(init=False)
 
     def __post_init__(self) -> None:
         """Assemble the payload and derive the base ``Event`` fields."""
-        payload: dict[str, object] = {"scope": self.scope}
-        _derive_typed_event(self, payload)
+        payload: dict[str, object] = {
+            "scope": self.scope,
+            "delivery": self.delivery,
+            "delivery_reported": self.delivery_reported,
+        }
+        _derive_typed_event(
+            self, payload, schema_version=_CANCEL_ALL_DIRECTIVE_SCHEMA_VERSION
+        )
 
 
 @dataclass(frozen=True)
