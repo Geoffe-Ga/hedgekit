@@ -119,6 +119,7 @@ class _StubVenue:
     fills: list[Fill] = field(default_factory=list)
     cash_by_fill_id: dict[str, int] = field(default_factory=dict)
     rested: list[OpenOrder] = field(default_factory=list)
+    collateral_by_order_id: dict[str, int] = field(default_factory=dict)
 
     def get_fills(self, since: datetime) -> tuple[Fill, ...]:
         """Return every executed fill strictly after ``since``."""
@@ -131,6 +132,15 @@ class _StubVenue:
     def get_rested_orders(self) -> tuple[OpenOrder, ...]:
         """Return the append-only log of orders that came to rest."""
         return tuple(self.rested)
+
+    def resting_collateral_micros(self, order: OpenOrder, /) -> MoneyMicros:
+        """Return what this venue withheld from ``available`` for ``order``.
+
+        Defaults to `0` -- the answer of a venue whose
+        `OrderCollateralInAvailable` is not `DEDUCTED_FROM_AVAILABLE` and which
+        therefore withholds nothing at all.
+        """
+        return MoneyMicros(self.collateral_by_order_id.get(order.id, 0))
 
 
 #: The cash a fill costs when a test does not care about the exact figure.
@@ -411,6 +421,46 @@ def test_an_order_that_came_to_rest_is_booked(store: SqliteLedgerStore) -> None:
     assert entry.payload["ticker"] == _TICKER
     assert entry.payload["resting_quantity_centis"] == 200
     assert entry.component == _COMPONENT
+
+
+def test_an_arrival_books_the_collateral_the_venue_says_it_withheld(
+    store: SqliteLedgerStore,
+) -> None:
+    """Issue #423: the arrival carries the venue's own reservation figure.
+
+    The number is asked of the venue rather than re-derived here. A booking
+    layer that recomputed book-cost-plus-fee itself would drift from the venue
+    the first time either rounding rule moved, and a bookkeeping drift is
+    indistinguishable from the venue divergence reconciliation exists to catch.
+    """
+    venue = _StubVenue(
+        rested=[_rested("paper-order-1", quantity_centis=200)],
+        collateral_by_order_id={"paper-order-1": 1_200_000},
+    )
+
+    LedgerFillBookkeeper(store, venue, component=_COMPONENT).book_new()
+
+    (entry,) = _rested_entries(store)
+    assert entry.payload["reserved_collateral_micros"] == 1_200_000
+
+
+def test_an_arrival_on_a_venue_that_withholds_nothing_books_a_zero(
+    store: SqliteLedgerStore,
+) -> None:
+    """The other collateral convention, booked without inventing a reservation.
+
+    `OrderCollateralInAvailable` exists because withholding is venue-dependent.
+    A venue that does not deduct answers zero and the arrival records that
+    zero -- booking a reservation anyway would push the cash expectation below
+    an `available` the venue never moved, and breach every cycle the order
+    rested.
+    """
+    venue = _StubVenue(rested=[_rested("paper-order-1", quantity_centis=200)])
+
+    LedgerFillBookkeeper(store, venue, component=_COMPONENT).book_new()
+
+    (entry,) = _rested_entries(store)
+    assert entry.payload["reserved_collateral_micros"] == 0
 
 
 def test_a_rested_order_is_never_booked_twice(store: SqliteLedgerStore) -> None:

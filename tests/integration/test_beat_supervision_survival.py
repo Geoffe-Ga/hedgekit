@@ -64,9 +64,6 @@ if TYPE_CHECKING:
 #: through when the disk gives out -- the shape of issue #443's traceback.
 _FULL_AT_EVENT_TYPE = "EquitySampled"
 
-#: The single ticker in the shared `deep_walk` books fixture.
-_TICKER = "MKT-DEEP"
-
 
 @dataclasses.dataclass
 class _RecordingSink:
@@ -439,8 +436,7 @@ def test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once(
         tmp_path: The per-test scratch directory.
     """
     caplog.set_level(logging.INFO)
-    from windbreak.connector.paper import PaperOrderIntent
-    from windbreak.numeric.types import ContractCentis, PricePips
+    from windbreak.numeric.types import MoneyMicros
     from windbreak.riskkernel.modes import Mode
     from windbreak.scheduler import loop as loop_module
 
@@ -477,7 +473,14 @@ def test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once(
     )
 
     def _on_beat(seq: int) -> BeatReport | None:
-        """Trade on the venue behind the loop's back, then run the real beat.
+        """Take cash off the venue with no execution behind it, then beat.
+
+        Not an order placed behind the loop's back: the bookkeeper reads the
+        venue's own fill and arrival logs, so it books whatever landed there
+        regardless of who placed it, and since issue #423 booked the
+        resting-order collateral too, such a movement reconciles in full. Cash
+        that simply left is the movement fill accounting genuinely cannot
+        explain.
 
         Args:
             seq: The 1-based beat sequence number.
@@ -486,14 +489,11 @@ def test_a_real_verification_breach_halts_the_kernel_and_pages_exactly_once(
             Whatever the real PAPER hook reports for this beat.
         """
         if seq == 2:
-            deps.exchange.place_order(
-                PaperOrderIntent(
-                    ticker=_TICKER,
-                    side="yes",
-                    price=PricePips(4600),
-                    quantity=ContractCentis(100),
-                ),
-                None,
+            opening = deps.exchange.balances
+            deps.exchange.balances = type(opening)(
+                total=MoneyMicros(opening.total.value - 7_000_000),
+                available=MoneyMicros(opening.available.value - 7_000_000),
+                fetched_at=opening.fetched_at,
             )
         return hook(seq)
 

@@ -63,6 +63,16 @@ _FILL_ACCOUNTED_SCHEMA_VERSION = 2
 #: delivered" -- two very different post-incident conclusions.
 _ALERT_EMITTED_SCHEMA_VERSION = 2
 
+#: ``RestingOrderAccounted``'s payload version. Issue #423 added
+#: ``reserved_collateral_micros`` so a booked arrival can say how much cash the
+#: venue withheld from ``available`` when the order came to rest. A v1 row
+#: carries no such key and said nothing about collateral at all; a v2 row always
+#: carries one, and ``0`` on a v2 row is the positive claim that this venue
+#: withheld nothing (``OrderCollateralInAvailable`` other than
+#: ``DEDUCTED_FROM_AVAILABLE``). Stamping them apart keeps "this venue reserves
+#: nothing" distinguishable from "nobody recorded whether it did".
+_RESTING_ORDER_ACCOUNTED_SCHEMA_VERSION = 2
+
 
 def canonical_json(obj: dict[str, object]) -> str:
     """Serialize a mapping to deterministic, whitespace-free JSON.
@@ -555,11 +565,26 @@ class RestingOrderAccounted(Event):
             rested nothing never rested. Retirement is expressed by a
             :class:`FillAccounted` naming the order, never by booking a
             zero-sized arrival.
+        reserved_collateral_micros: The cash the venue withheld from its
+            ``available`` balance when this order came to rest, in micros;
+            never negative (issue #423). It is the venue's own figure, read
+            through the booking layer's ``FillSource`` seam rather than
+            re-derived, and it is what lets the reconciliation expectation
+            follow an ``available`` that drops the moment an order rests
+            instead of breaching on it. ``0`` is a real answer, not an absent
+            one: a venue whose
+            :class:`~windbreak.connector.semantics.OrderCollateralInAvailable`
+            is not ``DEDUCTED_FROM_AVAILABLE`` withholds nothing, and the
+            booking must record that rather than invent a reservation. It
+            defaults to ``0`` so a caller that has not been taught to ask the
+            venue books the conservative answer: an unbooked reservation leaves
+            the venue looking short and breaches, which fails closed.
     """
 
     venue_order_id: str
     ticker: str
     resting_quantity_centis: int
+    reserved_collateral_micros: int = 0
     event_type: str = field(init=False)
     payload_schema_version: int = field(init=False)
     payload: dict[str, object] = field(init=False)
@@ -570,8 +595,11 @@ class RestingOrderAccounted(Event):
             "venue_order_id": self.venue_order_id,
             "ticker": self.ticker,
             "resting_quantity_centis": self.resting_quantity_centis,
+            "reserved_collateral_micros": self.reserved_collateral_micros,
         }
-        _derive_typed_event(self, payload)
+        _derive_typed_event(
+            self, payload, schema_version=_RESTING_ORDER_ACCOUNTED_SCHEMA_VERSION
+        )
 
 
 @dataclass(frozen=True)

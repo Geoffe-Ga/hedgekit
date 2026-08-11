@@ -239,6 +239,7 @@ def _booked_resting_order(
     venue_order_id: str = "paper-order-1",
     ticker: str = _TICKER,
     resting_quantity_centis: int = 200,
+    reserved_collateral_micros: int = 0,
 ) -> RestingOrderAccounted:
     """Build one `RestingOrderAccounted` entry booking an order's arrival.
 
@@ -247,6 +248,10 @@ def _booked_resting_order(
         ticker: The market the order rests in.
         resting_quantity_centis: The quantity that came to rest, in
             contract-centis.
+        reserved_collateral_micros: The cash the venue withheld from
+            `available` for this order; `0` -- the default -- is a venue that
+            withholds nothing, which is what every pre-#423 case here asserts
+            against.
 
     Returns:
         The constructed `RestingOrderAccounted` event.
@@ -256,6 +261,7 @@ def _booked_resting_order(
         venue_order_id=venue_order_id,
         ticker=ticker,
         resting_quantity_centis=resting_quantity_centis,
+        reserved_collateral_micros=reserved_collateral_micros,
     )
 
 
@@ -799,3 +805,367 @@ def test_the_open_order_baseline_still_carries_the_startup_capture() -> None:
     assert source.get_expectations().expected_open_order_ids == frozenset(
         {"pre-existing-1"}
     )
+
+
+# --- Issue #423: the collateral a resting order withholds from `available` ---
+#
+# Issue #390 stopped a resting remainder breaching the *open-order* dimension.
+# The *cash* dimension still breached, because a resting order also withholds
+# collateral from `available` (`OrderCollateralInAvailable` is
+# `DEDUCTED_FROM_AVAILABLE` on the paper venue) and no ledgered entry accounted
+# for it -- measured at 1_200_000 micros of `cash_drift` on #422's own fixture.
+# That failed *closed*, which is why #422 could stop there.
+#
+# The reservation now rides on the booked arrival and is released as the order
+# is drawn down by booked fills. The whole risk is arithmetic: money is in
+# micros, quantities in contract-centis, and a pro-rata release that loses a
+# micro to rounding across uneven fills is the defect these cases exist to
+# prevent. Every number below is hand-derived and asserted exactly.
+
+#: The reservation #422 measured as `cash_drift` the moment its fixture's
+#: remainder rested. Used wherever a case only needs "a real reservation".
+_RESERVED_MICROS = 1_200_000
+
+#: A reservation deliberately *not* divisible by the resting quantity, nor by
+#: any of the three uneven fills below, so a per-fill release that dropped its
+#: own remainder could not reconcile to it.
+_AWKWARD_RESERVED_MICROS = 1_200_007
+
+
+def test_a_booked_reservation_reconciles_the_cash_a_resting_order_withholds() -> None:
+    """The whole of issue #423: a resting order no longer breaches on cash.
+
+    The venue withheld 1_200_000 micros from `available` the moment the order
+    came to rest. The arrival entry books that reservation, so the expectation
+    moves with it and the cycle grades CLEAN across every dimension -- not just
+    the open-order flag #422's integration tests had to single out.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_resting_order(
+                    resting_quantity_centis=300,
+                    reserved_collateral_micros=_RESERVED_MICROS,
+                ),
+            )
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    venue.available = MoneyMicros(100_000_000 - _RESERVED_MICROS)
+    venue.open_orders = (_resting("paper-order-1", 300),)
+    outcome, writer = _run_cycle(venue, source)
+
+    assert outcome is VerificationOutcome.CLEAN
+    assert [event.event_type for event in writer.events] == ["VerificationPassed"]
+    assert writer.events[0].payload["cash_drift"] == 0
+
+
+def test_a_reservation_nobody_booked_still_breaches_by_its_full_size() -> None:
+    """Non-vacuity, and the exact measurement issue #423 was filed on.
+
+    Identical to the case above but for the booked reservation, which is zero:
+    the venue withheld cash the books cannot explain, so the cycle breaches and
+    reports the whole reservation as drift. Without this pair the fix would be
+    indistinguishable from widening a tolerance -- and `VerificationTolerances`
+    is untouched here, exactly as #422 left it.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_resting_order(
+                    resting_quantity_centis=300, reserved_collateral_micros=0
+                ),
+            )
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    venue.available = MoneyMicros(100_000_000 - _RESERVED_MICROS)
+    venue.open_orders = (_resting("paper-order-1", 300),)
+    outcome, writer = _run_cycle(venue, source)
+
+    assert outcome is VerificationOutcome.BREACH
+    assert [event.event_type for event in writer.events] == ["VerificationMismatch"]
+    assert writer.events[0].payload["cash_drift"] == _RESERVED_MICROS
+
+
+def test_three_uneven_fills_release_exactly_the_reserved_collateral() -> None:
+    """Issue #423's arithmetic, pinned to the micro over three uneven pieces.
+
+    The release is pro-rata on quantity and computed from the *cumulative*
+    consumption, so no piece can drop a remainder: 1_200_007 micros against 300
+    centis divides evenly by nothing here, and the three pieces (70, 130, 100)
+    are deliberately uneven. Each intermediate figure is asserted, so a release
+    that merely dumped the whole reservation on the last fill -- reconciling in
+    total while being wrong at every step -- fails here.
+    """
+    reserved = _AWKWARD_RESERVED_MICROS
+    opening = 100_000_000
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_resting_order(
+                    resting_quantity_centis=300, reserved_collateral_micros=reserved
+                ),
+            ),
+            (
+                _booked_fill(
+                    fill_id="paper-fill-1",
+                    cash_delta_micros=-280_000,
+                    position_delta_centis=70,
+                    venue_order_id="paper-order-1",
+                ),
+            ),
+            (
+                _booked_fill(
+                    fill_id="paper-fill-2",
+                    cash_delta_micros=-520_000,
+                    position_delta_centis=130,
+                    venue_order_id="paper-order-1",
+                ),
+            ),
+            (
+                _booked_fill(
+                    fill_id="paper-fill-3",
+                    cash_delta_micros=-400_000,
+                    position_delta_centis=100,
+                    venue_order_id="paper-order-1",
+                ),
+            ),
+        ]
+    )
+    source = LedgerExpectationSource(
+        [], _MutableVenue(available=MoneyMicros(opening)), fill_accounting=feed
+    )
+
+    after_arrival = source.get_expectations().expected_available_cash
+    after_first = source.get_expectations().expected_available_cash
+    after_second = source.get_expectations().expected_available_cash
+    after_third = source.get_expectations()
+
+    assert after_arrival == MoneyMicros(opening - reserved)
+    # reserved * 70 // 300 == 280_001 released against a 280_000-micro spend.
+    assert after_first == MoneyMicros(opening - reserved - 280_000 + 280_001)
+    # reserved * 200 // 300 == 800_004 released to date; 520_003 this fill.
+    assert after_second == MoneyMicros(opening - reserved - 800_000 + 800_004)
+    # Exhausted: the whole 1_200_007 is released, leaving only the cash spent.
+    assert after_third.expected_available_cash == MoneyMicros(opening - 1_200_000)
+    assert after_third.expected_open_order_ids == frozenset()
+
+    released_total = after_third.expected_available_cash.value - (
+        opening - reserved - 1_200_000
+    )
+    assert released_total == reserved
+
+
+def test_a_venue_that_withholds_no_collateral_has_no_reservation_invented() -> None:
+    """The other convention: `available` never moved, so neither do the books.
+
+    `OrderCollateralInAvailable` exists because withholding is venue-dependent.
+    A venue that does not deduct reports a zero reservation, and the arrival must
+    not conjure one -- inventing a reservation here would push the expectation
+    *below* the venue's untouched `available` and breach every cycle the order
+    rested.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_resting_order(
+                    resting_quantity_centis=300, reserved_collateral_micros=0
+                ),
+            ),
+            (
+                _booked_fill(
+                    cash_delta_micros=-1_200_000,
+                    position_delta_centis=300,
+                    venue_order_id="paper-order-1",
+                ),
+            ),
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(100_000_000)
+    exhausted = source.get_expectations()
+
+    assert exhausted.expected_available_cash == MoneyMicros(98_800_000)
+    assert exhausted.expected_open_order_ids == frozenset()
+
+
+def test_an_arrival_booked_before_reservations_existed_withholds_nothing() -> None:
+    """A schema-v1 arrival row carries no reservation leaf, and gets none.
+
+    Back-compatibility in the fail-closed direction: a row booked before issue
+    #423 said nothing about collateral, so crediting it with one would advance
+    the expectation past money nobody recorded. It reads as zero, and a venue
+    that really did withhold therefore still breaches.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    legacy = Event(
+        event_type="RestingOrderAccounted",
+        component="scheduler",
+        payload_schema_version=1,
+        payload={
+            "venue_order_id": "paper-order-1",
+            "ticker": _TICKER,
+            "resting_quantity_centis": 300,
+        },
+    )
+    source = LedgerExpectationSource(
+        [], venue, fill_accounting=_StubFeed(batches=[(legacy,)])
+    )
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(100_000_000)
+    assert source.get_expectations().expected_open_order_ids == frozenset(
+        {"paper-order-1"}
+    )
+
+
+def test_a_negative_booked_reservation_is_a_gap() -> None:
+    """A reservation that hands cash *back* on arrival is malformed, not a fact.
+
+    An order coming to rest can only withhold cash or withhold nothing. A
+    negative leaf would raise the expectation above the venue's `available` and
+    absorb real divergence, so the advance stops at it and latches instead.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_resting_order(
+                    resting_quantity_centis=300, reserved_collateral_micros=-1
+                ),
+            ),
+            (_booked_fill(),),
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    source.get_expectations()
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(100_000_000)
+    assert source.get_expectations().expected_open_order_ids == frozenset()
+
+
+def test_a_non_int_booked_reservation_is_a_gap() -> None:
+    """The same fail-closed narrowing every other booked money leaf gets.
+
+    A payload leaf that is not a scaled int is not a fact, so it can never reach
+    the `MoneyMicros` constructor from here.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    malformed = Event(
+        event_type="RestingOrderAccounted",
+        component="scheduler",
+        payload_schema_version=2,
+        payload={
+            "venue_order_id": "paper-order-1",
+            "ticker": _TICKER,
+            "resting_quantity_centis": 300,
+            "reserved_collateral_micros": "1200000",
+        },
+    )
+    feed = _StubFeed(batches=[(malformed,), (_booked_fill(),)])
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    source.get_expectations()
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(100_000_000)
+
+
+def test_an_arrival_repeating_a_still_resting_order_id_is_a_gap() -> None:
+    """One order cannot come to rest twice, nor pledge the same cash twice.
+
+    Before reservations rode on the arrival this was harmless -- a repeat merely
+    rewrote a quantity. Now it would debit the same pledged cash a second time,
+    permanently understating the expectation, so a duplicate of a *currently
+    held* id is treated as the gap it is.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    arrival = _booked_resting_order(
+        resting_quantity_centis=300, reserved_collateral_micros=_RESERVED_MICROS
+    )
+    feed = _StubFeed(batches=[(arrival,), (arrival,), (_booked_fill(),)])
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(
+        100_000_000 - _RESERVED_MICROS
+    )
+    source.get_expectations()
+
+    assert source.get_expectations().expected_available_cash == MoneyMicros(
+        100_000_000 - _RESERVED_MICROS
+    )
+
+
+def test_a_startup_captured_resting_order_releases_no_collateral() -> None:
+    """An order already resting at startup has its reservation *inside* the seed.
+
+    The cash baseline is the connector's `available`, which the venue has
+    already withheld that order's collateral from, so there is nothing left to
+    book and nothing to release. Releasing anyway would credit the expectation
+    with the same cash twice. What the venue does release as such an order fills
+    is therefore still unexplained movement and still breaches -- the same
+    fail-closed residual this dimension had before #423, now narrowed to startup
+    captures alone.
+    """
+    venue = _MutableVenue(
+        available=MoneyMicros(100_000_000),
+        open_orders=(_resting("pre-existing-1", 500),),
+    )
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_fill(
+                    cash_delta_micros=-2_000_000,
+                    position_delta_centis=500,
+                    venue_order_id="pre-existing-1",
+                ),
+            )
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    expectations = source.get_expectations()
+
+    assert expectations.expected_available_cash == MoneyMicros(98_000_000)
+    assert expectations.expected_open_order_ids == frozenset()
+
+
+def test_an_over_consuming_fill_releases_the_reservation_once_and_no_more() -> None:
+    """A fill larger than the order it names retires it and releases exactly R.
+
+    The clamp matters in both directions. Releasing pro-rata on the *unclamped*
+    consumption would hand back more cash than was ever withheld, absorbing the
+    very over-retirement `test_a_fill_retiring_less_than_the_venue_did_still_
+    breaches` proves must survive.
+    """
+    venue = _MutableVenue(available=MoneyMicros(100_000_000))
+    feed = _StubFeed(
+        batches=[
+            (
+                _booked_resting_order(
+                    resting_quantity_centis=300,
+                    reserved_collateral_micros=_RESERVED_MICROS,
+                ),
+            ),
+            (
+                _booked_fill(
+                    cash_delta_micros=-2_000_000,
+                    position_delta_centis=500,
+                    venue_order_id="paper-order-1",
+                ),
+            ),
+        ]
+    )
+    source = LedgerExpectationSource([], venue, fill_accounting=feed)
+
+    source.get_expectations()
+    exhausted = source.get_expectations()
+
+    assert exhausted.expected_available_cash == MoneyMicros(98_000_000)
+    assert exhausted.expected_open_order_ids == frozenset()

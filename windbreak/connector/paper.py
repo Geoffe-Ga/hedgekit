@@ -982,20 +982,68 @@ class PaperExchange:
     def _reserved_micros(self) -> int:
         """Return the cash this exchange's resting orders have pledged, in micros.
 
-        Each resting order reserves what it would cost to fill entirely at its
-        own limit -- the same book-cost-plus-fee arithmetic
-        :meth:`_cash_spent_micros` applies to a completed fill, which is what
-        makes filling a resting order balance-neutral for ``available``. A
-        cancelled order leaves :attr:`_resting` immediately, so its reservation
-        disappears from the next reading (``CancelCollateralRelease.IMMEDIATE``).
+        The whole-account fold of :meth:`resting_collateral_micros`, so the
+        figure a caller is told one order withholds and the figure
+        :meth:`get_balances` actually withholds for it are one definition and
+        cannot drift apart. A cancelled order leaves :attr:`_resting`
+        immediately, so its reservation disappears from the next reading
+        (``CancelCollateralRelease.IMMEDIATE``).
 
         Returns:
             The total collateral withheld for currently resting orders, in
             micros.
         """
         return sum(
+            self.resting_collateral_micros(order).value for order in self._resting
+        )
+
+    def resting_collateral_micros(self, order: OpenOrder, /) -> MoneyMicros:
+        """Return the cash ``order`` withholds from ``available`` while it rests.
+
+        The resting-order counterpart to :meth:`fill_cash_micros`, and exposed
+        for the same reason (issue #423). A resting order pledges what it would
+        cost to fill entirely at its own limit -- the identical
+        book-cost-plus-fee arithmetic a completed fill is charged, which is what
+        makes filling a resting order balance-neutral for ``available``. Until
+        this method existed nothing *said* how much any one order had withheld,
+        so ledgered fill accounting could not account for the reservation and
+        the reconciliation cash dimension breached the moment an order rested.
+
+        The venue reports its own figure rather than leaving a booking layer to
+        re-derive it: a reimplementation of book-cost-plus-fee would drift from
+        this class the first time either rounding rule moved, and a bookkeeping
+        drift is indistinguishable from the real venue divergence verification
+        exists to catch.
+
+        This class always withholds, because the constructor refuses any fixture
+        whose ``open_order_collateral_in_available`` is not
+        ``DEDUCTED_FROM_AVAILABLE`` (:data:`_SEMANTICS_REQUIREMENTS`), so the
+        answer here is unconditionally the full reservation. Withholding is
+        venue-dependent, though, which is exactly why
+        :class:`~windbreak.connector.semantics.OrderCollateralInAvailable`
+        exists: a venue that does *not* deduct answers ``0`` from its own
+        implementation of this seam, and the booking layer records that zero
+        rather than inventing a reservation nobody made.
+
+        It is deliberately a statement about *one* order -- a discrete report,
+        like :meth:`get_fills` and :meth:`get_rested_orders` -- and never the
+        account's aggregate withheld total. The reconciliation cycle compares
+        against the aggregate ``available``; advancing the expectation from that
+        same aggregate would grade the venue against itself and could never fail
+        (issue #352).
+
+        Args:
+            order: The resting order to price the reservation of. Its
+                ``quantity`` is the size that is *resting*, so an order read
+                from :meth:`get_rested_orders` reserves for the remainder that
+                came to rest, not for the whole intent that was placed.
+
+        Returns:
+            The book cost plus the venue's worst-case trading fee on ``order``,
+            in micros -- the exact amount :meth:`get_balances` withholds for it.
+        """
+        return MoneyMicros(
             self._order_cash_micros(order.ticker, order.price, order.quantity)
-            for order in self._resting
         )
 
     def _order_cash_micros(
