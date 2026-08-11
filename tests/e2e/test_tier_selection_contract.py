@@ -154,7 +154,12 @@ def test_the_container_job_arms_the_fail_closed_runtime_flag() -> None:
         f"expected exactly one step selecting `-m {GATED_MARKER}`, found "
         f"{len(selecting)}"
     )
-    assert selecting[0].get("env", {}).get(REQUIRE_RUNTIME_ENV_VAR) == (
+    # `or {}` rather than a `get` default: YAML maps a keyless `env:` to None,
+    # not to a missing key, and `{}.get` on None is an AttributeError. Deleting
+    # the env block's contents is the likeliest way this wiring regresses, and
+    # a mutation sweep confirmed it produced an unreadable traceback instead of
+    # the message below -- red either way, but red for no stated reason.
+    assert (selecting[0].get("env") or {}).get(REQUIRE_RUNTIME_ENV_VAR) == (
         REQUIRE_RUNTIME_ENABLED_VALUE
     ), (
         f"the `{CONTAINER_JOB_ID}` job's tier step does not set "
