@@ -942,6 +942,57 @@ startup with a `ValueError` naming the offending leaf -- a broken evaluation
 pass must not be indistinguishable from a genuinely empty one. Values are
 integers throughout: a fractional `brier_skill_ppm` is rejected, not truncated.
 
+#### Writing the artifact (issue #440)
+
+**Until issue #440, nothing wrote that file**, so the bootstrap above was
+terminal rather than transient: every provider stayed unproven whatever the
+loop did, and `min_resolved` could never be approached. `windbreak
+evaluate-providers` is the evaluation pass this section always described:
+
+```bash
+windbreak evaluate-providers \
+  --ledger-path /path/to/state/ledger.db \
+  --report-dir /path/to/state/reports
+```
+
+Both flags are required and neither path is created. `--ledger-path` must be
+the ledger the loop runs against and `--report-dir` the directory it was
+started with; a mistyped path is refused with exit `1` and nothing written,
+because scoring the wrong ledger, or publishing into a directory the gate never
+reads, both look exactly like success.
+
+It folds three row types off that one ledger: `ForecastCreated` (the
+probability and the executable-price baseline), `ProviderVoteRecorded` (which
+providers' votes actually backed each forecast -- an `abstained` or `discarded`
+vote backs nothing), and the `MarketResolved` rows you ingested with
+`windbreak ingest-resolution`. **So run `ingest-resolution` first**: with no
+settled market, no provider has a resolved forecast and the artifact is written
+as `{}`.
+
+Two properties are worth knowing before you read the numbers:
+
+- **`brier_skill_ppm` is the skill of the forecasts a provider backed**, scored
+  on the aggregate probability those forecasts were published with. The ledger
+  does not record each ensemble member's own probability, so this is not the
+  provider's isolated calibration. Providers that vote on identical market sets
+  earn identical skill; they diverge where their abstentions and discards do.
+- **Nothing optimistic is ever written.** A provider with no resolved forecast
+  the temporal gate admits -- or one whose skill has no defined denominator --
+  is omitted from the document entirely, and omitted reads as unproven. A
+  provider with real but insufficient evidence *is* written, with its exact
+  values, so the bars themselves are what hold it.
+
+The verb exits `0` and logs
+`provider track records published path=... providers=N summary=...` (the
+summary reads `none` when nothing qualified). It exits `1`, writing nothing, on
+a refused path or a ledger whose `MarketResolved` rows cannot be folded.
+
+**The loop reads the artifact once, at startup.** The gate is a process-lived
+read model built in `build_paper_deps`, so unlike `windbreak
+set-research-budget` this change does **not** take effect on the next tick:
+restart the loop after publishing, then confirm with the `ProviderGateHeld`
+query below that the provider is no longer named.
+
 Each hold appends exactly one `ProviderGateHeld` row (component `scheduler`)
 after that tick's `ProviderVoteRecorded` rows, carrying `forecast_id`,
 `market_ticker`, the comma-joined `unproven_providers`, their `unproven_count`,
@@ -959,8 +1010,9 @@ for r in SqliteLedgerStore(Path('var/ledger.db')).read_all():
 ```
 
 If a provider you expect to be proven is named there, the artifact is stale (or
-missing) rather than the provider being bad -- re-run the evaluation pass that
-writes it. Raising or lowering the bars is a config edit to
+missing) rather than the provider being bad -- re-run `windbreak
+evaluate-providers` and restart the loop. Raising or lowering the bars is a
+config edit to
 `config.forecast.provider_gate`; there is no runtime lever, and the bars in
 force at the time of each decision are on the row itself.
 
