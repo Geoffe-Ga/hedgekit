@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Protocol, TypeGuard
 
 from windbreak.alerts.registry import AlertType
 from windbreak.ledger.events import Event
+from windbreak.numeric.rounding import RoundingDirection, divide
 from windbreak.numeric.types import ContractCentis, MoneyMicros
 
 if TYPE_CHECKING:
@@ -231,6 +232,18 @@ _VENUE_ORDER_ID_KEY = "venue_order_id"
 #: The ``RestingOrderAccounted`` payload key carrying the quantity that rested.
 _RESTING_QUANTITY_KEY = "resting_quantity_centis"
 
+#: The ``RestingOrderAccounted`` payload key carrying the cash the venue
+#: withheld from ``available`` when the order came to rest (issue #423). Absent
+#: on a schema-v1 row booked before reservations were recorded at all, which
+#: reads as :data:`_NO_RESERVATION` -- the fail-closed direction, since an
+#: uncredited reservation leaves the venue looking short and breaches.
+_RESERVED_COLLATERAL_KEY = "reserved_collateral_micros"
+
+#: The reservation attributed to an arrival that booked none, and to every
+#: resting order captured from the connector at startup (whose collateral the
+#: venue had already withheld from the cash baseline itself).
+_NO_RESERVATION = 0
+
 
 def _own_component_events(events: tuple[Event, ...]) -> Iterator[Event]:
     """Return an iterator over only the events this kernel itself recorded.
@@ -401,9 +414,40 @@ def _rows_to_positions(rows: object) -> dict[str, ContractCentis]:
     return positions
 
 
+@dataclass(slots=True)
+class _RestingOrder:
+    """One resting order the expectation is following, and its reservation.
+
+    Mutable on purpose: an order is whittled away by several fills across
+    several cycles, and both the quantity left and the collateral released so
+    far have to survive between them.
+
+    Attributes:
+        total_centis: The quantity the order rested with, in contract-centis.
+            The pro-rata denominator, so it never changes once set.
+        consumed_centis: How much of ``total_centis`` booked fills have consumed
+            so far, clamped to ``total_centis``: a fill larger than the order it
+            names retires it and no more, so the surplus is never absorbed here.
+        reserved_micros: The cash the venue withheld from ``available`` when the
+            order came to rest, per the booked arrival. :data:`_NO_RESERVATION`
+            for a venue that withholds nothing, and for an order captured from
+            the connector at startup -- whose collateral the venue had already
+            withheld from the cash baseline this source seeded itself with.
+        released_micros: How much of ``reserved_micros`` has been released back
+            into the cash expectation so far. Tracked as a running total, not
+            per fill, so the release can be computed from *cumulative*
+            consumption and can never drop a rounding remainder.
+    """
+
+    total_centis: int
+    consumed_centis: int
+    reserved_micros: int
+    released_micros: int
+
+
 def _seed_open_orders(
     events: tuple[Event, ...], connector: ReadOnlyVenueView
-) -> dict[str, int]:
+) -> dict[str, _RestingOrder]:
     """Return the resting-order baseline seeded from history, else the connector.
 
     Empty *only* while the history ends KILLED and unrearmed: a kill cancels
@@ -436,6 +480,17 @@ def _seed_open_orders(
     quantity: a booked fill names the order it consumed and says how much, and
     the id may only leave the expectation once those consumptions exhaust it.
 
+    A startup capture carries :data:`_NO_RESERVATION`, and that is not a
+    shortcut. The cash baseline this source seeds beside it is either the
+    connector's ``available`` -- which the venue has *already* withheld these
+    orders' collateral from -- or a prior cycle's recorded cash, which was
+    graded against exactly that figure. Their reservations are therefore inside
+    the baseline already, and releasing them again as the orders fill would
+    credit the same cash twice. What the venue does release as a startup-captured
+    order fills is consequently unexplained movement and still breaches, which
+    is where this dimension already stood before issue #423; only *booked*
+    arrivals carry a reservation the expectation may follow.
+
     The :func:`~windbreak.riskkernel.kill.kill_state_in` import is deferred to
     call time because :mod:`windbreak.riskkernel.kill` imports this module at
     runtime (for :class:`VerificationOutcome`); a module-level import here would
@@ -446,13 +501,21 @@ def _seed_open_orders(
         connector: The read-only connector supplying the fallback orders.
 
     Returns:
-        The expected resting quantity, in contract-centis, per venue order id.
+        The resting-order bookkeeping, per venue order id.
     """
     from windbreak.riskkernel.kill import kill_state_in
 
     if kill_state_in(events).killed:
         return {}
-    return {order.id: order.quantity.value for order in connector.get_open_orders()}
+    return {
+        order.id: _RestingOrder(
+            total_centis=order.quantity.value,
+            consumed_centis=0,
+            reserved_micros=_NO_RESERVATION,
+            released_micros=0,
+        )
+        for order in connector.get_open_orders()
+    }
 
 
 class FillAccountingFeed(Protocol):
@@ -515,10 +578,14 @@ class _RestingEntry:
         venue_order_id: The venue's identifier for the order now resting.
         quantity_centis: The quantity that came to rest, in contract-centis;
             always strictly positive.
+        reserved_micros: The cash the venue withheld from ``available`` when the
+            order came to rest, in micros; never negative, and
+            :data:`_NO_RESERVATION` for a venue that withholds nothing.
     """
 
     venue_order_id: str
     quantity_centis: int
+    reserved_micros: int
 
 
 def _resting_entry(event: Event) -> _RestingEntry | None:
@@ -530,6 +597,16 @@ def _resting_entry(event: Event) -> _RestingEntry | None:
     naming the order. Admitting it here would let a zero-sized arrival silently
     stand in for a retirement nobody executed.
 
+    ``reserved_collateral_micros`` is the one leaf allowed to be absent, exactly
+    as ``venue_order_id`` is on a fill: a ``RestingOrderAccounted`` booked before
+    issue #423 (payload schema v1) carries no such key and said nothing about
+    collateral at all. It defaults to :data:`_NO_RESERVATION`, which is the
+    fail-closed reading -- an uncredited reservation leaves the venue looking
+    short and breaches, whereas an invented one would absorb real divergence. A
+    key that is *present* but not a scaled int, or one that is negative, is a
+    gap: an order coming to rest can withhold cash or withhold nothing, never
+    hand cash back.
+
     Args:
         event: The event drained from the fill-accounting seam, already known to
             carry the resting-order ``event_type``.
@@ -540,11 +617,18 @@ def _resting_entry(event: Event) -> _RestingEntry | None:
     """
     order_id = event.payload.get(_VENUE_ORDER_ID_KEY)
     quantity = event.payload.get(_RESTING_QUANTITY_KEY)
+    reserved = event.payload.get(_RESERVED_COLLATERAL_KEY, _NO_RESERVATION)
     if not (isinstance(order_id, str) and order_id):
         return None
     if not (_is_scaled_int(quantity) and quantity > 0):
         return None
-    return _RestingEntry(venue_order_id=order_id, quantity_centis=quantity)
+    if not (_is_scaled_int(reserved) and reserved >= _NO_RESERVATION):
+        return None
+    return _RestingEntry(
+        venue_order_id=order_id,
+        quantity_centis=quantity,
+        reserved_micros=reserved,
+    )
 
 
 def _fill_entry(event: Event) -> _FillEntry | None:
@@ -590,20 +674,29 @@ def _fill_entry(event: Event) -> _FillEntry | None:
 def _advanced(
     expectations: LedgerExpectations,
     entry: _FillEntry,
-    open_orders: Mapping[str, int],
+    open_orders: Mapping[str, _RestingOrder],
+    released_micros: int,
 ) -> LedgerExpectations:
     """Return ``expectations`` advanced by one booked fill's deltas.
 
-    The cash and position dimensions move by the entry's own two deltas; the
-    open-order dimension is rebuilt from ``open_orders``, which the caller has
-    already drawn down by whatever this fill consumed. Splitting it that way
-    keeps the resting-order bookkeeping -- which spans entries, since an order
-    can be whittled away by several fills -- in the one place that owns it.
+    Cash moves by *two* terms: the fill's own signed delta, and the collateral
+    the named resting order releases as this fill draws it down (issue #423).
+    Both are movements the venue really made -- it spent the cash and stopped
+    withholding the reservation in the same execution -- so absorbing only one
+    of them would leave the other as permanent, unexplained drift. Positions
+    move by the entry's own delta; the open-order dimension is rebuilt from
+    ``open_orders``, which the caller has already drawn down by whatever this
+    fill consumed. Splitting it that way keeps the resting-order bookkeeping --
+    which spans entries, since an order can be whittled away by several fills --
+    in the one place that owns it.
 
     Args:
         expectations: The expectation to advance.
         entry: The booked fill's reconstructed accounting.
-        open_orders: The resting quantity per venue order id, after this fill.
+        open_orders: The resting-order bookkeeping, after this fill.
+        released_micros: The collateral the named order released to this fill,
+            in micros; ``0`` when the fill named no order, when the venue
+            withheld nothing, or when the order was captured at startup.
 
     Returns:
         A new :class:`LedgerExpectations` with every dimension moved.
@@ -613,35 +706,97 @@ def _advanced(
     positions[entry.ticker] = ContractCentis(held.value + entry.position_delta.value)
     return LedgerExpectations(
         expected_available_cash=MoneyMicros(
-            expectations.expected_available_cash.value + entry.cash_delta.value
+            expectations.expected_available_cash.value
+            + entry.cash_delta.value
+            + released_micros
         ),
         expected_positions=positions,
         expected_open_order_ids=frozenset(open_orders),
     )
 
 
-def _with_open_orders(
-    expectations: LedgerExpectations, open_orders: Mapping[str, int]
+def _with_arrival(
+    expectations: LedgerExpectations,
+    open_orders: Mapping[str, _RestingOrder],
+    reserved_micros: int,
 ) -> LedgerExpectations:
-    """Return ``expectations`` with only its open-order dimension rebuilt.
+    """Return ``expectations`` advanced by one booked order arrival.
 
-    A booked order arrival moves neither cash nor positions: an order coming to
-    rest posts collateral the venue's *balance* already reflects, and holds no
-    position until it fills. Only the set of ids the venue should be reporting
-    changes.
+    An arrival moves no position -- an order holds nothing until it fills -- but
+    it does move cash on a venue whose
+    :class:`~windbreak.connector.semantics.OrderCollateralInAvailable` is
+    ``DEDUCTED_FROM_AVAILABLE``: the reservation leaves ``available`` the moment
+    the order rests. Booking that withdrawal is the whole of issue #423.
+    ``reserved_micros`` is ``0`` on a venue that withholds nothing, and then the
+    cash dimension is left exactly where it was rather than having a reservation
+    invented for it.
 
     Args:
-        expectations: The expectation to rebuild.
-        open_orders: The resting quantity per venue order id.
+        expectations: The expectation to advance.
+        open_orders: The resting-order bookkeeping, including this arrival.
+        reserved_micros: The cash the venue withheld for the arriving order.
 
     Returns:
-        A new :class:`LedgerExpectations` carrying the updated id set.
+        A new :class:`LedgerExpectations` carrying the updated id set and cash.
     """
     return LedgerExpectations(
-        expected_available_cash=expectations.expected_available_cash,
+        expected_available_cash=MoneyMicros(
+            expectations.expected_available_cash.value - reserved_micros
+        ),
         expected_positions=expectations.expected_positions,
         expected_open_order_ids=frozenset(open_orders),
     )
+
+
+def _released_by(order: _RestingOrder, consumed_centis: int) -> int:
+    """Return the collateral released by consuming up to ``consumed_centis``.
+
+    The release is pro-rata on quantity, and it is computed from *cumulative*
+    consumption rather than per fill, which is the property the whole design
+    turns on. Money is in micros and quantity in contract-centis, so a per-fill
+    ``reserved * piece // total`` drops a remainder on every uneven piece and
+    the released total never reconciles to the reserved total. Taking the
+    difference of two cumulative floors instead makes the remainders cancel:
+    once ``consumed_centis`` reaches ``total_centis`` the running total is
+    ``reserved * total // total``, which is ``reserved`` exactly -- no drift, no
+    leftover micro, however uneven the pieces were.
+
+    The quotient rounds toward negative infinity
+    (:data:`~windbreak.numeric.rounding.RoundingDirection.UNDERSTATE_EQUITY`),
+    so an intermediate release is understated rather than overstated: cash is
+    handed back to the expectation late, never early. Every intermediate
+    understatement is recovered by the final step, which is exact.
+
+    Pro-rata is a statement about the *reservation the arrival booked*, not a
+    re-reading of the venue. A venue that re-prices its remaining reservation
+    per partial fill -- book-cost-plus-fee on the surviving quantity, with its
+    own per-call fee rounding -- can therefore sit a micro or two away from this
+    figure while an order is *part* consumed, though the two agree exactly once
+    it is exhausted, since both have then released the whole reservation. That
+    intermediate window is unreachable in the shipped PAPER loop, whose replay
+    cursor is stationary (SPEC S7.5.1), so a resting order is never drawn down
+    across cycles there; re-reading the venue to close it is refused anyway,
+    because an expectation sourced from the view the cycle compares against
+    could never fail (issue #352).
+
+    Args:
+        order: The resting order being drawn down, carrying its reservation and
+            everything released from it so far.
+        consumed_centis: The cumulative consumption after this fill, already
+            clamped to ``order.total_centis``.
+
+    Returns:
+        The collateral this fill releases, in micros; ``0`` when the order
+        carries no reservation at all.
+    """
+    if order.reserved_micros == _NO_RESERVATION:
+        return 0
+    released_to_date = divide(
+        order.reserved_micros * consumed_centis,
+        order.total_centis,
+        rounding=RoundingDirection.UNDERSTATE_EQUITY,
+    )
+    return released_to_date - order.released_micros
 
 
 class LedgerExpectationSource:
@@ -665,8 +820,9 @@ class LedgerExpectationSource:
       execution, carrying that fill's signed cash and position deltas and the
       venue order id it executed against (``""`` when it rested nothing); and
     * a :class:`~windbreak.ledger.events.RestingOrderAccounted`, booked from the
-      venue's placement receipt, saying that an order came to rest and with what
-      size.
+      venue's placement receipt, saying that an order came to rest, with what
+      size, and how much collateral the venue withheld from ``available`` for
+      it.
 
     Each :meth:`get_expectations` call folds whatever the feed has newly drained
     onto the running expectation. Without the fill entries the baseline stayed at
@@ -687,15 +843,20 @@ class LedgerExpectationSource:
     vanished with no fill behind it -- still diverges and still halts. Only the
     *explained* part of the movement is absorbed.
 
-    Known residual, and deliberately out of scope here: a resting order also
-    withholds collateral from the venue's ``available`` cash on a venue whose
-    :class:`~windbreak.connector.semantics.OrderCollateralInAvailable` is
-    ``DEDUCTED_FROM_AVAILABLE``, and no entry accounts for that reservation. So
-    an order coming to rest still moves the *cash* dimension further than the
-    books explain, and still breaches there. That fails closed, which is why it
-    is safe to leave: booking a reservation correctly means releasing it
-    pro-rata as the order fills, against per-call fee rounding, and honouring
-    venues that do not deduct at all.
+    A resting order also withholds collateral from ``available`` on a venue
+    whose :class:`~windbreak.connector.semantics.OrderCollateralInAvailable` is
+    ``DEDUCTED_FROM_AVAILABLE``, and issue #423 gave that reservation a booked
+    fact too: it rides on the arrival entry, as the venue's own figure, and is
+    released back as booked fills draw the order down. The release is pro-rata
+    on quantity and taken from *cumulative* consumption
+    (:func:`_released_by`), so however unevenly an order fills the released
+    total is the reserved total exactly -- no drift, no leftover micro. A venue
+    that withholds nothing books ``0`` and has no reservation invented for it.
+    Two residuals stay, both closed: an order captured from the *connector* at
+    startup carries no reservation to release (its collateral is already inside
+    the seeded cash baseline), and a cancel releases collateral no entry books
+    at all -- in each case the venue moves further than the books explain and
+    the cycle still breaches.
 
     Fail closed: an entry whose accounting cannot be reconstructed (a malformed
     payload leaf, or an event the seam should never have delivered) is never
@@ -849,50 +1010,69 @@ class LedgerExpectationSource:
         """
         if event.event_type == _FILL_ACCOUNTED_EVENT_TYPE:
             entry = _fill_entry(event)
-            if entry is None or not self._consume(entry):
+            if entry is None:
                 return None
-            return _advanced(self._expectations, entry, self._open_orders)
+            released = self._consume(entry)
+            if released is None:
+                return None
+            return _advanced(self._expectations, entry, self._open_orders, released)
         if event.event_type == _RESTING_ORDER_ACCOUNTED_EVENT_TYPE:
             arrival = _resting_entry(event)
-            if arrival is None:
+            if arrival is None or arrival.venue_order_id in self._open_orders:
                 return None
-            self._open_orders[arrival.venue_order_id] = arrival.quantity_centis
-            return _with_open_orders(self._expectations, self._open_orders)
+            self._open_orders[arrival.venue_order_id] = _RestingOrder(
+                total_centis=arrival.quantity_centis,
+                consumed_centis=0,
+                reserved_micros=arrival.reserved_micros,
+                released_micros=0,
+            )
+            return _with_arrival(
+                self._expectations, self._open_orders, arrival.reserved_micros
+            )
         return None
 
-    def _consume(self, entry: _FillEntry) -> bool:
-        """Draw the named resting order down by this fill, reporting success.
+    def _consume(self, entry: _FillEntry) -> int | None:
+        """Draw the named resting order down, returning the collateral released.
 
-        A fill that names no order consumes nothing and trivially succeeds. A
-        fill that names an order the expectation has never held fails instead of
-        inventing one: applying it would conjure a resting order and discard it
-        in the same step, quietly absorbing a retirement the books cannot
-        explain. That is the exact fail-open shape this dimension exists to
-        refuse, so it is reported as a gap and latches the advance.
+        A fill that names no order consumes nothing, releases nothing, and
+        trivially succeeds. A fill that names an order the expectation has never
+        held fails instead of inventing one: applying it would conjure a resting
+        order and discard it in the same step, quietly absorbing a retirement
+        the books cannot explain. That is the exact fail-open shape this
+        dimension exists to refuse, so it is reported as a gap and latches the
+        advance.
 
         The drawdown is the fill's own size -- the magnitude of its signed
         position delta -- and the id leaves the expectation only once the order
         is exhausted. Consuming *more* than the order held still retires it and
-        no more: the surplus is not silently absorbed anywhere else, so a venue
-        that moved further than the books explain still diverges.
+        no more: the consumption is clamped to the order's own size, so the
+        surplus releases no extra collateral and is not silently absorbed
+        anywhere else, and a venue that moved further than the books explain
+        still diverges.
 
         Args:
             entry: The booked fill's reconstructed accounting.
 
         Returns:
-            Whether the named order could be drawn down.
+            The collateral this fill released, in micros, or ``None`` when the
+            named order could not be drawn down at all. ``0`` and ``None`` are
+            different answers: the caller must not read a zero release as a gap.
         """
         if not entry.venue_order_id:
-            return True
-        remaining = self._open_orders.get(entry.venue_order_id)
-        if remaining is None:
-            return False
-        remaining -= abs(entry.position_delta.value)
-        if remaining > 0:
-            self._open_orders[entry.venue_order_id] = remaining
-        else:
+            return 0
+        order = self._open_orders.get(entry.venue_order_id)
+        if order is None:
+            return None
+        consumed = min(
+            order.consumed_centis + abs(entry.position_delta.value),
+            order.total_centis,
+        )
+        released = _released_by(order, consumed)
+        order.consumed_centis = consumed
+        order.released_micros += released
+        if consumed >= order.total_centis:
             del self._open_orders[entry.venue_order_id]
-        return True
+        return released
 
 
 def _classify(

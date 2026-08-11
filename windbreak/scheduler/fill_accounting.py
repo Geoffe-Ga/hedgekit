@@ -138,6 +138,33 @@ class FillSource(Protocol):
         """
         ...
 
+    def resting_collateral_micros(self, order: OpenOrder, /) -> MoneyMicros:
+        """Return the cash this venue withholds from ``available`` for ``order``.
+
+        A *discrete report* about one order, like every other method here, never
+        the account's aggregate withheld total: the reconciliation cycle
+        compares against the aggregate ``available``, so advancing the
+        expectation from that same aggregate would grade the venue against
+        itself and could never fail (issue #352).
+
+        Withholding is venue-dependent, which is exactly why
+        :class:`~windbreak.connector.semantics.OrderCollateralInAvailable`
+        exists, and each venue answers for its own convention here. A venue
+        whose answer is not ``DEDUCTED_FROM_AVAILABLE`` withholds nothing and
+        must return ``0``; the booking records that zero rather than inventing a
+        reservation, because a booked reservation the venue never made would
+        push the cash expectation below an ``available`` that never moved.
+
+        Args:
+            order: The order that came to rest, as reported by
+                :meth:`get_rested_orders`; its quantity is the size that rested.
+
+        Returns:
+            The positive magnitude the venue withheld from ``available`` for
+            this order, or ``MoneyMicros(0)`` on a venue that withholds nothing.
+        """
+        ...
+
 
 class FillLedgerWriter(Protocol):
     """The append-only seam booked entries are written through."""
@@ -243,6 +270,14 @@ class LedgerFillBookkeeper:
         is small, and an id key cannot silently drop entries the way a timestamp
         cursor can.
 
+        Each arrival also carries the collateral the venue withheld from
+        ``available`` for that order (issue #423), asked of the venue rather
+        than re-derived here for the same reason ``cash_delta_micros`` is asked
+        of :meth:`FillSource.fill_cash_micros`: a second implementation of
+        book-cost-plus-fee would drift from the venue the first time either
+        rounding rule moved, and a bookkeeping drift is indistinguishable from
+        the venue divergence reconciliation exists to catch.
+
         Returns:
             The number of arrival entries appended.
         """
@@ -256,6 +291,9 @@ class LedgerFillBookkeeper:
                     venue_order_id=order.id,
                     ticker=order.ticker,
                     resting_quantity_centis=order.quantity.value,
+                    reserved_collateral_micros=(
+                        self._venue.resting_collateral_micros(order).value
+                    ),
                 )
             )
             self._booked_orders.add(order.id)

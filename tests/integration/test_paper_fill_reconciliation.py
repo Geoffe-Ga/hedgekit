@@ -21,15 +21,23 @@ Issue #390 adds the same pair for the *open-order* dimension. A limit that only
 partly crosses leaves a remainder resting, and before #390 no ledgered fact
 could name that order: the remainder read as unexplained venue movement and
 halted the loop the moment it routed anything other than an outright marketable
-order. Those two tests assert on the cycle's `open_order_ok` flag specifically,
-not on the whole outcome, because a resting order *also* withholds collateral
-from `available` and that reservation is deliberately still unbooked -- see
-`test_a_partial_fill_leaves_the_open_order_dimension_reconciled` for why that
-residual is safe to leave and out of scope here.
+order. Those two tests assert on the cycle's `open_order_ok` flag specifically
+rather than on the whole outcome, because when they were written the same tick
+still breached on *cash*.
+
+Issue #423 closes that last dimension. A resting order also withholds
+collateral from `available`, and no entry accounted for the reservation --
+1_200_000 micros of `cash_drift` on this very fixture. The arrival entry now
+carries the venue's own reservation figure, so
+`test_a_resting_order_reconciles_on_every_dimension_including_cash` can assert
+what #390 could not: the whole cycle, every dimension, clean. Its non-vacuity
+partner measures the withholding directly off the venue, so a reconciliation
+that passed merely because nothing was ever withheld cannot pass here.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from tests.integration.conftest import ledger_path_for
@@ -64,6 +72,10 @@ _RESTING_LIMIT = PricePips(4600)
 #: Large enough that the participation-capped taker walk cannot consume it all,
 #: so a genuine remainder is left resting at the venue.
 _RESTING_SIZE = ContractCentis(300)
+
+#: An instant no simulated fill can precede, for reading the venue's whole
+#: execution log (mirrors `windbreak.scheduler.fill_accounting._EPOCH_FLOOR`).
+_EPOCH_FLOOR = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _fixed_clock() -> int:
@@ -191,6 +203,27 @@ def _open_order_verdicts(deps: PaperTickDeps) -> list[bool]:
     return verdicts
 
 
+def _cash_drifts(deps: PaperTickDeps) -> list[int]:
+    """Return each recorded verification cycle's cash drift, in order.
+
+    Args:
+        deps: The tick's dependency bundle.
+
+    Returns:
+        The `cash_drift` micros of every verification event on the ledger.
+    """
+    import json
+
+    drifts: list[int] = []
+    for record in deps.store.read_all():
+        if not record.event_type.startswith("Verification"):
+            continue
+        data = json.loads(record.payload_json)["data"]
+        if "cash_drift" in data:
+            drifts.append(int(data["cash_drift"]))
+    return drifts
+
+
 def test_a_partial_fill_leaves_the_open_order_dimension_reconciled(
     books_dir: Path,
     cassette_path: Path,
@@ -207,14 +240,13 @@ def test_a_partial_fill_leaves_the_open_order_dimension_reconciled(
     routed outright marketable orders, and live the moment it did not.
 
     Only the open-order dimension is asserted, because only it is what #390
-    moved. The *cash* dimension still breaches on the same tick, for a different
-    and deliberately out-of-scope reason: a resting order withholds collateral
-    from `available` (`OrderCollateralInAvailable.DEDUCTED_FROM_AVAILABLE`) and
-    no ledgered entry accounts for that reservation. Booking a reservation
-    correctly means releasing it pro-rata as the order fills, against per-call
-    fee rounding, and honouring venues that do not deduct at all -- a design
-    that belongs with whatever change first needs it, not bolted onto this one.
-    It fails *closed*, which is why leaving it is safe.
+    moved: when this test was written the same tick still breached on *cash*,
+    over the collateral the resting remainder withholds from `available`. Issue
+    #423 booked that reservation too, and
+    `test_a_resting_order_reconciles_on_every_dimension_including_cash` is the
+    whole-outcome assertion this one deliberately could not make. Both are kept:
+    this one still fails if the open-order dimension alone regresses, which a
+    whole-outcome assertion would blur into whichever dimension broke.
     """
     from windbreak.scheduler.loop import run_single_tick
 
@@ -236,6 +268,90 @@ def test_a_partial_fill_leaves_the_open_order_dimension_reconciled(
     assert "FillAccounted" in event_types
     assert _open_order_verdicts(deps) == [True, True]
     deps.store.verify_chain()
+
+
+def test_a_resting_order_reconciles_on_every_dimension_including_cash(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """Issue #423 through the real composition root: no dimension left over.
+
+    #422 could only assert `open_order_ok`, because the same tick still breached
+    on *cash*: the resting remainder withholds collateral from `available`
+    (`OrderCollateralInAvailable.DEDUCTED_FROM_AVAILABLE`) and no ledgered entry
+    accounted for it -- 1_200_000 micros of `cash_drift` on this exact fixture.
+    The arrival entry now books that reservation, so the whole cycle grades
+    clean and the loop keeps ticking.
+
+    Asserted through `run_single_tick` rather than against the fold in
+    isolation: the bookkeeper, the ledger row, the feed, and the expectation all
+    have to agree, and a seam that is green on its own while the composition
+    never reaches it is the failure mode this suite exists to catch.
+    """
+    from windbreak.scheduler.loop import run_single_tick
+
+    deps = _build_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools_factory=research_tools_factory,
+    )
+    run_single_tick(deps, beat=1)
+
+    _partially_fill_the_account(deps)
+    outcome = run_single_tick(deps, beat=2)
+
+    event_types = [record.event_type for record in deps.store.read_all()]
+    assert "RestingOrderAccounted" in event_types
+    assert _cash_drifts(deps) == [0, 0]
+    assert "VerificationMismatch" not in event_types
+    assert "VerificationMismatchHalt" not in event_types
+    assert deps.kernel.mode is not Mode.HALT
+    assert outcome.kernel_halted is False
+    deps.store.verify_chain()
+
+
+def test_the_venue_really_did_withhold_the_collateral_that_now_reconciles(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """Non-vacuity for the fixture itself: the reservation is not zero.
+
+    A reconciliation that passes because nothing was ever withheld would pin
+    nothing at all. This measures the withholding directly off the venue -- the
+    1_200_000 micros #422 reported as `cash_drift` -- so the clean cycle above
+    is known to be absorbing a real movement rather than an absent one.
+    """
+    deps = _build_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path_for(tmp_path),
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools_factory=research_tools_factory,
+    )
+    before = deps.exchange.get_balances().available.value
+
+    _partially_fill_the_account(deps)
+
+    (rested,) = deps.exchange.get_rested_orders()
+    reserved = deps.exchange.resting_collateral_micros(rested).value
+    spent = sum(
+        deps.exchange.fill_cash_micros(fill).value
+        for fill in deps.exchange.get_fills(_EPOCH_FLOOR)
+    )
+    assert reserved == 1_200_000
+    assert before - deps.exchange.get_balances().available.value == spent + reserved
 
 
 def test_a_resting_order_that_left_the_venue_unexplained_still_breaches(

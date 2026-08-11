@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING
 from tests.integration.conftest import ledger_path_for
 from tests.riskkernel.conftest import DEFAULT_NOW_EPOCH_S, make_context, make_intent
 from tests.scheduler.conftest import proven_flat_exposure, proven_untraded_day
-from windbreak.numeric.types import ContractCentis, PricePips
+from windbreak.numeric.types import ContractCentis
 from windbreak.riskkernel.modes import Mode
 
 if TYPE_CHECKING:
@@ -429,9 +429,17 @@ def test_paper_verification_mismatch_halts_the_kernel_and_ledgers_the_breach(
 ) -> None:
     """A venue that moved off the reconciled baseline HALTs the kernel (#32).
 
-    The divergence is created by trading directly on the exchange, behind the
-    loop's back -- exactly the unattributed venue movement reconciliation
-    exists to catch. Halting, not vetoing, is the required response.
+    The divergence is cash leaving the account with no execution behind it --
+    exactly the unattributed venue movement reconciliation exists to catch.
+    Halting, not vetoing, is the required response.
+
+    It is deliberately *not* an order placed directly on the exchange. That was
+    this test's original divergence and it is no longer one: the bookkeeper
+    reads the venue's own fill and arrival logs, so it books whatever landed
+    there regardless of who placed it, and since issue #423 booked the
+    resting-order collateral too, such a movement reconciles in full. Keeping
+    the old idiom would have left this test green on an outcome it no longer
+    causes.
 
     Args:
         books_dir: The shared books-fixture directory.
@@ -441,7 +449,7 @@ def test_paper_verification_mismatch_halts_the_kernel_and_ledgers_the_breach(
         research_tools_factory: Builds the offline research tools double.
         tmp_path: The pytest scratch directory.
     """
-    from windbreak.connector.paper import PaperOrderIntent
+    from windbreak.numeric.types import MoneyMicros
     from windbreak.scheduler.loop import run_single_tick
 
     deps = _build_deps(
@@ -454,14 +462,11 @@ def test_paper_verification_mismatch_halts_the_kernel_and_ledgers_the_breach(
     )
     run_single_tick(deps, beat=1)
 
-    deps.exchange.place_order(
-        PaperOrderIntent(
-            ticker=_TICKER,
-            side="yes",
-            price=PricePips(4600),
-            quantity=ContractCentis(100),
-        ),
-        None,
+    opening = deps.exchange.balances
+    deps.exchange.balances = type(opening)(
+        total=MoneyMicros(opening.total.value - 7_000_000),
+        available=MoneyMicros(opening.available.value - 7_000_000),
+        fetched_at=opening.fetched_at,
     )
     outcome = run_single_tick(deps, beat=2)
 
