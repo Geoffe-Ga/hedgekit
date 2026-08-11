@@ -156,14 +156,31 @@ jobs:
           pip install -c constraints-quality.txt -r requirements-dev.txt
           pip install -e . -c constraints-quality.txt
 
+      - name: Build the distribution the wheel tier installs (issue #467)
+        # tests/e2e/test_installed_wheel.py asserts on the WHEEL, in a clean
+        # virtualenv -- not on the checkout. It therefore needs `dist/` to hold
+        # exactly one wheel before pytest starts. The `build` job below produces
+        # its own copy for `twine check` and the release artifact; duplicating
+        # ~10s of `python -m build` here is cheaper than making this job wait on
+        # that one, which would put a second job on the critical path of every
+        # merge to serialise two things that have no real dependency.
+        run: |
+          pip install build
+          python -m build --outdir dist
+          ls -l dist/
+
       - name: Report the runtimes this job actually has
-        # Printed, not asserted. The tier SKIPS where a runtime is absent, so a
-        # silent skip would otherwise read as a pass; this line is what makes
-        # the log answer "did it really run?" without opening the test output.
+        # Printed, not asserted. This job's tests skip where a runtime is
+        # absent, so a silent skip would otherwise read as a pass; this line is
+        # what makes the log answer "did it really run?" without opening the
+        # test output. WINDBREAK_E2E_REQUIRE_RUNTIME below is the enforcement
+        # that goes with it.
         run: |
           docker info --format 'docker daemon: {{.ServerVersion}}' || echo 'docker daemon: UNAVAILABLE'
           test -d /run/systemd/system && echo 'systemd: running' || echo 'systemd: NOT running'
           command -v systemd-analyze >/dev/null && echo 'systemd-analyze: present' || echo 'systemd-analyze: absent'
+          ls dist/*.whl >/dev/null 2>&1 && echo "built wheel: $(ls dist/*.whl)" || echo 'built wheel: ABSENT'
+          echo "fail-closed on a missing runtime: WINDBREAK_E2E_REQUIRE_RUNTIME=1"
 
       - name: Container tier (docker / systemd end-to-end)
         # This is NOT a gate weakening, and it is the same reasoning the chaos
@@ -187,6 +204,17 @@ jobs:
         # addopts, because pytest takes the LAST -m it is given. --strict-markers
         # and --strict-config stay active (we deliberately avoid --override-ini
         # and -o addopts=, which would silently drop them).
+        env:
+          # THE SKIP HAZARD, decided deliberately (issues #467, #468). This job
+          # is a REQUIRED check under branch protection, and a required check
+          # that skips reports success — the CI-level form of a corpus scan
+          # asserting over zero hits. Locally a skip is right: not every
+          # developer has a docker daemon, and a tier that errored there would
+          # simply be deleted. Here the runtimes are provisioned deliberately,
+          # so a missing one means the provisioning broke and the gate quietly
+          # stopped gating. This flag makes `tests.e2e.harness.require_runtime`
+          # FAIL instead of skip, naming what was missing.
+          WINDBREAK_E2E_REQUIRE_RUNTIME: "1"
         run: pytest -m container --no-cov -v
 
   build:
