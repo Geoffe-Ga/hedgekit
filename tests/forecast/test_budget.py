@@ -827,3 +827,57 @@ def test_charge_stage_remainder_preserves_the_page_ceiling() -> None:
     remainder = budget.charge_stage(1, market_ticker="KX-A", at=at)
 
     assert remainder.max_pages == 7
+
+
+def test_the_opening_day_counter_is_used_and_then_copied_not_aliased() -> None:
+    """A rehydrated budget reads its opening spend and never writes back to it.
+
+    Both halves matter and neither alone is enough. The opening total has to be
+    *seen* -- that is issue #442's whole fix, and the first assertion below
+    would fail if `opening_spend_by_day` were quietly ignored. And the mapping
+    has to be *copied*, because the scheduler folds one ledger read into a
+    mapping and hands it over; aliasing would let this budget's charges mutate
+    the caller's fold result, so a caller that read the fold once and used it
+    twice would see a total that had silently grown by its own spending.
+
+    The charge is made against a *different* day from the opening one, so the
+    "unchanged" assertion cannot pass by the charge happening to be zero.
+    """
+    opening = {"2026-08-09": 400_000}
+    budget = ResearchBudget(
+        per_day_micros=500_000,
+        ledger=InMemoryBudgetLedger(),
+        opening_spend_by_day=opening,
+    )
+
+    budget.charge_forecast(
+        100_000,
+        market_ticker="MKT-OPENING",
+        at=datetime(2026, 8, 9, 12, 0, tzinfo=UTC),
+    )
+
+    with pytest.raises(DailyBudgetExhaustedError) as caught:
+        budget.ensure_day_open(at=datetime(2026, 8, 9, 13, 0, tzinfo=UTC))
+
+    assert caught.value.spent_micros == 500_000
+    assert opening == {"2026-08-09": 400_000}
+
+
+def test_a_negative_opening_day_total_is_refused() -> None:
+    """A negative rehydrated total would credit the day, so it aborts startup.
+
+    Fail-closed in the direction that matters: a budget that cannot trust its
+    opening counter must refuse to exist rather than run with a ceiling it has
+    already been handed room under. The message names the offending day key so
+    a bad ledger row is locatable.
+    """
+    with pytest.raises(ValueError) as caught:
+        ResearchBudget(
+            ledger=InMemoryBudgetLedger(),
+            opening_spend_by_day={"2026-08-09": -1},
+        )
+
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == (
+        "opening_spend_by_day['2026-08-09'] must be non-negative, got -1"
+    )

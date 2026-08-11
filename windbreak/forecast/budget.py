@@ -31,6 +31,24 @@ verbatim on :class:`windbreak.forecast.triage.TriageLedgerWriter`) with
 package-wide no-float convention ``scripts/lint_no_floats.py`` enforces. All
 money math is integer-only, with the single per-unit division routed through
 :func:`windbreak.numeric.rounding.divide` so its rounding direction is explicit.
+
+THE DAY COUNTER IS DURABLE FROM OUTSIDE (issue #442)
+
+Two changes make the per-UTC-day ceiling a per-*day* ceiling rather than a
+per-*process* one. :meth:`ResearchBudget.charge_forecast` ledgers a
+``BUDGET_SPEND_RECORDED`` event on every successful charge, not only on a
+breach, so what a day spent exists somewhere other than this object's memory.
+And :meth:`ResearchBudget.__init__` accepts the day counter it opens with, so a
+composition root holding durable state can rehydrate it -- the scheduler folds
+those rows back through
+:func:`windbreak.scheduler.research_spend.spend_by_day_from_records` before the
+first tick of every process.
+
+The direction of that arrow is the point: this module still imports nothing
+from the ledger (SPEC S8.3 keeps the forecast engine free of it), so it names an
+event and takes a mapping, and the scheduler owns both the persistence and the
+replay. Before this, ``restart: on-failure`` plus an unbounded restart count
+meant the day's ceiling reset as often as the process died.
 """
 
 from __future__ import annotations
@@ -115,6 +133,17 @@ BUDGET_FORECAST_EXCEEDED_EVENT = "BUDGET_FORECAST_EXCEEDED"
 
 #: Event type recorded when a UTC day's cumulative budget is exhausted.
 BUDGET_DAY_EXHAUSTED_EVENT = "BUDGET_DAY_EXHAUSTED"
+
+#: Event type recorded on every *successful* research charge (issue #442).
+#:
+#: Until this existed, only breaches were ledgered, so nothing on disk said what
+#: a UTC day had already spent. :meth:`ResearchBudget.__init__` takes the day
+#: counter as an argument precisely so a composition root can fold these rows
+#: back and re-open a process on the day's real total instead of zero; the
+#: scheduler does that in :mod:`windbreak.scheduler.research_spend`. This module
+#: stays free of any ledger import (SPEC S8.3), so it names the event and lets
+#: the writer seam translate it.
+BUDGET_SPEND_RECORDED_EVENT = "BUDGET_SPEND_RECORDED"
 
 #: Event type recorded when a research-cost report is produced.
 COST_REPORT_EVENT = "COST_REPORT"
@@ -371,17 +400,32 @@ class ResearchBudget:
         per_day_micros: int = DEFAULT_PER_DAY_BUDGET_MICROS,
         max_pages: int = DEFAULT_MAX_PAGES,
         ledger: BudgetLedgerWriter,
+        opening_spend_by_day: Mapping[str, int] | None = None,
     ) -> None:
-        """Initialize the budget with its three ceilings and an empty day ledger.
+        """Initialize the budget with its three ceilings and its day counter.
+
+        ``opening_spend_by_day`` is what makes the per-UTC-day ceiling a per-day
+        ceiling rather than a per-*process* one (issue #442). A composition root
+        that can read durable state -- the scheduler folds the hash-chained
+        ledger through
+        :func:`windbreak.scheduler.research_spend.spend_by_day_from_records` --
+        passes the day's real spend here, so a restarted process resumes the
+        day where the last one left it. Defaulting to ``None`` (an empty
+        counter) keeps every existing caller and every unit test unchanged, and
+        is correct for a budget with no durable store behind it.
 
         Args:
             per_forecast_micros: The per-forecast spend ceiling, in micros.
             per_day_micros: The per-UTC-day spend ceiling, in micros.
             max_pages: The per-forecast web-page fetch ceiling.
             ledger: The budget-event ledger writer (keyword-only).
+            opening_spend_by_day: The day counter to open with, keyed by ISO
+                ``YYYY-MM-DD`` UTC day, or ``None`` to start empty. Copied, not
+                aliased, so the caller's mapping is never mutated by a charge.
 
         Raises:
-            ValueError: If any of the three ceilings is negative.
+            ValueError: If any of the three ceilings, or any opening day total,
+                is negative.
         """
         _require_non_negative(per_forecast_micros, "per_forecast_micros")
         _require_non_negative(per_day_micros, "per_day_micros")
@@ -390,7 +434,10 @@ class ResearchBudget:
         self._per_day_micros = per_day_micros
         self._max_pages = max_pages
         self._ledger = ledger
-        self._spend_by_day: dict[str, int] = {}
+        opening = dict(opening_spend_by_day or {})
+        for day, spent in opening.items():
+            _require_non_negative(spent, f"opening_spend_by_day[{day!r}]")
+        self._spend_by_day: dict[str, int] = opening
         self._already_charged_micros = 0
 
     @property
@@ -440,6 +487,13 @@ class ResearchBudget:
         already spent, and that aggregate is what the error and its ledgered
         event report.
 
+        A ``BUDGET_SPEND_RECORDED`` event is ledgered for the charge in the same
+        order and for the same reason: *before* the per-forecast check, so money
+        already committed is durable even when this call goes on to raise
+        (issue #442). Ledgering it only on the way out would lose exactly the
+        spend a breaching forecast made, which is the spend most worth
+        remembering.
+
         Args:
             cost_micros: The forecast's research cost, in micros.
             market_ticker: The forecasted market's ticker, for the audit trail
@@ -456,6 +510,14 @@ class ResearchBudget:
         _require_non_negative(cost_micros, "cost_micros")
         day = _utc_day_key(at)
         self._spend_by_day[day] = self._spend_by_day.get(day, 0) + cost_micros
+        spend_payload: dict[str, object] = {
+            "utc_day": day,
+            "market_ticker": market_ticker,
+            "cost_micros": cost_micros,
+        }
+        self._ledger.record(
+            BudgetEvent(BUDGET_SPEND_RECORDED_EVENT, spend_payload, iso_z(at))
+        )
         forecast_cost_micros = self._already_charged_micros + cost_micros
         if forecast_cost_micros > self._per_forecast_micros:
             payload: dict[str, object] = {

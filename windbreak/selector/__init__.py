@@ -341,7 +341,7 @@ def _size_and_emit(
         inputs.forecast.vote_dispersion_ppm, risk.dispersion_zero_ceiling_ppm
     )
     raw = kelly_size(
-        net_edge_ppm=figures.research_cost_adjusted_edge_ppm,
+        net_edge_ppm=figures.net_edge_ppm,
         min_net_edge_ppm=risk.min_net_edge_ppm,
         executable_price_ppm=figures.executable_price_ppm,
         kelly_fraction_ppm=risk.kelly_fraction_ppm,
@@ -378,7 +378,7 @@ def _size_and_emit(
     )
     if not isinstance(final, EdgeFigures):
         return _decision(inputs, (), (*reasons, final.reason))
-    net = final.research_cost_adjusted_edge_ppm
+    net = final.net_edge_ppm
     if net < risk.min_net_edge_ppm:
         detail = f"net_edge_ppm={net} min_net_edge_ppm={risk.min_net_edge_ppm}"
         reason = f"fail:net_edge_at_final_size: {detail}"

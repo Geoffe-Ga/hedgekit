@@ -614,6 +614,13 @@ def test_a_halt_on_the_second_market_ledgers_its_snapshot_but_no_forecast(
         ("VerificationPassed", ""),
         # MKT-ISO-A: the full per-market path.
         ("MarketSnapshotRecorded", "MKT-ISO-A"),
+        # Issue #442: every *successful* research charge now leaves a durable
+        # row, not only a breach, so a restarted process folds the day's spend
+        # back instead of resuming at zero. It precedes `ForecastCreated`
+        # because the pipeline charges the budget before it assembles the
+        # record -- and its absence against MKT-ISO-B below is the honest
+        # statement that the halted market spent nothing.
+        ("ResearchSpendRecorded", "MKT-ISO-A"),
         ("ForecastCreated", "MKT-ISO-A"),
         ("SelectorDecisionRecorded", "MKT-ISO-A"),
         ("ExchangeStatusObserved", ""),

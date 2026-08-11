@@ -9,6 +9,7 @@ or an optional beat budget.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import math
 import os
@@ -56,6 +57,7 @@ from windbreak.ledger import (
 from windbreak.logging_setup import configure_logging
 from windbreak.riskkernel.ack_flow import ACKS_DIRNAME
 from windbreak.riskkernel.kill import KILL_FILENAME, REARM_FILENAME
+from windbreak.scheduler.research_spend import ResearchBudgetCapSet
 
 if TYPE_CHECKING:
     import http.server
@@ -92,6 +94,13 @@ MODE_TICK_FAILED = "TICK_FAILED"
 #: component that never produced it would forge provenance in a hash-chained
 #: audit trail.
 _RESOLUTION_INGEST_COMPONENT = "operator"
+
+#: Component label stamped on an operator-appended ``ResearchBudgetCapSet``
+#: event (issues #442/#483). Deliberately the same human label the resolution
+#: ingest uses and never a pipeline process name: a spend ceiling is a human's
+#: instruction, and stamping it with a component that never issued it would
+#: forge provenance in a hash-chained audit trail.
+_RESEARCH_BUDGET_COMPONENT = "operator"
 
 #: Mode reported where there is no evidence of any mode -- the dashboard's
 #: no-ledger and no-heartbeat defaults (issue #447). Absent evidence is not
@@ -262,12 +271,48 @@ def _non_negative_int(raw: str) -> int:
     return value
 
 
+def _non_negative_micros(raw: str) -> int:
+    """Parse a non-negative micros amount for use as an argparse ``type``.
+
+    Distinct from :func:`_non_negative_int`, whose message names ``max beats``;
+    a money ceiling refused with that wording would send an operator looking at
+    the wrong flag.
+
+    Args:
+        raw: The raw command-line token.
+
+    Returns:
+        The parsed micros value.
+
+    Raises:
+        argparse.ArgumentTypeError: If ``raw`` is not an int or is negative. A
+            negative ceiling is unenforceable, so it is refused at parse time
+            -- before anything is composed and before any ledger is opened.
+    """
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("micros amount must be non-negative")
+    return value
+
+
 def _add_run_arguments(run_parser: argparse.ArgumentParser) -> None:
     """Register the ``run`` subcommand's options on its subparser.
 
     Args:
         run_parser: The ``run`` subparser to populate with options.
     """
+    run_parser.add_argument(
+        "--research-per-day-micros",
+        type=_non_negative_micros,
+        default=None,
+        help=(
+            "Per-UTC-day research spend ceiling, in micros, overriding the "
+            "configured value for this run (default: the configuration's). "
+            "This is the startup default only: a ledgered "
+            "`windbreak set-research-budget` row supersedes it, and is picked "
+            "up on the next tick without a restart."
+        ),
+    )
     run_parser.add_argument(
         "--heartbeat-interval",
         type=_non_negative_float,
@@ -463,6 +508,44 @@ def _add_ingest_resolution_arguments(ingest_parser: argparse.ArgumentParser) -> 
     )
 
 
+def _add_set_research_budget_arguments(
+    budget_parser: argparse.ArgumentParser,
+) -> None:
+    """Register the ``set-research-budget`` subcommand's options (#442, #483).
+
+    Every option is required. A money ceiling with a defaulted value would be a
+    guess written into a hash-chained audit trail, and a change nothing explains
+    cannot be reviewed, so there is nothing to default to.
+
+    Args:
+        budget_parser: The ``set-research-budget`` subparser to populate.
+    """
+    budget_parser.add_argument(
+        "--ledger-path",
+        type=Path,
+        required=True,
+        help="Path to the SQLite ledger database to append the change to.",
+    )
+    budget_parser.add_argument(
+        "--per-day-micros",
+        type=_non_negative_micros,
+        required=True,
+        help=(
+            "The new per-UTC-day research spend ceiling, in micros. 0 stops "
+            "all further research spend."
+        ),
+    )
+    budget_parser.add_argument(
+        "--note",
+        required=True,
+        help=(
+            "Why the ceiling is being changed, recorded verbatim in the "
+            "ledgered event. Never compared against anything, so its wording "
+            "can never make two changes disagree."
+        ),
+    )
+
+
 def _add_kill_arguments(kill_parser: argparse.ArgumentParser) -> None:
     """Register the ``kill`` subcommand's options on its subparser.
 
@@ -591,7 +674,10 @@ def build_parser() -> argparse.ArgumentParser:
         anchor file); an ``ingest-resolution`` subcommand exposing
         ``--ledger-path``, ``--market-ticker``, ``--outcome``, ``--resolved-at``
         and ``--source`` (record that a market settled, so forecasts on it can
-        be scored); ``kill`` and ``rearm`` subcommands exposing
+        be scored); a ``set-research-budget`` subcommand exposing
+        ``--ledger-path``, ``--per-day-micros`` and ``--note`` (change the
+        per-UTC-day research spend ceiling on a running loop, issues #442/#483);
+        ``kill`` and ``rearm`` subcommands exposing
         ``--state-dir``; an ``ack`` subcommand exposing ``--approval-id`` and
         ``--state-dir``; and a developer-only ``alert-test`` subcommand hidden
         from ``--help``.
@@ -626,6 +712,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers.add_parser(
             "ingest-resolution",
             help="Record that a market settled, so forecasts on it can be scored.",
+        )
+    )
+    _add_set_research_budget_arguments(
+        subparsers.add_parser(
+            "set-research-budget",
+            help="Change the per-UTC-day research spend ceiling, from now on.",
         )
     )
     _add_kill_arguments(
@@ -1587,6 +1679,89 @@ def _run_ingest_resolution(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_set_research_budget(args: argparse.Namespace) -> int:
+    """Append one ``ResearchBudgetCapSet`` row changing the daily research cap.
+
+    The runtime half of the owner's 2026-08-10 decision (#483) and the reason
+    #442's durable counter is usable rather than merely correct: an operator
+    re-caps a *running* loop, which re-reads the ledger at the head of every
+    tick, so the change takes effect on the next beat with no restart and no
+    source edit.
+
+    A later row supersedes an earlier one and two rows can therefore never
+    contradict, which is why -- unlike ``ingest-resolution`` (issue #439) --
+    there is no read-back conflict check here and nothing this verb writes can
+    ever stop a tick. What it does refuse, it refuses *before* opening the
+    ledger: the event's own ``__post_init__`` rejects a negative ceiling and a
+    blank note, so a refused call leaves the chain byte-for-byte untouched and
+    -- on a first run -- creates no database file at all.
+
+    Args:
+        args: Parsed ``set-research-budget`` arguments carrying ``ledger_path``,
+            ``per_day_micros`` and ``note``.
+
+    Returns:
+        The process exit code: 0 once the row is appended, 1 on a refused
+        change (with the reason logged as a ``FATAL`` critical).
+    """
+    try:
+        event = ResearchBudgetCapSet(
+            component=_RESEARCH_BUDGET_COMPONENT,
+            per_day_micros=args.per_day_micros,
+            note=args.note,
+        )
+    except ValueError as exc:
+        _LOGGER.critical("FATAL: %s", exc)
+        return 1
+    store = SqliteLedgerStore(args.ledger_path)
+    try:
+        sequence_number = store.append(event)
+    finally:
+        store.close()
+    _LOGGER.info(
+        "research per-day ceiling set to %d micros sequence=%d note=%s",
+        event.per_day_micros,
+        sequence_number,
+        event.note,
+    )
+    return 0
+
+
+def research_capped_config(
+    config: WindbreakConfig, *, per_day_micros: int | None
+) -> WindbreakConfig:
+    """Apply ``run --research-per-day-micros`` to a loaded configuration.
+
+    The invocation-argument half of "settable without a source-code change".
+    Exactly one field is replaced, through :func:`dataclasses.replace` at each
+    level, so an override cannot silently reset the per-forecast ceiling or the
+    page cap alongside the one it was asked to change.
+
+    With ``per_day_micros`` ``None`` the *same object* is returned, not an equal
+    copy: every deployment that does not pass the flag must be byte-identical to
+    before, and returning the original is the only version of that claim a test
+    can pin by identity.
+
+    Public because ``tests/test_cli_set_research_budget.py`` exercises it
+    directly: it is a pure function of a config and a flag, and testing it
+    through a whole ``run`` invocation would prove less about the field-level
+    behaviour that matters here.
+
+    Args:
+        config: The loaded configuration.
+        per_day_micros: The overriding per-UTC-day ceiling in micros, or
+            ``None`` to leave the configuration untouched (keyword-only).
+
+    Returns:
+        The configuration the run should use.
+    """
+    if per_day_micros is None:
+        return config
+    budget = dataclasses.replace(config.forecast.budget, per_day_micros=per_day_micros)
+    forecast = dataclasses.replace(config.forecast, budget=budget)
+    return dataclasses.replace(config, forecast=forecast)
+
+
 def _run_kill(args: argparse.Namespace) -> int:
     """Engage the kill switch by dropping a ``KILL`` file into ``--state-dir``.
 
@@ -2379,9 +2554,18 @@ def _run_heartbeat(args: argparse.Namespace) -> int:
         The process exit code (0 on success, 1 on a fatal config or alert-sink
         error).
     """
-    config = _load_and_ledger_config(args)
-    if config is None:
+    loaded = _load_and_ledger_config(args)
+    if loaded is None:
         return 1
+    config = research_capped_config(loaded, per_day_micros=args.research_per_day_micros)
+    _LOGGER.info(
+        "research per-day ceiling %d micros source=%s (a ledgered "
+        "set-research-budget row supersedes this on the next tick)",
+        config.forecast.budget.per_day_micros,
+        "--research-per-day-micros"
+        if args.research_per_day_micros is not None
+        else "configuration",
+    )
     # Handlers first, and before `_resolve_on_beat`: the PAPER hook's bundle is
     # built eagerly there -- it opens the SQLite ledger, loads the books, and
     # builds the connector -- and a SIGTERM arriving inside that window would
@@ -2685,9 +2869,18 @@ def _run_riskkernel(args: argparse.Namespace) -> int:
         The process exit code (0 on a clean shutdown, 1 on a fatal config or
         kernel-build error).
     """
-    config = _load_and_ledger_config(args)
-    if config is None:
+    loaded = _load_and_ledger_config(args)
+    if loaded is None:
         return 1
+    config = research_capped_config(loaded, per_day_micros=args.research_per_day_micros)
+    _LOGGER.info(
+        "research per-day ceiling %d micros source=%s (a ledgered "
+        "set-research-budget row supersedes this on the next tick)",
+        config.forecast.budget.per_day_micros,
+        "--research-per-day-micros"
+        if args.research_per_day_micros is not None
+        else "configuration",
+    )
     store = (
         SqliteLedgerStore(args.ledger_path) if args.ledger_path is not None else None
     )
@@ -2823,9 +3016,18 @@ def _run_dashboard(args: argparse.Namespace) -> int:
         The process exit code (0 on a clean shutdown, 1 on a fatal config or
         token/port error).
     """
-    config = _load_and_ledger_config(args)
-    if config is None:
+    loaded = _load_and_ledger_config(args)
+    if loaded is None:
         return 1
+    config = research_capped_config(loaded, per_day_micros=args.research_per_day_micros)
+    _LOGGER.info(
+        "research per-day ceiling %d micros source=%s (a ledgered "
+        "set-research-budget row supersedes this on the next tick)",
+        config.forecast.budget.per_day_micros,
+        "--research-per-day-micros"
+        if args.research_per_day_micros is not None
+        else "configuration",
+    )
     try:
         server = _build_dashboard_server(args, config)
     except ValueError as exc:
@@ -2874,6 +3076,7 @@ _COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "anchor": anchor_command,
     "verify": verify_command,
     "ingest-resolution": _run_ingest_resolution,
+    "set-research-budget": _run_set_research_budget,
     "kill": _run_kill,
     "ack": _run_ack,
     "rearm": _run_rearm,

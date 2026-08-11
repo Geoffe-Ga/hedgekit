@@ -28,28 +28,25 @@ in-process `select` calls over the same inputs serialize byte-identically.
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
+from tests.selector.entry_baseline import (
+    BASELINE_INSTANT,
+    PROBE_SIZE,
+    baseline_fee_model,
+    baseline_forecast,
+    baseline_inputs,
+    baseline_order_book,
+    baseline_slippage_model,
+)
 from windbreak.config.schema import RiskConfig
 from windbreak.connector.fees import FeeModel
-from windbreak.connector.models import OrderBookLevel, OrderBookSnapshot
-from windbreak.forecast.records import Citation, ForecastRecord
+from windbreak.connector.models import OrderBookLevel
 from windbreak.ledger.events import canonical_json
 from windbreak.numeric import ContractCentis, MoneyMicros, PricePips, ProbabilityPpm
 from windbreak.selector import SelectorInputs, select, serialize_decision
 from windbreak.selector.edge import EdgeFigures, compute_executable_edge
 from windbreak.selector.entry import evaluate_entry_conditions
-from windbreak.selector.types import (
-    FeeModelInput,
-    PositionReadModelInput,
-    RiskConfigInput,
-    SlippageModelInput,
-)
-
-#: The reference instant every baseline timestamp (order book, forecast,
-#: fee model) is pinned to, so `T = max(...)` collapses to this single value
-#: and every freshness check starts from a known-fresh state.
-_BASELINE_INSTANT = datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
 
 #: The exact SPEC S9.3 condition names, in the architect's pinned order.
 _EXPECTED_CHECK_NAMES: tuple[str, ...] = (
@@ -67,197 +64,6 @@ _EXPECTED_CHECK_NAMES: tuple[str, ...] = (
     "forecast_live_eligible",
 )
 
-#: `select`'s fixed probe size (SPEC S9.1/#44): every entry-condition test
-#: below computes `EdgeFigures` at this same size, matching what `select`
-#: itself uses internally.
-_PROBE_SIZE = ContractCentis(100)
-
-_BASELINE_CITATION = Citation(
-    url="https://example.com/entry-test",
-    content_hash="sha256:entry-test-citation",
-    quoted_text="Example quoted text supporting the baseline forecast.",
-    publication_date=None,
-    source_type="news_article",
-)
-
-
-def _baseline_forecast(**overrides: object) -> ForecastRecord:
-    """Build the baseline `ForecastRecord`: probability 600_000, all-pass.
-
-    Args:
-        **overrides: Field values overriding the defaults below.
-
-    Returns:
-        The constructed, post-init-validated `ForecastRecord`.
-    """
-    defaults: dict[str, object] = {
-        "forecast_id": "fc-entry-0001",
-        "market_ticker": "ENTRY-TICKER",
-        "normalized_question_hash": "sha256:entry-question",
-        "probability_ppm": 600_000,
-        "ci_low_ppm": 100_000,
-        "ci_high_ppm": 200_000,
-        "model_votes": (),
-        "vote_dispersion_ppm": 0,
-        "rationale_markdown": "n/a",
-        "citations": (_BASELINE_CITATION,),
-        "source_quality_notes": (),
-        "research_cost_micros": 0,
-        "triage_stage": "full",
-        "created_at": _BASELINE_INSTANT,
-        "forecast_horizon_hours": 48,
-        "market_price_baseline_pips": 5_000,
-        "baseline_quote_snapshot_id": "snap-entry-0001",
-        "coherence_group_sum_ppm": None,
-        "coherence_flag": False,
-        "abstention_reason": None,
-        "eligible_for_live": True,
-    }
-    defaults.update(overrides)
-    return ForecastRecord(**defaults)
-
-
-def _baseline_order_book(**overrides: object) -> OrderBookSnapshot:
-    """Build the baseline `OrderBookSnapshot`: one deep ask at 5000 pips.
-
-    Args:
-        **overrides: Field values overriding the defaults below.
-
-    Returns:
-        The constructed `OrderBookSnapshot`.
-    """
-    defaults: dict[str, object] = {
-        "ticker": "ENTRY-TICKER",
-        "yes_bids": (),
-        "yes_asks": (
-            OrderBookLevel(price=PricePips(5_000), quantity=ContractCentis(1_000)),
-        ),
-        "fetched_at": _BASELINE_INSTANT,
-    }
-    defaults.update(overrides)
-    return OrderBookSnapshot(**defaults)
-
-
-def _baseline_fee_model(**overrides: object) -> FeeModelInput:
-    """Build the baseline `FeeModelInput`: a 10_000 ppm taker rate.
-
-    Args:
-        **overrides: Field values overriding the defaults below.
-
-    Returns:
-        The constructed `FeeModelInput`.
-    """
-    defaults: dict[str, object] = {
-        "model": FeeModel(
-            schedule_id="entry-test-fee",
-            maker_fee_ppm=0,
-            taker_fee_ppm=10_000,
-            settlement_fee_ppm=0,
-        ),
-        "as_of": _BASELINE_INSTANT,
-    }
-    defaults.update(overrides)
-    return FeeModelInput(**defaults)
-
-
-def _baseline_slippage_model(**overrides: object) -> SlippageModelInput:
-    """Build the baseline `SlippageModelInput`: a 2_000 ppm buffer.
-
-    Args:
-        **overrides: Field values overriding the defaults below.
-
-    Returns:
-        The constructed `SlippageModelInput`.
-    """
-    defaults: dict[str, object] = {
-        "model_id": "entry-test-slippage",
-        "per_contract_buffer_ppm": 2_000,
-    }
-    defaults.update(overrides)
-    return SlippageModelInput(**defaults)
-
-
-def _baseline_positions(**overrides: object) -> PositionReadModelInput:
-    """Build the baseline `PositionReadModelInput`: generous enough (huge
-    equity/deploy-cap, zero exposures/notional) that none of the five
-    notional caps or the participation cap ever bind in this module's
-    scenarios -- only Kelly sizing (issue #45) or the fixed floor-to-100
-    quantization determine the emitted size.
-
-    Args:
-        **overrides: Field values overriding the generous defaults below.
-
-    Returns:
-        The constructed `PositionReadModelInput`.
-    """
-    defaults: dict[str, object] = {
-        "snapshot_id": "positions-entry-0001",
-        "equity_micros": MoneyMicros(1_000_000_000_000),
-        "above_floor_capital_micros": MoneyMicros(1_000_000_000),
-        "total_deploy_cap_micros": MoneyMicros(1_000_000_000_000),
-        "market_exposure": MoneyMicros(0),
-        "event_exposure": MoneyMicros(0),
-        "bucket_exposure": MoneyMicros(0),
-        "total_exposure": MoneyMicros(0),
-        "notional_today": MoneyMicros(0),
-    }
-    defaults.update(overrides)
-    return PositionReadModelInput(**defaults)
-
-
-def _baseline_risk_config(**overrides: object) -> RiskConfigInput:
-    """Build the baseline `RiskConfigInput` over unmodified `RiskConfig` defaults.
-
-    Args:
-        **overrides: `RiskConfig` field overrides.
-
-    Returns:
-        The constructed `RiskConfigInput`, `config_hash` fixed for this suite.
-    """
-    return RiskConfigInput(
-        config=RiskConfig(**overrides), config_hash="sha256:risk-entry"
-    )
-
-
-def _baseline_inputs(
-    *,
-    forecast: ForecastRecord | None = None,
-    order_book: OrderBookSnapshot | None = None,
-    fee_model: FeeModelInput | None = None,
-    slippage_model: SlippageModelInput | None = None,
-    positions: PositionReadModelInput | None = None,
-    risk_config: RiskConfigInput | None = None,
-) -> SelectorInputs:
-    """Assemble the baseline `SelectorInputs`, all twelve conditions passing.
-
-    Args:
-        forecast: Overriding `ForecastRecord`, or `None` for the baseline.
-        order_book: Overriding `OrderBookSnapshot`, or `None` for the baseline.
-        fee_model: Overriding `FeeModelInput`, or `None` for the baseline.
-        slippage_model: Overriding `SlippageModelInput`, or `None` for the
-            baseline.
-        positions: Overriding `PositionReadModelInput`, or `None` for the
-            generous baseline (issue #45; no cap ever binds by default).
-        risk_config: Overriding `RiskConfigInput`, or `None` for the baseline.
-
-    Returns:
-        The constructed `SelectorInputs`.
-    """
-    return SelectorInputs(
-        forecast=forecast if forecast is not None else _baseline_forecast(),
-        calibration_map_version="calib-entry-v1",
-        order_book=order_book if order_book is not None else _baseline_order_book(),
-        fee_model=fee_model if fee_model is not None else _baseline_fee_model(),
-        slippage_model=(
-            slippage_model if slippage_model is not None else _baseline_slippage_model()
-        ),
-        positions=positions if positions is not None else _baseline_positions(),
-        risk_config=(
-            risk_config if risk_config is not None else _baseline_risk_config()
-        ),
-        correlation_tags=(),
-    )
-
 
 def _figures_for(inputs: SelectorInputs) -> EdgeFigures:
     """Compute `EdgeFigures` for `inputs` at the fixed probe size.
@@ -274,7 +80,7 @@ def _figures_for(inputs: SelectorInputs) -> EdgeFigures:
     """
     result = compute_executable_edge(
         order_book=inputs.order_book,
-        size=_PROBE_SIZE,
+        size=PROBE_SIZE,
         forecast=inputs.forecast,
         fee_model=inputs.fee_model,
         slippage_model=inputs.slippage_model,
@@ -307,7 +113,7 @@ def _failed_names(inputs: SelectorInputs) -> set[str]:
 #     cents=ceil(25_000_000_000_000/1e14)=1 -> 10_000 micros; fee_ppm=10_000 (exact)
 #   fee_adjusted_edge_ppm = 100_000 - 10_000 = 90_000
 #   slippage_adjusted_edge_ppm = 90_000 - 2_000 = 88_000
-#   research_cost_adjusted_edge_ppm = 88_000 - 0 = 88_000 = net_edge_ppm
+#   net_edge_ppm = 88_000 (no research haircut since issue #483)
 #   net_edge_ppm(88_000) >= min_net_edge_ppm(30_000) -> net_edge_min passes
 #   annualized = floor(88_000*1_000_000*8760 / (500_000*48))
 #              = floor(770_880_000_000_000 / 24_000_000) = 32_120_000 (exact)
@@ -315,7 +121,7 @@ def _failed_names(inputs: SelectorInputs) -> set[str]:
 #     240_000 -> annualized_hurdle passes
 #   ci [100_000, 200_000] does not straddle executable_price_ppm(500_000)
 #     -> ci_straddles_executable_price passes
-#   T = _BASELINE_INSTANT for order_book.fetched_at, forecast.created_at, and
+#   T = BASELINE_INSTANT for order_book.fetched_at, forecast.created_at, and
 #     fee_model.as_of alike -> every freshness check passes at zero age
 #   coherence_flag=False, citations non-empty, price 5000 in [500, 9500],
 #     eligible_for_live=True -> the remaining checks pass
@@ -325,7 +131,7 @@ def test_all_twelve_conditions_pass_on_the_baseline_scenario() -> None:
     """The hand-verified baseline passes every named SPEC S9.3 condition, in
     the pinned evaluation order (a deterministic count of exactly twelve).
     """
-    inputs = _baseline_inputs()
+    inputs = baseline_inputs()
     figures = _figures_for(inputs)
 
     checks = evaluate_entry_conditions(inputs, figures)
@@ -342,7 +148,7 @@ def test_jurisdiction_and_category_checks_are_vacuous_placeholders() -> None:
     silent, unintentional no-ops: both are present, both pass, and both
     details name the screener seam explicitly.
     """
-    inputs = _baseline_inputs()
+    inputs = baseline_inputs()
     figures = _figures_for(inputs)
 
     checks = evaluate_entry_conditions(inputs, figures)
@@ -359,19 +165,41 @@ def test_jurisdiction_and_category_checks_are_vacuous_placeholders() -> None:
 
 
 def test_net_edge_min_fails_just_below_threshold() -> None:
-    """`research_cost_micros=58_001` drives `research_cost_adjusted_edge_ppm`
-    to 29_999 -- one ppm below `min_net_edge_ppm`'s default 30_000 -- failing
-    only `net_edge_min`.
+    """A 60_001 ppm slippage buffer drives the net edge to 29_999 -- one ppm
+    below `min_net_edge_ppm`'s default 30_000 -- failing only `net_edge_min`.
 
-    At probe size 100, `ceil(research_cost_micros*100 / 100)` reduces to
-    exactly `research_cost_micros` (no remainder ever possible at this size),
-    so `88_000 - 58_001 == 29_999` precisely.
+    The buffer is a plain ppm subtraction with no rounding, and it replaces
+    (rather than adds to) the baseline's own 2_000, so
+    `fee_adjusted(90_000) - 60_001 == 29_999` precisely. The buffer replaced
+    `research_cost_micros` as this boundary's lever when issue #483 removed the
+    research haircut from the chain: a per-forecast cost amortized over a
+    one-contract probe made `net_edge_min` unreachable for every market, so the
+    charge no longer moves the edge at all and can no longer be used to walk it
+    to a boundary.
     """
-    inputs = _baseline_inputs(forecast=_baseline_forecast(research_cost_micros=58_001))
+    inputs = baseline_inputs(
+        slippage_model=baseline_slippage_model(per_contract_buffer_ppm=60_001)
+    )
 
     figures = _figures_for(inputs)
-    assert figures.research_cost_adjusted_edge_ppm == 29_999
+    assert figures.net_edge_ppm == 29_999
     assert _failed_names(inputs) == {"net_edge_min"}
+
+
+def test_net_edge_min_passes_one_ppm_higher() -> None:
+    """One ppm less slippage clears the same floor, bracketing the boundary.
+
+    Without this the refusal above could come from any condition sitting far
+    from its own boundary; with it, the pair straddles `min_net_edge_ppm`
+    exactly and no condition fails on the passing side.
+    """
+    inputs = baseline_inputs(
+        slippage_model=baseline_slippage_model(per_contract_buffer_ppm=60_000)
+    )
+
+    figures = _figures_for(inputs)
+    assert figures.net_edge_ppm == RiskConfig().min_net_edge_ppm
+    assert _failed_names(inputs) == set()
 
 
 # --- annualized_hurdle ---------------------------------------------------------
@@ -387,7 +215,7 @@ def test_annualized_hurdle_fails_just_below_threshold() -> None:
     annualized = floor(88_000*1_000_000*8760 / (500_000*6425))
                = floor(770_880_000_000_000 / 3_212_500_000) = 239_962
     """
-    inputs = _baseline_inputs(forecast=_baseline_forecast(forecast_horizon_hours=6_425))
+    inputs = baseline_inputs(forecast=baseline_forecast(forecast_horizon_hours=6_425))
 
     figures = _figures_for(inputs)
     assert figures.annualized_expected_return_ppm == 239_962
@@ -402,8 +230,8 @@ def test_ci_straddles_executable_price_fails_at_the_inclusive_lower_boundary() -
     straddles inclusively -- the check must fail at the boundary itself, not
     only strictly inside the interval.
     """
-    inputs = _baseline_inputs(
-        forecast=_baseline_forecast(ci_low_ppm=500_000, ci_high_ppm=600_000)
+    inputs = baseline_inputs(
+        forecast=baseline_forecast(ci_low_ppm=500_000, ci_high_ppm=600_000)
     )
 
     assert _failed_names(inputs) == {"ci_straddles_executable_price"}
@@ -417,8 +245,8 @@ def test_ci_straddles_executable_price_fails_at_the_inclusive_upper_boundary() -
     (500_000 ppm) straddles inclusively -- the mirror of the lower-boundary
     test above, pinning that the upper bound is equally inclusive.
     """
-    inputs = _baseline_inputs(
-        forecast=_baseline_forecast(ci_low_ppm=100_000, ci_high_ppm=500_000)
+    inputs = baseline_inputs(
+        forecast=baseline_forecast(ci_low_ppm=100_000, ci_high_ppm=500_000)
     )
 
     assert _failed_names(inputs) == {"ci_straddles_executable_price"}
@@ -453,14 +281,14 @@ def test_ci_straddle_uses_finer_ppm_price_not_coarse_pips_reconstruction() -> No
     the correct fine-ppm comparison (`100_000 <= 500_050 <= 500_050` is true)
     -- exactly the case the old comparison would have gotten wrong.
     """
-    inputs = _baseline_inputs(
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(price=PricePips(5_000), quantity=ContractCentis(99)),
                 OrderBookLevel(price=PricePips(5_050), quantity=ContractCentis(1)),
             )
         ),
-        forecast=_baseline_forecast(ci_low_ppm=100_000, ci_high_ppm=500_050),
+        forecast=baseline_forecast(ci_low_ppm=100_000, ci_high_ppm=500_050),
     )
 
     figures = _figures_for(inputs)
@@ -479,9 +307,9 @@ def test_quote_snapshot_fresh_fails_when_the_quote_is_stale() -> None:
     exceeds the default 10s `quote_ttl_seconds`, failing only
     `quote_snapshot_fresh`.
     """
-    stale_fetched_at = _BASELINE_INSTANT - timedelta(seconds=100)
-    inputs = _baseline_inputs(
-        order_book=_baseline_order_book(fetched_at=stale_fetched_at)
+    stale_fetched_at = BASELINE_INSTANT - timedelta(seconds=100)
+    inputs = baseline_inputs(
+        order_book=baseline_order_book(fetched_at=stale_fetched_at)
     )
 
     assert _failed_names(inputs) == {"quote_snapshot_fresh"}
@@ -494,8 +322,8 @@ def test_forecast_fresh_fails_once_past_created_at_plus_horizon() -> None:
     """A `created_at` far enough in the past that `T` exceeds
     `created_at + forecast_horizon_hours` fails only `forecast_fresh`.
     """
-    stale_created_at = _BASELINE_INSTANT - timedelta(days=365)
-    inputs = _baseline_inputs(forecast=_baseline_forecast(created_at=stale_created_at))
+    stale_created_at = BASELINE_INSTANT - timedelta(days=365)
+    inputs = baseline_inputs(forecast=baseline_forecast(created_at=stale_created_at))
 
     assert _failed_names(inputs) == {"forecast_fresh"}
 
@@ -507,8 +335,8 @@ def test_fee_model_current_fails_when_the_fee_model_is_older_than_24h() -> None:
     """A `fee_model.as_of` 25h before the reference instant `T` exceeds the
     24h fee-model ttl, failing only `fee_model_current`.
     """
-    stale_as_of = _BASELINE_INSTANT - timedelta(hours=25)
-    inputs = _baseline_inputs(fee_model=_baseline_fee_model(as_of=stale_as_of))
+    stale_as_of = BASELINE_INSTANT - timedelta(hours=25)
+    inputs = baseline_inputs(fee_model=baseline_fee_model(as_of=stale_as_of))
 
     assert _failed_names(inputs) == {"fee_model_current"}
 
@@ -523,8 +351,8 @@ def test_coherence_flag_fails_both_market_coherent_and_forecast_live_eligible() 
     `forecast_live_eligible` (the forced-False eligibility) -- a coupling
     intrinsic to the domain type, not a loose test.
     """
-    inputs = _baseline_inputs(
-        forecast=_baseline_forecast(coherence_flag=True, eligible_for_live=False)
+    inputs = baseline_inputs(
+        forecast=baseline_forecast(coherence_flag=True, eligible_for_live=False)
     )
 
     assert _failed_names(inputs) == {"market_coherent", "forecast_live_eligible"}
@@ -535,7 +363,7 @@ def test_coherence_flag_fails_both_market_coherent_and_forecast_live_eligible() 
 
 def test_citation_support_fails_with_zero_citations() -> None:
     """An empty `citations` tuple fails only `citation_support`."""
-    inputs = _baseline_inputs(forecast=_baseline_forecast(citations=()))
+    inputs = baseline_inputs(forecast=baseline_forecast(citations=()))
 
     assert _failed_names(inputs) == {"citation_support"}
 
@@ -557,8 +385,8 @@ def test_price_within_bands_fails_below_the_minimum_open_price() -> None:
       cents=ceil(0.0384)=1 -> 10_000 micros; fee_ppm=10_000 (exact)
     fee_adjusted=550_000; slippage_adjusted=548_000; net_edge=548_000
     """
-    inputs = _baseline_inputs(
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(price=PricePips(400), quantity=ContractCentis(1_000)),
             )
@@ -592,14 +420,14 @@ def test_price_within_bands_fails_above_the_maximum_open_price() -> None:
       (>= 240_000 -> annualized_hurdle passes)
     ci [100_000, 200_000] does not straddle 960_000 -> ci check passes
     """
-    inputs = _baseline_inputs(
-        forecast=_baseline_forecast(probability_ppm=995_000),
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        forecast=baseline_forecast(probability_ppm=995_000),
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(price=PricePips(9_600), quantity=ContractCentis(1_000)),
             )
         ),
-        fee_model=_baseline_fee_model(
+        fee_model=baseline_fee_model(
             model=FeeModel(
                 schedule_id="entry-test-fee-zero",
                 maker_fee_ppm=0,
@@ -607,12 +435,12 @@ def test_price_within_bands_fails_above_the_maximum_open_price() -> None:
                 settlement_fee_ppm=0,
             )
         ),
-        slippage_model=_baseline_slippage_model(per_contract_buffer_ppm=0),
+        slippage_model=baseline_slippage_model(per_contract_buffer_ppm=0),
     )
 
     figures = _figures_for(inputs)
     assert figures.executable_price_pips == PricePips(9_600)
-    assert figures.research_cost_adjusted_edge_ppm == 35_000
+    assert figures.net_edge_ppm == 35_000
     assert _failed_names(inputs) == {"price_within_bands"}
 
 
@@ -634,8 +462,8 @@ def test_price_within_bands_passes_at_the_inclusive_minimum_boundary() -> None:
           (>= 30_000 -> net_edge_min passes)
         ci [100_000,200_000] does not straddle 50_000 (50_000 < 100_000)
     """
-    inputs = _baseline_inputs(
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(price=PricePips(500), quantity=ContractCentis(1_000)),
             )
@@ -662,14 +490,14 @@ def test_price_within_bands_passes_at_the_inclusive_maximum_boundary() -> None:
     net_edge_ppm(45_000) >= min_net_edge_ppm(30_000) -> net_edge_min passes
     ci [100_000,200_000] does not straddle 950_000
     """
-    inputs = _baseline_inputs(
-        forecast=_baseline_forecast(probability_ppm=995_000),
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        forecast=baseline_forecast(probability_ppm=995_000),
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(price=PricePips(9_500), quantity=ContractCentis(1_000)),
             )
         ),
-        fee_model=_baseline_fee_model(
+        fee_model=baseline_fee_model(
             model=FeeModel(
                 schedule_id="entry-test-fee-zero",
                 maker_fee_ppm=0,
@@ -677,7 +505,7 @@ def test_price_within_bands_passes_at_the_inclusive_maximum_boundary() -> None:
                 settlement_fee_ppm=0,
             )
         ),
-        slippage_model=_baseline_slippage_model(per_contract_buffer_ppm=0),
+        slippage_model=baseline_slippage_model(per_contract_buffer_ppm=0),
     )
 
     figures = _figures_for(inputs)
@@ -700,8 +528,8 @@ def test_price_within_bands_fails_one_pip_below_floor_with_a_greppable_detail() 
     fee_adjusted=540_100; slippage_adjusted=538_100; net_edge=538_100
       (>= 30_000 -> only price_within_bands fails)
     """
-    inputs = _baseline_inputs(
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(price=PricePips(499), quantity=ContractCentis(1_000)),
             )
@@ -731,14 +559,14 @@ def test_price_within_bands_fails_one_pip_above_ceiling_with_a_greppable_detail(
     net_edge_ppm(44_900) >= min_net_edge_ppm(30_000) -> only
       price_within_bands fails
     """
-    inputs = _baseline_inputs(
-        forecast=_baseline_forecast(probability_ppm=995_000),
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        forecast=baseline_forecast(probability_ppm=995_000),
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(price=PricePips(9_501), quantity=ContractCentis(1_000)),
             )
         ),
-        fee_model=_baseline_fee_model(
+        fee_model=baseline_fee_model(
             model=FeeModel(
                 schedule_id="entry-test-fee-zero",
                 maker_fee_ppm=0,
@@ -746,7 +574,7 @@ def test_price_within_bands_fails_one_pip_above_ceiling_with_a_greppable_detail(
                 settlement_fee_ppm=0,
             )
         ),
-        slippage_model=_baseline_slippage_model(per_contract_buffer_ppm=0),
+        slippage_model=baseline_slippage_model(per_contract_buffer_ppm=0),
     )
 
     figures = _figures_for(inputs)
@@ -764,8 +592,8 @@ def test_select_renders_a_greppable_fail_reason_for_a_below_band_price() -> None
     open_band` prefix -- not just `evaluate_entry_conditions`'s own detail,
     but the exact string a downstream ledger reader greps for.
     """
-    inputs = _baseline_inputs(
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(price=PricePips(499), quantity=ContractCentis(1_000)),
             )
@@ -790,7 +618,7 @@ def test_forecast_live_eligible_fails_when_not_eligible_for_live() -> None:
     """`eligible_for_live=False` (with no coherence flag or abstention reason)
     fails only `forecast_live_eligible`.
     """
-    inputs = _baseline_inputs(forecast=_baseline_forecast(eligible_for_live=False))
+    inputs = baseline_inputs(forecast=baseline_forecast(eligible_for_live=False))
 
     assert _failed_names(inputs) == {"forecast_live_eligible"}
 
@@ -813,11 +641,12 @@ def test_select_emits_one_sized_intent_with_hand_expected_deterministic_fields()
     deep 4_500-pip ask level (baseline default 5_000-pip/1_000-centi), and
     zero-rate fee/slippage (baseline defaults taker=10_000/buffer=2_000).
     `vote_dispersion_ppm` stays the baseline default (0) and
-    `research_cost_micros` stays the baseline default (0).
+    `research_cost_micros` stays the baseline default (0) -- and since
+    issue #483 it would not move a figure at any value.
 
     Probe-size (100-centi) entry-check figures:
         cost = 4_500*100 = 450_000 micros (exact); executable_price_ppm =
-            450_000 (exact, zero fee/slippage/research)
+            450_000 (exact, zero fee and zero slippage)
         gross_edge_ppm = 500_000-450_000 = 50_000 = net_edge_ppm (probe)
         net_edge_min: 50_000 >= 30_000 -> passes
         annualized = floor(50_000*1_000_000*8760 / (450_000*48))
@@ -828,7 +657,7 @@ def test_select_emits_one_sized_intent_with_hand_expected_deterministic_fields()
 
     Kelly sizing (g=dispersion_scale(0, 200_000)=1_000_000 at zero
     dispersion; kelly_fraction_ppm=100_000 default; capital=1_000_000_000
-    from `_baseline_positions`'s default `above_floor_capital_micros`):
+    from `baseline_positions`'s default `above_floor_capital_micros`):
         stake_micros = divide(1_000_000_000*50_000*100_000*1_000_000,
                                550_000*10**12, floor)
                      = divide(5*10**24, 5.5*10**17, floor) = 9_090_909
@@ -856,16 +685,16 @@ def test_select_emits_one_sized_intent_with_hand_expected_deterministic_fields()
         this repo, applied here to exactly the six named fields (never
         derived by calling `select` itself).
     """
-    inputs = _baseline_inputs(
-        forecast=_baseline_forecast(probability_ppm=500_000),
-        order_book=_baseline_order_book(
+    inputs = baseline_inputs(
+        forecast=baseline_forecast(probability_ppm=500_000),
+        order_book=baseline_order_book(
             yes_asks=(
                 OrderBookLevel(
                     price=PricePips(4_500), quantity=ContractCentis(1_000_000)
                 ),
             )
         ),
-        fee_model=_baseline_fee_model(
+        fee_model=baseline_fee_model(
             model=FeeModel(
                 schedule_id="entry-test-fee-zero",
                 maker_fee_ppm=0,
@@ -873,7 +702,7 @@ def test_select_emits_one_sized_intent_with_hand_expected_deterministic_fields()
                 settlement_fee_ppm=0,
             )
         ),
-        slippage_model=_baseline_slippage_model(per_contract_buffer_ppm=0),
+        slippage_model=baseline_slippage_model(per_contract_buffer_ppm=0),
     )
 
     decision = select(inputs)
@@ -918,7 +747,7 @@ def test_select_declines_with_insufficient_depth_reason_and_no_intents() -> None
     required_centis=100, available_centis=0)` and `select` short-circuits
     before ever evaluating the SPEC S9.3 entry conditions.
     """
-    inputs = _baseline_inputs(order_book=_baseline_order_book(yes_asks=()))
+    inputs = baseline_inputs(order_book=baseline_order_book(yes_asks=()))
 
     decision = select(inputs)
 
@@ -940,7 +769,7 @@ def test_select_declines_with_non_annualizable_reason_and_no_intents() -> None:
     `forecast_horizon_hours=0`, `compute_executable_edge` returns
     `NonAnnualizable(executable_price_ppm=500_000, forecast_horizon_hours=0)`.
     """
-    inputs = _baseline_inputs(forecast=_baseline_forecast(forecast_horizon_hours=0))
+    inputs = baseline_inputs(forecast=baseline_forecast(forecast_horizon_hours=0))
 
     decision = select(inputs)
 

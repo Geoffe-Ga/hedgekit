@@ -79,7 +79,7 @@ def _reference_instant(inputs: SelectorInputs) -> datetime:
 def _net_edge_min(inputs: SelectorInputs, figures: EdgeFigures) -> EntryCheck:
     """Check the net edge clears the configured floor (SPEC S9.3)."""
     floor = inputs.risk_config.config.min_net_edge_ppm
-    net = figures.research_cost_adjusted_edge_ppm
+    net = figures.net_edge_ppm
     return EntryCheck(
         name="net_edge_min",
         passed=net >= floor,

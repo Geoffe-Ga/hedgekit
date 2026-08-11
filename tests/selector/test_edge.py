@@ -11,7 +11,7 @@ at each level and accumulating the *exact* micros `level.price.value *
 taken.value` (no rounding: 1e-4 $ * 1e-2 contracts = 1e-6 $ = micros exactly),
 until either `size` is filled or the book runs out -- in which case it returns
 `InsufficientDepth` naming the shortfall, never raises. On a successful walk it
-returns `EdgeFigures`, the five signed-ppm-of-$1-per-contract figures chained
+returns `EdgeFigures`, the signed-ppm-of-$1-per-contract figures chained
 through SPEC S9.2's formulas:
 
     executable_price_pips = ceil(total_cost_micros / size_centis)
@@ -19,12 +19,18 @@ through SPEC S9.2's formulas:
     gross_edge_ppm         = probability_ppm - executable_price_ppm
     fee_ppm                = ceil(fee_micros * 100 / size_centis)
     fee_adjusted_edge_ppm  = gross_edge_ppm - fee_ppm
-    slippage_adjusted_edge_ppm = fee_adjusted_edge_ppm - per_contract_buffer_ppm
-    research_ppm           = ceil(research_cost_micros * 100 / size_centis)
-    research_cost_adjusted_edge_ppm = slippage_adjusted_edge_ppm - research_ppm
+    net_edge_ppm           = fee_adjusted_edge_ppm - per_contract_buffer_ppm
     annualized_expected_return_ppm =
-        floor(research_cost_adjusted_edge_ppm * 1_000_000 * 8760
+        floor(net_edge_ppm * 1_000_000 * 8760
               / (executable_price_ppm * forecast_horizon_hours))
+
+Issue #483 removed the sixth line the chain used to carry -- a
+`research_ppm = ceil(research_cost_micros * 100 / size_centis)` haircut between
+the slippage buffer and the annualization. Research is a per-forecast cost and
+this is a per-contract edge, and `select`'s entry probe prices a single
+contract, so that subtraction made `net_edge_min` unreachable for every market
+at every price. `test_research_cost_micros_moves_no_figure` pins its absence
+against the real charge the pipeline books.
 
 Every expected number below is hand-computed in integer arithmetic in each
 test's own comment/docstring -- never derived by calling
@@ -39,6 +45,7 @@ from typing import TYPE_CHECKING
 
 from windbreak.connector.fees import FeeModel
 from windbreak.connector.models import OrderBookLevel, OrderBookSnapshot
+from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
 from windbreak.forecast.records import ForecastRecord
 from windbreak.numeric import ContractCentis, MoneyMicros, PricePips
 from windbreak.selector.edge import (
@@ -187,10 +194,9 @@ def test_canonical_walk_yields_vwap_not_midpoint() -> None:
     assert result.executable_price_pips != PricePips(4600)  # not the midpoint
     assert result.marginal_price_pips == PricePips(4700)  # deepest level walked
     assert result.gross_edge_ppm == 163_333
-    # Zero fee/slippage/research: every downstream figure equals gross edge.
+    # Zero fee and zero slippage: every downstream figure equals gross edge.
     assert result.fee_adjusted_edge_ppm == 163_333
-    assert result.slippage_adjusted_edge_ppm == 163_333
-    assert result.research_cost_adjusted_edge_ppm == 163_333
+    assert result.net_edge_ppm == 163_333
 
 
 # --- Single-level exact fill (no remainder) ----------------------------------
@@ -373,11 +379,11 @@ def test_non_annualizable_when_executable_price_is_zero() -> None:
     assert result.reason == expected_reason
 
 
-# --- The full five-figure chain, engineered for a nonzero remainder at ------
-# --- every single division -- a wrong rounding direction anywhere fails. ---
+# --- The full chain, engineered for a nonzero remainder at every single -----
+# --- division -- a wrong rounding direction anywhere fails. -----------------
 
 
-def test_full_five_figures_with_nonzero_remainders_pin_rounding_direction() -> None:
+def test_full_chain_with_nonzero_remainders_pins_rounding_direction() -> None:
     """Every ceil/floor division in the chain has a nonzero remainder here, so
     a wrong rounding direction anywhere changes at least one asserted figure.
 
@@ -410,19 +416,22 @@ def test_full_five_figures_with_nonzero_remainders_pin_rounding_direction() -> N
         fee_adjusted_edge_ppm = 143_333 - 23_334 = 119_999
 
     Slippage buffer = 4_999 (plain subtraction, no rounding):
-        slippage_adjusted_edge_ppm = 119_999 - 4_999 = 115_000
+        net_edge_ppm = 119_999 - 4_999 = 115_000
 
-    Research cost = 778 micros:
-        research_ppm = ceil(778*100 / 300) = ceil(259.33) = 260
-                      (300*259=77_700, remainder 100)
-        research_cost_adjusted_edge_ppm = 115_000 - 260 = 114_740
+    The forecast still carries `research_cost_micros=778`, and every figure
+    above is computed as though it did not: since issue #483 the chain has no
+    research term, so that 778 must move nothing. Were the old
+    `research_ppm = ceil(778*100 / 300) = 260` haircut still applied, the net
+    edge would read 114_740 and the annualized figure 19_837_929 -- both
+    asserted *not* to be the answer below, so a reinstated haircut fails here
+    rather than shifting a number nobody re-derived.
 
     Annualized (forecast_horizon_hours=100):
-        annualized = floor(114_740 * 1_000_000 * 8760 / (506_667 * 100))
-                   = floor(1_005_122_400_000_000 / 50_666_700)
-                   = 19_837_929
-        (verified: 50_666_700*19_837_929 + 2_735_700 == 1_005_122_400_000_000,
-         with remainder 2_735_700 < 50_666_700)
+        annualized = floor(115_000 * 1_000_000 * 8760 / (506_667 * 100))
+                   = floor(1_007_400_000_000_000 / 50_666_700)
+                   = 19_882_881
+        (verified: 50_666_700*19_882_881 + 33_237_300 == 1_007_400_000_000_000,
+         with remainder 33_237_300 < 50_666_700)
     """
     book = _order_book([(5_000, 200), (5_200, 100)])
     forecast = _forecast(
@@ -447,9 +456,46 @@ def test_full_five_figures_with_nonzero_remainders_pin_rounding_direction() -> N
     assert result.marginal_price_pips == PricePips(5_200)
     assert result.gross_edge_ppm == 143_333
     assert result.fee_adjusted_edge_ppm == 119_999
-    assert result.slippage_adjusted_edge_ppm == 115_000
-    assert result.research_cost_adjusted_edge_ppm == 114_740
-    assert result.annualized_expected_return_ppm == 19_837_929
+    assert result.net_edge_ppm == 115_000
+    assert result.net_edge_ppm != 114_740
+    assert result.annualized_expected_return_ppm == 19_882_881
+    assert result.annualized_expected_return_ppm != 19_837_929
+
+
+def test_research_cost_micros_moves_no_figure() -> None:
+    """Every figure is identical whatever `research_cost_micros` carries (#483).
+
+    The charge compared is the production constant the full pipeline actually
+    books, imported from its definition site rather than restated, so the seam
+    and the composition cannot disagree again. Whole-dataclass equality is
+    asserted rather than the net edge alone: a research term reintroduced into
+    only the annualized return would survive a narrower check.
+
+    The zero-cost figures are asserted to be a real priced fill first, so the
+    equality cannot hold vacuously by both sides declining.
+    """
+    book = _order_book([(5_000, 200), (5_200, 100)])
+    fee_model = _fee_model_input(taker_fee_ppm=80_000, settlement_fee_ppm=17)
+    slippage = _slippage_input(per_contract_buffer_ppm=4_999)
+
+    figures = [
+        compute_executable_edge(
+            order_book=book,
+            size=ContractCentis(300),
+            forecast=_forecast(
+                probability_ppm=650_000,
+                research_cost_micros=cost,
+                forecast_horizon_hours=100,
+            ),
+            fee_model=fee_model,
+            slippage_model=slippage,
+        )
+        for cost in (0, FULL_PIPELINE_RESEARCH_COST_MICROS)
+    ]
+
+    assert isinstance(figures[0], EdgeFigures)
+    assert figures[0].net_edge_ppm == 115_000
+    assert figures[0] == figures[1]
 
 
 # --- Annualization: 8760/horizon scaling, and the negative-edge floor -------
@@ -528,6 +574,6 @@ def test_annualized_expected_return_floors_toward_negative_infinity() -> None:
     )
 
     assert isinstance(result, EdgeFigures)
-    assert result.research_cost_adjusted_edge_ppm == -500_000
+    assert result.net_edge_ppm == -500_000
     assert result.annualized_expected_return_ppm == -1_042_857_143
     assert result.annualized_expected_return_ppm != -1_042_857_142

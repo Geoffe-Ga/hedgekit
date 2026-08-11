@@ -10,7 +10,14 @@ first thing that stops the loop nor the last**. This module drives the real
 composition and pins the whole chain, in the order one tick meets it, with the
 exact values each stage records.
 
-Six barriers stand between ``docker compose up`` and one order intent:
+Six barriers stood between ``docker compose up`` and one order intent when this
+module was written. **Barrier 6 is now closed** -- issues #483 and #442 removed
+the per-trade research charge from the entry gate and moved research-spend
+governance onto a durable, operator-adjustable per-UTC-day ceiling -- so the
+positive control below no longer needs its monkeypatched constant and the real
+shipped charge reaches an intent unaided. The six are kept enumerated because
+five of them are still live and this module's job is to keep each one
+independently falsifiable:
 
 1. **The screen.** The shipped ``deep_walk`` fixture rests 300 contract-centis
    against a 10 000 floor and closes on a frozen 2025 literal that no longer
@@ -33,24 +40,29 @@ Six barriers stand between ``docker compose up`` and one order intent:
    (:func:`test_static_vote_cassette_and_horizon_filter_are_mutually_exclusive`).
 5. **The provider track record.** Absent the M6 artifact every vote provider is
    unproven, so no forecast is live-eligible.
-6. **The research charge at the entry probe.** This one is decisive and
-   unconditional. Every full-pipeline forecast books a flat
+6. **The research charge at the entry probe -- CLOSED (#483).** Every
+   full-pipeline forecast books a flat
    :data:`~windbreak.forecast.budget.FULL_PIPELINE_RESEARCH_COST_MICROS`
-   (3 000 000 micros, $3.00), and :func:`windbreak.selector.select` gates its
+   (3 000 000 micros, $3.00), and :func:`windbreak.selector.select` gated its
    twelve entry conditions on a fixed **1.00-contract** probe fill, amortizing
    that whole charge over that single contract. A one-contract gross edge
-   cannot exceed 1 000 000 ppm ($1.00), so ``net_edge_min`` is unreachable for
-   *any* market, at *any* price, with *any* capital
-   (:func:`test_flat_research_charge_makes_net_edge_unreachable`).
+   cannot exceed 1 000 000 ppm ($1.00), so ``net_edge_min`` was unreachable for
+   *any* market, at *any* price, with *any* capital. The owner's 2026-08-10
+   decision removed that subtraction: research cost is incurred per *forecast*
+   and the edge is a per-*contract* return, so no value of the charge made the
+   comparison mean anything at a one-contract probe. Governance moved to the
+   per-UTC-day ceiling, which bounds the quantity that actually needed
+   bounding. :func:`test_one_intent_is_emitted_on_the_shipped_research_charge`
+   is the evidence, and it asserts the ledgered forecast really did book the
+   full shipped charge, so this is not a test that quietly reduced the cost.
 
-Barrier 6 is why this module pins an impossibility rather than an emitted
-intent on the shipped composition: no fixture, cassette, or configuration
-change can clear it.
-:func:`test_one_intent_is_emitted_once_the_research_charge_is_amortizable`
-keeps that claim falsifiable by isolating the single term -- with it reduced
-and nothing else changed, the real tick emits exactly one intent and the ledger
-carries every stage. The parametrized negatives in
-:func:`test_restoring_any_single_barrier_removes_the_intent` then put each
+The daily ceiling replaces barrier 6 as the thing that can stop a spend, and it
+is pinned in both directions --
+:func:`test_an_exhausted_daily_research_cap_removes_the_intent` and
+:func:`test_raising_the_cap_on_the_same_ledger_restores_the_intent` -- through
+the same real tick, on the same ledger, differing only by an operator-appended
+row. The parametrized negatives in
+:func:`test_restoring_any_single_barrier_removes_the_intent` put each remaining
 condition back one at a time and watch the intent disappear, so every barrier
 is shown independently load-bearing rather than jointly asserted.
 
@@ -62,25 +74,20 @@ a fresh ledger the risk kernel vetoes on ``daily loss limit reached``, because
 and the check fires on ``0 >= 0``. The next beat approves the same intent and
 the venue fills it.
 
-No *threshold* is relaxed. ``min_depth_contract_centis``, ``horizon_days``,
-``min_net_edge_ppm`` and the price bands are read at their production defaults
-throughout, and barriers 1-5 are each cleared by handing the loop an input that
-genuinely satisfies the gate: a book that really is deep, a close that really is
-30 days out, a real correlation declaration, a real M6 artifact.
+No *threshold* is relaxed, and there is no longer any exception to that.
+``min_depth_contract_centis``, ``horizon_days``, ``min_net_edge_ppm`` and the
+price bands are read at their production defaults throughout, and every barrier
+is now cleared by handing the loop an input that genuinely satisfies the gate: a
+book that really is deep, a close that really is 30 days out, a real correlation
+declaration, a real M6 artifact.
 
-**Barrier 6 is the exception, and it is not an input.** The positive control
-clears it by monkeypatching ``windbreak.forecast.pipeline._RESEARCH_COST_MICROS``
--- a production module constant, not anything the loop is handed. Arithmetically
-that is indistinguishable from lowering ``min_net_edge_ppm`` by 2 100 000 ppm
-(from 30 000 to the -2 070 000 the best case actually measures). Saying so
-plainly matters, because the looser phrasing -- "every barrier is cleared by a
-genuine input" -- would be false, and a claim of that shape is exactly what this
-module exists to catch. It is a *control*, not an assertion that 3 000 micros is
-the right charge: barrier 6 refuses every market at every price with any
-capital, so no input exists that would let any stage below the selector be
-observed at all, and
-:func:`test_restoring_any_single_barrier_removes_the_intent` puts the shipped
-charge straight back and watches the intent disappear.
+Until #483 landed, barrier 6 was the exception and it was **not** an input: the
+positive control cleared it by monkeypatching
+``windbreak.forecast.pipeline._RESEARCH_COST_MICROS``, a production module
+constant, which arithmetically was indistinguishable from lowering
+``min_net_edge_ppm`` by 2 100 000 ppm (from 30 000 to the -2 070 000 the best
+case actually measured). That monkeypatch is gone, and its absence is the whole
+point: the tick below now runs the shipped 3 000 000-micro charge and emits.
 
 Issue #438's acceptance criteria
 --------------------------------
@@ -90,10 +97,11 @@ today. That is the finding, not a footnote:
 
 * *"with research configured against a recorded transport, a tick reaches*
   ``SelectorDecisionRecorded`` *with* ``intent_count >= 1``\\ *"* -- unachievable
-  as written. Barrier 6 is arithmetic and unconditional, so no research
-  configuration, recorded transport, fixture or cassette reaches it. Only a
-  change inside ``windbreak/forecast`` or ``windbreak/selector`` can, and that
-  is filed as **#483**.
+  when this module was written, because barrier 6 was arithmetic and
+  unconditional; **satisfied now**.
+  :func:`test_one_intent_is_emitted_on_the_shipped_research_charge` is exactly
+  that tick. The change it needed was inside ``windbreak/selector``, filed as
+  **#483** and landed together with **#442**.
 * *"a test that activates the PAPER loop the way the CLI activates it and
   asserts the run refuses to start"* -- unachievable for a different reason:
   there is no startup guard to assert against. The shipped loop starts, opens a
@@ -124,18 +132,23 @@ import pytest
 from windbreak.config.schema import (
     CorrelationConfig,
     CorrelationTagConfig,
+    ForecastBudget,
+    ForecastConfig,
     HorizonDays,
     RiskConfig,
     WindbreakConfig,
 )
 from windbreak.connector.paper import PaperExchange
-from windbreak.forecast import pipeline as forecast_pipeline
 from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
 from windbreak.forecast.cassettes import CassetteMissError, LlmRequest
 from windbreak.forecast.providers.base import build_vote_prompt
 from windbreak.forecast.records import BaselineQuoteSnapshot
 from windbreak.forecast.sandbox import build_research_tools
 from windbreak.scheduler.loop import build_paper_deps, run_single_tick
+from windbreak.scheduler.research_spend import (
+    ResearchBudgetCapSet,
+    ResearchSpendRecorded,
+)
 from windbreak.screener import horizon_filter
 
 if TYPE_CHECKING:
@@ -175,9 +188,9 @@ ARTICLE_PAGE = (
     "</html>"
 )
 
-#: A near-certain vote body. Deliberately extreme: barrier 6 is a claim about
-#: the *best case*, so the vote is the most favourable one the SPEC S6.3 vote
-#: schema admits rather than a plausible one.
+#: A near-certain vote body. Deliberately extreme: barrier 6's argument was a
+#: claim about the *best case*, so the vote is the most favourable one the SPEC
+#: S6.3 vote schema admits rather than a plausible one.
 NEAR_CERTAIN_VOTE = json.dumps(
     {
         "probability_ppm": 990000,
@@ -221,15 +234,18 @@ THIN_QUANTITY_CENTIS = 300
 #: An opening balance, in micros, well above `CapitalConfig().floor_micros`.
 FUNDED_CASH_MICROS = 10_000_000_000
 
-#: The research charge, in micros, the positive control substitutes for the
-#: shipped flat charge: small enough that its per-probe-contract amortization
-#: leaves the near-certain edge above `min_net_edge_ppm`.
-AMORTIZABLE_RESEARCH_COST_MICROS = 3_000
+#: A per-UTC-day research ceiling, in micros, for the cap tests. Small enough
+#: that one already-recorded charge exhausts it, so the tick meets a day that
+#: is genuinely shut rather than one it shuts itself.
+DAY_CAP_MICROS = 1_000_000
 
-#: The name of the module-private constant the positive control substitutes.
-#: `monkeypatch.setattr` raises when it is absent, so a rename fails this suite
-#: loudly instead of silently leaving the substitution unapplied.
-RESEARCH_COST_ATTR = "_RESEARCH_COST_MICROS"
+#: A ceiling comfortably above what one full-pipeline forecast costs, appended
+#: by the operator to show the refusal is the ceiling and nothing else.
+RAISED_DAY_CAP_MICROS = 100_000_000
+
+#: The UTC calendar day :data:`FIXED_NOW_EPOCH_S` falls on -- the day every
+#: charge in a clock-injected tick buckets to.
+TICK_UTC_DAY = "2027-01-15"
 
 #: The twelve SPEC S9.3 entry conditions, in the order the selector renders
 #: them, as they read when every one passes.
@@ -261,7 +277,7 @@ ALL_ENTRY_CONDITIONS_PASSING = [
 #: test compares the *whole* rendered sequence rather than a leading slice --
 #: a slice would silently drop a thirteenth condition appended later.
 SIZING_REASON = (
-    "sizing: raw_centis=1756421 g_ppm=1000000 "
+    "sizing: raw_centis=1762105 g_ppm=1000000 "
     "binding_cap=participation final_centis=25000"
 )
 
@@ -433,6 +449,47 @@ def _write_track_records(
     (report_dir / TRACK_RECORD_FILENAME).write_text(
         json.dumps({"openai": dict(entry), "anthropic": dict(entry)}),
         encoding="utf-8",
+    )
+
+
+def _capped_config(*, per_day_micros: int) -> WindbreakConfig:
+    """Return the bucketed config with a chosen per-UTC-day research ceiling.
+
+    The ceiling is the only field that moves. Every risk threshold stays at its
+    production default, because a spend ceiling is a budget, not a risk gate:
+    lowering it must stop the loop *spending*, never make it accept a trade it
+    would otherwise refuse.
+
+    Args:
+        per_day_micros: The per-UTC-day research spend ceiling, in micros.
+
+    Returns:
+        The constructed configuration.
+    """
+    return dataclasses.replace(
+        _bucketed_config(),
+        forecast=ForecastConfig(budget=ForecastBudget(per_day_micros=per_day_micros)),
+    )
+
+
+def _record_days_spend(deps: PaperTickDeps, micros: int) -> None:
+    """Put a prior day's research charge on the ledger, as a crashed run would.
+
+    Appends the same ``ResearchSpendRecorded`` row the budget writer appends on
+    every charge, so the tick that follows reads it back exactly as it would
+    read a charge made by a process that has since died.
+
+    Args:
+        deps: The wired dependencies whose store is written.
+        micros: The already-spent amount to record, in micros.
+    """
+    deps.store.append(
+        ResearchSpendRecorded(
+            component="scheduler",
+            utc_day=TICK_UTC_DAY,
+            market_ticker=TICKER,
+            cost_micros=micros,
+        )
     )
 
 
@@ -832,24 +889,31 @@ def test_static_vote_cassette_and_horizon_filter_are_mutually_exclusive() -> Non
     assert key.request_hash() != later_key.request_hash()
 
 
-def test_flat_research_charge_makes_net_edge_unreachable(
-    shipped_books: Path, tmp_path: Path, report_dir: Path
+def test_one_intent_is_emitted_on_the_shipped_research_charge(
+    shipped_books: Path,
+    tmp_path: Path,
+    report_dir: Path,
 ) -> None:
-    """The flat $3.00 research charge alone puts ``net_edge_min`` out of reach.
+    """The real tick emits one intent while booking the full shipped charge.
 
-    Every barrier above is cleared -- deep two-sided book, in-window close,
-    verifiable citations, near-certain votes, a declared bucket, proven
-    providers, capital far above the floor -- and the market is quoted at the
-    lowest price its open band admits, which is the price that maximizes the
-    gross edge an in-band fill can offer. The tick still emits no intent,
-    because the entry conditions amortize the whole flat charge over a fixed
-    1.00-contract probe.
+    Issue #483's acceptance criterion 1, through the real
+    :func:`~windbreak.scheduler.loop.run_single_tick` over the real shipped
+    composition -- not a constructed ``EdgeFigures``. Every barrier above is
+    cleared by a genuine input: a deep two-sided book, an in-window close,
+    verifiable citations, near-certain votes, a declared correlation bucket,
+    proven providers, capital far above the floor.
 
-    The bound is arithmetic rather than empirical: a one-contract gross edge
-    cannot exceed 1 000 000 ppm, and the charge is worth strictly more than
-    that per probe contract. Both the measured refusal and the bound that
-    explains it are asserted, so this test states *why* no other market would
-    do better rather than merely reporting that this one did not.
+    Nothing is monkeypatched. The ledgered forecast is asserted to carry
+    ``research_cost_micros == FULL_PIPELINE_RESEARCH_COST_MICROS``, read from
+    the production constant rather than restated, so this cannot be a test that
+    quietly cheapened the charge to reach an intent -- the charge is exactly
+    what it always was, and the entry gate simply no longer subtracts it from a
+    per-contract edge.
+
+    Every risk threshold is at its production default, and the whole rendered
+    reason sequence is compared -- twelve passing conditions plus the sizing
+    line -- so a condition that stopped being evaluated, or a thirteenth
+    appended later, fails here rather than passing a leading-slice check.
     """
     _tradeable_books(shipped_books)
     _write_track_records(report_dir)
@@ -866,58 +930,12 @@ def test_flat_research_charge_makes_net_edge_unreachable(
 
     rows = _rows(deps)
     forecast = _only(rows, "ForecastCreated")
+    assert outcome.intent_count == 1
+    assert outcome.candidate_tickers == (TICKER,)
     assert forecast["abstention_reason"] is None
     assert forecast["probability_ppm"] == NEAR_CERTAIN_PROBABILITY_PPM
     assert forecast["eligible_for_live"] is True
     assert forecast["research_cost_micros"] == FULL_PIPELINE_RESEARCH_COST_MICROS
-    assert outcome.intent_count == 0
-    assert _only(rows, "SelectorDecisionRecorded")["intent_count"] == 0
-    reasons = _reasons(rows)
-    assert [reason for reason in reasons if reason.startswith("fail:")] == [
-        "fail:net_edge_min: net_edge_ppm=-2070000 min_net_edge_ppm=30000",
-        "fail:annualized_hurdle: annualized_ppm=-503700000 hurdle_ppm=240000",
-    ]
-    assert FULL_PIPELINE_RESEARCH_COST_MICROS > 1_000_000
-
-
-def test_one_intent_is_emitted_once_the_research_charge_is_amortizable(
-    shipped_books: Path,
-    tmp_path: Path,
-    report_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With that one term reduced and nothing else changed, one intent appears.
-
-    The substitution isolates the single quantity barrier 6 names: the flat
-    per-forecast research charge the entry probe amortizes. Nothing else about
-    the tick changes, so an intent appearing here proves the other five
-    barriers are genuinely cleared above, and that this term alone accounts for
-    the remaining refusal -- the positive control the impossibility claim needs
-    in order to be falsifiable rather than merely asserted.
-
-    It asserts nothing about what the charge *should* be. Choosing that is a
-    risk decision inside ``windbreak/forecast`` and ``windbreak/selector``,
-    neither of which this change touches.
-    """
-    monkeypatch.setattr(
-        forecast_pipeline, RESEARCH_COST_ATTR, AMORTIZABLE_RESEARCH_COST_MICROS
-    )
-    _tradeable_books(shipped_books)
-    _write_track_records(report_dir)
-    deps = _build_deps(
-        books=shipped_books,
-        tmp_path=tmp_path,
-        report_dir=report_dir,
-        config=_bucketed_config(),
-        research=_finding_research_tools(tmp_path / "cache"),
-        votes=_NearCertainVoteTransport(),
-    )
-
-    outcome = run_single_tick(deps, beat=1)
-
-    rows = _rows(deps)
-    assert outcome.intent_count == 1
-    assert outcome.candidate_tickers == (TICKER,)
     entered = [event for event, _ in rows]
     assert entered.count("ScreenDecisionRecorded") == 1
     assert entered.count("MarketSnapshotRecorded") == 1
@@ -928,38 +946,139 @@ def test_one_intent_is_emitted_once_the_research_charge_is_amortizable(
     reasons = _reasons(rows)
     assert reasons == [*ALL_ENTRY_CONDITIONS_PASSING, SIZING_REASON]
     assert [reason for reason in reasons if reason.startswith("fail:")] == []
+    assert RiskConfig().min_net_edge_ppm == 30_000
+
+
+def test_an_exhausted_daily_research_cap_removes_the_intent(
+    shipped_books: Path, tmp_path: Path, report_dir: Path
+) -> None:
+    """A day whose ceiling is already spent stops the tick before it researches.
+
+    Issue #483's acceptance criterion 3, and the barrier that replaces the
+    removed research charge. The setup is the one that emits: every other
+    barrier cleared, every risk threshold at its production default. The only
+    difference is a ``ResearchSpendRecorded`` row already on the ledger for the
+    tick's own UTC day -- exactly what a process that spent the day and then
+    died leaves behind.
+
+    The refusal is required to be *auditable*, not merely observed: one
+    ``ResearchBudgetHalted`` row with the exact figures, and
+    ``TickOutcome.research_halted`` set, so an operator can tell a spent budget
+    from a quiet loop. No ``ForecastCreated`` row is expected either, because
+    the halt lands before any research is paid for.
+
+    Args:
+        shipped_books: A private copy of the shipped books fixture.
+        tmp_path: pytest's per-test temporary directory.
+        report_dir: The evaluation-artifact directory.
+    """
+    _tradeable_books(shipped_books)
+    _write_track_records(report_dir)
+    deps = _build_deps(
+        books=shipped_books,
+        tmp_path=tmp_path,
+        report_dir=report_dir,
+        config=_capped_config(per_day_micros=DAY_CAP_MICROS),
+        research=_finding_research_tools(tmp_path / "cache"),
+        votes=_NearCertainVoteTransport(),
+    )
+    _record_days_spend(deps, DAY_CAP_MICROS)
+
+    outcome = run_single_tick(deps, beat=1)
+
+    rows = _rows(deps)
+    entered = [event for event, _ in rows]
+    assert outcome.intent_count == 0
+    assert outcome.research_halted is True
+    assert entered.count("ForecastCreated") == 0
+    assert entered.count("SelectorDecisionRecorded") == 0
+    assert _only(rows, "ResearchBudgetHalted") == {
+        "market_ticker": "",
+        "halt_kind": "per_day",
+        "utc_day": TICK_UTC_DAY,
+        "spent_micros": DAY_CAP_MICROS,
+        "budget_micros": DAY_CAP_MICROS,
+    }
+
+
+def test_raising_the_cap_on_the_same_ledger_restores_the_intent(
+    shipped_books: Path, tmp_path: Path, report_dir: Path
+) -> None:
+    """One appended operator row, no restart, and the same loop emits again.
+
+    The negative half of the test above and the whole of "adjustable on the fly
+    rather than only at startup". Beat 1 meets an exhausted day and refuses.
+    A ``ResearchBudgetCapSet`` row is then appended to the *same* ledger, the
+    *same* process keeps running, and beat 2 -- reading the raised ceiling at
+    the head of its own tick -- emits.
+
+    Nothing else differs between the two beats: same books, same config object,
+    same research tools, same votes, same already-recorded spend. So the intent
+    can only be coming from the ledgered ceiling, and a cap that bound
+    unconditionally could not pass both halves.
+
+    Args:
+        shipped_books: A private copy of the shipped books fixture.
+        tmp_path: pytest's per-test temporary directory.
+        report_dir: The evaluation-artifact directory.
+    """
+    _tradeable_books(shipped_books)
+    _write_track_records(report_dir)
+    deps = _build_deps(
+        books=shipped_books,
+        tmp_path=tmp_path,
+        report_dir=report_dir,
+        config=_capped_config(per_day_micros=DAY_CAP_MICROS),
+        research=_finding_research_tools(tmp_path / "cache"),
+        votes=_NearCertainVoteTransport(),
+    )
+    _record_days_spend(deps, DAY_CAP_MICROS)
+
+    refused = run_single_tick(deps, beat=1)
+    deps.store.append(
+        ResearchBudgetCapSet(
+            component="operator",
+            per_day_micros=RAISED_DAY_CAP_MICROS,
+            note="raising for the backlog",
+        )
+    )
+    proceeded = run_single_tick(deps, beat=2)
+
+    rows = _rows(deps)
+    assert refused.intent_count == 0
+    assert refused.research_halted is True
+    assert proceeded.intent_count == 1
+    assert proceeded.research_halted is False
+    assert _only(rows, "ForecastCreated")["research_cost_micros"] == (
+        FULL_PIPELINE_RESEARCH_COST_MICROS
+    )
+    assert deps.config.forecast.budget.per_day_micros == DAY_CAP_MICROS
 
 
 def test_best_case_ask_is_the_open_band_floor(
     shipped_books: Path,
     tmp_path: Path,
     report_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One pip under :data:`BEST_CASE_ASK_PIPS` is refused by the open band.
 
-    Barrier 6's argument is stated at the *best case*, so the price the
-    barrier-6 tests quote has to really be the cheapest fill the band admits,
-    not merely a cheap one. Two things make that load-bearing rather than
-    asserted: the constant is compared against the production floor it claims
-    to be, and a real tick at one pip below it is refused by
+    The price these tests quote has to really be the cheapest fill the band
+    admits, not merely a cheap one. Two things make that load-bearing rather
+    than asserted: the constant is compared against the production floor it
+    claims to be, and a real tick at one pip below it is refused by
     ``price_within_bands`` and by nothing else.
 
     That second half also pins the comparison's direction.
     ``_price_within_bands`` refuses on ``price < min_open_price_pips``, so the
-    floor itself is admitted; a change to ``<=`` would leave the barrier-6
-    tests quoting a price the band rejects, and this test red.
+    floor itself is admitted; a change to ``<=`` would leave the emitting tests
+    quoting a price the band rejects, and this test red.
 
     Args:
         shipped_books: A private copy of the shipped books fixture.
         tmp_path: pytest's per-test temporary directory.
         report_dir: The evaluation-artifact directory.
-        monkeypatch: The active patcher.
     """
     assert RiskConfig().min_open_price_pips == BEST_CASE_ASK_PIPS
-    monkeypatch.setattr(
-        forecast_pipeline, RESEARCH_COST_ATTR, AMORTIZABLE_RESEARCH_COST_MICROS
-    )
     _tradeable_books(shipped_books)
     _set_book(
         shipped_books,
@@ -994,7 +1113,6 @@ def test_the_intent_is_vetoed_on_beat_one_and_fills_on_beat_two(
     shipped_books: Path,
     tmp_path: Path,
     report_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A selector intent is not a trade: the kernel vetoes the first beat.
 
@@ -1017,11 +1135,7 @@ def test_the_intent_is_vetoed_on_beat_one_and_fills_on_beat_two(
         shipped_books: A private copy of the shipped books fixture.
         tmp_path: pytest's per-test temporary directory.
         report_dir: The evaluation-artifact directory.
-        monkeypatch: The active patcher.
     """
-    monkeypatch.setattr(
-        forecast_pipeline, RESEARCH_COST_ATTR, AMORTIZABLE_RESEARCH_COST_MICROS
-    )
     _tradeable_books(shipped_books)
     _write_track_records(report_dir)
     deps = _build_deps(
@@ -1046,22 +1160,6 @@ def test_the_intent_is_vetoed_on_beat_one_and_fills_on_beat_two(
     assert [
         data["event"] for event, data in rows if event == "OrderTransitionLedgered"
     ] == ["APPROVE", "REQUEST_SUBMISSION", "SUBMIT", "ACK"]
-
-
-def _restore_shipped_research_charge(
-    monkeypatch: pytest.MonkeyPatch, books: Path, report_dir: Path
-) -> None:
-    """Restore the shipped flat research charge (barrier 6).
-
-    Args:
-        monkeypatch: The active patcher.
-        books: The (unused) books directory.
-        report_dir: The (unused) artifact directory.
-    """
-    del books, report_dir
-    monkeypatch.setattr(
-        forecast_pipeline, RESEARCH_COST_ATTR, FULL_PIPELINE_RESEARCH_COST_MICROS
-    )
 
 
 def _restore_thin_book(
@@ -1196,17 +1294,6 @@ def _assert_reason(rows: list[tuple[str, dict[str, object]]], reason: str) -> No
     assert reason in _reasons(rows)
 
 
-def _evidence_research_charge(rows: list[tuple[str, dict[str, object]]]) -> None:
-    """Assert the shipped research charge is what refused the intent.
-
-    Args:
-        rows: The ledgered rows.
-    """
-    _assert_reason(
-        rows, "fail:net_edge_min: net_edge_ppm=-2070000 min_net_edge_ppm=30000"
-    )
-
-
 def _evidence_thin_book(rows: list[tuple[str, dict[str, object]]]) -> None:
     """Assert the depth floor is what refused the intent.
 
@@ -1263,13 +1350,6 @@ def _evidence_undeclared_bucket(rows: list[tuple[str, dict[str, object]]]) -> No
 @pytest.mark.parametrize(
     ("restore", "bucketed", "researched", "evidence"),
     [
-        pytest.param(
-            _restore_shipped_research_charge,
-            True,
-            True,
-            _evidence_research_charge,
-            id="research_charge",
-        ),
         pytest.param(
             _restore_thin_book, True, True, _evidence_thin_book, id="thin_book"
         ),
@@ -1343,9 +1423,6 @@ def test_restoring_any_single_barrier_removes_the_intent(
         researched: Whether citation-finding research tools stay injected.
         evidence: The per-case assertion naming why the intent went away.
     """
-    monkeypatch.setattr(
-        forecast_pipeline, RESEARCH_COST_ATTR, AMORTIZABLE_RESEARCH_COST_MICROS
-    )
     _tradeable_books(shipped_books)
     _write_track_records(report_dir)
     restore(monkeypatch, shipped_books, report_dir)

@@ -500,6 +500,12 @@ def test_unexhausted_budget_leaves_the_tick_ledger_payloads_byte_identical(
         # follows it rather than opening the tick.
         "VerificationPassed",
         "MarketSnapshotRecorded",
+        # Issue #442: every *successful* research charge now leaves a durable
+        # row, not only a breach, so a restarted process can fold the day's
+        # spend back instead of resuming at zero. It precedes `ForecastCreated`
+        # because the pipeline charges the budget before it assembles the
+        # record.
+        "ResearchSpendRecorded",
         "ForecastCreated",
         "SelectorDecisionRecorded",
         "ExchangeStatusObserved",

@@ -944,6 +944,12 @@ halted:
   `PerForecastBudgetExceededError` only if that forecast's own cost *strictly
   exceeds* the per-forecast ceiling (an exactly-equal cost passes).
 
+Since issue #442 a third row is written on the *successful* path too:
+
+- `ResearchSpendRecorded` -- one ledger row per charge, carrying `utc_day`,
+  `market_ticker` and `cost_micros`. Nothing halts on it; it exists so the
+  day's spend is durable (see "Changing the daily research ceiling" below).
+
 The day bucket is keyed by the run's UTC calendar date
 (`datetime.astimezone(UTC).date().isoformat()`) -- it resets, not decays, at
 each UTC midnight; there is no manual reset lever and no partial-day rollover.
@@ -1013,18 +1019,17 @@ verdict on markets the tick never looked at.
 **Operator arithmetic.** With the SPEC defaults -- a 20,000,000-micro day
 ceiling against the fixed 3,000,000-micro per-forecast research charge -- a UTC
 day permits **7 charged forecasts** before research halts for the rest of that
-day. Raising the ceiling is a config edit to
-`config.forecast.budget.per_day_micros`; there is no runtime lever and no
-partial-day rollover.
+day. There is no partial-day rollover: the bucket resets, it does not decay.
 
-**Caveat -- the day counter is process-local.** Day spend lives in memory on the
-budget instance and is never persisted, so restarting the loop (crash, deploy,
-manual bounce) resets the day's spend to zero and the ceiling can be re-spent.
-This is fail-*open* across restarts and is the one gap in the guarantee above.
-Durable day-spend rehydration is deliberately out of scope here, because the
-obvious source -- summing `ForecastCreated.research_cost_micros` -- records a
-fixed constant rather than the true charged amount, so it would under-count and
-still fail open, just less visibly.
+**The daily ceiling is now the *only* governor of research spend (issue #483).**
+The entry gate used to subtract a forecast's whole research cost from the net
+edge of a fixed 1.00-contract probe. A binary contract's gross edge over one
+contract cannot exceed 1,000,000 ppm and the charge is 3,000,000 micros, so
+`net_edge_min` was arithmetically unreachable for every market at every price
+-- spend was held near zero by an accident, not by a policy. The owner's
+2026-08-10 decision removed that subtraction and moved governance here. Read
+that as an operational fact: the number below is what stands between an
+unattended loop and its LLM bill.
 
 **Caveat -- a negative ceiling now aborts startup.** The YAML loader applies no
 range checks, so a negative `per_forecast_micros`/`per_day_micros`/`max_pages`
@@ -1033,6 +1038,87 @@ reaches the composition root intact and `ResearchBudget` rejects it with a
 outcome: a loop that cannot determine its ceiling must not run. A **zero**
 ceiling is legal and means "immediately exhausted" -- it silently halts all
 research, which is fail-closed but easy to mistake for a hung loop.
+
+### Changing the daily research ceiling (issues #442, #483)
+
+There are three levers, in increasing order of immediacy. **The ledgered one
+wins**, and it is the only one that works without a restart.
+
+**1. Configuration (persistent default).** Edit
+`config.forecast.budget.per_day_micros` in the YAML you pass to `--config`.
+Takes effect on the next process start.
+
+**2. Invocation argument (per-run default, no file edit).**
+
+```bash
+windbreak run --process pipeline \
+  --research-per-day-micros 40000000 \
+  --config /path/to/windbreak.yaml \
+  ...
+```
+
+Overrides the configured value for that run and nothing else -- the
+per-forecast ceiling and the page cap are untouched. `windbreak run` logs the
+effective ceiling and which source it came from on startup, so an operator
+never has to infer it. A negative value is refused by the argument parser
+before anything is composed.
+
+**3. The ledgered verb (runtime, no restart).**
+
+```bash
+windbreak set-research-budget \
+  --ledger-path /var/lib/windbreak/ledger.db \
+  --per-day-micros 40000000 \
+  --note "Fed week: raising the ceiling through Friday"
+```
+
+Appends one `ResearchBudgetCapSet` row to the hash-chained ledger. The running
+loop re-reads the ledger at the head of **every tick**, so the new ceiling is in
+force on the next beat -- no restart, no source change, and the change is
+recorded tamper-evidently rather than living in a shell history.
+
+- **The latest row wins**, in both directions. Lowering after raising works, and
+  vice versa. Two rows can never "conflict": a ceiling is an instruction, not
+  evidence, so a later instruction simply supersedes an earlier one and nothing
+  this verb writes can ever stop a tick. (Contrast `ingest-resolution`, which
+  *does* refuse a contradicting append -- a settled outcome is evidence.)
+- **A ledgered row beats `--research-per-day-micros`, which beats the config
+  file.** The invocation argument is a startup default; the verb is a runtime
+  instruction. To go back to the configured value, run the verb again with it.
+- `--per-day-micros 0` is legal and means **stop all research spend**. Use it
+  when a cost anomaly is under investigation: it halts spending on the next
+  tick while the loop stays observably alive, screening, reconciling, and
+  reporting. Undo it by running the verb again with a positive ceiling.
+- `--note` is required, recorded verbatim, and **never compared against
+  anything**. Rewording it can never make two changes disagree.
+- A refused call (blank note, negative ceiling) writes nothing at all: exit 1
+  for the former, argparse's exit 2 for the latter, and the ledger is left
+  byte-for-byte unchanged.
+
+**The day's spend now survives a restart (issue #442).** `_build_research_budget`
+folds this ledger's `ResearchSpendRecorded` rows into the day counter the
+process opens with, at startup *and* at the head of every tick. Before that, day
+spend lived only in process memory: with `restart: on-failure` in
+`deploy/docker-compose.yml` and `Restart=on-failure` in every
+`deploy/systemd/*.service`, the per-day ceiling was really a **per-process**
+ceiling and the process count per day is unbounded. It is now genuinely per-day,
+across crashes, deploys and manual bounces, and across two processes sharing one
+`--ledger-path`.
+
+Two consequences worth knowing before an incident:
+
+- **A malformed spend row on the ledger stops the loop.** The fold refuses a
+  `ResearchSpendRecorded` row it cannot read rather than skipping it, because a
+  skipped charge would undercount the day and re-open a ceiling that should be
+  shut. Neither the budget writer nor `set-research-budget` can produce such a
+  row (both validate before appending), so this can only come from a ledger
+  windbreak did not write. The error names the offending key and the row's
+  `sequence_number`.
+- **The boundary is UTC, not local.** A day rolls over at 00:00 UTC. A local
+  midnight does not reset anything, and a UTC midnight does even when the local
+  date has not changed. `tests/scheduler/test_research_spend_durability.py`
+  pins both directions under a fixed UTC-05:00 process timezone, because CI runs
+  UTC and would not see the difference.
 
 ### Add / remove a provider
 
