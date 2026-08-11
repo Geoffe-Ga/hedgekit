@@ -46,6 +46,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from windbreak.config.schema import DEFAULT_RESEARCH_CACHE_MAX_BYTES
 from windbreak.forecast.citations import verify_citations
 from windbreak.forecast.pipeline import (
     ABSTENTION_NO_VERIFIED_CITATIONS,
@@ -190,6 +191,7 @@ def _build_tools_over_recorded_cassette(
                 allowed_content_types=("text/html", "text/html; charset=utf-8"),
             ),
         ),
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
     for subquestion in subquestions:
         for url in priming_tools.search(subquestion):
@@ -209,6 +211,7 @@ def _build_tools_over_recorded_cassette(
                 allowed_content_types=("text/html", "text/html; charset=utf-8"),
             ),
         ),
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
     return tools, cassette_path
 

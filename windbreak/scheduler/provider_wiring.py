@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from windbreak.config.schema import (
+    DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     PROVIDER_TRANSPORT_CASSETTE,
     PROVIDER_TRANSPORT_LIVE,
 )
@@ -201,6 +202,12 @@ def offline_research_tools(cache_dir: Path) -> ResearchTools:
     contract, without a live network. Shared by the cassette path and by a live
     deployment that has not configured a research endpoint.
 
+    The cache bound is the shipped default rather than the operator's
+    ``forecast.research.cache_max_bytes``, and that is inert by construction:
+    these transports find nothing, so no fetch ever runs and no cache entry is
+    ever written. Taking the configured value here would imply this path can
+    grow the cache, which it cannot.
+
     Args:
         cache_dir: The root the (never-written) fetch cache is jailed to.
 
@@ -213,6 +220,7 @@ def offline_research_tools(cache_dir: Path) -> ResearchTools:
         cache_dir=cache_dir,
         search_transport=transport,
         fetch_transport=transport,
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
 
 
@@ -356,6 +364,11 @@ def build_live_research_tools(
     empty: an unconfigured deployment therefore reaches *no* research host even
     in live mode, rather than inheriting a plausible-looking default.
 
+    This is the *only* path that can grow the fetch cache, so it is the path
+    that carries the operator's ``forecast.research.cache_max_bytes`` into it
+    (issue #453). Removing that one keyword is what
+    ``test_the_configured_cap_reaches_the_live_cache`` exists to catch.
+
     Args:
         config: The active configuration supplying endpoint, hosts, and budgets.
         provider_http: The live HTTP seams search and fetch are issued over.
@@ -364,6 +377,11 @@ def build_live_research_tools(
     Returns:
         A capability-closed :class:`~windbreak.forecast.sandbox.ResearchTools`;
         the offline no-network bundle when live research is unconfigured.
+
+    Raises:
+        ValueError: If ``forecast.research.cache_max_bytes`` is not a positive
+            byte count; see
+            :class:`~windbreak.forecast.sandbox.ResearchCache`.
     """
     research = config.forecast.research
     if provider_http.search is None or provider_http.fetch is None:
@@ -385,6 +403,7 @@ def build_live_research_tools(
                 allowed_content_types=research.allowed_content_types,
             ),
         ),
+        max_bytes=research.cache_max_bytes,
     )
 
 

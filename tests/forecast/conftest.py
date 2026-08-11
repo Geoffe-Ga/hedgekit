@@ -91,6 +91,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from windbreak.config.schema import DEFAULT_RESEARCH_CACHE_MAX_BYTES
 from windbreak.connector.models import NormalizedMarket
 from windbreak.forecast.budget import (
     InMemoryBudgetLedger,
@@ -327,6 +328,7 @@ def research_tools_factory() -> Callable[..., object]:
             cache_dir=cache_dir,
             search_transport=search_transport or FixtureSearchTransport(),
             fetch_transport=fetch_transport or FixtureFetchTransport(),
+            max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
         )
 
     return _build
