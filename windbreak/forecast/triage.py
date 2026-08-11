@@ -285,8 +285,7 @@ def run_stage0_prior(
         model_version=model.model_version,
         prompt=_stage0_prompt(market, baseline),
     )
-    response = transport.complete(request)
-    prior_ppm = _parse_prior_ppm(response)
+    prior_ppm = _parse_prior_ppm(transport.complete(request).text)
     return TriagePrior(prior_ppm=prior_ppm, cost_micros=_STAGE0_COST_MICROS)
 
 

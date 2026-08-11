@@ -46,6 +46,8 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 
+from windbreak.forecast.budget import TokenUsage
+from windbreak.forecast.cassettes import Completion
 from windbreak.forecast.providers import (
     FixtureVoteProvider,
     ProviderError,
@@ -118,29 +120,63 @@ _TAINTED_RESPONSE = f'{{"result": "ok", {next(iter(sorted(TOOL_CALL_MARKERS)))}:
 class _StubTransport:
     """A minimal `LlmTransport` double returning one fixed response verbatim."""
 
-    def __init__(self, response: str) -> None:
+    def __init__(self, response: str, *, usage: TokenUsage | None = None) -> None:
         """Store the response every `complete` call returns.
 
         Args:
             response: The fixed completion text to return.
+            usage: The token accounting every completion reports, or `None`
+                for a transport that reports none (keyword-only).
         """
         self._response = response
+        self._usage = usage
         self.calls = 0
 
-    def complete(self, request: object) -> str:
+    def complete(self, request: object) -> Completion:
         """Record one call and return the fixed response, ignoring `request`.
 
         Args:
             request: The (unused) completion request.
 
         Returns:
-            `self._response`, verbatim, every time.
+            `self._response` wrapped in a `Completion` carrying `self._usage`,
+            verbatim, every time.
         """
         self.calls += 1
-        return self._response
+        return Completion(text=self._response, usage=self._usage)
 
 
 # --- FixtureVoteProvider: happy path -----------------------------------------------
+
+
+def test_fixture_provider_threads_the_reported_usage_onto_the_forecast(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """The measured token counts cross the provider seam untouched (issue #451).
+
+    This provider measures but never prices: it must carry the transport's
+    reported usage through verbatim so the layer that *does* price -- the
+    retry wrapper -- has something to price from.
+    """
+    usage = TokenUsage(input_tokens=4_000, output_tokens=500)
+    provider = FixtureVoteProvider(
+        _StubTransport(_VALID_RESPONSE, usage=usage), _MEMBER
+    )
+
+    result = provider.forecast(market, baseline, 0, ())
+
+    assert result.usage == usage
+
+
+def test_fixture_provider_reports_no_usage_when_the_transport_reported_none(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot
+) -> None:
+    """Absent usage stays absent -- it is never invented as a zero count."""
+    provider = FixtureVoteProvider(_StubTransport(_VALID_RESPONSE), _MEMBER)
+
+    result = provider.forecast(market, baseline, 0, ())
+
+    assert result.usage is None
 
 
 def test_fixture_vote_provider_happy_path_returns_provider_forecast(

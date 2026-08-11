@@ -272,8 +272,8 @@ def run_canary_set(
             model_version=_CANARY_MODEL.model_version,
             prompt=_canary_prompt(question),
         )
-        response = transport.complete(request)
-        observed[question.question_id] = parse_observed_ppm(response)
+        completion = transport.complete(request)
+        observed[question.question_id] = parse_observed_ppm(completion.text)
     return observed
 
 

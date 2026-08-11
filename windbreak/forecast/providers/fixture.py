@@ -4,7 +4,8 @@
 :class:`~windbreak.forecast.cassettes.LlmTransport` (a fake, a recording
 cassette, a replay cassette, or a forbidden-live transport) plus one ensemble
 member. Its :meth:`~FixtureVoteProvider.forecast` builds the deterministic vote
-request, obtains the raw completion, and screens it through
+request, obtains the raw completion (its text plus any reported token usage),
+and screens it through
 :func:`windbreak.forecast.sanitize.validate_vote_response`: a rejected response
 raises :class:`ProviderResponseRejectedError` (fingerprint only, never the raw
 text), while a clean one is parsed into a :class:`ProviderForecast` carrying the
@@ -44,12 +45,14 @@ if TYPE_CHECKING:
 #:
 #: This zero is a *known* zero, never an "unknown" one (issue #399): replaying
 #: a recorded cassette makes no paid call, so nothing was spent. It is emphatically
-#: not this provider's answer to "what did a live call cost" -- the transport seam
-#: hands back bare completion text with no token accounting, so this layer cannot
-#: price a call at all. On the live path this provider is always wrapped in a
-#: :class:`~windbreak.forecast.providers.retry.RetryingProvider`, which prices
-#: every attempt from the fail-closed
-#: :class:`~windbreak.forecast.budget.ProviderPriceTable`; see
+#: not this provider's answer to "what did a live call cost". This layer measures
+#: rather than prices: since issue #451 the transport seam hands back the
+#: provider's reported :class:`~windbreak.forecast.budget.TokenUsage` alongside the
+#: completion text, and this provider threads that measurement onto
+#: ``ProviderForecast.usage`` untouched. Converting it into money is the job of
+#: the :class:`~windbreak.forecast.providers.retry.RetryingProvider` that wraps
+#: this provider on the live path, through the fail-closed
+#: :class:`~windbreak.forecast.budget.ModelRateTable`; see
 #: :mod:`windbreak.scheduler.provider_wiring` for why that wrap is structural.
 _FIXTURE_COST_MICROS = 0
 
@@ -95,12 +98,12 @@ class FixtureVoteProvider:
             model_version=self._member.model_version,
             prompt=build_vote_prompt(market, baseline, vote_index, quotes),
         )
-        response = self._transport.complete(request)
-        fingerprint = fingerprint_response(response)
-        failure = validate_vote_response(response)
+        completion = self._transport.complete(request)
+        fingerprint = fingerprint_response(completion.text)
+        failure = validate_vote_response(completion.text)
         if failure is not None:
             raise ProviderResponseRejectedError(failure, fingerprint)
-        parsed = parse_vote_response(response)
+        parsed = parse_vote_response(completion.text)
         return ProviderForecast(
             probability_ppm=parsed.probability_ppm,
             rationale_summary=parsed.rationale_summary,
@@ -111,4 +114,5 @@ class FixtureVoteProvider:
             training_cutoff=self._member.training_cutoff,
             response_fingerprint=fingerprint,
             abstain=parsed.abstain,
+            usage=completion.usage,
         )

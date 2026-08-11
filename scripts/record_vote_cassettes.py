@@ -63,7 +63,7 @@ from windbreak.forecast.records import BaselineQuoteSnapshot
 from windbreak.net.allowlist import OutboundAllowlist
 
 if TYPE_CHECKING:
-    from windbreak.forecast.cassettes import LlmRequest, LlmTransport
+    from windbreak.forecast.cassettes import Completion, LlmRequest, LlmTransport
     from windbreak.forecast.providers.http_cassettes import HttpRequest
 
 #: Per-request timeout, in whole seconds (an int -- no float on any path here).
@@ -162,14 +162,16 @@ class _RoutingLlmTransport:
         """
         self._adapters = adapters
 
-    def complete(self, request: LlmRequest) -> str:
+    def complete(self, request: LlmRequest) -> Completion:
         """Forward ``request`` to the adapter for its provider.
 
         Args:
             request: The completion request to route.
 
         Returns:
-            The routed adapter's completion text.
+            The routed adapter's completion -- its text and the token usage
+            that adapter read off the vendor's envelope (issue #451), which
+            the wrapping recorder writes into the cassette.
 
         Raises:
             KeyError: If no adapter is registered for the request's provider.

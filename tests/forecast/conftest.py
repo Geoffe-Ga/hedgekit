@@ -92,7 +92,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 from windbreak.connector.models import NormalizedMarket
-from windbreak.forecast.budget import InMemoryBudgetLedger, ResearchBudget
+from windbreak.forecast.budget import (
+    InMemoryBudgetLedger,
+    ResearchBudget,
+    TokenUsage,
+)
+from windbreak.forecast.cassettes import Completion
 from windbreak.forecast.records import BaselineQuoteSnapshot
 
 if TYPE_CHECKING:
@@ -132,27 +137,40 @@ class FakeVoteTransport:
     every non-cassette pipeline test wires in.
     """
 
-    def __init__(self, responses: tuple[str, ...] = CANNED_VOTE_RESPONSES) -> None:
+    def __init__(
+        self,
+        responses: tuple[str, ...] = CANNED_VOTE_RESPONSES,
+        *,
+        usage: TokenUsage | None = None,
+    ) -> None:
         """Store the canned response sequence and reset the call counter.
 
         Args:
             responses: The canned completions to cycle through, in call order.
+            usage: The token accounting every returned completion reports, or
+                `None` for a transport that reports none (keyword-only).
         """
         self._responses = responses
+        self._usage = usage
         self._calls = 0
 
-    def complete(self, request: object) -> str:
+    def complete(self, request: object) -> Completion:
         """Return the next canned response, ignoring `request`'s contents.
+
+        Carries the canned `usage` the fixture was built with (issue #451), so
+        a test that wants a *metered* replay gets one and every pre-existing
+        test -- which passes no usage -- keeps the `None` "cost unknown"
+        reading the fail-closed meter charges its unmetered figure.
 
         Args:
             request: The (unused) `LlmRequest`-shaped call.
 
         Returns:
-            The next canned response in `self._responses`, cycling by index.
+            The next canned completion in `self._responses`, cycling by index.
         """
         response = self._responses[self._calls % len(self._responses)]
         self._calls += 1
-        return response
+        return Completion(text=response, usage=self._usage)
 
 
 @pytest.fixture

@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from windbreak.connector.models import NormalizedMarket
+    from windbreak.forecast.budget import TokenUsage
     from windbreak.forecast.records import BaselineQuoteSnapshot
     from windbreak.forecast.sanitize import ResearchQuote
 
@@ -220,6 +221,13 @@ class ProviderForecast:
             an abstaining forecast is excluded from the median aggregation.
             Defaults to False -- the research-forecaster schema has no abstain
             concept.
+        usage: The token accounting the *provider itself* reported for this
+            response, or ``None`` when it reported none (issue #451). Kept
+            distinct from ``cost_micros``, which is money: this is the measured
+            quantity, and the rate table that converts it into micros lives
+            with the budget rather than with the vote. ``None`` means the cost
+            is unknown, never that it was zero -- a metering layer must charge
+            an unknown response its fail-closed upper bound.
     """
 
     probability_ppm: int
@@ -231,6 +239,7 @@ class ProviderForecast:
     training_cutoff: str
     response_fingerprint: str
     abstain: bool = False
+    usage: TokenUsage | None = None
 
     def __post_init__(self) -> None:
         """Validate the probability range and integrality invariant.
