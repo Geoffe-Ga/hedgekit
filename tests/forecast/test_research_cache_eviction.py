@@ -379,11 +379,24 @@ def test_eviction_ignores_files_that_are_not_cache_entries(tmp_path: Path) -> No
     foreign bytes here (2000 of them, nearly twice the corpus) are not counted
     against the cap either -- an implementation that counted what it cannot
     evict would evict the whole corpus to chase a total it can never reach.
+
+    Two of the foreign files are an operator's backups of real entries, whose
+    names *contain* a digest without *being* one. They are the reason the
+    entry pattern is anchored at both ends rather than merely searched for,
+    and they are backdated below the whole corpus so an unanchored
+    implementation would take them first.
     """
     root = tmp_path / "research-cache"
     _write_corpus(root)
     foreign_file = root / "operator-notes.md"
     foreign_file.write_text("k" * 2000, encoding="utf-8")
+    prefixed_backup = root / f"backup-{_entry_name('alpha')}"
+    prefixed_backup.write_text("b" * 137, encoding="utf-8")
+    suffixed_backup = root.joinpath(f"{_entry_name('beta')}.bak")
+    suffixed_backup.write_text("s" * 173, encoding="utf-8")
+    oldest_ns = _BASE_MTIME_NS - _AGE_STEP_NS
+    for backup in (prefixed_backup, suffixed_backup):
+        os.utime(backup, ns=(oldest_ns, oldest_ns))
     entry_named_directory = root.joinpath(_entry_name("directory"))
     entry_named_directory.mkdir()
     nested = root / "subdir"
@@ -396,6 +409,8 @@ def test_eviction_ignores_files_that_are_not_cache_entries(tmp_path: Path) -> No
 
     assert _surviving_seeds(root) == set(_SIZES)
     assert foreign_file.read_text(encoding="utf-8") == "k" * 2000
+    assert prefixed_backup.read_text(encoding="utf-8") == "b" * 137
+    assert suffixed_backup.read_text(encoding="utf-8") == "s" * 173
     assert entry_named_directory.is_dir()
     assert nested_entry.read_text(encoding="utf-8") == "n" * 700
 
