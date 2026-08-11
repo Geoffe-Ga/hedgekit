@@ -40,7 +40,10 @@ the chain fails the assertion for the right reason.
 
 from __future__ import annotations
 
+import dataclasses
+import re
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from windbreak.connector.fees import FeeModel
@@ -577,3 +580,53 @@ def test_annualized_expected_return_floors_toward_negative_infinity() -> None:
     assert result.net_edge_ppm == -500_000
     assert result.annualized_expected_return_ppm == -1_042_857_143
     assert result.annualized_expected_return_ppm != -1_042_857_142
+
+
+#: The SPEC document whose §9.2 figure list must match `EdgeFigures`.
+_SPEC_PATH = Path(__file__).resolve().parents[2] / "plans" / "SPEC_v3.md"
+
+#: The §9.2 sentence whose backticked figure names are the SPEC's claim about
+#: what the selector computes.
+_SPEC_FIGURES_PREFIX = "The selector walks the actual book to the proposed size"
+
+
+def _spec_figure_names() -> list[str]:
+    """Return the figure names SPEC §9.2 says the selector computes.
+
+    Returns:
+        The backticked identifiers from §9.2's opening sentence, in order.
+    """
+    sentences = [
+        line
+        for line in _SPEC_PATH.read_text(encoding="utf-8").splitlines()
+        if line.startswith(_SPEC_FIGURES_PREFIX)
+    ]
+    assert len(sentences) == 1, f"expected one §9.2 sentence, got {len(sentences)}"
+    return re.findall(r"`([a-z_]+)`", sentences[0])
+
+
+def test_spec_9_2_names_exactly_the_figures_the_chain_computes() -> None:
+    """SPEC §9.2's figure list and `EdgeFigures`' own fields are one list.
+
+    Nothing enforced this before, and it drifted: §9.2 went on listing
+    `research_cost_adjusted_edge` after issue #483 deleted the figure, so the
+    document that agent briefs and reviewers read as authoritative described a
+    haircut the code no longer applies -- the phantom-gate failure mode this
+    repo has closed four times in its own tooling.
+
+    The comparison runs both ways, as a set equality, so a figure added to the
+    chain without a SPEC update fails just as loudly as a figure removed from
+    it. The `_ppm` suffix is the code's unit convention rather than part of the
+    figure's name, so it is bridged here and nowhere else.
+    """
+    documented = {f"{name}_ppm" for name in _spec_figure_names()}
+
+    computed = {
+        field.name
+        for field in dataclasses.fields(EdgeFigures)
+        if field.name.endswith(("_edge_ppm", "_return_ppm"))
+    }
+
+    assert documented == computed
+    assert "research_cost_adjusted_edge_ppm" not in computed
+    assert len(computed) == 4

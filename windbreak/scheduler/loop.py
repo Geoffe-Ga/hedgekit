@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -219,7 +220,7 @@ from windbreak.selector.types import (
 from windbreak.timekeeping import require_aware
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
     from datetime import date
 
     from windbreak.config.schema import WindbreakConfig
@@ -242,8 +243,18 @@ if TYPE_CHECKING:
     from windbreak.scheduler.screening import MarketCandidate
     from windbreak.tokens.verify import SignedApprovalToken
 
+#: The scheduler's structured logger, installed by ``windbreak run``'s
+#: :func:`windbreak.logging_setup.configure_logging`.
+_LOGGER = logging.getLogger("windbreak.scheduler")
+
 #: The component label stamped on every scheduler-authored ledger event.
 _COMPONENT = "scheduler"
+
+#: The per-UTC-day research ceiling a budget opens with when this ledger's
+#: research rows cannot be folded. Zero, so every market halts on the budget
+#: and no research money is spent, while the loop itself keeps beating. See
+#: :func:`_research_ledger_state`.
+_UNREADABLE_LEDGER_CEILING_MICROS: Final = 0
 
 #: The calibration-map version tag echoed into every selector decision.
 _CALIBRATION_MAP_VERSION = "v0"
@@ -2005,6 +2016,53 @@ def _build_gateway(
     return gateway
 
 
+def _research_ledger_state(
+    records: tuple[LedgerRecord, ...], *, configured_micros: int
+) -> tuple[int, Mapping[str, int]]:
+    """Fold this ledger's research rows, failing closed *on the spend* (#442).
+
+    Both folds refuse a row they cannot read rather than skipping it, because a
+    skipped charge would undercount the day and re-open a ceiling that should be
+    shut. What that refusal must not do is take the process with it. A malformed
+    row can arrive from a schema migration or an external tool, it cannot be
+    removed from an append-only hash-chained ledger, and
+    :func:`_build_research_budget` is called from :func:`build_paper_deps` -- so
+    letting the ``ValueError`` escape would stop the loop from *composing*: no
+    heartbeat, no equity sample, no reconciliation, and no kill handling, under
+    a ``restart: on-failure`` supervisor that would retry it forever. A loop
+    that cannot start cannot honour a kill file; a loop that runs with research
+    disabled can.
+
+    So the refusal is caught here and turned into the strictest budget there is:
+    a :data:`_UNREADABLE_LEDGER_CEILING_MICROS` (zero) ceiling opening on an
+    empty day counter. Every market then halts on the budget and ledgers a
+    ``ResearchBudgetHalted`` row saying so, no research money is spent, and the
+    rest of the tick keeps running. The cause is logged as a ``CRITICAL`` on
+    every rebuild -- at startup and at the head of every tick -- because a loop
+    that cannot read its own spend history is an incident, not a mode.
+
+    Args:
+        records: This ledger's rows, in append order.
+        configured_micros: The ceiling from configuration, used when the ledger
+            carries no cap row (keyword-only).
+
+    Returns:
+        The ``(per_day_micros, spend_by_day)`` pair a budget opens with.
+    """
+    try:
+        return (
+            effective_per_day_micros(records, configured_micros=configured_micros),
+            spend_by_day_from_records(records),
+        )
+    except ValueError as exc:
+        _LOGGER.critical(
+            "research spend history unreadable, opening a zero ceiling: %s",
+            exc,
+            extra={"component": _COMPONENT},
+        )
+        return (_UNREADABLE_LEDGER_CEILING_MICROS, {})
+
+
 def _build_research_budget(
     store: SqliteLedgerStore, config: WindbreakConfig
 ) -> ResearchBudget:
@@ -2034,6 +2092,14 @@ def _build_research_budget(
     :func:`_refreshed_budget` at the head of every tick, so both facts are
     re-read while the loop runs rather than frozen at process start.
 
+    An unreadable ``ResearchSpendRecorded`` / ``ResearchBudgetCapSet`` row does
+    **not** propagate: :func:`_research_ledger_state` turns it into a zero
+    ceiling on an empty counter, so the loop composes, beats, and refuses to
+    spend rather than failing to start. A negative *configured* ceiling still
+    aborts, below -- that is an operator's own YAML, correctable without
+    touching an append-only ledger, and a loop that cannot determine its ceiling
+    at all must not run.
+
     Args:
         store: The ledger store a charge or a fail-closed halt is recorded to,
             and the durable state both are folded back out of.
@@ -2043,22 +2109,19 @@ def _build_research_budget(
         A research budget opened on the ledger's own day counter and ceiling.
 
     Raises:
-        ValueError: If any ceiling is negative -- aborting rather than degrading
-            to an unenforceable budget -- or if a ``ResearchSpendRecorded`` /
-            ``ResearchBudgetCapSet`` row on this ledger cannot be read. An
-            unreadable spend row is refused rather than skipped: skipping it
-            would undercount the day and re-open a ceiling that should be shut.
+        ValueError: If any configured ceiling is negative -- aborting rather
+            than degrading to an unenforceable budget.
     """
     caps = config.forecast.budget
-    records = tuple(store.read_all())
+    per_day_micros, opening_spend_by_day = _research_ledger_state(
+        tuple(store.read_all()), configured_micros=caps.per_day_micros
+    )
     return ResearchBudget(
         per_forecast_micros=caps.per_forecast_micros,
-        per_day_micros=effective_per_day_micros(
-            records, configured_micros=caps.per_day_micros
-        ),
+        per_day_micros=per_day_micros,
         max_pages=caps.max_pages,
         ledger=_SqliteBudgetLedgerWriter(store),
-        opening_spend_by_day=spend_by_day_from_records(records),
+        opening_spend_by_day=opening_spend_by_day,
     )
 
 

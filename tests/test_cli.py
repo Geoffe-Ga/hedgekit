@@ -9,6 +9,9 @@ after a bounded number of beats.
 from __future__ import annotations
 
 import json
+import shutil
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -522,3 +525,273 @@ def test_main_run_with_only_ledger_path_flag_ledgers_config_but_no_paper(
             "ForecastCreated",
         }
     )
+
+
+#: The shipped books fixture the PAPER-wiring tests below replay. Copied into
+#: `tmp_path` and re-dated, never mutated in place.
+_SHIPPED_BOOKS = Path(__file__).resolve().parent / "fixtures" / "books" / "deep_walk"
+
+#: A resolution horizon comfortably inside the *production* `[2, 120]`-day
+#: window, applied relative to the wall clock the CLI actually runs on -- the
+#: fixture's committed 2025 close time is outside every window a live run could
+#: have. No screener threshold is touched: the fixture is what is re-dated.
+_IN_WINDOW_HORIZON_DAYS = 30
+
+#: A resting quantity far above the production `min_depth_contract_centis`
+#: floor of 10 000, so the screen passes on real depth rather than a lowered
+#: bar. The committed fixture rests 300, which is deliberately tiny so its
+#: taker-walk arithmetic is readable by hand.
+_DEEP_QUANTITY_CENTIS = 100_000
+
+#: The fixed per-forecast research charge one CLI-driven PAPER tick incurs.
+#: Mirrored rather than imported so a change to the production constant
+#: surfaces here as a failing assertion instead of silently re-deriving itself.
+_EXPECTED_RESEARCH_COST_MICROS = 3_000_000
+
+
+def _paper_books(tmp_path: Path) -> Path:
+    """Copy the shipped books fixture and make it clear the production screen.
+
+    Only the two inputs the screen measures are changed -- the close time and
+    the resting depth -- and both to values that genuinely satisfy the shipped
+    thresholds. `ScreenerConfig()`'s defaults are untouched, so what these tests
+    pin is the wiring behind the screen and never a relaxed one.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+
+    Returns:
+        The prepared books directory.
+    """
+    books = tmp_path / "books"
+    shutil.copytree(_SHIPPED_BOOKS, books)
+    closes_at = datetime.now(UTC) + timedelta(days=_IN_WINDOW_HORIZON_DAYS)
+    markets_path = books / "markets.json"
+    markets = json.loads(markets_path.read_text(encoding="utf-8"))
+    markets[0]["close_time"] = closes_at.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    markets_path.write_text(json.dumps(markets, indent=2), encoding="utf-8")
+    sessions_path = books / "sessions.json"
+    sessions = json.loads(sessions_path.read_text(encoding="utf-8"))
+    for steps in sessions.values():
+        for step in steps:
+            step["book"]["yes_bids"] = [
+                {"price": 4500, "quantity": _DEEP_QUANTITY_CENTIS}
+            ]
+            step["book"]["yes_asks"] = [
+                {"price": 4600, "quantity": _DEEP_QUANTITY_CENTIS}
+            ]
+    sessions_path.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+    return books
+
+
+def _paper_run_argv(
+    tmp_path: Path, books: Path, ledger_path: Path, *, extra: list[str]
+) -> list[str]:
+    """Build a complete one-beat PAPER `run` argument vector.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        books: The prepared books directory.
+        ledger_path: The ledger the run writes to.
+        extra: Additional flags appended verbatim (keyword-only).
+
+    Returns:
+        The argument vector for `windbreak.main.main`.
+    """
+    config_path = tmp_path / f"{ledger_path.stem}-config.yaml"
+    config_path.write_text("mode_ceiling: paper\n", encoding="utf-8")
+    cassette_path = tmp_path / "cassette.json"
+    cassette_path.write_text("{}", encoding="utf-8")
+    return [
+        "run",
+        "--heartbeat-interval",
+        "0",
+        "--max-beats",
+        "1",
+        "--config",
+        str(config_path),
+        "--paper-books-dir",
+        str(books),
+        "--cassette-path",
+        str(cassette_path),
+        "--ledger-path",
+        str(ledger_path),
+        "--report-dir",
+        str(tmp_path / f"reports-{ledger_path.stem}"),
+        *extra,
+    ]
+
+
+def _event_types(ledger_path: Path) -> list[str]:
+    """Return every ledgered row's event type, in sequence order.
+
+    Args:
+        ledger_path: The ledger database to read.
+
+    Returns:
+        The event-type discriminators.
+    """
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        return [record.event_type for record in store.read_all()]
+    finally:
+        store.close()
+
+
+def test_run_research_per_day_micros_reaches_the_budget_that_stops_the_tick(
+    tmp_path: Path,
+) -> None:
+    """The flag's *effect* is observed, not merely its parse (#483).
+
+    Issue #483 names its own root cause as "every seam is tested and passes;
+    the composition of those seams is unreachable, and nothing tests the
+    composition". The flag's parsing had a test and the pure override function
+    had a test, and between them the line that actually applies the override
+    was executed on every `run` case with the flag left `None` -- so deleting
+    it made `--research-per-day-micros` a complete no-op with the whole suite
+    still green.
+
+    This drives two real `main(["run", ...])` invocations that differ in one
+    token, over separate ledgers, and reads the consequence off disk. With the
+    flag at `0` the tick reaches the forecast stage and is refused there: one
+    `ResearchBudgetHalted` row, no forecast, no charge. Without it the shipped
+    20 000 000-micro ceiling stands and the identical tick forecasts and books
+    the charge. Deleting the override call turns the capped arm into the
+    uncapped one, so it cannot pass with the wire cut.
+
+    The whole event sequence is compared, not a membership check, so a tick
+    that halted for some *other* reason -- a screen it failed, a book it could
+    not read -- fails here rather than passing as a false positive.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    books = _paper_books(tmp_path)
+    capped_ledger = tmp_path / "capped.db"
+    uncapped_ledger = tmp_path / "uncapped.db"
+
+    capped = main(
+        _paper_run_argv(
+            tmp_path,
+            books,
+            capped_ledger,
+            extra=["--research-per-day-micros", "0"],
+        )
+    )
+    uncapped = main(_paper_run_argv(tmp_path, books, uncapped_ledger, extra=[]))
+
+    capped_types = _event_types(capped_ledger)
+    uncapped_types = _event_types(uncapped_ledger)
+    assert (capped, uncapped) == (0, 0)
+    assert capped_types.count("ScreenDecisionRecorded") == 1
+    assert capped_types.count("ResearchBudgetHalted") == 1
+    assert capped_types.count("ForecastCreated") == 0
+    assert capped_types.count("ResearchSpendRecorded") == 0
+    assert uncapped_types.count("ScreenDecisionRecorded") == 1
+    assert uncapped_types.count("ResearchBudgetHalted") == 0
+    assert uncapped_types.count("ForecastCreated") == 1
+    assert uncapped_types.count("ResearchSpendRecorded") == 1
+
+
+def test_run_research_per_day_micros_books_the_charge_it_permits(
+    tmp_path: Path,
+) -> None:
+    """The uncapped arm's charge is the shipped one, read off the ledger.
+
+    The negative half of the test above needs to be a *real* forecast rather
+    than merely the absence of a halt, or a wire-cut capped arm could match a
+    wire-cut uncapped arm and both assertions would be describing one
+    behaviour. The exact charge is pinned, so a tick that forecast for free
+    would fail here.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    books = _paper_books(tmp_path)
+    ledger_path = tmp_path / "ledger.db"
+
+    exit_code = main(_paper_run_argv(tmp_path, books, ledger_path, extra=[]))
+
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        spends = [
+            json.loads(record.payload_json)["data"]
+            for record in store.read_all()
+            if record.event_type == "ResearchSpendRecorded"
+        ]
+    finally:
+        store.close()
+    assert exit_code == 0
+    assert len(spends) == 1
+    assert spends[0]["cost_micros"] == _EXPECTED_RESEARCH_COST_MICROS
+    assert spends[0]["market_ticker"] == "MKT-DEEP"
+
+
+def test_run_survives_a_malformed_spend_row_instead_of_failing_to_compose(
+    tmp_path: Path,
+) -> None:
+    """A row the fold cannot read halts research, never the whole loop.
+
+    `spend_by_day_from_records` fails closed by design, and it is called from
+    `build_paper_deps`, so the refusal used to stop the process from composing
+    at all: no heartbeat, no equity sample, no positions snapshot, no
+    verification cycle, and -- the one that matters -- no kill handling, under
+    a `restart: on-failure` supervisor that would retry it forever over a row
+    that cannot be deleted from an append-only hash-chained ledger.
+
+    The row is fabricated exactly as a schema migration or an external tool
+    would leave it: a genuine `ResearchSpendRecorded` row written by beat 1,
+    with its `cost_micros` key renamed in place. Beat 2 then runs against it.
+    The assertion is that the *loop* survived -- the liveness rows an operator
+    and the kill switch depend on are all present -- while research itself is
+    refused with a zero ceiling.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    books = _paper_books(tmp_path)
+    ledger_path = tmp_path / "ledger.db"
+    assert main(_paper_run_argv(tmp_path, books, ledger_path, extra=[])) == 0
+    _rename_payload_key(ledger_path, "cost_micros", "cost_micros_v2")
+
+    exit_code = main(_paper_run_argv(tmp_path, books, ledger_path, extra=[]))
+
+    types = _event_types(ledger_path)
+    assert exit_code == 0
+    assert types.count("ResearchBudgetHalted") == 1
+    assert types.count("ForecastCreated") == 1
+    assert types.count("ModeHeartbeat") == 2
+    assert types.count("EquitySampled") == 2
+    assert types.count("PositionsSnapshotRecorded") == 2
+    assert types.count("PipelineHeartbeatRecorded") == 2
+    assert types.count("VerificationPassed") == 2
+
+
+def _rename_payload_key(ledger_path: Path, key: str, replacement: str) -> None:
+    """Rename one payload key in every row that carries it, in place.
+
+    Written straight through `sqlite3` because the typed event refuses to
+    construct without the key -- which is the point: this is the shape an
+    external writer produces, not one windbreak can.
+
+    Args:
+        ledger_path: The ledger database to rewrite.
+        key: The payload key to rename.
+        replacement: The name to give it.
+    """
+    conn = sqlite3.connect(ledger_path)
+    try:
+        for sequence_number, payload_json in conn.execute(
+            "SELECT sequence_number, payload_json FROM ledger"
+        ).fetchall():
+            envelope = json.loads(str(payload_json))
+            if key not in envelope["data"]:
+                continue
+            envelope["data"][replacement] = envelope["data"].pop(key)
+            conn.execute(
+                "UPDATE ledger SET payload_json = ? WHERE sequence_number = ?",
+                (json.dumps(envelope), sequence_number),
+            )
+        conn.commit()
+    finally:
+        conn.close()

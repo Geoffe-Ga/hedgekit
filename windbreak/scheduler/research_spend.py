@@ -44,10 +44,22 @@ and a later instruction supersedes an earlier one. Two cap rows can therefore
 never conflict, so no fold here can ever brick a tick over one.
 
 The rows can still be *malformed*, and that fails closed and loudly: a spend
-row whose payload cannot be read is not skipped, because skipping it would
-undercount the day and re-open a ceiling that should be shut -- the exact
-runaway this module exists to prevent. ``windbreak set-research-budget``
-validates before it appends, so it cannot write a row this fold refuses.
+row whose payload cannot be read -- or whose ``payload_schema_version`` this
+module does not know -- is not skipped, because skipping it would undercount
+the day and re-open a ceiling that should be shut, the exact runaway this
+module exists to prevent. ``windbreak set-research-budget`` validates before it
+appends, so it cannot write a row this fold refuses.
+
+Which is fail-closed *on the spend*, and only on the spend. These folds raise;
+what raising must never do is stop the loop from composing, because a process
+that cannot start cannot honour a kill file, emit a heartbeat, or reconcile a
+position -- strictly worse than one that runs with research disabled. So
+:func:`windbreak.scheduler.loop._build_research_budget`, the only caller on the
+loop's path, catches the refusal and opens a **zero-ceiling** budget: every
+market halts on the budget, one ``ResearchBudgetHalted`` row per halt says so,
+and the rest of the tick keeps running. That is the fail-closed brake this
+module is for, applied to the thing that spends money rather than to the
+process that watches the kill file.
 
 Both events derive their base :class:`~windbreak.ledger.events.Event` fields
 through a LOCAL ``_derive_typed_event``, the house pattern from
@@ -80,6 +92,13 @@ RESEARCH_BUDGET_CAP_SET_EVENT_TYPE: Final = "ResearchBudgetCapSet"
 #: Payload schema version stamped on this module's events. Replicated locally
 #: (rather than imported from :mod:`windbreak.ledger.events`'s private copy) so
 #: a payload-shape change here can be versioned independently.
+#:
+#: Both folds *read* it back (:func:`_require_readable_schema`) as well as
+#: writing it. A version field that is only ever written is decoration: it
+#: cannot make a shape change survivable, because a v1 reader handed a v2
+#: payload would go on subscripting v1 keys and either mis-read the row or
+#: report a missing key that is merely renamed. Refusing an unknown version by
+#: name is what lets a future v2 ship a reader that dispatches on it.
 _SCHEMA_VERSION: Final = 1
 
 #: Envelope key under which a ledgered event's typed payload is nested.
@@ -246,6 +265,31 @@ def _payload_of(record: LedgerRecord) -> dict[str, Any]:
     return data
 
 
+def _require_readable_schema(record: LedgerRecord) -> None:
+    """Refuse a row whose payload schema version this module cannot read.
+
+    Read *before* any key is subscripted, so a future v2 payload shape is
+    refused by name rather than mis-read as a v1 one missing keys. This is what
+    makes :data:`_SCHEMA_VERSION` load-bearing rather than decorative: a v2
+    reader dispatches on the version this check would otherwise reject, and
+    until one exists an unknown version is a fail-closed refusal.
+
+    Args:
+        record: The row being read, whose sequence number locates a failure.
+
+    Raises:
+        ValueError: If the row's ``payload_schema_version`` is not this
+            module's.
+    """
+    if record.payload_schema_version != _SCHEMA_VERSION:
+        raise ValueError(
+            f"{record.event_type} payload at "
+            f"sequence_number={record.sequence_number} carries "
+            f"payload_schema_version={record.payload_schema_version}, which "
+            f"this fold cannot read (it reads version {_SCHEMA_VERSION})"
+        )
+
+
 def _int_field(record: LedgerRecord, data: Mapping[str, Any], key: str) -> int:
     """Read a required integer payload field, failing closed and locatably.
 
@@ -326,15 +370,19 @@ def spend_by_day_from_records(
         zero.
 
     Raises:
-        ValueError: If a ``ResearchSpendRecorded`` row's payload is missing a
-            key or carries a wrongly-typed one. It fails closed rather than
-            skipping the row: an unreadable charge dropped from the fold would
-            undercount the day and re-open a ceiling that should be shut.
+        ValueError: If a ``ResearchSpendRecorded`` row carries an unknown
+            ``payload_schema_version``, or a payload missing a key or carrying a
+            wrongly-typed one. It fails closed rather than skipping the row: an
+            unreadable charge dropped from the fold would undercount the day and
+            re-open a ceiling that should be shut. The loop's own caller turns
+            this refusal into a zero-ceiling budget rather than a failure to
+            compose (see this module's docstring).
     """
     totals: dict[str, int] = {}
     for record in records:
         if record.event_type != RESEARCH_SPEND_RECORDED_EVENT_TYPE:
             continue
+        _require_readable_schema(record)
         data = _payload_of(record)
         day = _str_field(record, data, _UTC_DAY_KEY)
         cost = _int_field(record, data, _COST_MICROS_KEY)
@@ -357,8 +405,10 @@ def effective_per_day_micros(
     smaller": the operator must be able to *raise* the cap on a live loop
     (issue #483 acceptance criterion 3 requires proving exactly that), and a
     minimum rule would make raising it impossible without a restart.
-    ``windbreak run`` logs which source won, so the precedence is visible
-    rather than inferred.
+    ``windbreak run`` folds this very function over the ``--ledger-path`` ledger
+    at startup and logs the ceiling it returns together with the source that
+    won -- ``set-research-budget`` when a cap row is present, otherwise the flag
+    or the configuration -- so the precedence is visible rather than inferred.
 
     Args:
         records: The ledger rows to fold, in append order.
@@ -370,13 +420,15 @@ def effective_per_day_micros(
         The per-UTC-day research ceiling in force, in micros.
 
     Raises:
-        ValueError: If a ``ResearchBudgetCapSet`` row's payload is missing
-            ``per_day_micros`` or carries a wrongly-typed one.
+        ValueError: If a ``ResearchBudgetCapSet`` row carries an unknown
+            ``payload_schema_version``, or a payload missing ``per_day_micros``
+            or carrying a wrongly-typed one.
     """
     effective = configured_micros
     for record in records:
         if record.event_type != RESEARCH_BUDGET_CAP_SET_EVENT_TYPE:
             continue
+        _require_readable_schema(record)
         data = _payload_of(record)
         effective = _int_field(record, data, _PER_DAY_MICROS_KEY)
     return effective

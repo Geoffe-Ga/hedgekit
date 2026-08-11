@@ -46,6 +46,7 @@ from windbreak.ledger.store import SqliteLedgerStore
 from windbreak.main import build_parser, main, research_capped_config
 from windbreak.scheduler.research_spend import (
     RESEARCH_BUDGET_CAP_SET_EVENT_TYPE,
+    ResearchSpendRecorded,
     effective_per_day_micros,
 )
 
@@ -121,25 +122,49 @@ def _seed(ledger_path: Path) -> None:
         store.close()
 
 
-def test_the_verb_appends_exactly_one_cap_row(tmp_path: Path) -> None:
+@pytest.fixture
+def seeded_ledger(tmp_path: Path) -> Path:
+    """Provide an *existing* ledger database carrying one unrelated row.
+
+    Every accepted call below appends to this rather than conjuring a database,
+    because since the ``--ledger-path`` typo hazard was closed the verb refuses
+    to create one: a cap change written to a brand-new ledger is invisible to
+    the running loop, which reads the ledger it was started with.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+
+    Returns:
+        The path of a ledger holding exactly one ``ModeHeartbeat`` row.
+    """
+    path = tmp_path / "ledger.db"
+    _seed(path)
+    return path
+
+
+def test_the_verb_appends_exactly_one_cap_row(seeded_ledger: Path) -> None:
     """A well-formed call exits 0 and leaves one row carrying exact values.
 
     The payload is compared whole rather than key by key, so a field silently
-    added, dropped, or renamed fails here.
+    added, dropped, or renamed fails here. The whole row *sequence* is compared
+    too, so the append lands after the ledger's existing content rather than
+    replacing it.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
     """
-    ledger = tmp_path / "ledger.db"
+    exit_code = main(_argv(seeded_ledger))
 
-    exit_code = main(_argv(ledger))
-
-    rows = _rows(ledger)
+    rows = _rows(seeded_ledger)
     assert exit_code == 0
     assert [event_type for event_type, _ in rows] == [
-        RESEARCH_BUDGET_CAP_SET_EVENT_TYPE
+        "ModeHeartbeat",
+        RESEARCH_BUDGET_CAP_SET_EVENT_TYPE,
     ]
-    assert rows[0][1] == {"per_day_micros": NEW_CAP_MICROS, "note": NOTE}
+    assert rows[1][1] == {"per_day_micros": NEW_CAP_MICROS, "note": NOTE}
 
 
-def test_the_appended_row_is_what_the_loop_reads_back(tmp_path: Path) -> None:
+def test_the_appended_row_is_what_the_loop_reads_back(seeded_ledger: Path) -> None:
     """The verb and the tick agree by construction, not by restatement.
 
     The fold the scheduler runs at the head of every tick is called here
@@ -147,8 +172,11 @@ def test_the_appended_row_is_what_the_loop_reads_back(tmp_path: Path) -> None:
     the next beat" is checked rather than asserted. The configured fallback is
     deliberately a *different* number, so the assertion cannot pass by the two
     coinciding.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
     """
-    ledger = tmp_path / "ledger.db"
+    ledger = seeded_ledger
     configured = NEW_CAP_MICROS + 1
 
     assert main(_argv(ledger)) == 0
@@ -205,25 +233,28 @@ def test_a_negative_ceiling_is_refused_at_parse_time(tmp_path: Path) -> None:
     assert _rows(ledger) == before
 
 
-def test_a_zero_ceiling_is_accepted(tmp_path: Path) -> None:
+def test_a_zero_ceiling_is_accepted(seeded_ledger: Path) -> None:
     """Zero is a legitimate instruction: stop all research spend.
 
     Refusing it would leave an operator with no way to halt spend on a running
     loop without a restart, which is the capability this verb exists to give
     them. Pinned explicitly because ``0`` sits one step from the ``-1`` the
     test above refuses, and a guard written ``<= 0`` would swallow it.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
     """
-    ledger = tmp_path / "ledger.db"
+    exit_code = main(_argv(seeded_ledger, micros=0, note="cost anomaly under review"))
 
-    exit_code = main(_argv(ledger, micros=0, note="cost anomaly under review"))
-
-    rows = _rows(ledger)
+    rows = _rows(seeded_ledger)
     assert exit_code == 0
-    assert len(rows) == 1
-    assert rows[0][1]["per_day_micros"] == 0
+    assert len(rows) == 2
+    assert rows[1][1]["per_day_micros"] == 0
 
 
-def test_two_calls_differing_only_in_note_are_both_accepted(tmp_path: Path) -> None:
+def test_two_calls_differing_only_in_note_are_both_accepted(
+    seeded_ledger: Path,
+) -> None:
     """A retyped note is not a contradiction, and never bricks the loop.
 
     This is PR #482's lesson made falsifiable. A conflict check that compared
@@ -231,8 +262,11 @@ def test_two_calls_differing_only_in_note_are_both_accepted(tmp_path: Path) -> N
     the *fold* would refuse every later tick, terminally. Both rows are
     accepted, both stay on the append-only ledger, and the fold reads the last
     one's ceiling.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
     """
-    ledger = tmp_path / "ledger.db"
+    ledger = seeded_ledger
 
     first = main(_argv(ledger, note="raising for Fed week"))
     second = main(_argv(ledger, note="raising for fed-week"))
@@ -245,8 +279,12 @@ def test_two_calls_differing_only_in_note_are_both_accepted(tmp_path: Path) -> N
         store.close()
 
     assert (first, second) == (0, 0)
-    assert len(rows) == 2
-    assert [row["note"] for _, row in rows] == [
+    assert len(rows) == 3
+    assert [
+        row["note"]
+        for event_type, row in rows
+        if event_type == RESEARCH_BUDGET_CAP_SET_EVENT_TYPE
+    ] == [
         "raising for Fed week",
         "raising for fed-week",
     ]
@@ -254,15 +292,18 @@ def test_two_calls_differing_only_in_note_are_both_accepted(tmp_path: Path) -> N
 
 
 def test_a_later_call_supersedes_an_earlier_one_in_both_directions(
-    tmp_path: Path,
+    seeded_ledger: Path,
 ) -> None:
     """Lowering after raising works, and raising after lowering works.
 
     Both directions, off one ledger, so "last row wins" is shown rather than
     inferred from a single ordering. A fold that took the minimum would pass
     the lowering half and fail the raising half.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
     """
-    ledger = tmp_path / "ledger.db"
+    ledger = seeded_ledger
 
     assert main(_argv(ledger, micros=9_000_000, note="raise")) == 0
     assert main(_argv(ledger, micros=2_000_000, note="lower")) == 0
@@ -275,6 +316,278 @@ def test_a_later_call_supersedes_an_earlier_one_in_both_directions(
         store.close()
 
     assert effective == 4_000_000
+
+
+def _ceiling_line(err: str) -> str:
+    """Return the single startup line reporting the research ceiling.
+
+    Reads the JSON log stream ``configure_logging`` installs rather than a
+    ``caplog`` capture: ``main`` calls ``logging.basicConfig(force=True, ...)``,
+    which removes pytest's own root handler, so stderr is where the record
+    actually lands.
+
+    Args:
+        err: The captured stderr of a ``main(["run", ...])`` call.
+
+    Returns:
+        The ``msg`` of the one ``research per-day ceiling`` record.
+    """
+    lines = [
+        str(json.loads(line)["msg"])
+        for line in err.splitlines()
+        if line.startswith("{")
+    ]
+    ceilings = [line for line in lines if line.startswith("research per-day ceiling")]
+    assert len(ceilings) == 1, f"expected one ceiling line, got {ceilings}"
+    return ceilings[0]
+
+
+def _one_beat_run(ledger_path: Path, *, extra: list[str]) -> int:
+    """Run one bare heartbeat beat against ``ledger_path``.
+
+    No PAPER flags, so nothing is composed beyond the config load and the
+    startup ceiling report -- which is the whole surface under test here.
+
+    Args:
+        ledger_path: The ledger the run reads (and ledgers ``ConfigLoaded`` to).
+        extra: Additional flags appended verbatim (keyword-only).
+
+    Returns:
+        The process exit code.
+    """
+    return main(
+        [
+            "run",
+            "--heartbeat-interval",
+            "0",
+            "--max-beats",
+            "1",
+            "--ledger-path",
+            str(ledger_path),
+            *extra,
+        ]
+    )
+
+
+def test_the_startup_log_reports_the_ledgered_ceiling_that_supersedes_the_flag(
+    seeded_ledger: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The log names the ceiling *in force*, not the one the flag asked for.
+
+    The counterexample this closes, exactly as an operator meets it: they run
+    ``set-research-budget --per-day-micros 0`` during a cost incident, then
+    restart with ``--research-per-day-micros 40000000``. The startup log used
+    to say ``ceiling 40000000 source=--research-per-day-micros`` -- while the
+    ceiling actually in force was ``0``, because by this module's own
+    precedence rule the ledgered row always wins when present. Wrong, and
+    wrong in the *permissive* direction, on a spend brake.
+
+    Both the figure and the source are asserted by full-string equality, so a
+    fix that folded the ceiling but kept naming the flag would still fail.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
+        capsys: pytest's stdout/stderr capture.
+    """
+    assert main(_argv(seeded_ledger, micros=0, note="cost anomaly under review")) == 0
+    capsys.readouterr()
+
+    exit_code = _one_beat_run(
+        seeded_ledger, extra=["--research-per-day-micros", "40000000"]
+    )
+
+    assert exit_code == 0
+    assert _ceiling_line(capsys.readouterr().err) == (
+        "research per-day ceiling 0 micros source=set-research-budget"
+    )
+
+
+def test_the_startup_log_names_the_flag_when_no_cap_row_exists(
+    seeded_ledger: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no ledgered row the flag is genuinely in force, and is named.
+
+    The other half of the test above: a fold that reported
+    ``set-research-budget`` unconditionally, or reported ``0``
+    unconditionally, would pass that test and fail this one. The figure is the
+    flag's own value, so the override is observed rather than assumed.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
+        capsys: pytest's stdout/stderr capture.
+    """
+    exit_code = _one_beat_run(
+        seeded_ledger, extra=["--research-per-day-micros", "40000000"]
+    )
+
+    assert exit_code == 0
+    assert _ceiling_line(capsys.readouterr().err) == (
+        "research per-day ceiling 40000000 micros source=--research-per-day-micros"
+    )
+
+
+def test_the_startup_log_names_the_configuration_when_no_flag_is_given(
+    seeded_ledger: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The shipped default is reported as coming from the configuration.
+
+    Pins the third source token and the shipped 20 000 000-micro ceiling, so a
+    change to either is a visible change to what operators are told.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
+        capsys: pytest's stdout/stderr capture.
+    """
+    exit_code = _one_beat_run(seeded_ledger, extra=[])
+
+    assert exit_code == 0
+    assert _ceiling_line(capsys.readouterr().err) == (
+        "research per-day ceiling 20000000 micros source=configuration"
+    )
+
+
+def test_the_startup_log_reports_zero_when_the_research_rows_cannot_be_folded(
+    seeded_ledger: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unreadable ledger is reported as the zero ceiling the loop will use.
+
+    The loop does not refuse to start over a malformed research row -- it opens
+    a zero ceiling and halts every market on the budget -- so the startup log
+    has to say zero too. Reporting the configured ceiling here would be the
+    same lie in the same permissive direction as the flag case above.
+
+    The row is corrupted through ``sqlite3`` because the typed event refuses to
+    construct without the key, which is precisely why this shape can only reach
+    a ledger from outside windbreak.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
+        capsys: pytest's stdout/stderr capture.
+    """
+    store = SqliteLedgerStore(seeded_ledger)
+    try:
+        store.append(
+            ResearchSpendRecorded(
+                component="scheduler",
+                utc_day="2026-08-09",
+                market_ticker="MKT-DEEP",
+                cost_micros=1,
+            )
+        )
+    finally:
+        store.close()
+    _drop_payload_key(seeded_ledger, "cost_micros")
+    capsys.readouterr()
+
+    exit_code = _one_beat_run(
+        seeded_ledger, extra=["--research-per-day-micros", "40000000"]
+    )
+
+    assert exit_code == 0
+    assert _ceiling_line(capsys.readouterr().err) == (
+        "research per-day ceiling 0 micros source=unreadable-ledger"
+    )
+
+
+def _drop_payload_key(ledger_path: Path, key: str) -> None:
+    """Delete one key from every row's typed payload, in place.
+
+    Args:
+        ledger_path: The ledger database to rewrite.
+        key: The payload key to remove.
+    """
+    conn = sqlite3.connect(ledger_path)
+    try:
+        for sequence_number, payload_json in conn.execute(
+            "SELECT sequence_number, payload_json FROM ledger"
+        ).fetchall():
+            envelope = json.loads(str(payload_json))
+            envelope["data"].pop(key, None)
+            conn.execute(
+                "UPDATE ledger SET payload_json = ? WHERE sequence_number = ?",
+                (json.dumps(envelope), sequence_number),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_typoed_ledger_path_is_refused_and_creates_no_database(
+    tmp_path: Path,
+) -> None:
+    """A path that is not an existing ledger exits 1 and writes nothing at all.
+
+    The fail-open this closes: the verb used to *succeed* on a mistyped
+    ``--ledger-path``. A fresh SQLite database was created, the row landed at
+    sequence 1, the log said "research per-day ceiling set to 0 micros
+    sequence=1", the exit code was 0 -- and the running loop, reading the
+    ledger it was started with, never saw the cap. On the one verb whose whole
+    purpose is to stop money, silence is the wrong answer.
+
+    The absence of the file is asserted, not just the exit code: a refusal that
+    still created an empty database would leave the operator's *next* attempt
+    at the same typo silently succeeding.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    typo = tmp_path / "ledgre.db"
+
+    exit_code = main(_argv(typo, micros=0, note="cost anomaly under review"))
+
+    assert exit_code == 1
+    assert not typo.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_directory_ledger_path_exits_one_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A directory is a refused change, not an uncaught sqlite traceback.
+
+    This verb's docstring already promised "exit 1 on a refused change"; a
+    directory used to escape as a bare ``sqlite3.OperationalError`` stack
+    trace instead, which is neither the documented contract nor something an
+    operator's wrapper script can branch on.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    directory = tmp_path / "ledger.db"
+    directory.mkdir()
+
+    exit_code = main(_argv(directory))
+
+    assert exit_code == 1
+    assert list(directory.iterdir()) == []
+
+
+def test_the_refusal_leaves_a_real_ledger_reachable_afterwards(
+    seeded_ledger: Path, tmp_path: Path
+) -> None:
+    """The recovery path works: retype the path and the change lands.
+
+    A refusal that were somehow sticky -- a half-open handle, a stray file --
+    would turn an operator's typo into an outage on the verb they reach for
+    during a cost incident. So the correction is exercised end to end rather
+    than assumed.
+
+    Args:
+        seeded_ledger: An existing ledger carrying one ``ModeHeartbeat``.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    refused = main(_argv(tmp_path / "typo.db", micros=0, note="halt spend"))
+
+    accepted = main(_argv(seeded_ledger, micros=0, note="halt spend"))
+
+    rows = _rows(seeded_ledger)
+    assert refused == 1
+    assert accepted == 0
+    assert [event_type for event_type, _ in rows] == [
+        "ModeHeartbeat",
+        RESEARCH_BUDGET_CAP_SET_EVENT_TYPE,
+    ]
+    assert rows[1][1] == {"per_day_micros": 0, "note": "halt spend"}
 
 
 def test_the_run_flag_overrides_the_configured_ceiling() -> None:

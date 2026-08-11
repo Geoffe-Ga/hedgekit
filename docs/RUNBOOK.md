@@ -1058,10 +1058,29 @@ windbreak run --process pipeline \
 ```
 
 Overrides the configured value for that run and nothing else -- the
-per-forecast ceiling and the page cap are untouched. `windbreak run` logs the
-effective ceiling and which source it came from on startup, so an operator
-never has to infer it. A negative value is refused by the argument parser
-before anything is composed.
+per-forecast ceiling and the page cap are untouched. A negative value is
+refused by the argument parser before anything is composed.
+
+**What startup logs, exactly.** With `--ledger-path` supplied, `windbreak run`
+*folds the ledger* and reports the ceiling genuinely in force, together with the
+source that won:
+
+```text
+research per-day ceiling <N> micros source=<source>
+```
+
+| `source=` | Means |
+|---|---|
+| `set-research-budget` | A ledgered `ResearchBudgetCapSet` row is present, and by the precedence rule below it wins. `<N>` is that row's ceiling. |
+| `--research-per-day-micros` | No cap row on the ledger; the invocation argument is in force. |
+| `configuration` | Neither; the YAML value (or its default) is in force. |
+| `unreadable-ledger` | This ledger's research rows cannot be folded. `<N>` is `0` and the loop will halt every market on the budget -- see [the malformed-row section](#a-malformed-research-row-is-not-terminal) below. |
+
+Do not infer the ceiling from the flag you typed. Before this was fixed the log
+printed the flag's own value and named the flag even when a `set-research-budget
+--per-day-micros 0` row was in force, which is wrong in the permissive
+direction on a spend brake. Without `--ledger-path` there is no ledger to fold
+and no loop that could read one, so the flag or the configuration is reported.
 
 **3. The ledgered verb (runtime, no restart).**
 
@@ -1094,6 +1113,15 @@ recorded tamper-evidently rather than living in a shell history.
 - A refused call (blank note, negative ceiling) writes nothing at all: exit 1
   for the former, argparse's exit 2 for the latter, and the ledger is left
   byte-for-byte unchanged.
+- **`--ledger-path` must name an existing ledger.** The verb refuses to create
+  one, with exit 1 and no file written. A typo'd path used to *succeed*: a fresh
+  database was created, the row landed at sequence 1, the log read `research
+  per-day ceiling set to 0 micros sequence=1`, the exit code was 0 -- and the
+  running loop, reading the ledger it was started with, never saw the cap. On
+  the verb whose purpose is to stop money that is a fail-open, so it is now an
+  error. Retype the path and re-run; nothing needs undoing. A path naming a
+  *directory* is refused the same way, with exit 1 and a message, rather than an
+  `sqlite3.OperationalError` traceback.
 
 **The day's spend now survives a restart (issue #442).** `_build_research_budget`
 folds this ledger's `ResearchSpendRecorded` rows into the day counter the
@@ -1107,18 +1135,58 @@ across crashes, deploys and manual bounces, and across two processes sharing one
 
 Two consequences worth knowing before an incident:
 
-- **A malformed spend row on the ledger stops the loop.** The fold refuses a
-  `ResearchSpendRecorded` row it cannot read rather than skipping it, because a
-  skipped charge would undercount the day and re-open a ceiling that should be
-  shut. Neither the budget writer nor `set-research-budget` can produce such a
-  row (both validate before appending), so this can only come from a ledger
-  windbreak did not write. The error names the offending key and the row's
-  `sequence_number`.
+- **A malformed research row halts research, not the loop.** See the next
+  section -- it is the one shape of ledger damage this machinery can meet, and
+  what it does is worth reading before you meet it.
 - **The boundary is UTC, not local.** A day rolls over at 00:00 UTC. A local
   midnight does not reset anything, and a UTC midnight does even when the local
   date has not changed. `tests/scheduler/test_research_spend_durability.py`
   pins both directions under a fixed UTC-05:00 process timezone, because CI runs
   UTC and would not see the difference.
+
+### A malformed research row is not terminal
+
+Both folds fail **closed**: a `ResearchSpendRecorded` or `ResearchBudgetCapSet`
+row they cannot read is refused, never skipped, because a skipped charge would
+undercount the day and re-open a ceiling that should be shut. Neither the budget
+writer nor `set-research-budget` can produce such a row -- both validate before
+appending -- so it can only arrive from a schema migration or a tool windbreak
+did not write. A row also counts as unreadable if its `payload_schema_version`
+is not one this build knows how to read.
+
+**What that refusal does, and deliberately does not do.** It fails closed on the
+*spend*, not on the process:
+
+- The loop **composes and beats normally**. Heartbeats, equity samples,
+  positions snapshots, the verification cycle, reconciliation, reporting and --
+  the one that matters -- **kill-file handling all keep working**.
+- The research budget opens with a **ceiling of `0`**, so every market halts on
+  the budget and ledgers a `ResearchBudgetHalted` row (`halt_kind: per_day`,
+  `spent_micros: 0`, `budget_micros: 0`). No research money is spent.
+- The cause is logged as a `CRITICAL` on **every tick**, naming the offending
+  key and the row's `sequence_number`: `research spend history unreadable,
+  opening a zero ceiling: ...`.
+- `windbreak run` reports `source=unreadable-ledger` at startup, so the ceiling
+  the log states is the ceiling the loop will actually enforce.
+
+This is a deliberate reversal. Letting the refusal escape stopped
+`build_paper_deps` from composing at all, which under the `restart: on-failure`
+of `deploy/docker-compose.yml` and the `Restart=on-failure` of every
+`deploy/systemd/*.service` is an unbounded crash loop -- over a row that cannot
+be removed from an append-only hash-chained ledger. **A loop that cannot start
+cannot honour a kill file.** A loop that runs with research disabled can, and
+can be watched, reconciled and killed while you fix the ledger. Disabling
+research is the strictest possible answer to "I cannot tell what this day has
+spent"; refusing to run is a strictly worse one.
+
+**Recovery.** The row cannot be deleted: the chain is append-only and
+hash-linked, and there is deliberately no verb that edits it. The recovery is to
+start the loop against a **fresh `--ledger-path`**, accepting that the new
+ledger's day counter starts at zero (so set the day's ceiling accordingly with
+`set-research-budget` before resuming, if the old day had already spent). Retain
+the damaged ledger for the audit trail. Until you do any of that, the loop is
+safe, loud, killable, and spending nothing on research -- which is why this is a
+decision you make on your own schedule rather than an outage.
 
 ### Add / remove a provider
 

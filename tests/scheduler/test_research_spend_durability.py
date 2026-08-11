@@ -720,6 +720,237 @@ def test_a_cap_row_refuses_a_negative_ceiling_and_a_blank_note() -> None:
     assert zero.payload["per_day_micros"] == 0
 
 
+def test_an_unknown_payload_schema_version_is_refused_on_a_spend_row(
+    tmp_path: Path,
+) -> None:
+    """``payload_schema_version`` is *read*, so versioning it means something.
+
+    It was written and never consulted: both folds went straight to
+    ``envelope["data"]`` and subscripted version-1 keys whatever the row said
+    it was. A field that is only ever written cannot make a shape change
+    survivable -- a v2 payload would either be mis-read as a v1 one, or be
+    reported as "missing 'cost_micros'" when the key had merely been renamed,
+    and either way every ledger carrying v1 rows would be unusable the day a v2
+    shipped.
+
+    Reading it turns that into a refusal that names the version, which is what
+    a future v2 reader dispatches on.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    ledger = tmp_path / "ledger.db"
+    store = SqliteLedgerStore(ledger)
+    try:
+        store.append(
+            ResearchSpendRecorded(
+                component="scheduler",
+                utc_day=MIDDAY_UTC_DAY,
+                market_ticker=TICKER,
+                cost_micros=123,
+            )
+        )
+    finally:
+        store.close()
+    _reversion_row(ledger, 1, 2)
+
+    reader = SqliteLedgerStore(ledger)
+    try:
+        with pytest.raises(ValueError) as caught:
+            spend_by_day_from_records(reader.read_all())
+    finally:
+        reader.close()
+
+    assert str(caught.value) == (
+        "ResearchSpendRecorded payload at sequence_number=1 carries "
+        "payload_schema_version=2, which this fold cannot read (it reads "
+        "version 1)"
+    )
+
+
+def test_an_unknown_payload_schema_version_is_refused_on_a_cap_row(
+    tmp_path: Path,
+) -> None:
+    """The cap fold reads the version too, so neither guard is decorative.
+
+    Swept separately from the spend fold above: both folds write the field, and
+    a guard added to only one of them would leave the other exactly as
+    decorative as before.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    ledger = tmp_path / "ledger.db"
+    store = SqliteLedgerStore(ledger)
+    try:
+        store.append(
+            ResearchBudgetCapSet(component="operator", per_day_micros=9, note="n")
+        )
+    finally:
+        store.close()
+    _reversion_row(ledger, 1, 2)
+
+    reader = SqliteLedgerStore(ledger)
+    try:
+        with pytest.raises(ValueError) as caught:
+            effective_per_day_micros(
+                reader.read_all(), configured_micros=DAY_CAP_MICROS
+            )
+    finally:
+        reader.close()
+
+    assert str(caught.value) == (
+        "ResearchBudgetCapSet payload at sequence_number=1 carries "
+        "payload_schema_version=2, which this fold cannot read (it reads "
+        "version 1)"
+    )
+
+
+def test_a_row_stamped_with_the_readable_version_is_still_folded(
+    tmp_path: Path,
+) -> None:
+    """The version guard refuses version 2 and *accepts* version 1.
+
+    Without this half the guard above would pass just as happily if it refused
+    every row unconditionally, which would brick the fold rather than version
+    it.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    ledger = tmp_path / "ledger.db"
+    store = SqliteLedgerStore(ledger)
+    try:
+        store.append(
+            ResearchSpendRecorded(
+                component="scheduler",
+                utc_day=MIDDAY_UTC_DAY,
+                market_ticker=TICKER,
+                cost_micros=123,
+            )
+        )
+        records = store.read_all()
+        folded = spend_by_day_from_records(records)
+    finally:
+        store.close()
+
+    assert [record.payload_schema_version for record in records] == [1]
+    assert folded == {MIDDAY_UTC_DAY: 123}
+
+
+def test_an_unreadable_spend_row_opens_a_zero_ceiling_instead_of_refusing_to_compose(
+    tmp_path: Path,
+) -> None:
+    """A malformed row fails closed on the *budget*, never on the process.
+
+    The blast radius this bounds: ``spend_by_day_from_records`` is called from
+    ``_build_research_budget``, which ``build_paper_deps`` calls, so letting the
+    refusal escape stopped the loop from *composing at all* -- no heartbeat, no
+    equity sample, no positions snapshot, no verification cycle, and no kill
+    handling -- under a ``restart: on-failure`` supervisor that retries forever,
+    over a row that cannot be deleted from an append-only hash-chained ledger.
+
+    A loop that cannot start cannot honour a kill file. A loop that runs with
+    research disabled can. So the refusal becomes the strictest budget there
+    is: a zero ceiling on an empty counter. The bundle composes, and the very
+    first ``ensure_day_open`` refuses with a ceiling of zero -- asserted by full
+    message equality, so a budget that quietly kept the configured 1 000 000
+    ceiling could not pass.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    seeding = _deps(tmp_path)
+    try:
+        _spend(seeding, 1, at=MIDDAY)
+    finally:
+        seeding.store.close()
+    _drop_payload_key(tmp_path / "ledger.db", "cost_micros")
+
+    restarted = _deps(tmp_path)
+    try:
+        with pytest.raises(DailyBudgetExhaustedError) as caught:
+            restarted.budget.ensure_day_open(at=MIDDAY)
+    finally:
+        restarted.store.close()
+
+    halts = [
+        data
+        for event_type, data in _rows(tmp_path / "ledger.db")
+        if event_type == "ResearchBudgetHalted"
+    ]
+    assert type(caught.value) is DailyBudgetExhaustedError
+    assert str(caught.value) == (
+        f"UTC day {MIDDAY_UTC_DAY} budget exhausted: spent 0 micros of 0 micros"
+    )
+    assert restarted.config.forecast.budget.per_day_micros == DAY_CAP_MICROS
+    assert len(halts) == 1
+    assert halts[0] == {
+        "market_ticker": "",
+        "halt_kind": "per_day",
+        "utc_day": MIDDAY_UTC_DAY,
+        "spent_micros": 0,
+        "budget_micros": 0,
+    }
+
+
+def test_an_unreadable_cap_row_also_opens_a_zero_ceiling(tmp_path: Path) -> None:
+    """The cap fold's refusal is caught on the same terms as the spend fold's.
+
+    Both folds run behind one ``try``, so a fix that caught only the spend
+    fold would leave a malformed ``ResearchBudgetCapSet`` row -- the rows an
+    operator's own verb writes -- still terminal.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    ledger = tmp_path / "ledger.db"
+    store = SqliteLedgerStore(ledger)
+    try:
+        store.append(
+            ResearchBudgetCapSet(
+                component="operator", per_day_micros=RAISED_DAY_CAP_MICROS, note="n"
+            )
+        )
+    finally:
+        store.close()
+    _drop_payload_key(ledger, "per_day_micros")
+
+    deps = _deps(tmp_path)
+    try:
+        with pytest.raises(DailyBudgetExhaustedError) as caught:
+            deps.budget.ensure_day_open(at=MIDDAY)
+    finally:
+        deps.store.close()
+
+    assert str(caught.value) == (
+        f"UTC day {MIDDAY_UTC_DAY} budget exhausted: spent 0 micros of 0 micros"
+    )
+
+
+def _reversion_row(ledger_path: Path, sequence_number: int, version: int) -> None:
+    """Rewrite one row's ``payload_schema_version`` column, in place.
+
+    Fabricates the future-schema row the version guard exists for. Written
+    straight through ``sqlite3`` because the typed events stamp the version
+    themselves, which is the point.
+
+    Args:
+        ledger_path: The ledger database to rewrite.
+        sequence_number: Which row to restamp.
+        version: The schema version to write.
+    """
+    conn = sqlite3.connect(ledger_path)
+    try:
+        conn.execute(
+            "UPDATE ledger SET payload_schema_version = ? WHERE sequence_number = ?",
+            (version, sequence_number),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _drop_payload_key(ledger_path: Path, key: str) -> None:
     """Delete one key from every row's typed payload, in place.
 

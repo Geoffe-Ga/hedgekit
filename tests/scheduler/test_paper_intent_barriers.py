@@ -1055,6 +1055,68 @@ def test_raising_the_cap_on_the_same_ledger_restores_the_intent(
     assert deps.config.forecast.budget.per_day_micros == DAY_CAP_MICROS
 
 
+def test_the_day_shuts_itself_on_the_spend_the_first_beat_recorded(
+    shipped_books: Path, tmp_path: Path, report_dir: Path
+) -> None:
+    """The loop governs its own spending, with nothing seeded by hand.
+
+    Issue #483's acceptance criterion 3 at full strength. Every other test of
+    the cap puts the day's spend on the ledger itself -- a fair model of a
+    crashed predecessor, but it proves the *fold* reads a row, not that the
+    loop writes the row that later stops it. Here the ceiling is set to exactly
+    one forecast's charge and nothing is pre-seeded: beat 1 emits an intent and
+    books :data:`FULL_PIPELINE_RESEARCH_COST_MICROS`, and beat 2 -- same
+    process, same config object, same books, same votes -- is halted by the
+    spend beat 1 recorded.
+
+    The ceiling is read from the production constant rather than restated, so a
+    charge that changed would move the ceiling with it and this would still be
+    the "exactly one forecast per day" scenario. Exactly one
+    ``ResearchSpendRecorded`` row is required across both beats: two would mean
+    beat 2 researched anyway, and zero would mean beat 1 never did.
+
+    Args:
+        shipped_books: A private copy of the shipped books fixture.
+        tmp_path: pytest's per-test temporary directory.
+        report_dir: The evaluation-artifact directory.
+    """
+    _tradeable_books(shipped_books)
+    _write_track_records(report_dir)
+    deps = _build_deps(
+        books=shipped_books,
+        tmp_path=tmp_path,
+        report_dir=report_dir,
+        config=_capped_config(per_day_micros=FULL_PIPELINE_RESEARCH_COST_MICROS),
+        research=_finding_research_tools(tmp_path / "cache"),
+        votes=_NearCertainVoteTransport(),
+    )
+
+    first = run_single_tick(deps, beat=1)
+    second = run_single_tick(deps, beat=2)
+
+    rows = _rows(deps)
+    entered = [event for event, _ in rows]
+    spends = [data for event, data in rows if event == "ResearchSpendRecorded"]
+    assert first.intent_count == 1
+    assert first.research_halted is False
+    assert second.intent_count == 0
+    assert second.research_halted is True
+    assert entered.count("ForecastCreated") == 1
+    assert entered.count("ResearchSpendRecorded") == 1
+    assert spends[0] == {
+        "utc_day": TICK_UTC_DAY,
+        "market_ticker": TICKER,
+        "cost_micros": FULL_PIPELINE_RESEARCH_COST_MICROS,
+    }
+    assert _only(rows, "ResearchBudgetHalted") == {
+        "market_ticker": "",
+        "halt_kind": "per_day",
+        "utc_day": TICK_UTC_DAY,
+        "spent_micros": FULL_PIPELINE_RESEARCH_COST_MICROS,
+        "budget_micros": FULL_PIPELINE_RESEARCH_COST_MICROS,
+    }
+
+
 def test_best_case_ask_is_the_open_band_floor(
     shipped_books: Path,
     tmp_path: Path,

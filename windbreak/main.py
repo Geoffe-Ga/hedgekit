@@ -57,7 +57,12 @@ from windbreak.ledger import (
 from windbreak.logging_setup import configure_logging
 from windbreak.riskkernel.ack_flow import ACKS_DIRNAME
 from windbreak.riskkernel.kill import KILL_FILENAME, REARM_FILENAME
-from windbreak.scheduler.research_spend import ResearchBudgetCapSet
+from windbreak.scheduler.research_spend import (
+    RESEARCH_BUDGET_CAP_SET_EVENT_TYPE,
+    ResearchBudgetCapSet,
+    effective_per_day_micros,
+    spend_by_day_from_records,
+)
 
 if TYPE_CHECKING:
     import http.server
@@ -101,6 +106,35 @@ _RESOLUTION_INGEST_COMPONENT = "operator"
 #: instruction, and stamping it with a component that never issued it would
 #: forge provenance in a hash-chained audit trail.
 _RESEARCH_BUDGET_COMPONENT = "operator"
+
+#: ``source=`` token logged when ``run --research-per-day-micros`` decided the
+#: per-UTC-day research ceiling this process starts on.
+_CEILING_SOURCE_FLAG = "--research-per-day-micros"
+
+#: ``source=`` token logged when the configuration file (or its defaults)
+#: decided the ceiling.
+_CEILING_SOURCE_CONFIG = "configuration"
+
+#: ``source=`` token logged when a ledgered ``ResearchBudgetCapSet`` row decided
+#: the ceiling. It supersedes both of the above by
+#: :func:`~windbreak.scheduler.research_spend.effective_per_day_micros`'s own
+#: precedence rule, so it is the source whenever such a row is present -- which
+#: is exactly the case the startup log used to misreport (it printed the flag's
+#: value and named the flag while the ledger's ceiling was the one in force).
+_CEILING_SOURCE_LEDGER = "set-research-budget"
+
+#: ``source=`` token logged when this ledger's research rows cannot be folded at
+#: all. The loop does not refuse to start over it -- see
+#: :func:`windbreak.scheduler.loop._research_ledger_state` -- it opens a zero
+#: ceiling and halts every market on the budget, so this is what the startup log
+#: must report if it is to match what the loop will actually do.
+_CEILING_SOURCE_UNREADABLE = "unreadable-ledger"
+
+#: The ceiling reported (and enforced) when this ledger's research rows cannot
+#: be folded. Mirrors
+#: :data:`windbreak.scheduler.loop._UNREADABLE_LEDGER_CEILING_MICROS`, which is
+#: private to that module; a test pins the two equal.
+_UNREADABLE_LEDGER_CEILING_MICROS = 0
 
 #: Mode reported where there is no evidence of any mode -- the dashboard's
 #: no-ledger and no-heartbeat defaults (issue #447). Absent evidence is not
@@ -1679,6 +1713,38 @@ def _run_ingest_resolution(args: argparse.Namespace) -> int:
     return 0
 
 
+def _existing_ledger_refusal(ledger_path: Path) -> str | None:
+    """Return why ``--ledger-path`` cannot be appended to, or ``None``.
+
+    ``set-research-budget`` is the one verb whose whole purpose is to *stop*
+    money, so a mistyped path must not look like success. Opening a
+    :class:`~windbreak.ledger.store.SqliteLedgerStore` on a path that does not
+    exist creates the database, appends at sequence 1, logs a cheerful "ceiling
+    set to 0 micros sequence=1" and exits 0 -- while the running loop, reading a
+    different file, never sees the cap at all. That is a fail-open hazard on a
+    spend brake: the operator is told the brake is on and it is not.
+
+    A directory is refused for the same reason with a message rather than an
+    uncaught ``sqlite3.OperationalError`` traceback, which this verb's own
+    docstring already promised was an exit-1 refusal.
+
+    Args:
+        ledger_path: The ``--ledger-path`` value to check.
+
+    Returns:
+        The refusal message, or ``None`` when the path is an existing file.
+    """
+    if ledger_path.is_dir():
+        return f"--ledger-path is a directory, not a ledger database: {ledger_path}"
+    if not ledger_path.exists():
+        return (
+            f"no ledger database at {ledger_path}: refusing to create one. A "
+            "cap change appended to a new ledger is invisible to the running "
+            "loop, which reads the ledger it was started with."
+        )
+    return None
+
+
 def _run_set_research_budget(args: argparse.Namespace) -> int:
     """Append one ``ResearchBudgetCapSet`` row changing the daily research cap.
 
@@ -1693,8 +1759,15 @@ def _run_set_research_budget(args: argparse.Namespace) -> int:
     there is no read-back conflict check here and nothing this verb writes can
     ever stop a tick. What it does refuse, it refuses *before* opening the
     ledger: the event's own ``__post_init__`` rejects a negative ceiling and a
-    blank note, so a refused call leaves the chain byte-for-byte untouched and
-    -- on a first run -- creates no database file at all.
+    blank note, and :func:`_existing_ledger_refusal` rejects a ``--ledger-path``
+    that is not an existing database -- so a refused call leaves the chain
+    byte-for-byte untouched and creates no database file at all.
+
+    That second refusal is the one an operator's fingers need. A typo'd path
+    used to be silently *successful*: a fresh ledger was created, the row landed
+    at sequence 1, the log said the ceiling was set, the exit code was 0, and
+    the running loop -- reading the ledger it was started with -- never saw it.
+    On the verb whose purpose is to stop money, that is a fail-open.
 
     Args:
         args: Parsed ``set-research-budget`` arguments carrying ``ledger_path``,
@@ -1712,6 +1785,10 @@ def _run_set_research_budget(args: argparse.Namespace) -> int:
         )
     except ValueError as exc:
         _LOGGER.critical("FATAL: %s", exc)
+        return 1
+    refusal = _existing_ledger_refusal(args.ledger_path)
+    if refusal is not None:
+        _LOGGER.critical("FATAL: %s", refusal)
         return 1
     store = SqliteLedgerStore(args.ledger_path)
     try:
@@ -1760,6 +1837,109 @@ def research_capped_config(
     budget = dataclasses.replace(config.forecast.budget, per_day_micros=per_day_micros)
     forecast = dataclasses.replace(config.forecast, budget=budget)
     return dataclasses.replace(config, forecast=forecast)
+
+
+def _startup_ceiling_source(args: argparse.Namespace) -> str:
+    """Return which non-ledger source set the ceiling this run starts on.
+
+    Args:
+        args: Parsed ``run`` arguments carrying ``research_per_day_micros``.
+
+    Returns:
+        :data:`_CEILING_SOURCE_FLAG` when the flag was supplied, otherwise
+        :data:`_CEILING_SOURCE_CONFIG`.
+    """
+    if args.research_per_day_micros is not None:
+        return _CEILING_SOURCE_FLAG
+    return _CEILING_SOURCE_CONFIG
+
+
+def _effective_research_ceiling(
+    config: WindbreakConfig, ledger_path: Path | None, *, args: argparse.Namespace
+) -> tuple[int, str]:
+    """Fold the ceiling actually in force, and name the source that won.
+
+    The startup log has to report the **folded** ceiling, not the configured
+    one. ``config.forecast.budget.per_day_micros`` is only the fallback: by
+    :func:`~windbreak.scheduler.research_spend.effective_per_day_micros`'s
+    precedence rule a ledgered ``ResearchBudgetCapSet`` row always wins when
+    present, so an operator who had run ``set-research-budget --per-day-micros
+    0`` and then restarted with ``--research-per-day-micros 40000000`` used to
+    be told the ceiling was 40 000 000 while 0 was the ceiling in force. A log
+    line that is wrong in the *permissive* direction on a spend brake is worse
+    than no log line.
+
+    Both folds run, not just the cap one: a malformed ``ResearchSpendRecorded``
+    row leaves the ceiling readable but makes
+    :func:`windbreak.scheduler.loop._build_research_budget` open a zero one, and
+    reporting the configured ceiling in that case would be the same lie in the
+    same direction.
+
+    Without ``--ledger-path`` there is no ledger to fold and no loop that could
+    read one, so the configured value stands and the source is the flag or the
+    configuration. The store is opened read-only in the sense that matters --
+    nothing is appended -- and closed in a ``finally`` so the PAPER loop can
+    reopen the same file.
+
+    Args:
+        config: The already-``--research-per-day-micros``-capped configuration.
+        ledger_path: The run's ``--ledger-path``, or ``None``.
+        args: The parsed ``run`` arguments, for the non-ledger source label
+            (keyword-only).
+
+    Returns:
+        The ``(per_day_micros, source)`` pair the startup log should report.
+    """
+    configured = config.forecast.budget.per_day_micros
+    if ledger_path is None:
+        return configured, _startup_ceiling_source(args)
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        records = tuple(store.read_all())
+    finally:
+        store.close()
+    try:
+        effective = effective_per_day_micros(records, configured_micros=configured)
+        spend_by_day_from_records(records)
+    except ValueError:
+        return _UNREADABLE_LEDGER_CEILING_MICROS, _CEILING_SOURCE_UNREADABLE
+    if any(
+        record.event_type == RESEARCH_BUDGET_CAP_SET_EVENT_TYPE for record in records
+    ):
+        return effective, _CEILING_SOURCE_LEDGER
+    return effective, _startup_ceiling_source(args)
+
+
+def _research_capped_and_logged(
+    loaded: WindbreakConfig, args: argparse.Namespace
+) -> WindbreakConfig:
+    """Apply ``--research-per-day-micros`` and log the ceiling really in force.
+
+    The single seam between the parsed flag and every ``run`` route, so the
+    three routes cannot drift apart in either what they apply or what they
+    report. ``tests/test_cli.py`` drives a real ``main(["run", ...])`` through
+    it and observes the flag's *effect* -- a market halted on the budget, and
+    the ledgered ``ResearchBudgetHalted`` row saying so -- rather than only its
+    parse, because "every seam is tested and the composition of them is not" is
+    the defect issue #483 exists to close.
+
+    Args:
+        loaded: The freshly loaded configuration.
+        args: The parsed ``run`` arguments.
+
+    Returns:
+        The configuration the run should use.
+    """
+    config = research_capped_config(loaded, per_day_micros=args.research_per_day_micros)
+    per_day_micros, source = _effective_research_ceiling(
+        config, args.ledger_path, args=args
+    )
+    _LOGGER.info(
+        "research per-day ceiling %d micros source=%s",
+        per_day_micros,
+        source,
+    )
+    return config
 
 
 def _run_kill(args: argparse.Namespace) -> int:
@@ -2557,15 +2737,7 @@ def _run_heartbeat(args: argparse.Namespace) -> int:
     loaded = _load_and_ledger_config(args)
     if loaded is None:
         return 1
-    config = research_capped_config(loaded, per_day_micros=args.research_per_day_micros)
-    _LOGGER.info(
-        "research per-day ceiling %d micros source=%s (a ledgered "
-        "set-research-budget row supersedes this on the next tick)",
-        config.forecast.budget.per_day_micros,
-        "--research-per-day-micros"
-        if args.research_per_day_micros is not None
-        else "configuration",
-    )
+    config = _research_capped_and_logged(loaded, args)
     # Handlers first, and before `_resolve_on_beat`: the PAPER hook's bundle is
     # built eagerly there -- it opens the SQLite ledger, loads the books, and
     # builds the connector -- and a SIGTERM arriving inside that window would
@@ -2872,15 +3044,7 @@ def _run_riskkernel(args: argparse.Namespace) -> int:
     loaded = _load_and_ledger_config(args)
     if loaded is None:
         return 1
-    config = research_capped_config(loaded, per_day_micros=args.research_per_day_micros)
-    _LOGGER.info(
-        "research per-day ceiling %d micros source=%s (a ledgered "
-        "set-research-budget row supersedes this on the next tick)",
-        config.forecast.budget.per_day_micros,
-        "--research-per-day-micros"
-        if args.research_per_day_micros is not None
-        else "configuration",
-    )
+    config = _research_capped_and_logged(loaded, args)
     store = (
         SqliteLedgerStore(args.ledger_path) if args.ledger_path is not None else None
     )
@@ -3019,15 +3183,7 @@ def _run_dashboard(args: argparse.Namespace) -> int:
     loaded = _load_and_ledger_config(args)
     if loaded is None:
         return 1
-    config = research_capped_config(loaded, per_day_micros=args.research_per_day_micros)
-    _LOGGER.info(
-        "research per-day ceiling %d micros source=%s (a ledgered "
-        "set-research-budget row supersedes this on the next tick)",
-        config.forecast.budget.per_day_micros,
-        "--research-per-day-micros"
-        if args.research_per_day_micros is not None
-        else "configuration",
-    )
+    config = _research_capped_and_logged(loaded, args)
     try:
         server = _build_dashboard_server(args, config)
     except ValueError as exc:
