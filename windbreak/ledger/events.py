@@ -54,6 +54,15 @@ _SCHEMA_VERSION = 1
 #: booked before ids were recorded at all".
 _FILL_ACCOUNTED_SCHEMA_VERSION = 2
 
+#: ``AlertEmitted``'s payload version. Issue #413 added ``deliveries`` and
+#: ``delivery_reported`` so an audit can tell an alert that was *delivered*
+#: from one that was merely *emitted*, which changes the payload's shape: a v1
+#: row carries neither key and can only ever prove emission, while a v2 row
+#: always carries both. Stamping them apart keeps "written before delivery was
+#: recorded at all" distinguishable from "written after, and nothing was
+#: delivered" -- two very different post-incident conclusions.
+_ALERT_EMITTED_SCHEMA_VERSION = 2
+
 
 def canonical_json(obj: dict[str, object]) -> str:
     """Serialize a mapping to deterministic, whitespace-free JSON.
@@ -123,8 +132,8 @@ def _derive_typed_event(
     """Populate the derived ``Event`` fields on a frozen typed subclass.
 
     Sets ``event_type`` to the concrete class name, ``payload_schema_version``
-    to ``schema_version`` (the module-wide default for every event but the one
-    that overrides it), and ``payload`` to the assembled dict, using
+    to ``schema_version`` (the module-wide default for every event but the few
+    that override it), and ``payload`` to the assembled dict, using
     ``object.__setattr__`` because the instances are frozen.
 
     Args:
@@ -132,8 +141,12 @@ def _derive_typed_event(
         payload: The type-specific payload assembled by the subclass.
         schema_version: The payload schema version to stamp; defaults to the
             module-wide :data:`_SCHEMA_VERSION`. Only an event whose payload
-            shape has diverged from its v1 form (``ForecastCreated``, #188)
-            supplies an override.
+            shape has diverged from its v1 form supplies an override. Three do:
+            ``ForecastCreated``
+            (:data:`_FORECAST_CREATED_SCHEMA_VERSION`, #188), ``FillAccounted``
+            (:data:`_FILL_ACCOUNTED_SCHEMA_VERSION`, #390) and ``AlertEmitted``
+            (:data:`_ALERT_EMITTED_SCHEMA_VERSION`, #413). Each override
+            constant carries the reason its shape diverged.
     """
     object.__setattr__(event, "event_type", type(event).__name__)
     object.__setattr__(event, "payload_schema_version", schema_version)
@@ -187,15 +200,36 @@ class ModeHeartbeat(Event):
 
 @dataclass(frozen=True)
 class AlertEmitted(Event):
-    """Records that a component emitted an operational alert.
+    """Records that a component emitted an operational alert, and its delivery.
+
+    Emission is not delivery (issue #413). A row carrying only the severity and
+    body proves the alert fired; it looks identical whether every sink accepted
+    it or every sink failed, so an audit cannot establish that anyone was told.
+    ``deliveries`` closes that gap.
+
+    Everything in ``deliveries`` must come from a vocabulary the *code*
+    controls: :func:`windbreak.alerts.dispatch.ledger_deliveries` is the
+    intended producer, and it emits only a screened sink identity, an
+    enumerated outcome, and a fallback flag. Never pass sink-supplied text --
+    an exception message, a URL, a header -- through here: this payload is
+    hashed into an append-only chain and can never be redacted (issue #274).
 
     Attributes:
         severity: The alert's severity label.
         message: Human-readable description of the alert.
+        deliveries: One closed ``{sink, outcome, fallback}`` mapping per
+            attempted sink, in attempt order. Empty means the emitting
+            component reported no delivery evidence, never that the alert was
+            delivered.
+        delivery_reported: Whether the emitting component had any delivery
+            evidence to record. False with an empty ``deliveries`` is the
+            fail-closed "unknown" state; it must never read as healthy.
     """
 
     severity: str
     message: str
+    deliveries: list[dict[str, object]] = field(default_factory=list)
+    delivery_reported: bool = False
     event_type: str = field(init=False)
     payload_schema_version: int = field(init=False)
     payload: dict[str, object] = field(init=False)
@@ -205,8 +239,10 @@ class AlertEmitted(Event):
         payload: dict[str, object] = {
             "severity": self.severity,
             "message": self.message,
+            "deliveries": self.deliveries,
+            "delivery_reported": self.delivery_reported,
         }
-        _derive_typed_event(self, payload)
+        _derive_typed_event(self, payload, schema_version=_ALERT_EMITTED_SCHEMA_VERSION)
 
 
 @dataclass(frozen=True)

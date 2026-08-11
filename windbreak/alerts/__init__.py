@@ -29,13 +29,17 @@ One dependency-injection seam is still wired by a successor issue: the ledger
 :class:`AlertEmitted` in place of :class:`LoggingLedgerWriter`.
 """
 
+from windbreak.alerts.delivery import DeliveryOutcome
 from windbreak.alerts.dispatch import (
+    AlertDeliveryReport,
     AlertDispatcher,
     AlertEmitted,
     LedgerWriter,
     LoggingLedgerWriter,
+    SinkDelivery,
     SinkOutcome,
     dispatch_hook,
+    ledger_deliveries,
 )
 from windbreak.alerts.registry import (
     ALERT_REGISTRY,
@@ -59,17 +63,20 @@ from windbreak.alerts.sinks import (
 
 __all__ = [
     "ALERT_REGISTRY",
+    "AlertDeliveryReport",
     "AlertDispatcher",
     "AlertEmitted",
     "AlertRegistration",
     "AlertSeverity",
     "AlertType",
+    "DeliveryOutcome",
     "DesktopSink",
     "LedgerWriter",
     "LogOnlySink",
     "LoggingLedgerWriter",
     "NtfySink",
     "NtfySinkConfig",
+    "SinkDelivery",
     "SinkOutcome",
     "SinkSendError",
     "SmtpSink",
@@ -79,4 +86,5 @@ __all__ = [
     "cli_token",
     "dispatch_hook",
     "get_registration",
+    "ledger_deliveries",
 ]
