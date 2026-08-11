@@ -35,6 +35,7 @@ import dataclasses
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -96,6 +97,12 @@ _AGE_STEP_NS = 1_000_000_000
 #: An arbitrary, fixed base modification time (nanoseconds since the epoch).
 #: Fixed rather than "now" so the corpus is byte-identical between runs.
 _BASE_MTIME_NS = 1_700_000_000_000_000_000
+
+#: The repository root, three levels up from `tests/forecast/<this file>`.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Bytes in one mebibyte, for checking the runbook's unit gloss.
+_BYTES_PER_MIB = 1024 * 1024
 
 
 def _entry_name(seed: str) -> str:
@@ -560,6 +567,24 @@ def test_the_shipped_cap_default_is_a_positive_integer() -> None:
     assert WindbreakConfig().forecast.research.cache_max_bytes == (
         DEFAULT_RESEARCH_CACHE_MAX_BYTES
     )
+
+
+def test_the_runbook_documents_the_shipped_cap_default_exactly() -> None:
+    """docs/RUNBOOK.md's stated default is the code's default, in both units.
+
+    An operator sizes the `ledger` volume from the runbook, not from the
+    source. A default that drifted from its documentation would have them
+    provision against a number the loop does not use, so the byte figure and
+    its MiB gloss are both derived from the file rather than restated here.
+    """
+    runbook = _REPO_ROOT.joinpath("docs", "RUNBOOK.md").read_text(encoding="utf-8")
+
+    matches = re.findall(r"defaulting to `(\d+)`\s+\((\d+) MiB\)", runbook)
+
+    assert len(matches) == 1
+    documented_bytes, documented_mib = matches[0]
+    assert int(documented_bytes) == DEFAULT_RESEARCH_CACHE_MAX_BYTES
+    assert int(documented_mib) * _BYTES_PER_MIB == DEFAULT_RESEARCH_CACHE_MAX_BYTES
 
 
 @pytest.mark.parametrize("bad_cap", [0, -1])
