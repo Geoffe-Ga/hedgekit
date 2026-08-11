@@ -227,8 +227,12 @@ def _https_post(url: str, body: bytes, headers: Mapping[str, str]) -> int:
         The HTTP response status code (always 2xx on return).
 
     Raises:
-        SinkSendError: If ``url`` is not ``https://`` or the response is
-            not a 2xx status.
+        SinkSendError: If ``url`` is not ``https://`` (recorded as the
+            fail-closed :attr:`DeliveryOutcome.ERRORED`, because nothing was
+            ever dialled) or the response is not a 2xx status (recorded as
+            :attr:`DeliveryOutcome.REFUSED` -- the destination answered and
+            declined, which is a different operational fact from an
+            unrecognized failure and is what an operator reads off the ledger).
     """
     parts = urlsplit(url)
     if parts.scheme != "https":
@@ -243,7 +247,10 @@ def _https_post(url: str, body: bytes, headers: Mapping[str, str]) -> int:
     finally:
         connection.close()
     if not _HTTP_OK_MIN <= status < _HTTP_OK_EXCLUSIVE_MAX:
-        raise SinkSendError(f"HTTPS POST to {url!r} returned status {status}")
+        raise SinkSendError(
+            f"HTTPS POST to {url!r} returned status {status}",
+            outcome=DeliveryOutcome.REFUSED,
+        )
     return status
 
 
@@ -287,12 +294,21 @@ def _send_http(
     Raises:
         SinkSendError: If the transport raises or returns a non-2xx status,
             carrying the closed :class:`DeliveryOutcome` the failure is
-            recorded as -- ``REFUSED`` when the destination answered and
-            declined, otherwise whatever the raised exception's *type*
-            classifies to.
+            recorded as. A transport that raises :class:`SinkSendError` has
+            already chosen that outcome for itself and propagates *unchanged* --
+            re-classifying it here would discard the choice and flatten the
+            shipped transport's ``REFUSED`` for a declining destination
+            (:func:`_https_post`) back to ``ERRORED``. Anything else a transport
+            raises is classified by exception *type*; a transport that instead
+            *returns* a non-2xx status (permitted by the
+            :data:`HttpTransport` signature, though :func:`_https_post` raises
+            rather than returning one) is recorded ``REFUSED`` on the same
+            reasoning.
     """
     try:
         status = transport(url, body, headers)
+    except SinkSendError:
+        raise
     except Exception as exc:
         raise SinkSendError(str(exc), outcome=classify_transport_failure(exc)) from exc
     if not _HTTP_OK_MIN <= status < _HTTP_OK_EXCLUSIVE_MAX:

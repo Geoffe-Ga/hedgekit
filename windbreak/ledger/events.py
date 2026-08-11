@@ -132,8 +132,8 @@ def _derive_typed_event(
     """Populate the derived ``Event`` fields on a frozen typed subclass.
 
     Sets ``event_type`` to the concrete class name, ``payload_schema_version``
-    to ``schema_version`` (the module-wide default for every event but the one
-    that overrides it), and ``payload`` to the assembled dict, using
+    to ``schema_version`` (the module-wide default for every event but the few
+    that override it), and ``payload`` to the assembled dict, using
     ``object.__setattr__`` because the instances are frozen.
 
     Args:
@@ -141,8 +141,12 @@ def _derive_typed_event(
         payload: The type-specific payload assembled by the subclass.
         schema_version: The payload schema version to stamp; defaults to the
             module-wide :data:`_SCHEMA_VERSION`. Only an event whose payload
-            shape has diverged from its v1 form (``ForecastCreated``, #188)
-            supplies an override.
+            shape has diverged from its v1 form supplies an override. Three do:
+            ``ForecastCreated``
+            (:data:`_FORECAST_CREATED_SCHEMA_VERSION`, #188), ``FillAccounted``
+            (:data:`_FILL_ACCOUNTED_SCHEMA_VERSION`, #390) and ``AlertEmitted``
+            (:data:`_ALERT_EMITTED_SCHEMA_VERSION`, #413). Each override
+            constant carries the reason its shape diverged.
     """
     object.__setattr__(event, "event_type", type(event).__name__)
     object.__setattr__(event, "payload_schema_version", schema_version)

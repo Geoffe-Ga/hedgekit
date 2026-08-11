@@ -78,6 +78,10 @@ _CLOSED_ALERT_PAYLOAD_KEYS = frozenset(
     {"severity", "message", "deliveries", "delivery_reported"}
 )
 
+#: The two keys issue #413 added. Everything outside them is what a pre-#413
+#: row already held, and is what made the failed and delivered rows identical.
+_DELIVERY_KEYS = frozenset({"deliveries", "delivery_reported"})
+
 
 def _webhook(*, failing: bool) -> WebhookSink:
     """Build a real `WebhookSink` over a token-bearing URL and a fake transport.
@@ -209,9 +213,10 @@ def test_a_total_delivery_failure_is_distinguishable_from_a_delivered_page() -> 
     """All-sinks-failed and all-sinks-succeeded ledger *different* rows.
 
     Acceptance criterion 3, and the whole point of issue #413: before it, both
-    cases produced a byte-identical `AlertEmitted` row. The two payloads are
-    pinned exactly *and* asserted unequal, so a change that collapsed them back
-    together fails here rather than passing on a coincidence.
+    cases produced a byte-identical `AlertEmitted` row. Both payloads are pinned
+    exactly, and the *rest* of each row is then asserted still identical -- so
+    the distinction is pinned to the two keys #413 added rather than leaking out
+    of some other field that happened to differ.
     """
     failed_writer = InMemoryKernelLedgerWriter()
     delivered_writer = InMemoryKernelLedgerWriter()
@@ -228,7 +233,17 @@ def test_a_total_delivery_failure_is_distinguishable_from_a_delivered_page() -> 
     assert delivered["deliveries"] == [
         {"sink": "webhook", "outcome": "delivered", "fallback": False}
     ]
-    assert failed != delivered
+    # `failed != delivered` would be implied by the two exact pins above and so
+    # could never fail. What is *not* implied: that every field outside the two
+    # keys #413 added is still identical between the two rows -- which is both
+    # the reason the pre-#413 rows were indistinguishable and the guarantee that
+    # the new distinction is carried by the delivery evidence and nothing else.
+    # Guarded first against a payload reduced to the delivery keys alone, which
+    # would otherwise compare two empty mappings and pass vacuously.
+    assert set(failed) - _DELIVERY_KEYS
+    assert {key: failed[key] for key in set(failed) - _DELIVERY_KEYS} == {
+        key: delivered[key] for key in set(delivered) - _DELIVERY_KEYS
+    }
 
 
 def test_a_dispatcher_that_reports_nothing_ledgers_absence_not_delivery() -> None:
@@ -302,6 +317,35 @@ def test_no_substring_of_a_token_bearing_sink_url_reaches_the_kill_chain(
         assert secret.encode("utf-8") not in blob
 
 
+class _KillFileWatchingWriter:
+    """Records, per appended event, whether the `KILL` file existed *yet*.
+
+    The event list alone cannot see the ordering this pins: moving the audit
+    append above `_write_kill_file()` leaves `AlertEmitted` last in the list all
+    the same, and the file exists by the time the test looks either way. Sampling
+    the filesystem *at append time* is what makes the ordering observable.
+    """
+
+    def __init__(self, state_dir: Path) -> None:
+        """Initialize with an empty log and the directory the `KILL` file lands in.
+
+        Args:
+            state_dir: The kill switch's state directory.
+        """
+        self._kill_file = state_dir / "KILL"
+        self.events: list[Event] = []
+        self.kill_file_seen: dict[str, bool] = {}
+
+    def record(self, event: Event) -> None:
+        """Retain `event` alongside whether the `KILL` file was on disk yet.
+
+        Args:
+            event: The kernel event to persist.
+        """
+        self.kill_file_seen[event.event_type] = self._kill_file.exists()
+        self.events.append(event)
+
+
 def test_the_delivery_bearing_row_is_still_the_kill_paths_last_write(
     tmp_path: Path,
 ) -> None:
@@ -310,8 +354,13 @@ def test_the_delivery_bearing_row_is_still_the_kill_paths_last_write(
     A failing append must never be able to skip the halt, the cancel-all, the
     release, the page or the on-disk `KILL` file, so the row carrying delivery
     evidence is written last -- exactly where the emission-only row was.
+
+    The `KILL`-file half of that claim is asserted at append time rather than
+    after the fact: `kill_file_seen` is False when `KillEngaged` is written and
+    True when `AlertEmitted` is, which is false for any reordering that hoists
+    the audit append above the kill file.
     """
-    writer = InMemoryKernelLedgerWriter()
+    writer = _KillFileWatchingWriter(tmp_path)
     machine = ModeStateMachine(mode_ceiling=Mode.LIVE, mode=Mode.LIVE)
     switch = KillSwitch(
         machine,
@@ -328,6 +377,11 @@ def test_the_delivery_bearing_row_is_still_the_kill_paths_last_write(
         "CancelAllDirective",
         "AlertEmitted",
     ]
+    assert writer.kill_file_seen == {
+        "KillEngaged": False,
+        "CancelAllDirective": False,
+        "AlertEmitted": True,
+    }
     assert machine.mode is Mode.KILLED
     assert (tmp_path / "KILL").exists()
 

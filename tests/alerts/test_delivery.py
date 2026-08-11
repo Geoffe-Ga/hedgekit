@@ -20,6 +20,7 @@ so this module fails at collection with ``ModuleNotFoundError``.
 from __future__ import annotations
 
 import dataclasses
+import http.client
 
 import pytest
 
@@ -57,6 +58,63 @@ _TOKEN_URL = f"https://{_WEBHOOK_HOST}/services/s3cr3t-token?key=abc123"
 #: Spelled once so the `dataclasses.fields` guard below reads as a field check
 #: rather than as a second construction.
 _DELIVERED = DeliveryOutcome.DELIVERED
+
+#: The status a reachable-but-declining destination answers with: a pager that
+#: is up and rate-limited, not an unreachable one.
+_DECLINED_STATUS = 503
+
+
+class _DeclinedHTTPSResponse:
+    """A response that carries the declined status and nothing else.
+
+    Attributes:
+        status: The HTTP status code `_https_post` reads off the response.
+    """
+
+    status = _DECLINED_STATUS
+
+
+class _DecliningHTTPSConnection:
+    """A `http.client.HTTPSConnection` stand-in that answers 503.
+
+    Substituted one layer *below* the shipped `_https_post` so that transport --
+    the one a configured `WebhookSink` dials by default -- is the code actually
+    under test, with no socket opened.
+    """
+
+    def __init__(self, host: str, *, timeout: float, context: object) -> None:
+        """Accept the connection arguments `_https_post` supplies and keep none.
+
+        Args:
+            host: The destination netloc (unused).
+            timeout: The transport timeout (unused).
+            context: The TLS context (unused).
+        """
+        del host, timeout, context
+
+    def request(
+        self, method: str, path: str, body: bytes, headers: dict[str, str]
+    ) -> None:
+        """Accept the request without sending it.
+
+        Args:
+            method: The HTTP method (unused).
+            path: The request path (unused).
+            body: The request body (unused).
+            headers: The request headers (unused).
+        """
+        del method, path, body, headers
+
+    def getresponse(self) -> _DeclinedHTTPSResponse:
+        """Return the declining response.
+
+        Returns:
+            A response whose ``status`` is the declined status code.
+        """
+        return _DeclinedHTTPSResponse()
+
+    def close(self) -> None:
+        """Close the connection: a no-op, for parity with the real class."""
 
 
 class _RaisingSink:
@@ -260,12 +318,48 @@ def test_sink_outcome_ok_is_derived_from_its_closed_outcome() -> None:
     }
 
 
-def test_a_non_2xx_webhook_response_is_recorded_as_refused() -> None:
-    """A destination that answers and declines classifies REFUSED, not ERRORED.
+def test_the_shipped_transport_records_a_declining_destination_as_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 503 from the *shipped* transport reaches the projection as REFUSED.
 
-    This is the one path that makes REFUSED reachable from a real sink, so the
-    four-member vocabulary is four *live* members rather than three plus a
-    decorative one.
+    The sink is built with **no** ``transport`` argument, so the code under test
+    is the default `_https_post` every configured webhook actually dials with;
+    only `http.client.HTTPSConnection` is replaced, one layer below it. That
+    makes this the path that puts REFUSED in production: the four-member
+    vocabulary is four *live* members rather than three plus a decorative one.
+
+    Recording it apart from ERRORED is the operator-facing point. A pager that
+    answers 503 is up and declining -- retry it, check its quota -- while ERRORED
+    is an unrecognized failure. Before this, both read ``errored``.
+
+    Args:
+        monkeypatch: Replaces `http.client.HTTPSConnection` so no socket opens.
+    """
+    monkeypatch.setattr(http.client, "HTTPSConnection", _DecliningHTTPSConnection)
+    sink = WebhookSink(
+        WebhookSinkConfig(url=f"https://{_WEBHOOK_HOST}/incoming"),
+        allowlist=OutboundAllowlist(frozenset({_WEBHOOK_HOST})),
+    )
+    dispatcher = AlertDispatcher([sink], ledger_writer=LoggingLedgerWriter())
+
+    event = dispatcher.dispatch(AlertType.HALT_KILL, "halted")
+
+    assert event.deliveries[0] == SinkDelivery(
+        sink=WebhookSink.name, outcome=DeliveryOutcome.REFUSED, fallback=False
+    )
+    assert event.outcomes[0].outcome is DeliveryOutcome.REFUSED
+
+
+def test_a_transport_that_returns_a_non_2xx_status_is_recorded_as_refused() -> None:
+    """The `HttpTransport` *contract* guard, on a shape production never emits.
+
+    `HttpTransport` is declared ``(url, body, headers) -> status_code``, so a
+    transport is permitted to hand back a non-2xx code instead of raising. The
+    shipped `_https_post` never does -- it raises, and its REFUSED is pinned by
+    the test above -- so this covers `_send_http`'s return-value guard for an
+    injected transport only. It is a contract test, not evidence about shipped
+    behaviour.
     """
     sink = WebhookSink(
         WebhookSinkConfig(url=f"https://{_WEBHOOK_HOST}/incoming"),

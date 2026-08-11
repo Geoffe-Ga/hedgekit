@@ -1296,9 +1296,12 @@ def test_a_supervised_failure_is_appended_to_the_hash_chained_ledger(
             "message": "beat seq=1 failed: RuntimeError: database or disk is full",
             # Issue #413 bumped `AlertEmitted` to schema 2 so an audit can tell
             # a delivered alert from a merely emitted one. `LedgerAlertWriter`
-            # (windbreak/main.py) does not yet forward the dispatch's delivery
-            # report, so its rows say so explicitly: unreported, never
-            # delivered. Absent evidence reads as absent, which is the point.
+            # (windbreak/main.py) does not forward the dispatch's delivery
+            # report, so its rows carry none. This is pinned as the *current*
+            # shape, not endorsed: the writer is handed the report and drops
+            # it, so an unqualified `delivery_reported: false` is a claim the
+            # dispatch contradicts. Issue #488 fixes it; `main.py` was outside
+            # this change's owned paths.
             "deliveries": [],
             "delivery_reported": False,
         }
@@ -1375,9 +1378,12 @@ def test_the_composed_supervisor_ledgers_to_the_configured_ledger_path(
             "message": "beat seq=1 failed: RuntimeError: database or disk is full",
             # Issue #413 bumped `AlertEmitted` to schema 2 so an audit can tell
             # a delivered alert from a merely emitted one. `LedgerAlertWriter`
-            # (windbreak/main.py) does not yet forward the dispatch's delivery
-            # report, so its rows say so explicitly: unreported, never
-            # delivered. Absent evidence reads as absent, which is the point.
+            # (windbreak/main.py) does not forward the dispatch's delivery
+            # report, so its rows carry none. This is pinned as the *current*
+            # shape, not endorsed: the writer is handed the report and drops
+            # it, so an unqualified `delivery_reported: false` is a claim the
+            # dispatch contradicts. Issue #488 fixes it; `main.py` was outside
+            # this change's owned paths.
             "deliveries": [],
             "delivery_reported": False,
         }
