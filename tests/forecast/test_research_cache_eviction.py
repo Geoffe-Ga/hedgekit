@@ -218,19 +218,28 @@ def test_eviction_holds_the_byte_cap_not_an_entry_count(tmp_path: Path) -> None:
     assert _entry_bytes(root) == _SIZES["delta"]
 
 
-def test_a_total_exactly_at_the_cap_is_not_evicted(tmp_path: Path) -> None:
-    """The cap is inclusive: a total equal to it is within bounds.
+def test_a_total_exactly_at_the_cap_is_not_evicted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cap is inclusive: a total equal to it is within bounds, and silent.
 
-    Pins the threshold comparison against an off-by-one: an implementation
-    evicting on ``total >= cap`` would remove the oldest entry here.
+    Pins the threshold comparison against an off-by-one in either of the two
+    places it appears: an implementation evicting on ``total >= cap`` would
+    remove the oldest entry here, and one *reporting* on ``total >= cap``
+    would cry "cap unhonourable" at a cache that is exactly within its cap --
+    a false alarm on every beat of a steady-state run. Nothing at all is
+    logged when nothing happens, so a report that fires unconditionally is
+    caught too.
     """
     root = tmp_path / "research-cache"
     _write_corpus(root)
     cache = ResearchCache(root=root, max_bytes=_CORPUS_BYTES)
+    caplog.set_level(logging.INFO, logger="windbreak.forecast.sandbox")
 
     cache.store(_entry_name("trigger"), "")
 
     assert _surviving_seeds(root) == set(_SIZES)
+    assert [record.getMessage() for record in caplog.records] == []
 
 
 def test_a_total_one_byte_over_the_cap_evicts_exactly_the_oldest(
@@ -296,11 +305,16 @@ def test_eviction_never_removes_the_entry_just_written(tmp_path: Path) -> None:
 def test_an_unhonourable_cap_is_announced_rather_than_silently_broken(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A cap smaller than one entry logs exactly one warning naming the overshoot."""
+    """A cap smaller than one entry logs exactly one warning naming the overshoot.
+
+    Captured from ``INFO`` up, so the assertion also pins that *no* eviction
+    was reported: nothing was removable, and a sweep that announced an empty
+    eviction would be claiming work it did not do.
+    """
     root = tmp_path / "research-cache"
     root.mkdir()
     cache = ResearchCache(root=root, max_bytes=500)
-    caplog.set_level(logging.WARNING, logger="windbreak.forecast.sandbox")
+    caplog.set_level(logging.INFO, logger="windbreak.forecast.sandbox")
 
     cache.store(_entry_name("oversized"), "w" * 900)
 
