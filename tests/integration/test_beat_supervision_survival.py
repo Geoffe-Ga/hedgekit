@@ -33,6 +33,7 @@ import dataclasses
 import json
 import logging
 import sqlite3
+from datetime import date
 from typing import TYPE_CHECKING
 
 from tests.integration.conftest import FIXED_NOW_EPOCH_S, ledger_path_for
@@ -47,6 +48,7 @@ from windbreak.main import (
     _build_paper_on_beat,
     run_loop,
 )
+from windbreak.reports import maybe_write_weekly
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -63,6 +65,12 @@ if TYPE_CHECKING:
 #: appends it after the tick's `ModeHeartbeat`, so the tick is genuinely partway
 #: through when the disk gives out -- the shape of issue #443's traceback.
 _FULL_AT_EVENT_TYPE = "EquitySampled"
+
+#: The `today` the report-fault expectation is derived with. Fixed and
+#: arbitrary: it shapes only the dated report filename, and the unified
+#: report-directory diagnosis (#551) names the directory, never the file -- so
+#: no ISO week, timezone or clock reaches the expectation.
+_A_REPORT_DATE = date(2026, 1, 7)
 
 
 @dataclasses.dataclass
@@ -298,6 +306,131 @@ def test_a_full_volume_mid_tick_leaves_the_loop_beating_and_says_so(
     status = _build_dashboard_status_source(tick_ledger_path)()
     assert status.mode == "TICK_FAILED"
     assert status.mode != "PAPER"
+
+
+def _report_write_failure_text(report_dir: Path) -> str:
+    """Return the `Type: message` a real report write raises against `report_dir`.
+
+    Derived by making the call the tick makes -- `maybe_write_weekly`, on the
+    same path -- and rendering it the way `BeatSupervisor.observe` renders a
+    raising beat, so a platform whose wording differs moves the expectation
+    with the behaviour. `OSError` is caught rather than the specific type, so
+    this derives what the call *does* rather than presupposing it; the test
+    asserts the type separately.
+
+    `today` is fixed and arbitrary: it shapes only the dated report filename,
+    which the report-directory diagnosis deliberately does not name.
+
+    Args:
+        report_dir: The report directory, currently a regular file.
+
+    Returns:
+        The exception's type name and message, as the supervisor renders them.
+
+    Raises:
+        AssertionError: If the call succeeded, meaning the fault under test was
+            never in place and every assertion resting on it proves nothing.
+    """
+    try:
+        maybe_write_weekly(report_dir, today=_A_REPORT_DATE)
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    message = f"{report_dir} is a usable directory, so no fault was induced"
+    raise AssertionError(message)
+
+
+def test_a_report_volume_that_is_a_file_leaves_the_loop_beating_and_says_so(
+    books_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    research_tools_factory: Callable[[], object],
+    tmp_path: Path,
+) -> None:
+    """A real tick whose report volume came back as a file is still survivable.
+
+    The in-process counterpart of
+    `tests/e2e/test_unattended_run.py::\
+test_an_induced_report_volume_fault_is_survived_and_stays_loud`, and the guard
+    that issue #551's unified diagnosis did not cost the #443/#444/#447
+    behaviour it is carried by. Nothing is stubbed: the fault is induced from
+    the filesystem, by replacing the report directory with a regular file after
+    the dependency bundle is built, exactly as a bad bind mount presents.
+
+    The escalation is asserted end to end and none of it by scraping a log for
+    a substring: the alert message is *derived* by making the same call on the
+    same path, the heartbeat lines stop claiming PAPER, the ledger carries the
+    supervisor's row after the healthy row the tick had already stamped (#447's
+    ordering), and beat 2 still runs, which is the survival #443 asks for.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        caplog: The pytest log capture fixture.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used to hand the hook the real dependency bundle.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory, faulted below.
+        research_tools_factory: Builds the offline research tools.
+        tmp_path: The per-test scratch directory.
+    """
+    caplog.set_level(logging.INFO)
+    from windbreak.scheduler import loop as loop_module
+
+    tick_ledger_path = ledger_path_for(tmp_path, "tick.db")
+    alert_ledger_path = ledger_path_for(tmp_path, "alerts.db")
+    deps = loop_module.build_paper_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=tick_ledger_path,
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools=research_tools_factory(),
+        clock=_fixed_clock,
+    )
+    monkeypatch.setattr(loop_module, "build_paper_deps", lambda **_kwargs: deps)
+    supervisor = BeatSupervisor(
+        component="pipeline",
+        dispatcher=AlertDispatcher(
+            sinks=[],
+            ledger_writer=LedgerAlertWriter(alert_ledger_path, component="pipeline"),
+        ),
+        mode_writer=LedgerModeWriter(tick_ledger_path, component="pipeline"),
+    )
+    report_dir.write_text("", encoding="utf-8")
+
+    run_loop(
+        0,
+        max_beats=2,
+        on_beat=_build_paper_on_beat(
+            _paper_args(tmp_path, tick_ledger_path),
+            paper_config,
+            dispatcher=_log_only_dispatcher(),
+        ),
+        supervisor=supervisor,
+    )
+
+    raised = _report_write_failure_text(report_dir)
+    assert raised.startswith("WeeklyReportDirectoryError: ")
+    assert str(report_dir) in raised
+    assert _alert_messages(alert_ledger_path) == [f"beat seq=1 failed: {raised}"]
+    assert [
+        record.message
+        for record in caplog.records
+        if "heartbeat seq=" in record.message
+    ] == [
+        "mode=TICK_FAILED heartbeat seq=1",
+        "mode=TICK_FAILED heartbeat seq=2",
+    ]
+    assert _ledgered_modes(tick_ledger_path) == [
+        "PAPER",
+        "TICK_FAILED",
+        "PAPER",
+        "TICK_FAILED",
+    ]
+    deps.store.verify_chain()
+    deps.store.close()
 
 
 def test_the_same_tick_without_a_full_volume_reports_its_real_mode(
