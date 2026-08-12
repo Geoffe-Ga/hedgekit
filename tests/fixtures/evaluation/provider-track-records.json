@@ -1,0 +1,10 @@
+{
+  "anthropic": {
+    "resolved_count": 200,
+    "brier_skill_ppm": 50000
+  },
+  "openai": {
+    "resolved_count": 200,
+    "brier_skill_ppm": 50000
+  }
+}

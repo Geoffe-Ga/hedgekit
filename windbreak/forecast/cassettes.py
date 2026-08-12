@@ -277,6 +277,61 @@ def _recorded_usage(entry: dict[str, object], key: str) -> TokenUsage | None:
     return TokenUsage(input_tokens=counts[0], output_tokens=counts[1])
 
 
+def load_recorded_completions(path: Path) -> dict[str, Completion]:
+    """Load a recorded-completion document into a key -> completion mapping.
+
+    The shared reader behind every recorded transport in this package. It is
+    deliberately agnostic about what the top-level keys *mean*:
+    :class:`ReplayCassette` keys entries by
+    :meth:`LlmRequest.request_hash`, while
+    :func:`windbreak.forecast.corpus.load_replay_corpus` keys them by
+    ``provider:model_version`` -- a distinction issue #510 forced, because a
+    prompt hash digests the market's close time and so cannot be committed.
+    What both need is identical: the float rejection, the ``response`` leaf, and
+    the optional ``usage`` block, read once here rather than twice.
+
+    Args:
+        path: The recorded document to load.
+
+    Returns:
+        Each key paired with its recorded completion.
+
+    Raises:
+        ValueError: If the document contains a float leaf, an entry is not an
+            object, an entry has no string ``response``, or an entry carries a
+            malformed ``usage`` block.
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"), parse_float=_reject_float)
+    if not isinstance(raw, dict):
+        msg = f"recorded completions at {path} are not a JSON object"
+        raise ValueError(msg)
+    return {key: _completion_from_entry(entry, key) for key, entry in raw.items()}
+
+
+def _completion_from_entry(entry: object, key: str) -> Completion:
+    """Read one recorded entry's response text and token usage.
+
+    Args:
+        entry: The parsed entry.
+        key: The entry's key, named in any error.
+
+    Returns:
+        The recorded completion.
+
+    Raises:
+        ValueError: If the entry is not an object, or carries no string
+            ``response``.
+    """
+    if not isinstance(entry, dict):
+        msg = f"recorded entry {key!r} is not an object"
+        raise ValueError(msg)
+    text = entry.get(_RESPONSE_KEY)
+    if not isinstance(text, str):
+        msg = f"recorded entry {key!r} has no string {_RESPONSE_KEY!r} leaf"
+        raise ValueError(msg)
+    return Completion(text=text, usage=_recorded_usage(entry, key))
+
+
 class ReplayCassette:
     """An :class:`LlmTransport` that serves recorded responses, fail-closed."""
 
@@ -307,14 +362,7 @@ class ReplayCassette:
             ValueError: If the cassette contains a float leaf, or an entry
                 carries a malformed ``usage`` block.
         """
-        raw = json.loads(path.read_text(encoding="utf-8"), parse_float=_reject_float)
-        entries = {
-            key: Completion(
-                text=entry[_RESPONSE_KEY], usage=_recorded_usage(entry, key)
-            )
-            for key, entry in raw.items()
-        }
-        return cls(entries)
+        return cls(load_recorded_completions(path))
 
     def complete(self, request: LlmRequest) -> Completion:
         """Return the recorded completion for ``request`` or fail closed.

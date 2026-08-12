@@ -113,7 +113,6 @@ import shutil
 import signal
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -127,6 +126,7 @@ from tests.e2e.harness import (
     verify_ledger_chain,
     wait_until,
 )
+from tests.paper_books import set_close_time
 from windbreak.main import PROCESS_CHOICES
 
 if TYPE_CHECKING:
@@ -291,11 +291,7 @@ def _tradeable_books(destination: Path) -> Path:
         The path to the repaired copy.
     """
     shutil.copytree(SHIPPED_BOOKS, destination)
-    closes_at = datetime.now(UTC) + timedelta(days=IN_WINDOW_HORIZON_DAYS)
-    markets_path = destination / "markets.json"
-    markets = json.loads(markets_path.read_text(encoding="utf-8"))
-    markets[0]["close_time"] = closes_at.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-    markets_path.write_text(json.dumps(markets, indent=2), encoding="utf-8")
+    set_close_time(destination, days_after_recording=IN_WINDOW_HORIZON_DAYS)
     sessions_path = destination / "sessions.json"
     sessions = json.loads(sessions_path.read_text(encoding="utf-8"))
     for steps in sessions.values():

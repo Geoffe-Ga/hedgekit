@@ -11,11 +11,11 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from tests.paper_books import set_close_time
 from windbreak.ledger.store import SqliteLedgerStore
 from windbreak.main import build_parser, main
 
@@ -565,11 +565,7 @@ def _paper_books(tmp_path: Path) -> Path:
     """
     books = tmp_path / "books"
     shutil.copytree(_SHIPPED_BOOKS, books)
-    closes_at = datetime.now(UTC) + timedelta(days=_IN_WINDOW_HORIZON_DAYS)
-    markets_path = books / "markets.json"
-    markets = json.loads(markets_path.read_text(encoding="utf-8"))
-    markets[0]["close_time"] = closes_at.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-    markets_path.write_text(json.dumps(markets, indent=2), encoding="utf-8")
+    set_close_time(books, days_after_recording=_IN_WINDOW_HORIZON_DAYS)
     sessions_path = books / "sessions.json"
     sessions = json.loads(sessions_path.read_text(encoding="utf-8"))
     for steps in sessions.values():
