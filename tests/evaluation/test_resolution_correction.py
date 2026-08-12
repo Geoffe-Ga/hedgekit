@@ -188,8 +188,13 @@ def _ledger(tmp_path: Path, *events: Event) -> list[LedgerRecord]:
         store.close()
 
 
-def _correction_record(*, sequence_number: int, dropped: str) -> LedgerRecord:
-    """Build a persisted correction row with one payload key removed.
+def _correction_record(
+    *,
+    sequence_number: int,
+    dropped: str | None = None,
+    target: object = 1,
+) -> LedgerRecord:
+    """Build a persisted correction row with one payload key removed or altered.
 
     A malformed row can only reach a live ledger from outside this verb, so it
     is constructed here directly rather than appended -- the event constructor
@@ -197,19 +202,21 @@ def _correction_record(*, sequence_number: int, dropped: str) -> LedgerRecord:
 
     Args:
         sequence_number: The row's ledger position, named in the error.
-        dropped: The payload key to omit.
+        dropped: The payload key to omit, or ``None`` to omit nothing.
+        target: The raw ``superseded_sequence_number`` value to write.
 
     Returns:
         The malformed :class:`LedgerRecord`.
     """
-    data = {
+    data: dict[str, object] = {
         "market_ticker": _TICKER,
-        "superseded_sequence_number": 1,
+        "superseded_sequence_number": target,
         "outcome": "yes",
         "resolved_at": "2026-03-02T09:30:00.000000Z",
         "source": "corrected",
     }
-    del data[dropped]
+    if dropped is not None:
+        del data[dropped]
     return LedgerRecord(
         sequence_number=sequence_number,
         event_type=SETTLEMENT_REVERSED_EVENT_TYPE,
@@ -660,6 +667,30 @@ def test_a_correction_payload_missing_a_key_names_it_and_the_row(dropped: str) -
 
     assert str(exc_info.value) == (
         f"SettlementReversed payload at sequence_number=4 is missing {dropped!r}"
+    )
+
+
+@pytest.mark.parametrize("target", [True, "1", 1.5, None])
+def test_a_correction_payload_naming_a_non_integer_row_is_refused(
+    target: object,
+) -> None:
+    """A persisted target that is not an integer position cannot supersede anything.
+
+    `True` is included on purpose: it is an `int` subclass, so a guard that
+    only checked `isinstance(target, int)` would silently read it as row 1 and
+    supersede whatever happened to be there.
+
+    Args:
+        target: The raw `superseded_sequence_number` value under test.
+    """
+    record = _correction_record(sequence_number=6, target=target)
+
+    with pytest.raises(ValueError) as exc_info:
+        fold_resolutions([record])
+
+    assert str(exc_info.value) == (
+        "SettlementReversed payload at sequence_number=6 carries a "
+        f"non-integer superseded_sequence_number: {target!r}"
     )
 
 
