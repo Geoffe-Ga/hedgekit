@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-12T02:56:02.297802+00:00",
+  "timestamp": "2026-08-12T03:24:24.348204+00:00",
   "project": "windbreak",
   "thresholds": {
     "coverage": 90,
@@ -13,13 +13,13 @@
     "type_errors": 0
   },
   "metrics": {
-    "coverage": 95.22,
+    "coverage": 95.25,
     "coverage_status": "pass",
-    "branch_coverage": 92.66,
+    "branch_coverage": 92.7,
     "branch_coverage_status": "pass",
     "complexity_avg": 2.1,
     "complexity_status": "pass",
-    "maintainability_avg": 68.03,
+    "maintainability_avg": 67.99,
     "maintainability_status": "pass",
     "docs_coverage": 100.0,
     "docs_status": "pass",
@@ -31,8 +31,8 @@
     "lint_status": "pass",
     "type_errors": 0,
     "typecheck_status": "pass",
-    "tests_total": 6083,
-    "tests_passed": 6082,
+    "tests_total": 6117,
+    "tests_passed": 6116,
     "tests_failed": 0,
     "tests_skipped": 1,
     "tests_status": "pass",
@@ -47,7 +47,7 @@
       "passing_jobs": 0,
       "percentage": 0.0,
       "status": "unknown",
-      "run_url": "https://github.com/Geoffe-Ga/windbreak/actions/runs/31557914148"
+      "run_url": "https://github.com/Geoffe-Ga/windbreak/actions/runs/31559338068"
     }
   }
 }
