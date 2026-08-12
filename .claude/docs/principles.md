@@ -14,7 +14,7 @@ Always invoke tools through `./scripts/*` instead of directly.
 
 | Task | ❌ NEVER | ✅ ALWAYS |
 |------|----------|-----------|
-| Format code | `black .` | `./scripts/format.sh` |
+| Format code | `ruff format .` | `./scripts/format.sh` |
 | Run tests | `pytest` | `./scripts/test.sh` |
 | Type check | `mypy .` | `./scripts/lint.sh` (includes mypy) |
 | Lint code | `ruff check .` | `./scripts/lint.sh` |

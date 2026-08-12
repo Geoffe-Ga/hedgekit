@@ -15,11 +15,9 @@ only tracker.
 
 ## The four gates (this is the whole game)
 1. **Gate 1 — TDD.** Red→Green→Refactor via the **`stay-green`** skill.
-2. **Gate 2 — Local quality.** The relevant `./scripts/<side>/check-all.sh`
-   exits 0 (`scripts/backend/check-all.sh` for backend changes,
-   `scripts/frontend/check-all.sh` for frontend changes — run both if both
-   sides are touched). **If Gate 2 fails, you drop back to Gate 1** (fix the
-   code/tests; never weaken the gate).
+2. **Gate 2 — Local quality.** `./scripts/check-all.sh` exits 0. **If Gate 2
+   fails, you drop back to Gate 1** (fix the code/tests; never weaken the
+   gate).
    - **Gate 2.5 — Pre-push self-review.** Once Gate 2 is green and before you
      push, dispatch the **ralph-code-review-orchestrator** over the diff; fix every
      blocking finding (drop to Gate 1 via the owning specialist) until it returns
@@ -82,12 +80,11 @@ drives Gates 3–4. The taxonomy you dispatch is mapped in
      hand its fixes to ralph-implementation-specialist). Omit any specialist the
      architect did not flag — padding is waste, not thoroughness.
    Meet the non-negotiable thresholds in `CLAUDE.md` (and
-   `shared/house-rules.md`): backend ≥90% line / ≥80% branch (pytest-cov),
-   ≥85% docstring (interrogate), xenon A, radon MI ≥ B, mypy strict, ruff
-   `select = ["ALL"]`; frontend ≥90% jest, ESLint zero-warning, `tsc --noEmit`.
-7. **Gate 2 → Gate 2.5.** Run the relevant `./scripts/<side>/check-all.sh` until
-   exit 0 (`scripts/backend/check-all.sh` and/or `scripts/frontend/check-all.sh`;
-   `./scripts/<side>/fix-all.sh` for autofixable lint/format — never bypass).
+   `shared/house-rules.md`): ≥90% line / ≥80% branch (pytest-cov), a docstring
+   on every public symbol (ruff `D1` — presence per symbol, not a percentage),
+   xenon A, radon MI ≥ B, mypy strict, ruff `select = ["ALL"]`.
+7. **Gate 2 → Gate 2.5.** Run `./scripts/check-all.sh` until exit 0
+   (`./scripts/fix-all.sh` for autofixable lint/format — never bypass).
    Then dispatch **`Agent(ralph-code-review-orchestrator)`** over the diff and fix every
    blocking finding (drop to Gate 1 via the owning specialist) until `CLEAN`.
 8. **Stay scoped.** Implement exactly the issue. Found an unrelated bug?
