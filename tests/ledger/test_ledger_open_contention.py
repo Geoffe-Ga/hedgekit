@@ -447,28 +447,40 @@ def test_a_lock_that_never_frees_fails_closed_and_loudly_on_the_wal_conversion(
 def test_a_failure_that_is_not_contention_reaches_the_caller_unchanged(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """An unopenable ledger is not reported as a lock another process holds.
+    """A ledger that fails to open for another reason keeps its own diagnosis.
 
-    A guard that answers "another process held the write lock" to every
-    ``sqlite3.OperationalError`` would hand the operator a confident wrong
-    diagnosis for a wrong path, a read-only mount, or a full disk -- strictly
-    worse than the bare error it replaced. Only ``SQLITE_BUSY``/``SQLITE_LOCKED``
-    are translated; everything else propagates with its own message and logs no
-    ``FATAL``.
+    A guard that answered "another process held the write lock" to every
+    ``sqlite3.OperationalError`` would hand the operator a confident *wrong*
+    diagnosis for a read-only mount, a full disk, or the database here -- a file
+    that is not the ledger's schema. That is strictly worse than the bare error
+    it replaced, so only ``SQLITE_BUSY``/``SQLITE_LOCKED`` are translated.
+
+    The refusal has to come from **inside** the open sequence to prove anything:
+    a bad path fails in :func:`sqlite3.connect` before the guard is reached, so
+    it would leave the guard untested however confidently it passed. This one is
+    raised by the index statement, the last statement of the open, with no lock
+    held by anyone -- so it travels the whole guarded path and comes out
+    unchanged, with no ``FATAL`` logged.
 
     Args:
         tmp_path: pytest's per-test temporary directory.
         caplog: pytest's log capture, asserted empty.
     """
-    not_a_database_file = tmp_path / "ledger.db"
-    not_a_database_file.mkdir()
+    db_path = tmp_path / "ledger.db"
+    foreign = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        foreign.execute("CREATE TABLE ledger_event_type_sequence (unrelated INTEGER)")
+    finally:
+        foreign.close()
     caplog.set_level(logging.CRITICAL, logger="windbreak.ledger.store")
 
     with pytest.raises(sqlite3.OperationalError) as caught:
-        SqliteLedgerStore(not_a_database_file)
+        SqliteLedgerStore(db_path)
 
     assert type(caught.value) is sqlite3.OperationalError
-    assert str(caught.value) == "unable to open database file"
+    assert (
+        str(caught.value) == "there is already a table named ledger_event_type_sequence"
+    )
     assert caplog.records == []
 
 
