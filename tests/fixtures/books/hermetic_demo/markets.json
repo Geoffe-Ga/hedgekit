@@ -1,0 +1,20 @@
+[
+  {
+    "exchange": "paper-exchange",
+    "ticker": "MKT-DEMO",
+    "event_ticker": "MKT-DEMO-EVT",
+    "title": "Hermetic demonstration market",
+    "resolution_criteria": "Test fixture; resolves YES if the recorded corpus says so.",
+    "category": "test",
+    "close_time": "2025-01-31T00:00:00.000000Z",
+    "expected_resolution_time": null,
+    "market_type": "fully_collateralized_binary",
+    "price_tick_pips": 100,
+    "min_order_contract_centis": 100,
+    "fractional_trading_enabled": false,
+    "mutually_exclusive_group_id": null,
+    "jurisdiction_status": "eligible",
+    "raw_exchange_payload_hash": "sha256:hermeticdemo11122233344455566677",
+    "volume_24h_micros": 5000000000
+  }
+]

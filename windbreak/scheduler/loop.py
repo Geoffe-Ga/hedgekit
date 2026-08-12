@@ -195,11 +195,16 @@ from windbreak.scheduler.fill_accounting import (
 )
 from windbreak.scheduler.provider_wiring import (
     ProviderFactory,
+    build_corpus_research_tools,
+    build_corpus_vote_transport,
     build_live_llm_transport,
     build_live_research_tools,
     build_provider_factory,
     is_live_mode,
+    load_corpus,
     offline_research_tools,
+    replay_corpus_directory,
+    replay_corpus_source,
 )
 from windbreak.scheduler.research_spend import (
     ResearchSpendRecorded,
@@ -238,6 +243,7 @@ if TYPE_CHECKING:
     from windbreak.connector.snapshot import MarketScreener
     from windbreak.forecast.budget import BudgetEvent
     from windbreak.forecast.cassettes import LlmTransport
+    from windbreak.forecast.corpus import ReplayCorpus
     from windbreak.forecast.records import ForecastRecord
     from windbreak.forecast.sandbox import ResearchTools
     from windbreak.ledger.events import Event
@@ -2332,10 +2338,86 @@ def _default_clock() -> int:
     return int(time.time())
 
 
+def _log_replay_corpus(config: WindbreakConfig, corpus: ReplayCorpus | None) -> None:
+    """Report the replay-corpus mode in force and the source that chose it.
+
+    An operator has to be able to tell, from the log of a run that traded,
+    whether that run's evidence was recorded. The line therefore names the
+    *effective* mode, the directory, the source that won, and what the corpus
+    actually holds -- a mode name alone would not distinguish a corpus that
+    covers the ensemble from one that covers nothing and abstains.
+
+    It is logged at ``WARNING`` when a corpus is in force, because a replaying
+    run's forecasts are recorded material rather than measurements and that must
+    not be discoverable only by reading configuration; and at ``INFO`` for the
+    shipped default, which is the offline loop that cannot trade.
+
+    Args:
+        config: The active configuration.
+        corpus: The loaded corpus, or ``None`` when none is selected.
+    """
+    settings = config.forecast.replay_corpus
+    source = replay_corpus_source(config)
+    if corpus is None:
+        _LOGGER.info("forecast replay corpus mode=%s source=%s", settings.mode, source)
+        return
+    _LOGGER.warning(
+        "forecast replay corpus mode=%s dir=%s source=%s documents=%d votes=%d; "
+        "forecasts on this run replay recorded material and measure nothing",
+        settings.mode,
+        settings.corpus_dir,
+        source,
+        len(corpus.documents),
+        len(corpus.votes),
+    )
+
+
+def _resolve_replay_corpus(
+    config: WindbreakConfig, provider_http: LiveProviderHttp | None
+) -> ReplayCorpus | None:
+    """Load the committed replay corpus this run selects, or ``None`` (#510).
+
+    Resolved once per process, before the ledger database or any exchange
+    session exists, so a corpus an operator pointed at and got wrong aborts
+    startup rather than leaving half-built durable state behind -- the same
+    ordering :func:`_resolve_forecast_transport` already has.
+
+    A corpus and the live transport are mutually exclusive, and the refusal is
+    explicit rather than a precedence rule. They are two answers to the same
+    question -- where does this run's evidence come from -- and a deployment
+    that stated both has stated a contradiction. Silently preferring either
+    would hand an operator recorded material while they believed they were
+    reading the world, or the reverse.
+
+    Args:
+        config: The active configuration naming the corpus mode.
+        provider_http: The live HTTP seams, or ``None`` in cassette mode.
+
+    Returns:
+        The loaded corpus, or ``None`` when no corpus is selected.
+
+    Raises:
+        ValueError: On an unknown mode, on a replay mode naming no directory,
+            or on a corpus selected alongside the live transport.
+        CorpusFormatError: If the named directory is not a well-formed corpus.
+    """
+    directory = replay_corpus_directory(config)
+    if directory is None:
+        return None
+    if provider_http is not None:
+        raise ValueError(
+            "forecast.replay_corpus selects a recorded corpus while "
+            "forecast.provider_transport.mode is 'live'; a run reads recorded "
+            "material or the world, never both -- select one"
+        )
+    return load_corpus(directory)
+
+
 def _resolve_forecast_transport(
     config: WindbreakConfig,
     cassette_path: Path,
     provider_http: LiveProviderHttp | None,
+    corpus: ReplayCorpus | None = None,
 ) -> tuple[LlmTransport, bool]:
     """Select the recorded cassette or the live provider transport (issue #344).
 
@@ -2355,6 +2437,10 @@ def _resolve_forecast_transport(
         cassette_path: The recorded cassette the offline replay transport
             serves from.
         provider_http: The live HTTP seams, or ``None``.
+        corpus: The loaded replay corpus (issue #510), or ``None``. When one is
+            selected the votes come from it rather than from the prompt-hash
+            cassette, because a cassette key digests the market's close time and
+            an anchored replay moves that on every run.
 
     Returns:
         The selected transport paired with whether live mode is in force.
@@ -2374,6 +2460,8 @@ def _resolve_forecast_transport(
             "forecast.provider_transport.mode is 'cassette'; select 'live' or "
             "omit the seam"
         )
+    if corpus is not None:
+        return build_corpus_vote_transport(corpus), False
     if provider_http is None:
         return ReplayCassette.from_path(cassette_path), False
     return build_live_llm_transport(config, provider_http), True
@@ -2384,6 +2472,7 @@ def _resolve_research_tools(
     ledger_path: Path,
     config: WindbreakConfig,
     provider_http: LiveProviderHttp | None,
+    corpus: ReplayCorpus | None = None,
 ) -> ResearchTools:
     """Return the supplied research tools, or the mode's own default.
 
@@ -2400,6 +2489,10 @@ def _resolve_research_tools(
         ledger_path: The tick's ledger path, whose parent roots the fetch cache.
         config: The active configuration supplying live research settings.
         provider_http: The live HTTP seams, or ``None`` in cassette mode.
+        corpus: The loaded replay corpus (issue #510), or ``None``. A corpus
+            outranks the offline default and is mutually exclusive with the
+            live seams -- :func:`_resolve_replay_corpus` refuses that pairing
+            before either can be built.
 
     Returns:
         A sandboxed :class:`~windbreak.forecast.sandbox.ResearchTools`.
@@ -2407,6 +2500,8 @@ def _resolve_research_tools(
     cache_dir = ledger_path.parent.joinpath("research-cache")
     if research_tools is not None:
         return research_tools
+    if corpus is not None:
+        return build_corpus_research_tools(corpus, cache_dir)
     if provider_http is not None:
         return build_live_research_tools(config, provider_http, cache_dir)
     return offline_research_tools(cache_dir)
@@ -3126,7 +3221,11 @@ def build_paper_deps(
     # Selected first, before the ledger database or any exchange session
     # exists, so a misconfigured transport aborts startup without leaving
     # half-built durable state behind.
-    transport, live = _resolve_forecast_transport(config, cassette_path, provider_http)
+    corpus = _resolve_replay_corpus(config, provider_http)
+    _log_replay_corpus(config, corpus)
+    transport, live = _resolve_forecast_transport(
+        config, cassette_path, provider_http, corpus
+    )
     # The exchange must observe on the same clock the tick reads, or its status
     # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
     # freshness against two unrelated timelines (issue #342).
@@ -3189,7 +3288,7 @@ def build_paper_deps(
         verification_key=key,
         transport=transport,
         research_tools=_resolve_research_tools(
-            research_tools, ledger_path, config, provider_http
+            research_tools, ledger_path, config, provider_http, corpus
         ),
         report_dir=report_dir,
         clock=resolved_clock,

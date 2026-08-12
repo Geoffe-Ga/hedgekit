@@ -1,0 +1,8 @@
+{
+  "default": {
+    "schedule_id": "paper-test-v1",
+    "maker_fee_ppm": 0,
+    "taker_fee_ppm": 70000,
+    "settlement_fee_ppm": 0
+  }
+}

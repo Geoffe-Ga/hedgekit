@@ -116,6 +116,39 @@ today. That is the finding, not a footnote:
 
 So #438 stays open and its acceptance criteria need amending against the
 evidence below rather than closing against it.
+
+Amendment (issue #510): barriers 2 and 4 are now closable from configuration
+---------------------------------------------------------------------------
+
+Everything above stays true of the *shipped default*, and this module keeps
+driving that default -- which is the point of keeping it. What changed is that
+an operator now has a written-down way past barriers 2 and 4 together:
+``forecast.replay_corpus`` selects a committed research/vote corpus, replayed
+offline, and :func:`windbreak.scheduler.loop.build_paper_deps` resolves both
+seams from that one token. Together, deliberately: closing research alone turns
+:func:`test_clearing_the_screen_reaches_the_citation_abstention`'s graceful
+abstention into
+:func:`test_shipped_vote_cassette_cannot_serve_the_pipelines_own_prompt`'s
+raise.
+
+The contradiction :func:`test_static_vote_cassette_and_horizon_filter_are_\
+mutually_exclusive` proves is *not* repaired by that and was never going to be;
+it is the reason the corpus keys on the subquestion text and the
+``provider:model_version`` pair rather than on a prompt hash. It stays pinned
+here unchanged.
+
+One thing below did move. ``_set_close_time`` now states a close as whole days
+from the *recording's own leading book* rather than as an instant, because
+issue #510 also fixed ``PaperExchange`` re-dating its books onto the replay
+anchor while assigning its markets verbatim. A fixture's close is part of the
+recording and moves with it; see ``tests/paper_books.py`` and
+``tests/integration/test_paper_replay_market_horizon.py``.
+
+The end-to-end consequence -- the shipped CLI reaching a non-abstaining
+forecast and one approved intent over committed fixtures and committed
+configuration -- lives in
+``tests/integration/test_shipped_cli_hermetic_forecast.py``, because it is a
+claim about the entry point rather than about this seam.
 """
 
 from __future__ import annotations
@@ -129,6 +162,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.paper_books import set_close_time
 from windbreak.config.schema import (
     DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     CorrelationConfig,
@@ -207,10 +241,17 @@ NEAR_CERTAIN_PROBABILITY_PPM = 990000
 #: module depends on the host's wall clock or timezone (2027-01-15T08:00:00Z).
 FIXED_NOW_EPOCH_S = 1_800_000_000
 
-#: Whole days from the injected clock to the re-dated fixture close: inside
-#: `HorizonDays()`'s production [2, 120]-day window, which is therefore
-#: satisfied rather than widened.
+#: Whole days from the *recording's* leading book to the re-dated fixture
+#: close: inside `HorizonDays()`'s production [2, 120]-day window, which is
+#: therefore satisfied rather than widened. Measured from the recording rather
+#: than from the clock because an anchored replay re-dates the market calendar
+#: with the books (issue #510); see `tests/paper_books.py`.
 IN_WINDOW_HORIZON_DAYS = 30
+
+#: A close 400 days *before* the recording's leading book, and therefore 400
+#: days in the past on any beat that replays it -- far outside the window on a
+#: measurement rather than on a literal that merely went stale.
+OUT_OF_WINDOW_HORIZON_DAYS = -400
 
 #: The ask price, in pips, the barrier-6 tests quote. `price_within_bands`
 #: (`windbreak/selector/entry.py:219`) fails only on
@@ -382,17 +423,21 @@ def _fixed_clock() -> int:
     return FIXED_NOW_EPOCH_S
 
 
-def _set_close_time(books: Path, *, closes_at: datetime) -> None:
-    """Re-date the fixture market's close time.
+def _set_close_time(books: Path, *, days_after_recording: int) -> None:
+    """Re-date the fixture market's close relative to its own recording.
+
+    Delegates to :func:`tests.paper_books.set_close_time`, whose docstring
+    carries the reason a close time cannot be written as a plain instant: an
+    anchored replay shifts every recorded instant -- the market calendar
+    included since issue #510 -- so what a fixture can state is a *horizon*,
+    never a date.
 
     Args:
         books: The books directory to rewrite.
-        closes_at: The instant trading closes.
+        days_after_recording: Whole days from the recording's leading book to
+            the market's close.
     """
-    path = books / "markets.json"
-    markets = json.loads(path.read_text(encoding="utf-8"))
-    markets[0]["close_time"] = closes_at.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-    path.write_text(json.dumps(markets, indent=2), encoding="utf-8")
+    set_close_time(books, days_after_recording=days_after_recording)
 
 
 def _set_book(books: Path, *, bid_pips: int, ask_pips: int, quantity: int) -> None:
@@ -578,9 +623,7 @@ def _tradeable_books(books: Path) -> None:
     Args:
         books: The books directory to rewrite in place.
     """
-    _set_close_time(
-        books, closes_at=_fixed_now() + timedelta(days=IN_WINDOW_HORIZON_DAYS)
-    )
+    _set_close_time(books, days_after_recording=IN_WINDOW_HORIZON_DAYS)
     _set_book(
         books,
         bid_pips=BEST_CASE_BID_PIPS,
@@ -712,9 +755,7 @@ def test_clearing_the_screen_reaches_the_citation_abstention(
     (4 600 pips = 460 000 ppm), which is the observable that separates "the
     pipeline abstained" from "the pipeline forecast and happened to agree".
     """
-    _set_close_time(
-        shipped_books, closes_at=_fixed_now() + timedelta(days=IN_WINDOW_HORIZON_DAYS)
-    )
+    _set_close_time(shipped_books, days_after_recording=IN_WINDOW_HORIZON_DAYS)
     _set_book(
         shipped_books, bid_pips=4500, ask_pips=4600, quantity=DEEP_QUANTITY_CENTIS
     )
@@ -750,9 +791,7 @@ def test_unbucketed_market_refuses_before_any_edge_arithmetic(
     evaluated: a tick that reached the twelve conditions would carry twelve
     reasons here instead of one.
     """
-    _set_close_time(
-        shipped_books, closes_at=_fixed_now() + timedelta(days=IN_WINDOW_HORIZON_DAYS)
-    )
+    _set_close_time(shipped_books, days_after_recording=IN_WINDOW_HORIZON_DAYS)
     _set_book(
         shipped_books, bid_pips=4500, ask_pips=4600, quantity=DEEP_QUANTITY_CENTIS
     )
@@ -790,9 +829,7 @@ def test_shipped_vote_cassette_cannot_serve_the_pipelines_own_prompt(
     a real request hash" is a claim this test can actually falsify: recording
     one real hash into that file would fail it.
     """
-    _set_close_time(
-        shipped_books, closes_at=_fixed_now() + timedelta(days=IN_WINDOW_HORIZON_DAYS)
-    )
+    _set_close_time(shipped_books, days_after_recording=IN_WINDOW_HORIZON_DAYS)
     _set_book(
         shipped_books, bid_pips=4500, ask_pips=4600, quantity=DEEP_QUANTITY_CENTIS
     )
@@ -1276,7 +1313,7 @@ def _restore_frozen_close(
         report_dir: The (unused) artifact directory.
     """
     del monkeypatch, report_dir
-    _set_close_time(books, closes_at=_fixed_now() - timedelta(days=400))
+    _set_close_time(books, days_after_recording=OUT_OF_WINDOW_HORIZON_DAYS)
 
 
 def _no_file_restoration(
