@@ -12,7 +12,10 @@ Head-hash anchoring (issue #75) closes the one gap ``verify_chain`` cannot:
 :func:`anchor_head` records the chain head to an append-only anchor file and
 :func:`verify_anchors` flags any live chain that a tail rewrite has moved away
 from its anchors (:class:`AnchorMismatchError`), failing closed on a missing or
-malformed anchor file (:class:`AnchorFormatError`).
+malformed anchor file (:class:`AnchorFormatError`). :func:`anchor_head` refuses
+a ledger path that names no existing file and returns ``None`` when the ledger
+holds no head to anchor, so neither outcome can reach an operator as silence
+(issue #217).
 
 The Order Gateway / crash-recovery event vocabulary (issue #38-#40) lives here
 too, so a persisted envelope can be reconstructed from :data:`EVENT_TYPES`

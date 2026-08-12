@@ -64,6 +64,19 @@ RESPONSE_FAILURE_DELIMITER_FORGERY: Final = "delimiter_forgery"
 #: key that would coax a caller into dispatching an unrequested tool call).
 RESPONSE_FAILURE_TOOL_CALL_LURE: Final = "tool_call_lure"
 
+#: Response-failure code: untrusted text bound for a *single line* of a trusted
+#: prompt scaffold carries a line terminator, so it can forge whole scaffold
+#: lines while carrying no delimiter token at all (issue #463). Deliberately
+#: distinct from :data:`RESPONSE_FAILURE_DELIMITER_FORGERY`: the two artifacts
+#: are different attacks and a ledger reader must be able to tell them apart.
+RESPONSE_FAILURE_LINE_FORGERY: Final = "line_forgery"
+
+#: The characters that terminate a line, and so the characters a single-line
+#: field must refuse. Both are listed because a consumer that splits on ``\r``
+#: alone (an old-Mac convention still honoured by some renderers) would see a
+#: forged line where a ``\n``-only guard saw none.
+_LINE_BREAK_CHARS: Final[tuple[str, ...]] = ("\n", "\r")
+
 #: The JSON key tokens a tool-call lure uses; a vote response carrying any of
 #: them is discarded rather than trusted (SPEC S8.5). Matching is a plain
 #: substring test, so a legitimate vote response that happens to contain the
@@ -445,6 +458,46 @@ def _contains_delimiter(text: str) -> bool:
     return DATA_BLOCK_BEGIN in text or DATA_BLOCK_END in text
 
 
+def _require_block_label_safe(name: str, value: str) -> None:
+    """Guard a value destined for the opening line's quoted attribute.
+
+    The opening line is ``<<<UNTRUSTED-DATA <name>="<value>">>>``, so a
+    delimiter token, a newline, or a double quote inside ``value`` would break
+    that line's structure. Shared by every block writer so they cannot drift
+    apart on what a label may carry.
+
+    Args:
+        name: The attribute's name, as it appears in the failure message.
+        value: The candidate attribute value.
+
+    Raises:
+        ValueError: If ``value`` carries a delimiter token, a newline, or a
+            double-quote character.
+    """
+    if _contains_delimiter(value) or "\n" in value or '"' in value:
+        raise ValueError(
+            f"{name} must not contain a delimiter token, a newline, or a "
+            f"double-quote character: {value!r}"
+        )
+
+
+def _require_block_body_safe(name: str, value: str) -> None:
+    """Guard a value destined for a block's body.
+
+    A body may carry newlines -- that is the whole point of framing it -- but
+    never a delimiter token, which would let it close its own block.
+
+    Args:
+        name: The body's name, as it appears in the failure message.
+        value: The candidate body text.
+
+    Raises:
+        ValueError: If ``value`` carries a delimiter token.
+    """
+    if _contains_delimiter(value):
+        raise ValueError(f"{name} must not contain a delimiter token: {value!r}")
+
+
 def wrap_data_block(*, url: str, quote: str) -> str:
     """Wrap a sanitized quote in a labelled untrusted-data block (S8.5).
 
@@ -461,14 +514,36 @@ def wrap_data_block(*, url: str, quote: str) -> str:
             double-quote character (any of which could break the opening
             line's structure), or if ``quote`` contains a delimiter token.
     """
-    if _contains_delimiter(url) or "\n" in url or '"' in url:
-        raise ValueError(
-            f"url must not contain a delimiter token, a newline, or a "
-            f"double-quote character: {url!r}"
-        )
-    if _contains_delimiter(quote):
-        raise ValueError(f"quote must not contain a delimiter token: {quote!r}")
+    _require_block_label_safe("url", url)
+    _require_block_body_safe("quote", quote)
     return f'{DATA_BLOCK_BEGIN} url="{url}">>>\n{quote}\n{DATA_BLOCK_END}'
+
+
+def wrap_field_block(*, field: str, value: str) -> str:
+    """Wrap an upstream-sourced field's value in a labelled data block (#463).
+
+    The sibling of :func:`wrap_data_block` for text that has no source URL: a
+    market's own metadata. A field rendered through this block cannot forge a
+    line of the trusted scaffold, because every line it carries is inside a
+    region the prompt has already told the model is data rather than
+    instructions -- so a genuinely multi-line field (Kalshi ``rules_primary``
+    prose) stays forecastable instead of being refused wholesale.
+
+    Args:
+        field: The metadata field's name, rendered on the opening line.
+        value: The field's untrusted value, framed verbatim (newlines and all).
+
+    Returns:
+        The value framed between the opening and closing delimiter tokens, with
+        the field name on the opening line.
+
+    Raises:
+        ValueError: If ``field`` contains a delimiter token, a newline, or a
+            double-quote character, or if ``value`` contains a delimiter token.
+    """
+    _require_block_label_safe("field", field)
+    _require_block_body_safe("value", value)
+    return f'{DATA_BLOCK_BEGIN} field="{field}">>>\n{value}\n{DATA_BLOCK_END}'
 
 
 def _probability_failure(value: object) -> str | None:
@@ -593,6 +668,43 @@ def screen_untrusted_text(text: str) -> str | None:
         return RESPONSE_FAILURE_DELIMITER_FORGERY
     if any(marker in text for marker in TOOL_CALL_MARKERS):
         return RESPONSE_FAILURE_TOOL_CALL_LURE
+    return None
+
+
+def screen_single_line_text(text: str) -> str | None:
+    """Screen untrusted text bound for one line of a trusted scaffold (#463).
+
+    A strict superset of :func:`screen_untrusted_text`: everything that screen
+    refuses, plus any line terminator. A field interpolated onto a single
+    scaffold line -- ``f"Question: {market.title}\\n"`` -- can forge whole
+    scaffold lines with an embedded newline alone, carrying no delimiter token
+    at all, which is the same defect class reached by a different token. This
+    module already refuses ``"\\n"`` for exactly that reason on the neighbouring
+    URL path (:func:`wrap_data_block`); this carries that rule to the fields
+    that need it.
+
+    The base screen runs first, so a multiply-hostile field always reports the
+    delimiter verdict rather than one that depends on which artifact happened
+    to appear earlier in the string.
+
+    Use this only for fields that are genuinely single-line. A field that may
+    legitimately carry prose (and therefore newlines) belongs in a
+    :func:`wrap_field_block` block instead -- refusing it wholesale would make
+    real markets permanently unforecastable, which is a cost, not a saving.
+
+    Args:
+        text: The untrusted text to screen.
+
+    Returns:
+        Whatever :func:`screen_untrusted_text` returns when it refuses, else
+        :data:`RESPONSE_FAILURE_LINE_FORGERY` if ``text`` carries a line
+        terminator, else ``None``.
+    """
+    failure = screen_untrusted_text(text)
+    if failure is not None:
+        return failure
+    if any(char in text for char in _LINE_BREAK_CHARS):
+        return RESPONSE_FAILURE_LINE_FORGERY
     return None
 
 
