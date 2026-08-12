@@ -725,9 +725,19 @@ class TestAnUnsampledLedgerFailsClosed:
     """Neither cap may pass on an account whose equity nothing attests to."""
 
     def test_a_fresh_ledger_folds_to_no_reading_at_all(self, tmp_path: Path) -> None:
-        """`None`, never a zero dressed up as an observation."""
+        """`None`, never a zero dressed up as an observation.
+
+        Each named read is asserted, not just the day fold behind them: an
+        unsampled day and a day that provably lost nothing map onto the same
+        `AccountState`, so only the contract at this seam distinguishes "no
+        evidence" from "evidence of no loss". Letting the reads answer zero
+        would be indistinguishable here today and permissive the moment either
+        term stops being paired with the baseline it is measured against.
+        """
         store = _store(tmp_path, ())
         assert read_day_equity(store, now_epoch_s=_NOW_EPOCH_S) is None
+        assert read_start_of_day_equity_micros(store, now_epoch_s=_NOW_EPOCH_S) is None
+        assert read_realized_loss_today_micros(store, now_epoch_s=_NOW_EPOCH_S) is None
         assert read_equity_curve(store) is None
 
     def test_a_fresh_ledger_vetoes_both_caps(self, tmp_path: Path) -> None:
