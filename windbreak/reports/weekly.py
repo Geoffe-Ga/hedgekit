@@ -7,15 +7,22 @@ top: at most one file is written per ISO calendar week, so the always-on loop
 can call it every beat yet only produce one report per week. The real report
 bodies are a later documentation pass; the stub exists so an operator always has
 a current file on disk.
+
+A report directory that is not a directory -- a volume that came back as a
+regular file -- reaches the operator as exactly one diagnosis,
+:class:`WeeklyReportDirectoryError`, whichever of the write's two syscalls
+notices it (issue #551).
 """
 
 from __future__ import annotations
 
+import errno
+from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from datetime import date
     from pathlib import Path
 
@@ -40,6 +47,69 @@ _REPORT_BODY = (
     "## Decisions\n\n"
     "No data yet.\n"
 )
+
+
+class WeeklyReportDirectoryError(OSError):
+    """Raised when the report directory is not a usable directory (issue #551).
+
+    One physical fault -- a report volume that came back as a regular file,
+    which is what a bad bind mount looks like -- used to reach an operator as
+    two different diagnoses, depending on which of :func:`write_weekly_stub`'s
+    two syscalls noticed it first: ``FileExistsError`` naming the *directory*
+    from ``mkdir``, or ``NotADirectoryError`` naming the *report file* from the
+    write, when the fault landed in the window between them. The message is
+    carried to an operator on an ``AlertEmitted`` row, so one recurring fault
+    was filed under two headings and the second heading named a file rather
+    than the directory that was actually wrong.
+
+    Both are normalized to this one type, carrying one message that names the
+    directory. An :class:`OSError` subclass, so a caller with an existing
+    ``except OSError`` branch (the ``mkdir``/write failures both already were
+    one) keeps handling it, and the raise that noticed the fault is preserved
+    as ``__cause__`` for a traceback reader who wants the raw errno.
+    """
+
+
+#: The two errnos that mean "this path is not a usable directory", and the
+#: only ones :func:`write_weekly_stub` re-diagnoses. ``EEXIST`` is what
+#: ``mkdir(exist_ok=True)`` raises when the target exists and is *not* a
+#: directory (it swallows the exist case); ``ENOTDIR`` is what either syscall
+#: raises when the path, or a parent, is a file. Every other ``OSError`` --
+#: ``ENOSPC`` on a full volume, ``EACCES`` on a read-only mount -- has a
+#: different remedy and reaches the operator unchanged.
+_UNUSABLE_DIR_ERRNOS = frozenset({errno.EEXIST, errno.ENOTDIR})
+
+
+@contextmanager
+def _one_diagnosis_for(output_dir: Path) -> Iterator[None]:
+    """Re-raise an unusable-directory failure as one message naming ``output_dir``.
+
+    Wraps a *single* syscall rather than the whole write, and both of
+    :func:`write_weekly_stub`'s syscalls are wrapped separately: the body fold
+    that runs between them reads the ledger, so an ``OSError`` it raises is
+    about a different volume entirely and must keep its own diagnosis.
+
+    Args:
+        output_dir: The report directory the diagnosis names.
+
+    Yields:
+        ``None``; the caller's block runs inside the guard.
+
+    Raises:
+        WeeklyReportDirectoryError: If the wrapped call failed because the
+            report path is not a usable directory.
+    """
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno in _UNUSABLE_DIR_ERRNOS:
+            message = (
+                f"the report directory {output_dir} is not usable: the path "
+                "exists and is not a directory, which is what a report volume "
+                "that came back as a file looks like"
+            )
+            raise WeeklyReportDirectoryError(message) from exc
+        raise
 
 
 def _iso_week_key(today: date) -> tuple[int, int]:
@@ -102,11 +172,26 @@ def write_weekly_stub(
 
     Returns:
         The path of the written report file.
+
+    Raises:
+        WeeklyReportDirectoryError: If ``output_dir`` is not a usable
+            directory, whichever of the two syscalls below noticed it. The
+            fault is one physical thing -- a report volume that came back as a
+            file -- and the operator-facing message is one string naming that
+            directory, not two strings naming two different paths (#551).
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    with _one_diagnosis_for(output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
     stamp = today.strftime(_DATE_FORMAT)
     path = output_dir.joinpath(f"weekly-{stamp}.md")
-    path.write_text(_resolve_body(body, stamp), encoding="utf-8")
+    # Resolved *between* the two guards, deliberately. The fold is expensive
+    # (a whole-ledger walk, #188) and it is what makes the window between the
+    # two syscalls 0.188ms wide rather than two adjacent instructions -- but it
+    # reads the *ledger* volume, so an `OSError` out of it is not evidence
+    # about the report directory and is never re-diagnosed as one.
+    content = _resolve_body(body, stamp)
+    with _one_diagnosis_for(output_dir):
+        path.write_text(content, encoding="utf-8")
     return path
 
 
@@ -133,6 +218,14 @@ def maybe_write_weekly(
 
     Returns:
         The path of the freshly written, or already-existing, report file.
+
+    Raises:
+        WeeklyReportDirectoryError: If a report has to be written and
+            ``output_dir`` is not a usable directory (#551). The
+            already-exists short-circuit reads through
+            :meth:`~pathlib.Path.is_dir`, which reports a non-directory as
+            simply having no reports in it, so the fault surfaces from the
+            write rather than from the scan.
     """
     target_key = _iso_week_key(today)
     if output_dir.is_dir():

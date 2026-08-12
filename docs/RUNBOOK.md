@@ -773,6 +773,15 @@ already-written file untouched). The stub carries markdown section headers
 -- populating the real bodies from ledgered data is a later documentation
 pass.
 
+If `--report-dir` is not a directory -- a volume that came back as a regular
+file, which is what a bad bind mount looks like -- the tick fails with a single
+`WeeklyReportDirectoryError` naming **that directory**, whichever of the write's
+two syscalls notices the fault (issue #551). One physical fault therefore files
+under one heading in alert history rather than two, and the message never names
+the dated report file, which is merely downstream of the directory that is
+wrong. The failure is escalated and survivable, not fatal: the beat is ledgered
+`TICK_FAILED` and alerted, and the loop keeps beating (issues #443/#444/#447).
+
 ### Ingesting a resolved outcome (issue #439)
 
 **Nothing in the running system learns that a market settled on its own.** There

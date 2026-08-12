@@ -123,7 +123,7 @@ import json
 import os
 import shutil
 import signal
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
@@ -145,6 +145,7 @@ from tests.hermetic_demo import (
 from windbreak.config.loader import load_config
 from windbreak.config.schema import WindbreakConfig
 from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
+from windbreak.reports import WeeklyReportDirectoryError, maybe_write_weekly
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -198,6 +199,12 @@ CAPPED_PHASE_TWO_HALTS = 2
 #: because :func:`test_the_daily_research_ceiling_binds_across_a_restart` raises
 #: nothing and is where the ceiling itself is proved to bind.
 AMPLE_DAY_MICROS = FULL_PIPELINE_RESEARCH_COST_MICROS * 1000
+
+#: The ``today`` :func:`_induced_failure_text` derives its expectation with.
+#: Fixed and arbitrary: it shapes only the dated report filename, and the
+#: unified report-directory diagnosis (#551) names the directory, never the
+#: file -- so no ISO week, timezone or clock reaches the expectation.
+_A_REPORT_DATE = date(2026, 1, 7)
 
 #: Seconds of UTC day that must remain before a per-UTC-day run may start.
 #: Comfortably longer than this whole module; see the module docstring.
@@ -846,10 +853,12 @@ def test_an_induced_report_volume_fault_is_survived_and_stays_loud(
     from the filesystem, not from a patched object: the run's ``--report-dir``
     is replaced by a regular *file* mid-run, which is what a bind mount that
     came back wrong looks like. ``run_single_tick`` writes this ISO week's
-    report on every tick, and ``write_weekly_stub``'s ``mkdir(exist_ok=True)``
-    over a non-directory raises ``FileExistsError``. That is a genuine tick
-    exception -- the class ``#443`` says must never be fatal -- reached without
-    stubbing anything the product owns.
+    report on every tick, and that write over a non-directory raises
+    :class:`~windbreak.reports.WeeklyReportDirectoryError` -- one diagnosis for
+    the one fault, whichever of its two syscalls notices (#551), which is what
+    makes the derived expectation below a fact rather than a coin flip (#550).
+    That is a genuine tick exception -- the class ``#443`` says must never be
+    fatal -- reached without stubbing anything the product owns.
 
     A swallowed fault would be worse than a crash, so all three escalations are
     asserted, and none of them by scraping a log:
@@ -940,11 +949,23 @@ def test_an_induced_report_volume_fault_is_survived_and_stays_loud(
 def _induced_failure_text(report_dir: Path) -> str:
     """Return the ``Type: message`` text the induced report-volume fault raises.
 
-    Derived rather than transcribed: this makes the *same* call the tick made,
-    on the *same* path, and renders it the way
+    Derived rather than transcribed: this makes the *same* call the tick made
+    -- :func:`~windbreak.reports.maybe_write_weekly`, which is what
+    ``run_single_tick`` calls -- on the *same* path, and renders it the way
     :meth:`windbreak.main.BeatSupervisor.observe` renders a raising beat. A
     platform whose ``strerror`` wording differs therefore moves the expectation
     with the behaviour instead of reddening a required check.
+
+    Since issue #551 that call fails **one** way for this one fault, whichever
+    of its two syscalls notices, so the derivation no longer depends on which
+    side of a 0.188ms window the parent's ``write_text`` landed on -- which is
+    what made this assertion a coin flip (#550). It is also now the real write
+    call rather than a hand-reproduced ``mkdir``, so a future change to how the
+    report write diagnoses this fault moves the expectation with it.
+
+    ``today`` is fixed and arbitrary because the unified message names the
+    *directory* and never the dated report filename, so no ISO week, timezone
+    or clock reaches this expectation.
 
     Must be called while the fault is still induced, which is asserted rather
     than assumed: a call that *succeeded* would mean the fault was never in
@@ -960,8 +981,8 @@ def _induced_failure_text(report_dir: Path) -> str:
         AssertionError: If the induced fault is not actually in place.
     """
     try:
-        report_dir.mkdir(parents=True, exist_ok=True)
-    except FileExistsError as exc:
+        maybe_write_weekly(report_dir, today=_A_REPORT_DATE)
+    except WeeklyReportDirectoryError as exc:
         return f"{type(exc).__name__}: {exc}"
     message = (
         f"{report_dir} is a usable directory, so the fault this test induces "
