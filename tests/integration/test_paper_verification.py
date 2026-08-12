@@ -51,7 +51,11 @@ from typing import TYPE_CHECKING
 
 from tests.integration.conftest import ledger_path_for
 from tests.riskkernel.conftest import DEFAULT_NOW_EPOCH_S, make_context, make_intent
-from tests.scheduler.conftest import proven_flat_exposure, proven_untraded_day
+from tests.scheduler.conftest import (
+    proven_flat_exposure,
+    proven_idle_hour,
+    proven_untraded_day,
+)
 from windbreak.numeric.types import ContractCentis
 from windbreak.riskkernel.modes import Mode
 
@@ -196,6 +200,7 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
         visible_depth=visible_depth_centis(order_book),
         exposure=proven_flat_exposure(_TICKER),
         notional_today=proven_untraded_day(),
+        orders_last_hour=proven_idle_hour(),
     )
 
 

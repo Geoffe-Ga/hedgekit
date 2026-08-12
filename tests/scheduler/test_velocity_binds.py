@@ -31,6 +31,7 @@ import dataclasses
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from tests.scheduler.conftest import proven_idle_hour
 from windbreak.config.schema import CapitalConfig, RiskConfig, WindbreakConfig
 from windbreak.ledger.events import FillAccounted
 from windbreak.ledger.store import SqliteLedgerStore
@@ -205,6 +206,11 @@ def _context(notional_today: MoneyMicros | None) -> EvaluationContext:
         visible_depth=ContractCentis(1_000_000),
         exposure=None,
         notional_today=notional_today,
+        # A provably idle hour, so the sibling hourly-order term of this very
+        # check (issue #491) passes and the daily-notional term under test here
+        # is the one that decides. Left as the hardcoded `0` it used to be, this
+        # would be indistinguishable from the defect #491 removed.
+        orders_last_hour=proven_idle_hour(),
     )
     fees = dataclasses.replace(
         context.fees,

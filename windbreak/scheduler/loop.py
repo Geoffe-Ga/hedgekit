@@ -330,6 +330,29 @@ _FILL_ACCOUNTED_EVENT_TYPE = "FillAccounted"
 #: movement, in micros. Its *magnitude* is the notional that fill routed.
 _CASH_DELTA_MICROS_KEY = "cash_delta_micros"
 
+#: The ledger event type carrying one Order Gateway lifecycle transition. The
+#: trailing-hour fold behind ``velocity_limits``' hourly order cap reads these
+#: rows (:func:`orders_last_hour_count`, issue #491), and it is the single type
+#: that fold's reverse walk is filtered to.
+_ORDER_TRANSITION_EVENT_TYPE = "OrderTransitionLedgered"
+
+#: The ``OrderTransitionLedgered`` payload key naming the lifecycle event that
+#: drove the transition.
+_TRANSITION_EVENT_KEY = "event"
+
+#: The single lifecycle event that marks one order being routed at the venue.
+#: :meth:`~windbreak.order_gateway.gateway.OrderGateway._submit_new` records it
+#: immediately *before* it calls the submitter -- the write-before-next-action
+#: discipline :func:`~windbreak.order_gateway.ledger_writer.apply_and_ledger`
+#: enforces -- so every venue touch is preceded by exactly one such row, and a
+#: submission the exchange then rejected still counts against the cap. Counting
+#: the later ``SUBMIT`` instead would undercount precisely the runaway case:
+#: orders flung at a venue that is failing to answer.
+_REQUEST_SUBMISSION_EVENT = "REQUEST_SUBMISSION"
+
+#: The width of ``velocity_limits``' hourly window, in whole seconds.
+_TRAILING_HOUR_SECONDS = 3600
+
 #: The :class:`~windbreak.ledger.store.LedgerRecord` field naming the recorded
 #: instant, surfaced in the timezone-awareness refusal it is read through.
 _CREATED_AT_FIELD = "created_at"
@@ -962,6 +985,189 @@ def read_notional_today_micros(
     return notional_today_micros(store.read_all(), now_epoch_s=now_epoch_s)
 
 
+def _record_epoch_s(record: LedgerRecord) -> int | None:
+    """Return the instant a row was recorded at, in epoch seconds, or ``None``.
+
+    The sub-day sibling of :func:`_fill_utc_day`, and it reads the same column
+    for the same reason: ``created_at`` is folded into the chain digest by
+    :func:`~windbreak.ledger.store.compute_event_hash`, so a window measured on
+    it carries the ledger's tamper-evidence rather than a rewritable field's.
+
+    An offsetless stamp yields ``None`` rather than a guessed instant.
+    :func:`~windbreak.timekeeping.require_aware` refuses rather than repairs,
+    and here the stakes are the same shape as the day bucket's: read as the
+    host's local time, a naive stamp lands five hours away from its true instant
+    on a UTC-05:00 host, which slides rows into and out of the trailing hour
+    per host. An unparseable stamp is refused on the same grounds.
+
+    The cast to whole seconds truncates toward zero, which can only move a row
+    *earlier* on the timeline. On the trailing hour's inclusive lower edge that
+    is safe -- a true instant at or after the cutoff still truncates to at or
+    after it -- so the truncation can never drop a genuinely in-window order out
+    of the count.
+
+    Args:
+        record: The row to read.
+
+    Returns:
+        The epoch second the row was recorded at, or ``None`` when its stamp is
+        unparseable or carries no UTC offset.
+    """
+    try:
+        instant = datetime.fromisoformat(record.created_at)
+        require_aware(instant, _CREATED_AT_FIELD)
+    except ValueError:
+        return None
+    return int(instant.timestamp())
+
+
+def _is_order_routing(record: LedgerRecord) -> bool:
+    """Return whether a transition row marks one order being routed at a venue.
+
+    Args:
+        record: The ``OrderTransitionLedgered`` row to classify.
+
+    Returns:
+        ``True`` for the single ``REQUEST_SUBMISSION`` edge, ``False`` for every
+        other lifecycle transition -- acks, fills, cancels and reconciliations
+        all belong to orders already routed, and counting them would make the
+        cap bind on an order's *progress* rather than on its placement.
+
+    Raises:
+        KeyError: If the payload is missing the field this reads -- a loud shape
+            drift, never a silently uncounted order.
+    """
+    data = json.loads(record.payload_json)[_PAYLOAD_DATA_KEY]
+    return bool(data[_TRANSITION_EVENT_KEY] == _REQUEST_SUBMISSION_EVENT)
+
+
+def _fold_orders_last_hour(
+    transitions: Iterable[LedgerRecord], cutoff_epoch_s: int
+) -> int | None:
+    """Count the orders routed at or after ``cutoff_epoch_s``.
+
+    The shared body of both read paths below, so the indexed walk and the
+    whole-ledger fold can never answer differently.
+
+    The window is closed on its lower edge and *open* on its upper one: a row
+    stamped ahead of the tick's own clock is counted rather than discarded. A
+    forward clock blip is not evidence that the order was never routed, and
+    skipping it would report a count smaller than the evidence supports --
+    under-reporting what a cap has already consumed is precisely the permissive
+    direction. The window is pure epoch arithmetic besides, so unlike the daily
+    fold's calendar bucket it does not move with the host's timezone at all.
+
+    A routing row whose instant cannot be established abandons the whole answer
+    rather than being skipped, for the reason the day fold gives: the unreadable
+    row might be this hour's, so counting only the readable ones would under-
+    report the hour. A row of some *other* lifecycle edge is skipped whatever
+    its stamp, because it could never have been counted.
+
+    Args:
+        transitions: The ``OrderTransitionLedgered`` rows to fold, in any order.
+        cutoff_epoch_s: The oldest instant the trailing hour admits.
+
+    Returns:
+        The number of orders routed in the window, or ``None`` when any routing
+        row's recorded instant could not be established.
+
+    Raises:
+        KeyError: If a payload is missing ``event``.
+    """
+    routed = 0
+    for record in transitions:
+        if not _is_order_routing(record):
+            continue
+        epoch_s = _record_epoch_s(record)
+        if epoch_s is None:
+            return None
+        if epoch_s >= cutoff_epoch_s:
+            routed += 1
+    return routed
+
+
+def orders_last_hour_count(
+    records: Iterable[LedgerRecord], *, now_epoch_s: int
+) -> int | None:
+    """Return the number of orders routed in the trailing hour, or ``None``.
+
+    ``velocity_limits`` caps the orders routed within the trailing hour, and the
+    scheduler fed it a hardcoded zero. That made the gate evaluate ``0 + 1 >
+    max_orders_per_hour`` -- false for every configured maximum of one or more
+    -- so the runaway-order protection ran every tick, reported success, and
+    could not veto however many orders the loop had just flung at the venue
+    (issue #491). This is the fold that feeds it, and it is the last of the
+    hardcoded-zero risk terms: the exposure quartet went in #407 and the day's
+    notional in #415.
+
+    An hour with no routed order is a genuine ``0`` and not ``None``, exactly as
+    an untraded day is a genuine ``MoneyMicros(0)``: ``OrderTransitionLedgered``
+    is written once per transition and never rewritten, so its absence is
+    evidence rather than the lack of it. That makes the cap bind from the first
+    tick against a fresh ledger instead of vetoing until something happens to be
+    routed.
+
+    ``None`` is reserved for the one case where the window genuinely cannot be
+    established -- a routing row whose recorded instant carries no UTC offset
+    (see :func:`_record_epoch_s`) -- and the caller must fail closed on it.
+
+    Args:
+        records: The ledger read (``SqliteLedgerStore.read_all()``). Rows of
+            other types are ignored.
+        now_epoch_s: The instant the trailing hour ends at.
+
+    Returns:
+        The number of orders routed in the trailing hour, or ``None`` when it is
+        unprovable.
+
+    Raises:
+        KeyError: If an ``OrderTransitionLedgered`` payload is missing the field
+            this reads -- a loud shape drift, never a silently uncounted order.
+    """
+    transitions = (
+        record
+        for record in records
+        if record.event_type == _ORDER_TRANSITION_EVENT_TYPE
+    )
+    return _fold_orders_last_hour(transitions, now_epoch_s - _TRAILING_HOUR_SECONDS)
+
+
+def read_orders_last_hour(store: LedgerStore, *, now_epoch_s: int) -> int | None:
+    """Read the number of orders routed in the trailing hour from ``store``.
+
+    The tick's entry point, mirroring :func:`read_notional_today_micros`: a
+    store declaring the optional
+    :class:`~windbreak.ledger.store.ReverseTypeScan` capability is walked over
+    its ``OrderTransitionLedgered`` rows alone -- O(transitions) rather than
+    O(ledger), on the composite index that walk already has -- and every other
+    store, including each hand-rolled double, falls back to the whole-ledger
+    fold.
+
+    Like that fold's, and unlike the equity baseline's, this walk deliberately
+    does **not** stop at the window boundary. An early stop is safe when the
+    answer is a single earliest row; it is not safe for a *count*, because a
+    clock that stepped backwards would put an out-of-window stamp above an
+    in-window one and truncate the tally. A truncated tally under-reports how
+    much of the hour's budget is spent, which fails open -- so the walk pays the
+    full pass over the transitions and keeps the two paths' answers identical.
+
+    Args:
+        store: The ledger to read the hour's routed orders out of.
+        now_epoch_s: The instant the trailing hour ends at.
+
+    Returns:
+        The number of orders routed in the trailing hour, or ``None`` when it is
+        unprovable -- which keeps the hourly cap vetoing (see
+        :func:`_build_limits`).
+    """
+    if isinstance(store, ReverseTypeScan):
+        return _fold_orders_last_hour(
+            store.iter_records_of_type_reversed(_ORDER_TRANSITION_EVENT_TYPE),
+            now_epoch_s - _TRAILING_HOUR_SECONDS,
+        )
+    return orders_last_hour_count(store.read_all(), now_epoch_s=now_epoch_s)
+
+
 def visible_depth_centis(order_book: OrderBookSnapshot) -> ContractCentis:
     """Return the visible depth ``participation_cap_compliance`` may bound against.
 
@@ -1107,6 +1313,7 @@ def _build_limits(
     *,
     exposure_provable: bool,
     notional_provable: bool,
+    orders_provable: bool,
 ) -> RiskLimits:
     """Map a configuration into the risk limits the pre-trade checks read.
 
@@ -1135,9 +1342,26 @@ def _build_limits(
     provably de-risking close stays exempt, correctly: it can only reduce
     exposure, so an unknown budget must not block the exit.
 
-    Both are deliberately *conditional*. A cap that vetoed unconditionally would
-    not be failing closed, it would be broken; these caps veto only while the
-    evidence is missing, and pass on a legitimate position once it is not.
+    ``orders_provable=False`` is that same seam for issue #491's hourly cap, and
+    it is the last of the three. ``AccountState.orders_last_hour`` is a plain
+    ``int`` with no ``None``, so an hour whose routed-order count could not be
+    established would have to be carried as a zero that reads as an idle hour --
+    the very value that made this cap incapable of vetoing in the first place.
+    Zeroing ``max_orders_per_hour`` instead states the real policy: "no order may
+    be routed while the hour's routing history is unknown". ``velocity_limits``
+    then vetoes on ``0 + 1 > 0`` before it consults anything else.
+
+    That last one is deliberately stricter than the daily-notional half beside
+    it, because the check is: the hourly gate runs *before* the de-risking-close
+    exemption, on the stated grounds that a close can flood a venue just as an
+    open can. So an unprovable hour blocks exits too. That is a real cost, and it
+    is the one the check's own contract already chose -- widening the exemption
+    to cover the hourly term would be loosening a risk gate under cover of a
+    wiring fix, which belongs in its own issue with its own evidence.
+
+    All three are deliberately *conditional*. A cap that vetoed unconditionally
+    would not be failing closed, it would be broken; these caps veto only while
+    the evidence is missing, and pass on a legitimate position once it is not.
 
     Args:
         config: The configuration to map.
@@ -1146,6 +1370,9 @@ def _build_limits(
             ``False`` zeroes the four concentration caps, as above.
         notional_provable: Whether this tick established the day's booked
             notional. ``False`` zeroes ``max_notional_per_day``, as above.
+        orders_provable: Whether this tick established how many orders the
+            trailing hour routed. ``False`` zeroes ``max_orders_per_hour``, as
+            above.
 
     Returns:
         The assembled :class:`~windbreak.riskkernel.context.RiskLimits`.
@@ -1168,6 +1395,10 @@ def _build_limits(
     notional_per_day = (
         risk.max_notional_per_day_micros if notional_provable else no_notional_permitted
     )
+    no_order_permitted = 0
+    orders_per_hour = (
+        risk.max_orders_per_hour if orders_provable else no_order_permitted
+    )
     return RiskLimits(
         floor=MoneyMicros(config.capital.floor_micros),
         instrument_whitelist=instrument_whitelist,
@@ -1181,7 +1412,7 @@ def _build_limits(
         max_pos_total_pct_ppm=total_pct_ppm,
         daily_loss_limit_pct_ppm=risk.daily_loss_limit_pct_ppm,
         max_drawdown_pct_ppm=risk.max_drawdown_pct_ppm,
-        max_orders_per_hour=risk.max_orders_per_hour,
+        max_orders_per_hour=orders_per_hour,
         max_notional_per_day=MoneyMicros(notional_per_day),
         quote_ttl_seconds=risk.quote_ttl_seconds,
         forecast_ttl_seconds=_DEFAULT_FORECAST_TTL_SECONDS,
@@ -1199,6 +1430,7 @@ def _account_from_verification(
     equity_start_of_day: MoneyMicros | None,
     exposure: ExposureProjection | None,
     notional_today: MoneyMicros | None,
+    orders_last_hour: int | None,
 ) -> AccountState:
     """Return the account snapshot the tick's ledgered evidence supports.
 
@@ -1255,6 +1487,23 @@ def _account_from_verification(
     to carry "unprovable" with, so the fact is stated in the limits instead of
     fabricated into the account. Neither half is correct alone.
 
+    ``orders_last_hour`` closes the same shape for the last time (issue #491).
+    It was hardcoded to zero, and zero is *permissive* in the strongest possible
+    sense for ``velocity_limits``' hourly cap: the gate reads ``0 + 1 >
+    max_orders_per_hour``, which is false for every configured maximum of one or
+    more, so the runaway-order protection could not veto at any order rate
+    whatsoever. :func:`read_orders_last_hour` now folds it out of the ledger's
+    own ``OrderTransitionLedgered`` rows, counting the one ``REQUEST_SUBMISSION``
+    edge per routed order and bucketing on each row's hash-chained
+    ``created_at``.
+
+    ``orders_last_hour=None`` means the hour's routing history could not be
+    established, and the term falls back to zero *only* because
+    :func:`_build_limits` has simultaneously zeroed ``max_orders_per_hour`` --
+    the same paired reading ``exposure`` and ``notional_today`` use, and for the
+    same reason. Neither half is correct alone; here that is especially true,
+    since the zero this term falls back to is the exact defect being removed.
+
     ``equity_high_water_mark`` stays zero for a related but distinct reason:
     no ledgered high-water history exists to fold.
 
@@ -1269,6 +1518,9 @@ def _account_from_verification(
         notional_today: The current UTC day's booked notional, or ``None`` when
             it could not be established -- in which case the caller must also
             have zeroed the daily notional cap, as above.
+        orders_last_hour: The number of orders the trailing hour routed, or
+            ``None`` when it could not be established -- in which case the
+            caller must also have zeroed the hourly order cap, as above.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.AccountState`.
@@ -1294,7 +1546,7 @@ def _account_from_verification(
         event_exposure=exposure.event_exposure if exposure is not None else zero,
         bucket_exposure=exposure.bucket_exposure if exposure is not None else zero,
         total_exposure=exposure.total_exposure if exposure is not None else zero,
-        orders_last_hour=0,
+        orders_last_hour=orders_last_hour if orders_last_hour is not None else 0,
         notional_today=notional_today if notional_today is not None else zero,
     )
 
@@ -1317,6 +1569,7 @@ def build_evaluation_context(
     visible_depth: ContractCentis | None,
     exposure: ExposureProjection | None,
     notional_today: MoneyMicros | None,
+    orders_last_hour: int | None,
 ) -> EvaluationContext:
     """Compose the evaluation context a PAPER-mode approval reads.
 
@@ -1454,6 +1707,17 @@ def build_evaluation_context(
             ``velocity_limits`` veto. A day with no booked fill is
             ``MoneyMicros(0)``, not ``None`` -- an untraded day provably routed
             nothing.
+        orders_last_hour: The number of orders the trailing hour routed, from
+            :func:`read_orders_last_hour`, or ``None`` when it could not be
+            established (issue #491). It sets both halves of the hourly cap the
+            way ``notional_today`` sets the daily one: the ``AccountState`` term
+            and, when ``None``, the zeroed ``max_orders_per_hour`` that makes
+            ``velocity_limits`` veto. An hour with no routed order is ``0``, not
+            ``None`` -- a quiet hour provably routed nothing. Never this
+            function's own ``now_epoch_s`` window read at composition time on a
+            *different* clock than the one stamped here: the count and the
+            instant it is a trailing hour of must be one reading, or the window
+            is measured against a boundary the evaluation never used.
 
     Returns:
         The composed :class:`~windbreak.riskkernel.context.EvaluationContext`.
@@ -1485,9 +1749,14 @@ def build_evaluation_context(
             instrument_whitelist,
             exposure_provable=exposure is not None,
             notional_provable=notional_today is not None,
+            orders_provable=orders_last_hour is not None,
         ),
         account=_account_from_verification(
-            verification, equity_start_of_day, exposure, notional_today
+            verification,
+            equity_start_of_day,
+            exposure,
+            notional_today,
+            orders_last_hour,
         ),
         market=market_view,
         fees=fees,
@@ -3138,6 +3407,16 @@ def _approve_stage(
     Stamped with this stage's clock instead, the forecast was zero seconds old
     however long it had taken, and the check could not veto at any age.
 
+    Threads the trailing hour's routed-order count (issue #491), folded out of
+    the ledger's own ``OrderTransitionLedgered`` rows at the same clock reading
+    the context is stamped with, so the window the cap measures ends exactly
+    where the evaluation happens. It was a hardcoded ``0``, which made
+    ``velocity_limits`` evaluate ``0 + 1 > max_orders_per_hour`` on every tick --
+    false for every configured maximum -- so the runaway-order gate could not
+    veto at any order rate. It is read here rather than at tick start for the
+    same reason the equity baseline is: a tick that has already routed for an
+    earlier candidate must have that order counted against the next one.
+
     A market the exchange cannot resolve becomes ``None`` rather than an
     exception, so an unknown ticker vetoes the tick instead of aborting it.
 
@@ -3210,6 +3489,7 @@ def _approve_stage(
         visible_depth=visible_depth_centis(order_book),
         exposure=exposure,
         notional_today=read_notional_today_micros(deps.store, now_epoch_s=now_epoch_s),
+        orders_last_hour=read_orders_last_hour(deps.store, now_epoch_s=now_epoch_s),
     )
     filled = 0
     for intent in decision.intents:

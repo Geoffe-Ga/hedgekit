@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 
+from tests.scheduler.conftest import proven_idle_hour
 from windbreak.config.schema import (
     CapitalConfig,
     CorrelationConfig,
@@ -169,6 +170,7 @@ def _verdict(peer_micros: int) -> str | None:
         visible_depth=ContractCentis(1_000_000),
         exposure=projection,
         notional_today=MoneyMicros(0),
+        orders_last_hour=proven_idle_hour(),
     )
     # Worst-case equity is what the cap is a share of, so it is set here rather
     # than left at the composed zero -- a zero-equity account makes every cap
@@ -281,6 +283,7 @@ class TestUnprovableExposureFailsClosed:
             visible_depth=ContractCentis(1_000_000),
             exposure=projection,
             notional_today=MoneyMicros(0),
+            orders_last_hour=proven_idle_hour(),
         )
         assert context.limits.max_pos_market_pct_ppm == 0
         assert context.limits.max_pos_event_pct_ppm == 0
@@ -313,5 +316,6 @@ class TestUnprovableExposureFailsClosed:
             visible_depth=ContractCentis(1_000_000),
             exposure=projection,
             notional_today=MoneyMicros(0),
+            orders_last_hour=proven_idle_hour(),
         )
         assert context.limits.max_pos_bucket_pct_ppm == _BUCKET_PCT_PPM

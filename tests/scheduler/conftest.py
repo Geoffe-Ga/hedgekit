@@ -136,6 +136,27 @@ def proven_untraded_day() -> MoneyMicros:
     return MoneyMicros(0)
 
 
+def proven_idle_hour() -> int:
+    """Return the trailing hour's routed-order count for a ledger with none.
+
+    The `orders_last_hour` companion of `proven_untraded_day`, and it exists for
+    the same reason: `None` and a proven zero are different facts, and
+    `build_evaluation_context` treats them differently. `None` means the hour's
+    routing history could not be established, which zeroes `max_orders_per_hour`
+    so `velocity_limits` vetoes; this helper means the ledger was read and no
+    order was routed in the trailing hour, which is what every test below
+    assumed implicitly back when the term was hardcoded (issue #491).
+
+    Named rather than written as a bare `0` at each call site precisely because
+    the bare `0` *was* the defect: a reader could not tell the hardcoded
+    placeholder from a measured idle hour, and neither could a reviewer.
+
+    Returns:
+        `0` -- an hour that routed nothing, provably.
+    """
+    return 0
+
+
 def build_kernel_approval_components(
     *, key_material: bytes = KEY_MATERIAL, config_hash: str = TEST_CONFIG_HASH
 ) -> tuple[RiskKernel, ApprovalPipeline, InMemoryKernelLedgerWriter]:
