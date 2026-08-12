@@ -261,6 +261,59 @@ _LOGGER = logging.getLogger("windbreak.scheduler")
 #: The component label stamped on every scheduler-authored ledger event.
 _COMPONENT = "scheduler"
 
+#: Evidence source token for a research bundle the caller handed in. Not
+#: reachable from ``windbreak run`` -- ``build_paper_deps``'s ``research_tools``
+#: parameter is a test seam -- and deliberately *not* classified: this guard
+#: cannot know whether an injected bundle finds anything.
+RESEARCH_EVIDENCE_INJECTED: Final = "injected"
+
+#: Evidence source token for the committed replay corpus (issue #510), the one
+#: source a shipped command line can select without a network.
+RESEARCH_EVIDENCE_CORPUS: Final = "replay-corpus"
+
+#: Evidence source token for the live search/fetch transports (issue #344).
+RESEARCH_EVIDENCE_LIVE: Final = "live-search"
+
+#: Evidence source token for the offline bundle whose search finds nothing by
+#: construction. A run wired to it must abstain on ``no_verified_citations``
+#: before a single vote, every tick, forever.
+RESEARCH_EVIDENCE_NONE: Final = "none"
+
+#: Every evidence source token, in the order :func:`_resolve_research_tools`
+#: decides them. Enumerated here so a caller reasons over the set rather than
+#: restating it.
+RESEARCH_EVIDENCE_SOURCES: Final = (
+    RESEARCH_EVIDENCE_INJECTED,
+    RESEARCH_EVIDENCE_CORPUS,
+    RESEARCH_EVIDENCE_LIVE,
+    RESEARCH_EVIDENCE_NONE,
+)
+
+#: What an operator is told, once at startup, when this deployment composed no
+#: source of research evidence at all (issue #485).
+#:
+#: It is a constant with **no interpolation site**: the guard reports
+#: configuration, and every leaf that can select an evidence source sits beside
+#: one naming a credential's environment variable, so a message assembled from
+#: values would be one refactor away from carrying a secret into a log
+#: aggregator and, via ``AlertEmitted``, into the append-only ledger.
+EVIDENCE_STARVED_MESSAGE: Final = (
+    "DEGRADED: this PAPER loop composed no research evidence source, so every "
+    "forecast it makes must abstain on no_verified_citations before a single "
+    "vote and it can never emit an order intent -- it will keep beating, and "
+    "keep reporting healthy, for as long as it runs. "
+    "REMEDY: either replay a committed corpus (set forecast.replay_corpus.mode "
+    "to 'replay' and forecast.replay_corpus.corpus_dir to that directory), or "
+    "configure live research (set forecast.provider_transport.mode to 'live' "
+    "and forecast.research.search_endpoint_url to your search endpoint). "
+    "WHAT THIS DOES NOT CLAIM: it reads the research wiring this process "
+    "actually composed and nothing else. Its implication runs one way -- no "
+    "evidence source means no intent, ever -- and it proves nothing about a "
+    "deployment that has one, because the depth floor, the resolution horizon, "
+    "the correlation declaration and the provider track record are judged per "
+    "tick against the books and this guard reads none of them."
+)
+
 #: The per-UTC-day research ceiling a budget opens with when this ledger's
 #: research rows cannot be folded. Zero, so every market halts on the budget
 #: and no research money is spent, while the loop itself keeps beating. See
@@ -2473,8 +2526,8 @@ def _resolve_research_tools(
     config: WindbreakConfig,
     provider_http: LiveProviderHttp | None,
     corpus: ReplayCorpus | None = None,
-) -> ResearchTools:
-    """Return the supplied research tools, or the mode's own default.
+) -> tuple[str, ResearchTools]:
+    """Return this run's evidence source token and the research tools for it.
 
     An explicitly supplied bundle always wins, so a test can drive counted or
     doubled transports through either mode. Otherwise the default follows the
@@ -2495,16 +2548,90 @@ def _resolve_research_tools(
             before either can be built.
 
     Returns:
-        A sandboxed :class:`~windbreak.forecast.sandbox.ResearchTools`.
+        The branch's :data:`RESEARCH_EVIDENCE_SOURCES` token paired with the
+        sandboxed :class:`~windbreak.forecast.sandbox.ResearchTools` it built.
+        The token is returned *from here* rather than re-derived from config by
+        the guard that consumes it (issue #485), so the two cannot disagree:
+        dropping ``corpus`` from this function's call site moves the reported
+        source to :data:`RESEARCH_EVIDENCE_NONE` in the same edit. A guard that
+        re-read configuration instead would keep reporting a corpus that the
+        wiring no longer passed -- the composition trap, wearing a safety label.
+
+        The live branch's token keys on the same ``search``/``fetch`` pair
+        :func:`~windbreak.scheduler.provider_wiring.build_live_research_tools`
+        keys its own offline fallback on, so a live deployment that pinned an
+        LLM but never named a search endpoint is reported as having no evidence
+        source -- which is exactly what it has.
     """
     cache_dir = ledger_path.parent.joinpath("research-cache")
     if research_tools is not None:
-        return research_tools
+        return RESEARCH_EVIDENCE_INJECTED, research_tools
     if corpus is not None:
-        return build_corpus_research_tools(corpus, cache_dir)
+        return RESEARCH_EVIDENCE_CORPUS, build_corpus_research_tools(corpus, cache_dir)
     if provider_http is not None:
-        return build_live_research_tools(config, provider_http, cache_dir)
-    return offline_research_tools(cache_dir)
+        tools = build_live_research_tools(config, provider_http, cache_dir)
+        if provider_http.search is None or provider_http.fetch is None:
+            return RESEARCH_EVIDENCE_NONE, tools
+        return RESEARCH_EVIDENCE_LIVE, tools
+    return RESEARCH_EVIDENCE_NONE, offline_research_tools(cache_dir)
+
+
+def research_evidence_fold(source: str) -> str:
+    """Return the startup fold line reporting the effective evidence source.
+
+    PR #487 established the shape: an operator must be able to read the
+    *effective* value out of the log rather than infer it from configuration
+    they may not have written. One formatter, used by the emitter and by the
+    tests that pin it, so the line an operator greps for is the line asserted.
+
+    Args:
+        source: One of :data:`RESEARCH_EVIDENCE_SOURCES`.
+
+    Returns:
+        The rendered fold line.
+    """
+    return f"research evidence source={source}"
+
+
+def _log_research_evidence(source: str) -> None:
+    """Fold this run's evidence source into the log, loudly when there is none.
+
+    Issue #438 asked for a startup failure when the PAPER loop is activated in a
+    composition that can only abstain; issue #485 carried that forward and the
+    owner deferred it twice, because until PR #522 (#510) made a corpus
+    selectable from a command line, *every* configuration was such a
+    composition and this signal would have fired on every start. A signal that
+    always fires teaches operators to ignore it, which is worse than none.
+
+    It **warns and continues** rather than refusing, which is the deliberate
+    deviation from #438's wording:
+
+    * PR #487's standard is fail closed on the capability, never on the
+      process. A starved loop already fails closed on the capability -- it
+      emits no intent. Refusing the process would additionally cost the
+      operator the kill file, the ledger and the verification cycle; a
+      deployment that cannot produce evidence is not one that must not be
+      stoppable.
+    * The shipped default *is* the starved composition, on purpose, and #522
+      proved it stays that way. Refusing it would turn ``docker compose up``
+      into a hard failure -- a regression dressed as a fix.
+    * Configuration *contradictions* do refuse, here and next door:
+      :func:`_resolve_replay_corpus` rejects an unknown mode, a replay mode
+      naming no directory, and a corpus selected alongside the live transport.
+      An evidence-starved deployment has contradicted nothing; it has merely
+      configured less than it needed, and the two must not read alike.
+
+    An injected bundle (:data:`RESEARCH_EVIDENCE_INJECTED`) folds like any other
+    source and is never warned on: a caller that handed in its own tools knows
+    what they find, and this function does not.
+
+    Args:
+        source: The token :func:`_resolve_research_tools` returned.
+    """
+    if source == RESEARCH_EVIDENCE_NONE:
+        _LOGGER.warning(EVIDENCE_STARVED_MESSAGE)
+        return
+    _LOGGER.info(research_evidence_fold(source))
 
 
 def _resolved_dispatcher(dispatcher: AlertDispatcher | None) -> AlertDispatcher:
@@ -3226,6 +3353,14 @@ def build_paper_deps(
     transport, live = _resolve_forecast_transport(
         config, cassette_path, provider_http, corpus
     )
+    # Resolved and folded here, beside the other two evidence decisions and
+    # before the ledger database or any exchange session exists, so an operator
+    # reads what this deployment can produce from the first lines of its log
+    # rather than inferring it from a tick that never forecasts (issue #485).
+    evidence_source, resolved_research_tools = _resolve_research_tools(
+        research_tools, ledger_path, config, provider_http, corpus
+    )
+    _log_research_evidence(evidence_source)
     # The exchange must observe on the same clock the tick reads, or its status
     # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
     # freshness against two unrelated timelines (issue #342).
@@ -3287,9 +3422,7 @@ def build_paper_deps(
         kernel=kernel,
         verification_key=key,
         transport=transport,
-        research_tools=_resolve_research_tools(
-            research_tools, ledger_path, config, provider_http, corpus
-        ),
+        research_tools=resolved_research_tools,
         report_dir=report_dir,
         clock=resolved_clock,
         budget=_build_research_budget(store, config),
