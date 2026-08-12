@@ -63,6 +63,68 @@ windbreak run \
   logs the shutdown reason. `--max-beats N` stops it automatically after `N`
   heartbeats (useful for a bounded smoke run).
 
+### The evidence-starvation warning (issue #485)
+
+Every start folds the **effective** research evidence source into the log, so
+you never have to infer it from a configuration file you may not have written:
+
+```
+INFO    research evidence source=replay-corpus
+INFO    research evidence source=live-search
+```
+
+If this deployment composed **no** evidence source at all — no replay corpus and
+no live research — there is no fold line. Instead the loop logs, once, at
+`WARNING`:
+
+```
+DEGRADED: this PAPER loop composed no research evidence source, so every
+forecast it makes must abstain on no_verified_citations before a single vote
+and it can never emit an order intent -- it will keep beating, and keep
+reporting healthy, for as long as it runs. REMEDY: either replay a committed
+corpus (set forecast.replay_corpus.mode to 'replay' and
+forecast.replay_corpus.corpus_dir to that directory), or configure live research
+(set forecast.provider_transport.mode to 'live' and
+forecast.research.search_endpoint_url to your search endpoint). WHAT THIS DOES
+NOT CLAIM: it reads the research wiring this process actually composed and
+nothing else. Its implication runs one way -- no evidence source means no
+intent, ever -- and it proves nothing about a deployment that has one, because
+the depth floor, the resolution horizon, the correlation declaration and the
+provider track record are judged per tick against the books and this guard reads
+none of them.
+```
+
+**The shipped default is that configuration**, deliberately, so a bare
+`docker compose up` warns on every start until you select an evidence source.
+That is the honest reading of the shipped default: it is the offline loop that
+cannot trade.
+
+**It warns; it does not refuse.** Three reasons, and they are load-bearing
+rather than stylistic:
+
+- Fail closed on the **capability**, never on the process. A starved loop is
+  already failing closed on the capability — it emits no intent. Refusing to
+  start would additionally cost you the kill file, the ledger, and the
+  verification cycle. A deployment that cannot produce evidence is not the same
+  as one that cannot be stopped.
+- The default composition must keep starting. Turning `docker compose up` into
+  a hard failure would be a regression, not a fix.
+- Configuration **contradictions** do still refuse — an unknown
+  `forecast.replay_corpus.mode`, a `replay` mode naming no directory, a corpus
+  selected alongside the live transport, a live mode with no live seam. An
+  evidence-starved deployment has contradicted nothing; it has configured less
+  than it needed, and the two must not read alike.
+
+**What it cannot detect.** It is a deliberately partial guard. It proves the
+implication in one direction only. A deployment that *has* an evidence source
+can still abstain or screen out on every tick forever, and this check will say
+nothing, because the depth floor, the resolution horizon, the correlation
+declaration (see "Declaring correlation buckets") and the provider track record
+are judged per tick against the books rather than at startup. An **injected**
+research bundle (a test seam; not reachable from `windbreak run`) folds as
+`source=injected` and is never warned about — the guard does not know what a
+caller's own tools find.
+
 ### Running against live venue books (issue #343)
 
 Adding one optional fifth flag points the loop at the exchange's **real,
@@ -172,18 +234,18 @@ windbreak run --paper-books-dir ... --cassette-path ... --ledger-path ... \
   `research.search_api_key_env` are therefore **required** for any
   evidence-producing run, not optional.
 
-  No concrete end-to-end working configuration can be named here yet, and the
-  reason is not research. Configuring research clears one of six barriers
-  between an activated PAPER loop and a single order intent; the decisive one
-  is arithmetic and unconditional -- every full-pipeline forecast books a flat
-  $3.00 research charge, and the selector amortizes the whole of it over a
-  fixed 1.00-contract entry probe, so `net_edge_min` is unreachable for any
-  market, at any price, with any capital (issue #483). Until that is resolved,
-  an activated PAPER loop cannot emit an order intent regardless of how
-  research is configured, and nothing in the loop refuses to start or says so
-  (issue #485). `tests/scheduler/test_paper_intent_barriers.py` drives the real
-  tick over the real shipped composition and pins each barrier with the exact
-  values it records.
+  Configuring research clears **one** of the six barriers issue #481 mapped
+  between an activated PAPER loop and a single order intent, so do not read a
+  configured search endpoint as a working deployment. The end-to-end
+  composition that does reach an intent is the offline one in "Demonstrating
+  the whole stack offline (the replay corpus)" (issue #510); it clears the
+  remaining barriers with committed books, a declared correlation bucket and a
+  committed track-record artifact, and the flat-charge barrier was closed by
+  issue #483. A loop that clears *none* of them says so at startup — see "The
+  evidence-starvation warning" — but only for this one barrier, and it makes no
+  claim about the other five. `tests/scheduler/test_paper_intent_barriers.py`
+  drives the real tick over the real shipped composition and pins each barrier
+  with the exact values it records.
 - **Every live vote is retried and priced.** `RetryingProvider` bounds attempts,
   the total deadline, backoff, and spend from the `retry` block above, and
   charges each failed attempt against the `prices` table. The cassette path is
@@ -936,6 +998,10 @@ INFO    forecast replay corpus mode=disabled source=default
 did and you are on the shipped, offline, cannot-trade path. The corpus line is
 a **WARNING** on purpose: a replaying run must not be discoverable only by
 reading configuration.
+
+Beside it, `research evidence source=replay-corpus` folds the *effective*
+research wiring the corpus selected. On the `disabled` path that line is
+replaced by the degraded-mode warning — see "The evidence-starvation warning".
 
 ### What a corpus is, and why it is not a cassette
 

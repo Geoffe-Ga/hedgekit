@@ -64,6 +64,8 @@ from windbreak.riskkernel.modes import Mode
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from windbreak.forecast.corpus import ReplayCorpus
+
 #: The three veto reasons a PAPER-mode evaluation with `verification=None` must
 #: produce, in the exact SPEC S10.3 check order
 #: (`windbreak/riskkernel/checks.py::_SPEC_10_3_CHECK_NAMES`): the three
@@ -1860,12 +1862,16 @@ def test_omitted_research_tools_default_to_the_offline_no_network_bundle(
             parent.
     """
     from windbreak.config.schema import WindbreakConfig
-    from windbreak.scheduler.loop import _resolve_research_tools
+    from windbreak.scheduler.loop import (
+        RESEARCH_EVIDENCE_NONE,
+        _resolve_research_tools,
+    )
 
-    tools = _resolve_research_tools(
+    source, tools = _resolve_research_tools(
         None, tmp_path / "ledger.db", WindbreakConfig(), None
     )
 
+    assert source == RESEARCH_EVIDENCE_NONE
     assert tools.search("will this reach the network") == ()
     with pytest.raises(RuntimeError, match="unexpectedly called"):
         tools.fetch(f"https://{_OFFLINE_RESEARCH_HOST}/anything")
@@ -1883,13 +1889,252 @@ def test_supplied_research_tools_are_used_verbatim(tmp_path: Path) -> None:
             parent.
     """
     from windbreak.config.schema import WindbreakConfig
-    from windbreak.scheduler.loop import _resolve_research_tools
+    from windbreak.scheduler.loop import (
+        RESEARCH_EVIDENCE_INJECTED,
+        _resolve_research_tools,
+    )
     from windbreak.scheduler.provider_wiring import offline_research_tools
 
     supplied = offline_research_tools(tmp_path / "supplied-cache")
 
-    resolved = _resolve_research_tools(
+    source, resolved = _resolve_research_tools(
         supplied, tmp_path / "ledger.db", WindbreakConfig(), None
     )
 
+    assert source == RESEARCH_EVIDENCE_INJECTED
     assert resolved is supplied
+
+
+# --- the evidence-starvation startup guard (issue #485) ------------------------
+
+#: A recorded page URL, so a hand-built corpus has a host to derive its egress
+#: allowlist from.
+_CORPUS_URL = "https://research.example/recorded"
+
+
+def _one_document_corpus() -> ReplayCorpus:
+    """Build the smallest well-formed corpus: one page, one result, no votes.
+
+    Returns:
+        A `ReplayCorpus` holding a single recorded document.
+    """
+    from windbreak.forecast.corpus import ReplayCorpus
+
+    return ReplayCorpus(
+        documents={_CORPUS_URL: "recorded body"},
+        results={"a recorded subquestion": (_CORPUS_URL,)},
+        votes={},
+    )
+
+
+def test_a_selected_corpus_is_reported_as_the_runs_evidence_source(
+    tmp_path: Path,
+) -> None:
+    """A corpus outranks the offline default and is named as the source (#485).
+
+    This is the direction that made issue #485 buildable at all: until PR #522
+    every configuration resolved to `RESEARCH_EVIDENCE_NONE`, so the guard could
+    not discriminate and would have fired on every startup.
+
+    Args:
+        tmp_path: The pytest scratch directory, standing in for the ledger's
+            parent.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.scheduler.loop import (
+        RESEARCH_EVIDENCE_CORPUS,
+        _resolve_research_tools,
+    )
+
+    source, tools = _resolve_research_tools(
+        None,
+        tmp_path / "ledger.db",
+        WindbreakConfig(),
+        None,
+        _one_document_corpus(),
+    )
+
+    assert source == RESEARCH_EVIDENCE_CORPUS
+    assert tools.search("a recorded subquestion") == (_CORPUS_URL,)
+
+
+def test_live_seams_without_a_search_endpoint_report_no_evidence_source(
+    tmp_path: Path,
+) -> None:
+    """A live provider bundle with no research half is starved, and says so.
+
+    `_live_research_http` returns `(None, None)` when
+    `forecast.research.search_endpoint_url` is still the unconfigured
+    placeholder, and `build_live_research_tools` then hands back the offline
+    bundle that finds nothing. Reporting that run as `live-search` would be the
+    guard overclaiming in the one direction that costs an operator something:
+    it would say "you have evidence" to a deployment that has none.
+
+    Args:
+        tmp_path: The pytest scratch directory, standing in for the ledger's
+            parent.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.scheduler.loop import (
+        RESEARCH_EVIDENCE_NONE,
+        _resolve_research_tools,
+    )
+    from windbreak.scheduler.provider_wiring import LiveProviderHttp
+
+    source, tools = _resolve_research_tools(
+        None,
+        tmp_path / "ledger.db",
+        WindbreakConfig(),
+        LiveProviderHttp(llm={}, search=None, fetch=None),
+    )
+
+    assert source == RESEARCH_EVIDENCE_NONE
+    assert tools.search("will this reach the network") == ()
+
+
+def test_live_seams_with_a_search_endpoint_report_the_live_source(
+    tmp_path: Path,
+) -> None:
+    """Both live research halves present is reported as the live source (#485).
+
+    The pair, not either half: `build_live_research_tools` degrades on *either*
+    being absent, so the token must key on the same conjunction or the two
+    disagree on the one run where it matters.
+
+    Args:
+        tmp_path: The pytest scratch directory, standing in for the ledger's
+            parent.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.forecast.providers.http_cassettes import (
+        ForbiddenLiveHttpTransport,
+    )
+    from windbreak.scheduler.loop import (
+        RESEARCH_EVIDENCE_LIVE,
+        _resolve_research_tools,
+    )
+    from windbreak.scheduler.provider_wiring import LiveProviderHttp
+
+    # A transport that raises on any `send`, so the token below can only come
+    # from the seams being *present* -- nothing here is allowed to dial.
+    seam = ForbiddenLiveHttpTransport()
+
+    source, _tools = _resolve_research_tools(
+        None,
+        tmp_path / "ledger.db",
+        WindbreakConfig(),
+        LiveProviderHttp(llm={}, search=seam, fetch=seam),
+    )
+
+    assert source == RESEARCH_EVIDENCE_LIVE
+
+
+def test_half_a_live_research_bundle_reports_no_evidence_source(
+    tmp_path: Path,
+) -> None:
+    """One live research seam without the other is starved, and reported so.
+
+    `build_live_research_tools` degrades to the offline bundle when *either*
+    half is absent, so the token has to key on the same disjunction or the two
+    disagree: the run would be told it has live research while holding
+    transports that find nothing. This pins the agreement rather than the
+    choice -- the tools returned are asserted to find nothing, so the token and
+    the bundle are checked against each other, not against a literal.
+
+    Args:
+        tmp_path: The pytest scratch directory, standing in for the ledger's
+            parent.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.forecast.providers.http_cassettes import (
+        ForbiddenLiveHttpTransport,
+    )
+    from windbreak.scheduler.loop import (
+        RESEARCH_EVIDENCE_NONE,
+        _resolve_research_tools,
+    )
+    from windbreak.scheduler.provider_wiring import LiveProviderHttp
+
+    source, tools = _resolve_research_tools(
+        None,
+        tmp_path / "ledger.db",
+        WindbreakConfig(),
+        LiveProviderHttp(llm={}, search=ForbiddenLiveHttpTransport(), fetch=None),
+    )
+
+    assert source == RESEARCH_EVIDENCE_NONE
+    assert tools.search("will this reach the network") == ()
+
+
+def test_only_the_absent_evidence_source_is_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exactly one of the four sources warns; the other three fold at INFO.
+
+    Enumerated from `RESEARCH_EVIDENCE_SOURCES` rather than from a restated
+    list, so a fifth source added without a decision about how it is reported
+    fails here. This is the assertion that kills both degenerate mutants: a
+    guard rewired to always warn breaks the three folding cases, and one rewired
+    to never warn breaks the starved case.
+
+    Args:
+        caplog: The pytest log capture fixture.
+    """
+    import logging as logging_module
+
+    from windbreak.scheduler.loop import (
+        EVIDENCE_STARVED_MESSAGE,
+        RESEARCH_EVIDENCE_NONE,
+        RESEARCH_EVIDENCE_SOURCES,
+        _log_research_evidence,
+        research_evidence_fold,
+    )
+
+    caplog.set_level(logging_module.INFO, logger="windbreak.scheduler")
+    for source in RESEARCH_EVIDENCE_SOURCES:
+        _log_research_evidence(source)
+
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging_module.WARNING, EVIDENCE_STARVED_MESSAGE)
+        if source == RESEARCH_EVIDENCE_NONE
+        else (logging_module.INFO, research_evidence_fold(source))
+        for source in RESEARCH_EVIDENCE_SOURCES
+    ]
+
+
+def test_the_starvation_warning_carries_no_interpolation_site(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning's format string has no `%` at all, so nothing can enter it.
+
+    The guard reports *configuration*, and every leaf that can select an
+    evidence source sits beside one naming a credential's environment variable.
+    A message assembled from values would be one refactor away from carrying an
+    endpoint or a key into an operator's log aggregator and, through
+    `AlertEmitted`, into the append-only ledger.
+
+    The property asserted is the one that cannot be worked around: a format
+    string containing no `%` cannot interpolate an argument whatever arguments
+    are supplied. Asserting `record.args == ()` instead would look stronger and
+    be weaker -- `RedactionFilter.filter` collapses args into the message and
+    sets `args` to `None` in place, so that assertion passes or fails on
+    whether some *earlier* test in the session installed the real handler.
+
+    Args:
+        caplog: The pytest log capture fixture.
+    """
+    import logging as logging_module
+
+    from windbreak.scheduler.loop import (
+        EVIDENCE_STARVED_MESSAGE,
+        RESEARCH_EVIDENCE_NONE,
+        _log_research_evidence,
+    )
+
+    caplog.set_level(logging_module.WARNING, logger="windbreak.scheduler")
+    _log_research_evidence(RESEARCH_EVIDENCE_NONE)
+
+    assert "%" not in EVIDENCE_STARVED_MESSAGE
+    assert [record.getMessage() for record in caplog.records] == [
+        EVIDENCE_STARVED_MESSAGE
+    ]
