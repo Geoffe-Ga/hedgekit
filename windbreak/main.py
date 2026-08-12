@@ -18,9 +18,11 @@ import signal
 import threading
 import time
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from windbreak import __version__ as _source_version
 from windbreak.alerts import (
     AlertDispatcher,
     AlertType,
@@ -791,6 +793,42 @@ def _add_drill_arguments(drill_parser: argparse.ArgumentParser) -> None:
     )
 
 
+#: The name this CLI is installed under -- `[project] name` in `pyproject.toml`
+#: and therefore the key `importlib.metadata` looks the installed build up by.
+_DISTRIBUTION_NAME = "windbreak"
+
+
+def _reported_version() -> str:
+    """Report the version of the build this process is actually running.
+
+    ``--version`` exists so that an operator holding a DEPLOYED ARTIFACT can
+    ask it which build it is, so the installed distribution's own metadata --
+    what `pip show` reports, stamped into the wheel's ``.dist-info`` from
+    `pyproject.toml` at build time -- is authoritative whenever there is an
+    installed distribution to ask.
+
+    ``windbreak.__version__`` is the fallback, and it is not the same claim: it
+    is a string in the source tree, which in an install whose checkout has since
+    been edited can disagree with what was actually installed. It is what a
+    checkout that was never installed has, though, and that is a real way to run
+    this CLI -- including this repository's own test suite -- so falling back
+    beats raising `PackageNotFoundError` in front of an operator.
+
+    The two are pinned equal for a release by
+    `tests/test_cli_version.py::test_the_package_dunder_version_matches_the_pyproject_declaration`,
+    so neither answer can drift from `pyproject.toml` unnoticed. Nothing here
+    restates a version literal: both values are read.
+
+    Returns:
+        The installed distribution's version, or the source tree's declared
+        version when no distribution is installed.
+    """
+    try:
+        return metadata.version(_DISTRIBUTION_NAME)
+    except metadata.PackageNotFoundError:
+        return _source_version
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``windbreak`` command-line argument parser.
 
@@ -816,11 +854,27 @@ def build_parser() -> argparse.ArgumentParser:
         ``kill`` and ``rearm`` subcommands exposing
         ``--state-dir``; an ``ack`` subcommand exposing ``--approval-id`` and
         ``--state-dir``; and a developer-only ``alert-test`` subcommand hidden
-        from ``--help``.
+        from ``--help``. The parser itself takes ``--version``, which prints
+        :func:`_reported_version` and exits 0 *without* a subcommand (#507).
     """
     parser = argparse.ArgumentParser(
         prog="windbreak",
         description="windbreak always-on forecast trader CLI.",
+    )
+    # Registered BEFORE the required ``command`` positional, and as argparse's
+    # ``version`` action rather than a flag the dispatch table would have to
+    # notice. Both matter: a ``version`` action short-circuits during argv
+    # consumption, so it exits 0 before argparse's end-of-parse check for the
+    # required positional -- which is precisely what issue #507 hit, where the
+    # missing positional errored (exit 2) without the typed flag even being
+    # mentioned. The printed string is bare, with no ``%(prog)s`` prefix, so
+    # `windbreak --version` is directly comparable to `pyproject.toml`'s
+    # declaration and usable as `VERSION="$(windbreak --version)"`.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=_reported_version(),
+        help="Print the version of the installed build and exit.",
     )
     # ``metavar`` keeps the auto-generated ``{run,alert-test}`` choice list --
     # which would otherwise leak the hidden ``alert-test`` command -- out of the

@@ -60,6 +60,7 @@ from tests.e2e.harness import (
     require_runtime,
     wait_until,
 )
+from tests.project_metadata import declared_project_version
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -113,14 +114,16 @@ def _declared_version() -> str:
     """Read the distribution version `pyproject.toml` declares.
 
     Derived rather than restated so a release that bumps one and forgets the
-    other cannot pass by matching a copy of itself.
+    other cannot pass by matching a copy of itself. Delegated to
+    :func:`tests.project_metadata.declared_project_version` so this tier and
+    the default-suite pin in `tests/test_cli_version.py` compare against the
+    same read of the same file (issue #507) rather than two parsers that could
+    disagree.
 
     Returns:
         The `[project] version` string.
     """
-    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
-        parsed = tomllib.load(handle)
-    return str(parsed["project"]["version"])
+    return declared_project_version()
 
 
 def _source_subpackages() -> list[str]:
@@ -426,11 +429,13 @@ def test_the_installed_distribution_version_matches_pyproject(
 ) -> None:
     """The wheel's metadata version and `windbreak.__version__` both match.
 
-    Issue #467 asked for this through ``windbreak --version``. That flag does
-    not exist -- see
-    :func:`test_the_console_script_has_no_version_flag_yet` -- so the same
-    guarantee is taken from the installed distribution's own metadata, which is
-    strictly closer to what a release actually publishes. A bump that touches
+    Issue #467 asked for this through ``windbreak --version``, which now exists
+    (#507) and is asserted from the console script by
+    :func:`test_the_console_script_reports_the_version_pyproject_declares`.
+    This test stays because it pins the layer under that one: the flag reports
+    the installed distribution's METADATA, and this is what proves the metadata
+    the wheel was built with, the ``__version__`` the wheel ships, and the
+    declaration in `pyproject.toml` are all one value. A bump that touches
     `pyproject.toml` but not `windbreak/__init__.py` (or the reverse) fails
     here.
 
@@ -454,19 +459,27 @@ def test_the_installed_distribution_version_matches_pyproject(
     assert observed["dunder"] == declared
 
 
-def test_the_console_script_has_no_version_flag_yet(
+def test_the_console_script_reports_the_version_pyproject_declares(
     venv_console_script: Path,
     run_root: RunRoot,
 ) -> None:
-    """`windbreak --version` is not implemented; this pins the gap (#507).
+    """`windbreak --version` prints the declared version and exits 0 (#507).
 
-    Issue #467's acceptance criteria assume the flag exists. It does not:
-    `build_parser` registers no ``--version`` action, so argparse rejects the
-    invocation and exits 2 with a usage message. Asserting the *current*
-    behaviour keeps `main` green while making the gap impossible to lose --
-    this test fails the moment the flag lands, which forces #467's original
-    assertion to be written then. Same pattern as
-    `test_documented_rearm_invocation_fails_without_an_interactive_phrase`.
+    This is issue #467's original acceptance criterion, finally assertable, and
+    it is asserted HERE rather than in the default suite for a reason that is
+    the whole point of this module: the flag reports the INSTALLED
+    distribution's metadata, and a checkout has no installed distribution to
+    report. Only from the wheel in the clean venv does the branch an operator
+    actually runs get exercised.
+
+    Three separate claims, because the defect could return as any of them:
+
+    * exit status 0 -- the gap this replaces exited 2, and a test that only
+      asserted "some output" or "SystemExit" could not tell the two apart;
+    * stdout equal to `pyproject.toml`'s declaration EXACTLY, not by substring,
+      so ``0.1.0`` cannot pass for ``0.1.0.dev1``;
+    * no subcommand supplied, since the required ``command`` positional
+      erroring first is what hid the flag in the first place.
 
     Args:
         venv_console_script: Path to the venv's ``bin/windbreak``.
@@ -474,9 +487,9 @@ def test_the_console_script_has_no_version_flag_yet(
     """
     completed = _run_console_script(venv_console_script, "--version", cwd=run_root.root)
 
-    assert completed.returncode == 2
-    assert _declared_version() not in completed.stdout
-    assert "usage: windbreak" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == _declared_version()
+    assert completed.stderr == ""
 
 
 def test_the_console_script_help_exits_zero(
