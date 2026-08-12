@@ -36,6 +36,12 @@ it -- which is precisely why it went unasserted while three tests happily
 checked the wiring underneath it. :func:`_required_status_check_contexts`
 reads the live setting, so the claim is checked against GitHub rather than
 against a comment restating it.
+
+That last check is LOCAL-ONLY, and the rest of this module is not. Reading
+branch protection needs an admin-scoped token, which CI does not have, so in
+CI it skips while everything above it asserts on every run. The skip is loud
+and says so; see the test's own docstring for why it is still worth having and
+what would make it run in CI.
 """
 
 from __future__ import annotations
@@ -320,20 +326,27 @@ def _required_status_check_contexts() -> list[str]:
 
     Queries GitHub rather than any file in this tree, because the setting is
     not in this tree. The read is deliberately allowed to *skip* -- never to
-    pass -- when it cannot be performed: the endpoint needs an administrative
-    token, which a CI runner's default `GITHUB_TOKEN` is not, so on a runner
-    this reports SKIPPED with the refusal quoted rather than inventing an
-    answer. A silent pass here would be the same defect the caller exists to
-    catch, one level up.
+    pass -- when it cannot be performed. A silent pass here would be the same
+    defect the caller exists to catch, one level up.
+
+    WHERE THIS ACTUALLY RUNS: the endpoint needs an admin-scoped token. CI has
+    none -- `ci.yml` sets no `GH_TOKEN` or `GITHUB_TOKEN`, and a runner's
+    default `GITHUB_TOKEN` would not carry the scope anyway -- so on every CI
+    run this takes the skip path. In practice the assertion is made by a
+    maintainer running the suite locally with an authenticated `gh`. The skip
+    reasons below say so in as many words, because a bare SKIP in a CI log
+    reads like coverage.
 
     Returns:
         The required context names, exactly as GitHub records them.
     """
     if shutil.which("gh") is None:
         pytest.skip(
-            "cannot verify branch protection: no `gh` CLI on PATH. The "
-            "required-status-check set lives on the repository, not in this "
-            "tree, so there is nothing local to fall back to."
+            "branch-protection guard is LOCAL-ONLY here: no `gh` CLI on PATH, "
+            "so the required-status-check set cannot be read. It lives on the "
+            "repository, not in this tree, so there is nothing to fall back "
+            "to. This run asserted nothing about whether the container tier "
+            "gates merge."
         )
     completed = subprocess.run(
         [
@@ -349,11 +362,14 @@ def _required_status_check_contexts() -> list[str]:
     )
     if completed.returncode != 0:
         pytest.skip(
-            "cannot verify branch protection: `gh api "
+            "branch-protection guard is LOCAL-ONLY here: `gh api "
             f"repos/.../branches/{PROTECTED_BRANCH}/protection` exited "
             f"{completed.returncode}. Reading protection needs an admin-scoped "
-            "token, which a CI runner's default GITHUB_TOKEN is not. "
-            f"stderr: {completed.stderr.strip()}"
+            "token; CI provides none (no GH_TOKEN/GITHUB_TOKEN is set in "
+            "ci.yml, and the default runner token lacks the scope regardless), "
+            "so this is the expected CI outcome and NOT evidence that the "
+            "container tier gates merge. Run the suite locally with an "
+            f"authenticated `gh` to assert it. stderr: {completed.stderr.strip()}"
         )
     protection = json.loads(completed.stdout)
     checks = protection.get("required_status_checks") or {}
@@ -374,6 +390,24 @@ def test_the_container_job_is_a_required_status_check() -> None:
     this setting. It is a property of the repository, so it can neither be
     changed by a pull request nor asserted from a file; the only honest check
     is a live read.
+
+    WHAT THIS GUARD IS AND IS NOT. It asserts only where an admin-scoped token
+    can read branch protection, which today means a maintainer running the
+    suite locally with an authenticated `gh`. **In CI it skips, every time**:
+    `ci.yml` sets no `GH_TOKEN` or `GITHUB_TOKEN`, and a runner's default token
+    would not carry the scope in any case. So this test is not a merge gate on
+    the setting, and nothing here should be read as claiming CI verifies it.
+
+    It still earns its place twice over. It caught the `ci.yml` job-name
+    truncation below on its very first run -- a live misconfiguration that
+    would have blocked every pull request on this repository -- and it turns a
+    silent repository-level misconfiguration into a visible local failure for
+    anyone who runs the suite with credentials, which is the only place the
+    check *can* be made at all.
+
+    Making it run in CI is mechanical if the repo owner wants it: expose an
+    admin-scoped token to the workflow as `GH_TOKEN`. That is a credentials
+    policy decision, deliberately not taken here.
 
     The context GitHub matches on is the job's `name:`, not its key in `jobs:`,
     so the expected value is read out of the workflow. Rename the job without

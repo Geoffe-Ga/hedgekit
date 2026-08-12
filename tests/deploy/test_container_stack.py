@@ -62,7 +62,7 @@ from tests.e2e.harness import (
 from windbreak.main import DASHBOARD_AUTH_ENV_VAR
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 pytestmark = pytest.mark.container
@@ -266,7 +266,7 @@ def _restart_counts() -> dict[str, int]:
 
 
 def _assert_stable_for(
-    predicate: object,
+    predicate: Callable[[], bool],
     *,
     seconds: float,
     description: str,
@@ -286,11 +286,9 @@ def _assert_stable_for(
     Raises:
         AssertionError: If the predicate is ever false during the window.
     """
-    checker = predicate
-    assert callable(checker)
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        assert checker(), f"{description} stopped holding during the soak"
+        assert predicate(), f"{description} stopped holding during the soak"
         time.sleep(SOAK_INTERVAL_SECONDS)
 
 

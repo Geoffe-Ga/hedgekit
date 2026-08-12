@@ -50,7 +50,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from setuptools import find_namespace_packages, find_packages
 
 from tests.e2e.harness import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -669,9 +668,24 @@ def _declared_packages() -> list[str]:
     same `[tool.setuptools.packages.find]` arguments, rather than restating
     the answer or re-implementing the glob semantics.
 
+    THE IMPORT IS DEFERRED ON PURPOSE. `setuptools` is a build-time
+    dependency -- `[build-system] requires` names it, `requirements.txt` and
+    `requirements-dev.txt` do not. At module scope the import would become a
+    *collection*-time dependency for every pytest run in the repository,
+    including Gate 1 and all three `quality` legs, none of which reach this
+    function: pytest imports a module to read its markers even when the whole
+    module is about to be deselected. Deferring it scopes the dependency to
+    the one job that genuinely has setuptools, the container job, which
+    installs it explicitly. Pinning it in `requirements-dev.txt` would be the
+    alternative, and is defensible -- but that file is outside this change's
+    owned paths, and needing it there at all is an artefact of where the
+    import sat.
+
     Returns:
         The declared package names, sorted.
     """
+    from setuptools import find_namespace_packages, find_packages
+
     with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
         parsed = tomllib.load(handle)
     config = parsed["tool"]["setuptools"]["packages"]["find"]
