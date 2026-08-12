@@ -249,7 +249,8 @@ def test_the_rows_that_still_carry_a_hostile_ticker_are_exactly_the_known_two(
     *earlier* stages still can, and both are outside issue #525's lane: the
     screener's own `ScreenDecisionRecorded` and the loop's
     `MarketSnapshotRecorded`, each appended before the forecast stage is
-    reached. They are filed separately rather than fixed here.
+    reached. Filed as issue #530 rather than fixed here; that issue's acceptance
+    criteria include narrowing the set below.
 
     The set below is computed from the swept rows, so the day a new row kind
     starts carrying attacker text this fails -- which a hand-written list of
