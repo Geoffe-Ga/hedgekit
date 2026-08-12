@@ -57,11 +57,6 @@ import pytest
 
 from windbreak.ledger.events import ConfigLoaded
 from windbreak.ledger.store import (
-    LEDGER_BUSY_TIMEOUT_MILLIS,
-    LedgerLockedError,
-    SqliteLedgerStore,
-)
-from windbreak.ledger.store import (
     _CREATE_EVENT_TYPE_INDEX_SQL as CREATE_INDEX_SQL,
 )
 from windbreak.ledger.store import (
@@ -72,6 +67,11 @@ from windbreak.ledger.store import (
 )
 from windbreak.ledger.store import (
     _TAKE_WRITE_LOCK_SQL as TAKE_WRITE_LOCK_SQL,
+)
+from windbreak.ledger.store import (
+    LEDGER_BUSY_TIMEOUT_MILLIS,
+    LedgerLockedError,
+    SqliteLedgerStore,
 )
 
 if TYPE_CHECKING:
