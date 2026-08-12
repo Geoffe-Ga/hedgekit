@@ -118,18 +118,32 @@ fi
 # Build pytest arguments
 PYTEST_ARGS=(-v)
 
+# Every -m below must carry `and not container`, and this is not optional.
+# pytest takes the LAST -m it is given, so any selection here REPLACES the
+# `-m "not container"` in pyproject.toml's addopts rather than intersecting
+# with it -- silently re-selecting the tier that exists precisely because it is
+# too expensive for the default run (issues #466, #467, #468). Until issue #468
+# there was exactly one container test and it skipped for want of systemd, so
+# the leak cost nothing visible; it does now, because Gate 1's unit step would
+# otherwise run a `docker build` and five `docker compose up` cycles, and CI's
+# `quality` matrix would run all of it three more times. The `all` case adds no
+# -m at all, so pyproject's deselection stands there unaided.
+# tests/e2e/test_tier_selection_contract.py fails if this guard is dropped.
 case "$TEST_TYPE" in
     unit)
         echo "=== Running Unit Tests ==="
-        PYTEST_ARGS+=(-m "not integration and not e2e")
+        PYTEST_ARGS+=(-m "not integration and not e2e and not container")
         ;;
     integration)
         echo "=== Running Integration Tests ==="
-        PYTEST_ARGS+=(-m "integration")
+        PYTEST_ARGS+=(-m "integration and not container")
         ;;
     e2e)
         echo "=== Running End-to-End Tests ==="
-        PYTEST_ARGS+=(-m "e2e")
+        # `and not container` is not redundant with `e2e`: a module may carry
+        # both markers, and this script is the process-level tier only. The
+        # container tier has its own entry point, scripts/e2e.sh --container.
+        PYTEST_ARGS+=(-m "e2e and not container")
         ;;
     all)
         echo "=== Running All Tests ==="

@@ -19,13 +19,17 @@ import subprocess
 from typing import cast
 
 import pytest
+from _pytest.outcomes import Failed, Skipped
 
 from tests.e2e.harness import (
+    REQUIRE_RUNTIME_ENABLED_VALUE,
+    REQUIRE_RUNTIME_ENV_VAR,
     ProcessLauncher,
     RunRoot,
     SpawnedProcess,
     docker_skip_reason,
     pid_alive,
+    require_runtime,
     run_windbreak,
     systemd_skip_reason,
     wait_until,
@@ -331,3 +335,99 @@ def test_launcher_fixture_spawns_and_owns_a_tracked_process(
 
     assert launcher.spawned == (spawned,)
     assert spawned.is_running()
+
+
+def test_require_runtime_is_silent_when_the_runtime_is_present() -> None:
+    """A ``None`` reason lets the calling test proceed, in either mode.
+
+    The uninteresting branch, pinned because the interesting ones below both
+    raise: if this one raised too, `require_runtime` would gate every test off
+    unconditionally and the tier would go red for a reason unrelated to any
+    deployment claim.
+    """
+    require_runtime(None)
+
+
+def test_require_runtime_skips_when_the_flag_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no fail-closed flag, a missing runtime SKIPS with its reason.
+
+    The developer-machine path. A tier that errored here instead of skipping
+    would be deleted within a week, and the coverage would go with it.
+
+    Args:
+        monkeypatch: Used to clear the fail-closed environment variable.
+    """
+    monkeypatch.delenv(REQUIRE_RUNTIME_ENV_VAR, raising=False)
+
+    with pytest.raises(Skipped) as caught:
+        require_runtime("docker runtime unavailable: no `docker` CLI on PATH")
+
+    assert type(caught.value) is Skipped
+    assert caught.value.msg == ("docker runtime unavailable: no `docker` CLI on PATH")
+
+
+def test_require_runtime_fails_instead_of_skipping_when_the_flag_is_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the flag armed, a missing runtime FAILS -- it never skips.
+
+    The whole point of the flag, and the reason the container job is safe to
+    make a required check: a required check that skips reports success while
+    verifying nothing.
+
+    WHY THIS IS NOT `pytest.raises(Failed)`. It was, and a mutation sweep found
+    the hole: rewriting `require_runtime`'s `pytest.fail` as `pytest.skip` --
+    precisely the regression this test exists to catch -- left the sweep green,
+    because the escaping `Skipped` skipped THIS TEST rather than failing it,
+    and a skipped test is not a red one. A guard that the mutation it guards
+    can silently switch off is not a guard. `Skipped` is therefore caught
+    explicitly and converted into a failure, and the exact type is asserted
+    besides, since `Skipped` and `Failed` share an ancestor.
+
+    Args:
+        monkeypatch: Used to arm the fail-closed environment variable.
+    """
+    monkeypatch.setenv(REQUIRE_RUNTIME_ENV_VAR, REQUIRE_RUNTIME_ENABLED_VALUE)
+    reason = "docker runtime unavailable: no `docker` CLI on PATH"
+
+    try:
+        require_runtime(reason)
+    except Skipped as skipped:
+        message = (
+            "require_runtime SKIPPED while the fail-closed flag was armed "
+            f"(reason: {skipped.msg}). A required check that skips reports "
+            "success while verifying nothing."
+        )
+        raise AssertionError(message) from skipped
+    except Failed as failed:
+        outcome: BaseException = failed
+    else:
+        message = "require_runtime returned normally while armed"
+        raise AssertionError(message)
+
+    assert type(outcome) is Failed
+    assert REQUIRE_RUNTIME_ENV_VAR in str(outcome)
+    assert "no `docker` CLI on PATH" in str(outcome)
+
+
+@pytest.mark.parametrize("value", ["", "0", "true", "yes", "11"])
+def test_require_runtime_only_arms_on_the_exact_flag_value(
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any value other than ``"1"`` leaves the skip behaviour in place.
+
+    A substring or truthiness test would arm on ``"0"`` or on an empty string
+    left behind by a shell export, turning every developer machine without
+    docker into a red suite. The comparison is exact, and this pins it.
+
+    Args:
+        value: An environment value that must NOT arm the fail-closed mode.
+        monkeypatch: Used to set the environment variable under test.
+    """
+    monkeypatch.setenv(REQUIRE_RUNTIME_ENV_VAR, value)
+
+    with pytest.raises(Skipped):
+        require_runtime("docker runtime unavailable: no `docker` CLI on PATH")

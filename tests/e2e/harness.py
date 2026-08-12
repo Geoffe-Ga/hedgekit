@@ -36,6 +36,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
 
+import pytest
+
 from windbreak.ledger.store import SqliteLedgerStore
 
 if TYPE_CHECKING:
@@ -76,6 +78,32 @@ SYSTEMD_NOT_RUNNING_REASON = (
 
 #: Marker file systemd creates when it is the running init system.
 _SYSTEMD_RUNTIME_MARKER = Path("/run/systemd/system")
+
+#: Environment variable that converts a missing-runtime SKIP into a FAILURE.
+#:
+#: The container tier is a REQUIRED check under branch protection, and a
+#: required check that skips reports success -- the CI-level form of a corpus
+#: scan asserting over zero hits. On a developer machine a skip is right: not
+#: everyone has a docker daemon, and a tier that errored there would just be
+#: deleted. In CI the runtime is provisioned deliberately, so a skip means the
+#: provisioning broke and the gate silently stopped gating. Setting this to
+#: ``1`` (the CI job does, in `.github/workflows/ci.yml`) makes that
+#: impossible: every gate in the tier fails loudly instead of skipping.
+#:
+#: THAT LAST SENTENCE IS A UNIVERSAL, AND IT IS ONLY TRUE WHILE EVERY RUNTIME
+#: PROBE IS ROUTED THROUGH :func:`require_runtime`. It was false when first
+#: written: `tests/deploy/test_deployment_cli_contract.py` probed systemd and
+#: called `pytest.skip` on the answer itself, so its four `systemd-analyze
+#: verify` assertions over the shipped unit files would have vanished silently
+#: on a runner that lost systemd -- while this comment promised they could
+#: not. One opted-out call site is enough to make the promise a lie, so the
+#: quantifier is enforced rather than asserted here:
+#: `tests/e2e/test_tier_selection_contract.py` fails if any module in the tier
+#: probes a runtime without importing this gate.
+REQUIRE_RUNTIME_ENV_VAR = "WINDBREAK_E2E_REQUIRE_RUNTIME"
+
+#: Value :data:`REQUIRE_RUNTIME_ENV_VAR` must hold to arm the fail-closed mode.
+REQUIRE_RUNTIME_ENABLED_VALUE = "1"
 
 
 @dataclass(frozen=True)
@@ -527,6 +555,36 @@ def port_is_serving(port: int, *, timeout: float = 0.25) -> bool:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
         sock.settimeout(timeout)
         return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def require_runtime(reason: str | None) -> None:
+    """Gate the calling test on a runtime probe, skipping or failing closed.
+
+    The one place the tier decides what a missing runtime means, so the answer
+    cannot differ between modules. See :data:`REQUIRE_RUNTIME_ENV_VAR` for why
+    the answer is environment-dependent rather than fixed.
+
+    Args:
+        reason: ``None`` when the runtime is present, else a human-readable
+            explanation of what is missing, as returned by
+            :func:`docker_skip_reason` and friends.
+
+    Raises:
+        Failed: If the runtime is absent while :data:`REQUIRE_RUNTIME_ENV_VAR`
+            is armed.
+    """
+    if reason is None:
+        return
+    if os.environ.get(REQUIRE_RUNTIME_ENV_VAR) == REQUIRE_RUNTIME_ENABLED_VALUE:
+        message = (
+            f"{reason}. {REQUIRE_RUNTIME_ENV_VAR}="
+            f"{REQUIRE_RUNTIME_ENABLED_VALUE} is set, so this tier refuses to "
+            "skip: it is a required check, and a required check that skips "
+            "reports success while verifying nothing. Provision the runtime "
+            f"or unset {REQUIRE_RUNTIME_ENV_VAR}."
+        )
+        pytest.fail(message)
+    pytest.skip(reason)
 
 
 @lru_cache(maxsize=1)
