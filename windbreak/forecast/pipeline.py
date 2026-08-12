@@ -42,6 +42,7 @@ from windbreak.forecast.providers.base import (
     ProviderTimeoutError,
     ProviderVoteError,
     fingerprint_response,
+    provider_performs_own_research,
     screen_market_metadata,
 )
 from windbreak.forecast.providers.retry import is_retryable_status
@@ -838,6 +839,58 @@ def _build_provider(
     return provider_factory(member)
 
 
+def _build_providers(
+    members: tuple[EnsembleMemberLike, ...],
+    provider_factory: Callable[[EnsembleMemberLike], ForecastProvider] | None,
+    transport: LlmTransport,
+) -> tuple[ForecastProvider, ...]:
+    """Resolve every ensemble member's provider once, up front.
+
+    Built ahead of the vote loop rather than inside it because :func:`run_pipeline`
+    has to know what kind of members it is driving *before* it decides whether to
+    research for them (issue #556) -- and constructing a provider twice, once to
+    ask and once to drive, would let the two disagree.
+
+    Args:
+        members: The resolved ensemble members, in call order.
+        provider_factory: The caller's provider factory, or ``None`` for the
+            default fixture provider.
+        transport: The LLM transport the default fixture provider votes through.
+
+    Returns:
+        One provider per member, in member order.
+    """
+    return tuple(
+        _build_provider(provider_factory, transport, member) for member in members
+    )
+
+
+def _ensemble_performs_own_research(providers: tuple[ForecastProvider, ...]) -> bool:
+    """Return whether *every* member of a non-empty ensemble researches for itself.
+
+    ``all`` over the members, never ``any``: an ensemble holding one no-tools LLM
+    voter beside a research forecaster still needs the pipeline's verified quotes,
+    because that voter has nothing else to vote on (SPEC S8.2, ADR-0005 S1(a)).
+    Skipping the stage for a mixed ensemble would not save money, it would
+    silently vote on nothing.
+
+    The non-empty guard is load-bearing, not defensive: ``all(())`` is vacuously
+    true, so an ensemble with no members at all would otherwise stop researching
+    -- a behavior change on a configuration that has no research forecaster in it.
+
+    Args:
+        providers: The ensemble's providers, in member order.
+
+    Returns:
+        ``True`` iff there is at least one provider and
+        :func:`~windbreak.forecast.providers.base.provider_performs_own_research`
+        holds for every one of them.
+    """
+    return bool(providers) and all(
+        provider_performs_own_research(provider) for provider in providers
+    )
+
+
 def _is_transport_failure(error: ProviderVoteError) -> bool:
     """Return whether a discarded vote's failure means no provider was reached.
 
@@ -913,15 +966,14 @@ def _collect_provider_forecasts(
     market: NormalizedMarket,
     baseline: BaselineQuoteSnapshot,
     *,
-    transport: LlmTransport,
     quotes: tuple[ResearchQuote, ...],
     recorder: _DiscardRecorder | None,
     members: tuple[EnsembleMemberLike, ...],
-    provider_factory: Callable[[EnsembleMemberLike], ForecastProvider] | None,
+    providers: tuple[ForecastProvider, ...],
 ) -> _VoteCollection:
     """Drive each member's provider into a :class:`_VoteCollection`.
 
-    One provider per member (see :func:`_build_provider`) produces one forecast;
+    One provider per member (see :func:`_build_providers`) produces one forecast;
     any per-vote failure crossing the seam
     (:class:`~windbreak.forecast.providers.base.ProviderVoteError` -- a
     screen-side rejection, a version drift, or a transport-class timeout/
@@ -936,22 +988,24 @@ def _collect_provider_forecasts(
     Args:
         market: The market under forecast.
         baseline: The baseline quote snapshot.
-        transport: The LLM transport the default fixture provider votes through.
         quotes: The sanitized web quotes threaded into each fixture vote prompt.
         recorder: The discard recorder, or ``None`` to ledger nothing.
         members: The resolved ensemble members to drive, in order.
-        provider_factory: The caller's provider factory, or ``None`` for the
-            default fixture provider.
+        providers: Each member's already-built provider, in the identical order;
+            see :func:`_build_providers` for why they are resolved up front.
 
     Returns:
         The surviving forecasts plus the discarded votes' aggregate cost and
         per-discard transport-class flags.
+
+    Raises:
+        ValueError: If ``providers`` and ``members`` differ in length, which
+            would silently pair a member's provenance with another's provider.
     """
     forecasts: list[ProviderForecast] = []
     discarded_cost_micros = 0
     discard_transport_flags: list[bool] = []
-    for index, member in enumerate(members):
-        provider = _build_provider(provider_factory, transport, member)
+    for index, (member, provider) in enumerate(zip(members, providers, strict=True)):
         try:
             # The seam, not the prompt builder (issue #462): screening here
             # covers every provider -- including one that assembles its own
@@ -1065,11 +1119,10 @@ def collect_model_votes(
     collection = _collect_provider_forecasts(
         market,
         baseline,
-        transport=transport,
         quotes=quotes,
         recorder=recorder,
         members=members,
-        provider_factory=provider_factory,
+        providers=_build_providers(members, provider_factory, transport),
     )
     voting_forecasts, _ = _partition_abstaining(collection.forecasts)
     return tuple(_build_model_vote(forecast) for forecast in voting_forecasts)
@@ -1215,6 +1268,7 @@ def build_forecast_record(
     source_notes: tuple[str, ...],
     rationale: str,
     coherence_sum: int | None,
+    research_cost_micros: int,
     eligible_for_live: bool = True,
 ) -> ForecastRecord:
     """Assemble and validate the final :class:`ForecastRecord`.
@@ -1231,6 +1285,10 @@ def build_forecast_record(
         source_notes: The source-quality notes.
         rationale: The rationale markdown.
         coherence_sum: The coherence group sum, or None.
+        research_cost_micros: What this run's research actually cost, in micros.
+            Required rather than defaulted to the stage constant: a default
+            would let a caller that skipped the research stage still stamp the
+            full stub on its record without saying so (issue #556).
         eligible_for_live: Whether the record may back a live order; defaults to
             ``True`` and is overridden by the caller's live-eligibility gate.
 
@@ -1249,7 +1307,7 @@ def build_forecast_record(
         rationale_markdown=rationale,
         citations=citations,
         source_quality_notes=source_notes,
-        research_cost_micros=_RESEARCH_COST_MICROS,
+        research_cost_micros=research_cost_micros,
         triage_stage="full",
         created_at=created_at,
         forecast_horizon_hours=_forecast_horizon_hours(market, created_at),
@@ -1270,6 +1328,7 @@ def _build_abstention_record(
     question_hash: str,
     citations: tuple[Citation, ...],
     abstention_reason: str,
+    research_cost_micros: int,
 ) -> ForecastRecord:
     """Assemble a schema-valid abstention record (mirrors the triage-only one).
 
@@ -1285,6 +1344,8 @@ def _build_abstention_record(
         question_hash: The normalized-question hash.
         citations: The gathered citations, retained for audit.
         abstention_reason: Why the engine abstained. Must be a known reason.
+        research_cost_micros: What this run's research actually cost and was
+            charged, in micros (issue #556).
 
     Returns:
         A schema-valid, immutable abstention forecast record.
@@ -1312,7 +1373,7 @@ def _build_abstention_record(
         rationale_markdown=rationale_markdown,
         citations=citations,
         source_quality_notes=(),
-        research_cost_micros=_RESEARCH_COST_MICROS,
+        research_cost_micros=research_cost_micros,
         triage_stage="full",
         created_at=created_at,
         forecast_horizon_hours=_forecast_horizon_hours(market, created_at),
@@ -1693,30 +1754,37 @@ class _VoteBundle:
         shortfall_reason: The abstention reason when too few votes survived to
             aggregate over (see :func:`_vote_shortfall_reason`), or ``None`` when
             the quorum is met and aggregation may proceed.
+        research_cost_micros: What this run's research actually cost and was
+            actually charged: the research stage's own charge (zero when the
+            ensemble researches for itself) plus every vote's reported cost,
+            surviving and discarded alike. The record stamps this figure rather
+            than the stage constant, so what the record says was spent is what
+            the budget was asked for (issue #556).
     """
 
     votes: tuple[ModelVote, ...]
     forecasts: tuple[ProviderForecast, ...]
     shortfall_reason: str | None
+    research_cost_micros: int
 
 
 def _collect_votes(
     market: NormalizedMarket,
     baseline: BaselineQuoteSnapshot,
     *,
-    transport: LlmTransport,
     quotes: tuple[ResearchQuote, ...],
     created_at: datetime,
     min_ensemble_votes: int,
     ledger: ForecastLedgerWriter | None,
     budget: ResearchBudget | None,
-    ensemble: tuple[EnsembleMemberLike, ...] | None,
-    provider_factory: Callable[[EnsembleMemberLike], ForecastProvider] | None,
+    members: tuple[EnsembleMemberLike, ...],
+    providers: tuple[ForecastProvider, ...],
+    research_stage_micros: int,
 ) -> _VoteBundle:
     """Drive the vote stage, charge its spend, and classify any shortfall.
 
     Collects one forecast per ensemble member (discarding per-vote failures),
-    charges the run's full research spend -- the fixed stub cost plus every
+    charges the run's full research spend -- ``research_stage_micros`` plus every
     surviving *and* discarded vote's cost (an abstaining member is charged too:
     it did call the provider) -- into ``budget``. It then partitions off any
     explicitly abstaining members (:func:`_partition_abstaining`): only the
@@ -1728,15 +1796,16 @@ def _collect_votes(
     Args:
         market: The market under forecast.
         baseline: The baseline quote snapshot the votes are struck against.
-        transport: The LLM transport the default fixture provider votes through.
         quotes: The sanitized, verified web quotes threaded into each vote prompt.
         created_at: The run's creation instant, bucketing the budget spend.
         min_ensemble_votes: The minimum surviving votes a full record requires.
         ledger: The ledger writer for vote-discard events, or ``None``.
         budget: The research budget to charge, or ``None`` for a no-op.
-        ensemble: The vote ensemble to drive, or ``None`` for the pinned default.
-        provider_factory: The caller's provider factory, or ``None`` for the
-            default fixture provider.
+        members: The resolved ensemble members to drive, in order.
+        providers: Each member's already-built provider, in the identical order.
+        research_stage_micros: What the pipeline's own research stage cost this
+            run: the full stub charge when it ran, or zero when it was skipped
+            because every member researches for itself (issue #556).
 
     Returns:
         The surviving votes and forecasts paired with the shortfall abstention
@@ -1749,21 +1818,18 @@ def _collect_votes(
     collection = _collect_provider_forecasts(
         market,
         baseline,
-        transport=transport,
         quotes=quotes,
         recorder=_build_discard_recorder(ledger, created_at),
-        members=_resolve_vote_ensemble(ensemble),
-        provider_factory=provider_factory,
+        members=members,
+        providers=providers,
     )
     provider_cost_micros = sum(
         forecast.cost_micros for forecast in collection.forecasts
     )
-    _charge_research(
-        budget,
-        _RESEARCH_COST_MICROS + provider_cost_micros + collection.discarded_cost_micros,
-        market,
-        created_at,
+    research_cost_micros = (
+        research_stage_micros + provider_cost_micros + collection.discarded_cost_micros
     )
+    _charge_research(budget, research_cost_micros, market, created_at)
     voting_forecasts, abstain_count = _partition_abstaining(collection.forecasts)
     votes = tuple(_build_model_vote(forecast) for forecast in voting_forecasts)
     shortfall_reason = _vote_shortfall_reason(
@@ -1773,7 +1839,98 @@ def _collect_votes(
         abstain_count=abstain_count,
     )
     return _VoteBundle(
-        votes=votes, forecasts=voting_forecasts, shortfall_reason=shortfall_reason
+        votes=votes,
+        forecasts=voting_forecasts,
+        shortfall_reason=shortfall_reason,
+        research_cost_micros=research_cost_micros,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ResearchOutcome:
+    """What stage 5 gathered, and what it cost, for one run.
+
+    ``performed`` is the one *declared* field the other three answers derive
+    from, so "we researched and found nothing" and "we never researched" cannot
+    drift apart into two independently-editable flags. They are different runs
+    with the same zero verified count and must stay different: only the first is
+    an evidence failure worth abstaining on (SPEC S8.8), and only the first
+    spent the stage's money.
+
+    Attributes:
+        citations: The citations stage 5 gathered; empty when it did not run.
+        verdicts: Each gathered citation's independent verification verdict.
+        performed: Whether the pipeline ran its own research at all. ``False``
+            only when every ensemble member researches for itself (issue #556).
+    """
+
+    citations: tuple[Citation, ...]
+    verdicts: tuple[CitationVerdict, ...]
+    performed: bool
+
+    @property
+    def verified_count(self) -> int:
+        """Return how many gathered citations independently verified."""
+        return count_verified(self.verdicts)
+
+    @property
+    def cost_micros(self) -> int:
+        """Return what the research stage cost this run, in micros.
+
+        Returns:
+            :data:`_RESEARCH_COST_MICROS` when the stage ran, else ``0`` -- the
+            stub is a charge *for* the search and fetch work, so a run that made
+            no search and no fetch call owes nothing for it.
+        """
+        return _RESEARCH_COST_MICROS if self.performed else 0
+
+    @property
+    def abstains_on_evidence(self) -> bool:
+        """Return whether the run must abstain for want of verified evidence.
+
+        Only a run that actually researched can fail this way. A self-researching
+        ensemble gathers no pipeline citations by design, which is not the same
+        fact as researching and verifying none of what came back -- reading it as
+        such would abstain on every research-forecaster run ever made.
+        """
+        return self.performed and self.verified_count == 0
+
+
+def _run_research_stage(
+    *,
+    providers: tuple[ForecastProvider, ...],
+    subquestions: tuple[str, ...],
+    research_tools: ResearchTools,
+    max_pages: int | None,
+    created_at: datetime,
+) -> _ResearchOutcome:
+    """Run stage 5, or skip it when the ensemble researches for itself (#556).
+
+    The skip removes the *work*, not merely its accounting: no search, no fetch,
+    no verification refetch. Skipping only the charge would leave the egress
+    spend happening with nothing in the ledger admitting it -- strictly worse
+    than paying twice and saying so.
+
+    Args:
+        providers: The ensemble's already-built providers, in member order.
+        subquestions: The decomposed subquestions to research.
+        research_tools: The sandboxed research tools stage 5 reaches the web
+            through.
+        max_pages: The budget's page ceiling bounding stage 5's fetches.
+        created_at: The instant each citation is verified as of.
+
+    Returns:
+        The gathered citations and verdicts, or an empty, unperformed outcome.
+    """
+    if _ensemble_performs_own_research(providers):
+        return _ResearchOutcome(citations=(), verdicts=(), performed=False)
+    citations = bounded_web_research(
+        subquestions, tools=research_tools, max_pages=max_pages
+    )
+    return _ResearchOutcome(
+        citations=citations,
+        verdicts=verify_citations(research_tools, citations, as_of=created_at),
+        performed=True,
     )
 
 
@@ -1864,6 +2021,7 @@ def _aggregate_into_record(
         source_notes=source_notes,
         rationale=rationale,
         coherence_sum=coherence_sum,
+        research_cost_micros=bundle.research_cost_micros,
         eligible_for_live=_full_run_eligible_for_live(
             canary_gate=canary_gate,
             provider_gate_ok=provider_gate_ok,
@@ -1898,7 +2056,17 @@ def run_pipeline(
     :func:`collect_model_votes` touches ``transport``, so wiring a forbidden
     or empty transport fails the run closed rather than reaching a network.
     Stage 5 reaches the web only through ``research_tools``, whose egress
-    allowlist can make the run raise :class:`EgressDeniedError` before any vote.
+    allowlist can make the run raise :class:`EgressDeniedError` before any vote
+    -- unless *every* ensemble member's provider declares it researches for
+    itself (ADR-0005 S1(b),
+    :func:`~windbreak.forecast.providers.base.provider_performs_own_research`),
+    in which case stage 5 is skipped outright: no search, no fetch, no
+    verification, and no research charge, because the pipeline's research would
+    be work those members ignore by design and money spent twice (issue #556). A
+    *mixed* ensemble still researches -- its no-tools members have nothing else
+    to vote on. A skipped run gathers no citations, so it can never be
+    live-eligible under ``min_verified_citations``: a provider's own reported
+    citations stay audit-only and never substitute for verification.
     Each gathered citation is then independently re-verified (SPEC S8.8); when
     *zero* verify, the run abstains with
     :data:`ABSTENTION_NO_VERIFIED_CITATIONS` -- returning a live-ineligible
@@ -2009,39 +2177,48 @@ def run_pipeline(
     # already holds, so a market that can never be forecast opens no budget
     # day and pays for no research.
     screen_market_metadata(market)
+    # The daily cap governs *all* spend, including a research forecaster's own
+    # call, so it opens the day before anything else -- deliberately above the
+    # research skip rather than below it (issue #556). Hoisting the skip over
+    # this line would let an exhausted day keep paying providers indefinitely.
     max_pages = _open_budget_day(budget, created_at)
     question_hash = normalize_question(market)
     criteria = extract_resolution_criteria(market)
     base_rate_ppm = outside_view_base_rate(baseline)
     subquestions = decompose_subquestions(market)
-    citations = bounded_web_research(
-        subquestions, tools=research_tools, max_pages=max_pages
+    members = _resolve_vote_ensemble(ensemble)
+    providers = _build_providers(members, provider_factory, transport)
+    research = _run_research_stage(
+        providers=providers,
+        subquestions=subquestions,
+        research_tools=research_tools,
+        max_pages=max_pages,
+        created_at=created_at,
     )
-    verdicts = verify_citations(research_tools, citations, as_of=created_at)
-    verified_count = count_verified(verdicts)
-    if verified_count == 0:
-        _charge_research(budget, _RESEARCH_COST_MICROS, market, created_at)
+    if research.abstains_on_evidence:
+        _charge_research(budget, research.cost_micros, market, created_at)
         return _build_abstention_record(
             market=market,
             baseline=baseline,
             created_at=created_at,
             question_hash=question_hash,
-            citations=citations,
+            citations=research.citations,
             abstention_reason=ABSTENTION_NO_VERIFIED_CITATIONS,
+            research_cost_micros=research.cost_micros,
         )
-    source_notes = assess_source_reliability(verdicts)
+    source_notes = assess_source_reliability(research.verdicts)
     counterpoints = adversarial_counterargument(subquestions)
     bundle = _collect_votes(
         market,
         baseline,
-        transport=transport,
-        quotes=_verified_quotes(verdicts),
+        quotes=_verified_quotes(research.verdicts),
         created_at=created_at,
         min_ensemble_votes=min_ensemble_votes,
         ledger=ledger,
         budget=budget,
-        ensemble=ensemble,
-        provider_factory=provider_factory,
+        members=members,
+        providers=providers,
+        research_stage_micros=research.cost_micros,
     )
     if bundle.shortfall_reason is not None:
         return _build_abstention_record(
@@ -2049,8 +2226,9 @@ def run_pipeline(
             baseline=baseline,
             created_at=created_at,
             question_hash=question_hash,
-            citations=citations,
+            citations=research.citations,
             abstention_reason=bundle.shortfall_reason,
+            research_cost_micros=bundle.research_cost_micros,
         )
     return _aggregate_into_record(
         bundle,
@@ -2058,13 +2236,13 @@ def run_pipeline(
         baseline=baseline,
         created_at=created_at,
         question_hash=question_hash,
-        citations=citations,
+        citations=research.citations,
         criteria=criteria,
         counterpoints=counterpoints,
         base_rate_ppm=base_rate_ppm,
         source_notes=source_notes,
         canary_gate=canary_gate,
-        verified_count=verified_count,
+        verified_count=research.verified_count,
         min_verified_citations=min_verified_citations,
         calibration_map=calibration_map,
         ledger=ledger,

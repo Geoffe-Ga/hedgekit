@@ -60,6 +60,14 @@ _FIXTURE_COST_MICROS = 0
 class FixtureVoteProvider:
     """A network-free :class:`ForecastProvider` over a transport + member."""
 
+    #: ADR-0005 S1(a): this member votes only on the quotes the pipeline
+    #: verified and threaded into its prompt, so the pipeline's research stage
+    #: is what it votes *on* -- never redundant (issue #556). Declared
+    #: explicitly rather than left to the absent-means-false default, because
+    #: this is the direction that must not regress: it is a statement about
+    #: what this provider needs, not an omission.
+    performs_own_research = False
+
     def __init__(self, transport: LlmTransport, member: EnsembleMemberLike) -> None:
         """Bind the transport and ensemble member this provider votes through.
 

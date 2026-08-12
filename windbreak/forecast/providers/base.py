@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
 from windbreak.forecast.sanitize import (
     MAX_RATIONALE_CHARS,
@@ -701,6 +701,54 @@ class ForecastProvider(Protocol):
                 such failure per-vote rather than crashing the whole run.
         """
         ...
+
+
+@runtime_checkable
+class SelfResearchingProvider(Protocol):
+    """A provider that declares its research and its vote are fused.
+
+    ADR-0005 S1(b)'s family (b): a research forecaster performs its own bounded
+    research server-side and never reads the pipeline's verified quotes -- which
+    is why :class:`~windbreak.forecast.providers.futuresearch.FutureSearchProvider`
+    builds a request body that is a pure function of the market/baseline
+    question fields. The pipeline's own stage-5 research is therefore redundant
+    work *and* redundant spend for an ensemble made entirely of such members
+    (issue #556).
+
+    This is a **declaration**, not an inference. The pipeline must decide whether
+    to research *before* any provider is called, so there is nothing to observe
+    yet -- and inferring the answer from a vendor name would be a different
+    question with a different answer ("is this provider called futuresearch"
+    agrees with "does this provider research for itself" only until the second
+    research vendor, or the first wrapper, exists). A provider that says nothing
+    is read as family (a): the pipeline researches, exactly as it always did.
+
+    Attributes:
+        performs_own_research: Whether this provider does its own research, so
+            the pipeline's stage-5 research would be redundant for it.
+    """
+
+    performs_own_research: bool
+
+
+def provider_performs_own_research(provider: object) -> bool:
+    """Return whether ``provider`` declares it researches for itself.
+
+    Reads the provider's own :class:`SelfResearchingProvider` declaration.
+    Absence and a declared ``False`` are the same answer -- the pipeline
+    researches -- so a provider written before this seam existed keeps its
+    pre-#556 behavior byte-for-byte.
+
+    Args:
+        provider: The provider to interrogate; any object is accepted, since a
+            provider satisfies :class:`ForecastProvider` structurally.
+
+    Returns:
+        ``True`` iff ``provider`` declares ``performs_own_research`` true.
+    """
+    return (
+        isinstance(provider, SelfResearchingProvider) and provider.performs_own_research
+    )
 
 
 def fingerprint_response(text: str) -> str:

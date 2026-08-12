@@ -52,8 +52,10 @@ from windbreak.forecast.providers.base import (
     ProviderTimeoutError,
     ProviderVersionDriftError,
     ProviderVoteError,
+    SelfResearchingProvider,
     build_vote_prompt,
     fingerprint_response,
+    provider_performs_own_research,
 )
 from windbreak.forecast.providers.fetch_live import (
     BodyTooLargeError,
@@ -132,9 +134,11 @@ __all__ = [
     "ReplayHttpCassette",
     "RetryPolicy",
     "RetryingProvider",
+    "SelfResearchingProvider",
     "TokenUsage",
     "UnreachableUrlError",
     "build_vote_prompt",
     "fingerprint_response",
     "is_retryable_status",
+    "provider_performs_own_research",
 ]
