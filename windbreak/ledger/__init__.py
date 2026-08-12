@@ -72,9 +72,11 @@ from windbreak.ledger.events import (
 )
 from windbreak.ledger.rebuild import rebuild, rebuild_command
 from windbreak.ledger.store import (
+    LEDGER_BUSY_TIMEOUT_MILLIS,
     ChainHead,
     ChainIntegrityError,
     LatestRecordLookup,
+    LedgerLockedError,
     LedgerRecord,
     LedgerStore,
     ReverseTypeScan,
@@ -86,6 +88,7 @@ from windbreak.ledger.store import (
 __all__ = [
     "EVENT_TYPES",
     "GENESIS_PREV_HASH",
+    "LEDGER_BUSY_TIMEOUT_MILLIS",
     "AlertEmitted",
     "AnchorFormatError",
     "AnchorMismatchError",
@@ -98,6 +101,7 @@ __all__ = [
     "ExchangeStatusObserved",
     "ForecastCreated",
     "LatestRecordLookup",
+    "LedgerLockedError",
     "LedgerRecord",
     "LedgerStore",
     "MarketSnapshotRecorded",

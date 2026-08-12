@@ -22,6 +22,34 @@ useful for a bounded smoke run. See `docs/RUNBOOK.md` for the four
 `--paper-books-dir`/`--cassette-path`/`--ledger-path`/`--report-dir` flags that
 activate the always-on PAPER loop, and for what one PAPER tick actually does.
 
+### A process that will not start on a busy ledger (issue #328)
+
+Several processes may share one ledger file, and opening it is itself a write.
+A process starting while a sibling holds SQLite's write lock now **waits** for
+it — ten seconds, chosen to be far beyond anything windbreak itself holds (every
+write is one row in its own transaction) and far below the point at which a
+container that never starts stops looking like a crash. Nothing needs doing:
+simultaneous startup is the normal case, and the wait is invisible.
+
+If the lock is still held after ten seconds the process refuses to start, exits
+non-zero, and logs the reason at `CRITICAL`, prefixed `FATAL:`, naming the
+ledger path and SQLite's own wording:
+
+    FATAL: cannot open the ledger at /var/lib/windbreak/ledger/windbreak.db:
+    another process still held the SQLite write lock after 10000 ms (database
+    is locked). Stop whichever windbreak process is using the same
+    --ledger-path, or let it finish, then start this one again.
+
+That means a *stuck* holder, not a busy one. Find the other process against the
+same ledger path and stop it, or wait for it to finish, then start this one
+again. Under a restart policy the refusal repeats, so the `FATAL:` line will be
+in the log every time — a service that keeps restarting with no such line is a
+different fault.
+
+Any other startup failure against the ledger — a path that cannot be opened, a
+read-only mount, a full disk — is reported with its own message and is **not**
+this condition.
+
 ## 2. Kill switch, re-arm, and human acknowledgement (SPEC §10.11, §10.8)
 
 Engage the kill switch by dropping an empty `KILL` file into the state
