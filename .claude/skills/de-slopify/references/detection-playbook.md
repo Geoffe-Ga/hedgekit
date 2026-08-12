@@ -72,7 +72,7 @@ runs the read-only subset and writes a report to the scratchpad.
 | **xenon** | complexity grade gate | `xenon src --max-absolute B --max-average A` |
 | **mypy** (strict) | type holes, `Any` creep, unreachable code | `mypy src` |
 | **bandit** | security smells (injection, weak crypto, asserts) | `bandit -r src -f json` |
-| **interrogate** | docstring coverage gaps | `interrogate src -v` |
+| **ruff** (`D1`) | missing docstrings on public symbols | `ruff check src --select D1` |
 | **pip-audit** | vulnerable dependencies | `pip-audit -r requirements.txt` |
 | **detect-secrets** | hardcoded secrets | `detect-secrets scan` |
 | **git** | churn / hotspots / commented-out code | `git log --format= --name-only \| sort \| uniq -c \| sort -rn` |
@@ -153,9 +153,10 @@ the first audit.
 
 ## The weekly run procedure
 
-1. **Snapshot.** Run `scripts/collect-evidence.sh` → a consolidated evidence
-   report in the scratchpad (all tool JSON + grep hits + churn + reading
-   targets). Treat the linter JSON as a map, per the rule above.
+1. **Snapshot.** Run `.claude/skills/de-slopify/scripts/collect-evidence.sh`
+   → a consolidated evidence report in the scratchpad (all tool JSON + grep
+   hits + churn + reading targets). Treat the linter JSON as a map, per the
+   rule above.
 2. **Triage candidates.** Parse the report into candidate findings. Discard
    anything in the "NOT slop" guard list (`slop-taxonomy.md`) — generated code,
    migrations, justified suppressions, framework boilerplate, test fixtures —

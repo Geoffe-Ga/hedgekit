@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tests.scheduler.conftest import ScanCountingStore, WalkCountingStore
 from windbreak.ledger.events import EquitySampled, ExchangeStatusObserved
 from windbreak.ledger.store import ReverseTypeScan, SqliteLedgerStore
 from windbreak.numeric import MoneyMicros
@@ -48,11 +49,7 @@ from windbreak.scheduler.loop import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
-
-    from windbreak.ledger.events import Event
-    from windbreak.ledger.store import LedgerRecord
 
 #: A fixed "now" so no test depends on the wall clock. 2023-11-14T22:13:20Z --
 #: late enough in its UTC day that whole hours can be subtracted without
@@ -111,89 +108,6 @@ def _prior_day_samples() -> tuple[tuple[int, int], ...]:
     )
 
 
-class _ScanCountingStore:
-    """A `LedgerStore` delegate counting how often `read_all` is called.
-
-    Wraps a real, hash-chained `SqliteLedgerStore` so every answer stays
-    genuine; only the call accounting is added. Declares no optional capability,
-    so it stands in for every hand-rolled double that must keep working.
-
-    Attributes:
-        read_all_calls: How many times `read_all` has been called.
-    """
-
-    def __init__(self, inner: SqliteLedgerStore) -> None:
-        """Wrap `inner`, starting the scan counter at zero.
-
-        Args:
-            inner: The real store every call is delegated to.
-        """
-        self._inner = inner
-        self.read_all_calls = 0
-
-    def append(self, event: Event) -> int:
-        """Delegate the append.
-
-        Args:
-            event: The event to persist.
-
-        Returns:
-            The sequence number the inner store assigned.
-        """
-        return self._inner.append(event)
-
-    def read_all(self) -> list[LedgerRecord]:
-        """Delegate the full scan, counting the call.
-
-        Returns:
-            Every persisted record in ascending sequence order.
-        """
-        self.read_all_calls += 1
-        return self._inner.read_all()
-
-    def verify_chain(self) -> None:
-        """Delegate chain verification."""
-        self._inner.verify_chain()
-
-    def close(self) -> None:
-        """Delegate the close."""
-        self._inner.close()
-
-
-class _WalkCountingStore(_ScanCountingStore):
-    """A `_ScanCountingStore` that also declares the bounded reverse walk.
-
-    Counts records as they are *yielded*, one at a time, so the count measures
-    what the consumer actually pulled rather than what the query could have
-    returned -- which is precisely the bound under test.
-
-    Attributes:
-        records_walked: How many records the consumer has pulled from the walk.
-    """
-
-    def __init__(self, inner: SqliteLedgerStore) -> None:
-        """Wrap `inner`, starting both counters at zero.
-
-        Args:
-            inner: The real store every call is delegated to.
-        """
-        super().__init__(inner)
-        self.records_walked = 0
-
-    def iter_records_of_type_reversed(self, event_type: str) -> Iterator[LedgerRecord]:
-        """Delegate the newest-first walk, counting each record pulled.
-
-        Args:
-            event_type: The single event type to walk.
-
-        Yields:
-            The matching records, newest first.
-        """
-        for record in self._inner.iter_records_of_type_reversed(event_type):
-            self.records_walked += 1
-            yield record
-
-
 def test_the_walk_is_bounded_by_todays_samples(tmp_path: Path) -> None:
     """The baseline is derived from today's samples plus ONE boundary row --
     never the whole ledger.
@@ -212,7 +126,7 @@ def test_the_walk_is_bounded_by_todays_samples(tmp_path: Path) -> None:
             (_NOW_EPOCH_S, 140_000_000),
         ),
     )
-    store = _WalkCountingStore(inner)
+    store = WalkCountingStore(inner)
     try:
         baseline = read_start_of_day_equity_micros(store, now_epoch_s=_NOW_EPOCH_S)
 
@@ -236,7 +150,7 @@ def test_falls_back_to_the_full_fold_without_the_capability(tmp_path: Path) -> N
             (_NOW_EPOCH_S, 140_000_000),
         ),
     )
-    store = _ScanCountingStore(inner)
+    store = ScanCountingStore(inner)
     try:
         baseline = read_start_of_day_equity_micros(store, now_epoch_s=_NOW_EPOCH_S)
 
@@ -262,8 +176,8 @@ def test_both_paths_return_the_earliest_sample_of_the_day(tmp_path: Path) -> Non
             (_NOW_EPOCH_S, 140_000_000),
         ),
     )
-    walking = _WalkCountingStore(inner)
-    scanning = _ScanCountingStore(inner)
+    walking = WalkCountingStore(inner)
+    scanning = ScanCountingStore(inner)
     try:
         from_walk = read_start_of_day_equity_micros(walking, now_epoch_s=_NOW_EPOCH_S)
         from_scan = read_start_of_day_equity_micros(scanning, now_epoch_s=_NOW_EPOCH_S)
@@ -292,7 +206,7 @@ def test_the_earliest_sample_wins_even_when_appended_last(tmp_path: Path) -> Non
             (_NOW_EPOCH_S - 7_200, 90_000_000),
         ),
     )
-    store = _WalkCountingStore(inner)
+    store = WalkCountingStore(inner)
     try:
         baseline = read_start_of_day_equity_micros(store, now_epoch_s=_NOW_EPOCH_S)
 
@@ -311,7 +225,7 @@ def test_a_day_with_no_sample_yet_still_has_no_baseline(tmp_path: Path) -> None:
     baseline instead of failing closed.
     """
     inner = _ledger(tmp_path / "ledger.db", _prior_day_samples())
-    store = _WalkCountingStore(inner)
+    store = WalkCountingStore(inner)
     try:
         assert read_start_of_day_equity_micros(store, now_epoch_s=_NOW_EPOCH_S) is None
         assert store.records_walked == 1
@@ -324,7 +238,7 @@ def test_an_empty_ledger_has_no_baseline(tmp_path: Path) -> None:
     which would be indistinguishable from a genuine reading of zero equity.
     """
     inner = _ledger(tmp_path / "ledger.db", ())
-    store = _WalkCountingStore(inner)
+    store = WalkCountingStore(inner)
     try:
         assert read_start_of_day_equity_micros(store, now_epoch_s=_NOW_EPOCH_S) is None
     finally:
@@ -347,7 +261,7 @@ def test_a_future_dated_sample_does_not_end_the_walk(tmp_path: Path) -> None:
             (_NOW_EPOCH_S + _ONE_DAY_S, 999_000_000),
         ),
     )
-    store = _WalkCountingStore(inner)
+    store = WalkCountingStore(inner)
     try:
         baseline = read_start_of_day_equity_micros(store, now_epoch_s=_NOW_EPOCH_S)
 
@@ -364,7 +278,7 @@ def test_the_capability_leaves_ledger_store_doubles_alone(tmp_path: Path) -> Non
     """
     inner = _ledger(tmp_path / "ledger.db", ())
     try:
-        assert not isinstance(_ScanCountingStore(inner), ReverseTypeScan)
-        assert isinstance(_WalkCountingStore(inner), ReverseTypeScan)
+        assert not isinstance(ScanCountingStore(inner), ReverseTypeScan)
+        assert isinstance(WalkCountingStore(inner), ReverseTypeScan)
     finally:
         inner.close()

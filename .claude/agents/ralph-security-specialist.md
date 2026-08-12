@@ -43,7 +43,7 @@ judgment role.
 3. **Write a failing security test first** (e.g. rejects a forged/expired JWT,
    rejects malformed input, denies cross-user access), then implement the control
    to make it pass.
-4. Verify with `scripts/backend/security.sh` (bandit + pip-audit) and the
+4. Verify with `scripts/security.sh` (bandit + pip-audit) and the
    `security` skill checklist; confirm no secret is committed (detect-secrets).
 5. Ensure errors fail closed and reveal nothing about internals, then hand back
    the Handoff block below.
@@ -53,7 +53,7 @@ judgment role.
 ```
 Status: HARDENED | FINDINGS | BLOCKED
 Files touched: <paths, incl. the failing-then-passing security test>
-Verify with: scripts/backend/security.sh + <the test command>
+Verify with: scripts/security.sh + <the test command>
 Threats closed: <IDOR / forged-JWT / injection / … — 1 line each>
 Residual risk / follow-ups: <notes, or "none">
 ```
@@ -81,7 +81,7 @@ gates, thresholds, and anti-bypass rules.
 **Issue**: new `/orders/{id}` endpoint. Harden it: a failing test asserting user
 A cannot fetch user B's order (IDOR), enforce the ownership check in the query,
 validate the path param, and confirm the 404/403 message leaks nothing. Verify
-`scripts/backend/security.sh` is clean.
+`scripts/security.sh` is clean.
 
 ---
 

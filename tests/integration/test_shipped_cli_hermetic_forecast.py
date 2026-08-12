@@ -66,11 +66,20 @@ from __future__ import annotations
 import dataclasses
 import json
 import shutil
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.hermetic_demo import (
+    DEMO_BOOKS,
+    DEMO_CONFIG,
+    DEMO_CORPUS,
+    DEMO_TRACK_RECORDS,
+    REPO_ROOT,
+    SHIPPED_CASSETTE,
+    TICKER,
+    place_track_records,
+)
 from tests.paper_books import recording_origin, set_close_time
 from windbreak.config.loader import load_config
 from windbreak.config.schema import (
@@ -93,35 +102,7 @@ from windbreak.main import main
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-#: The repository root, resolved from this file rather than the process's cwd.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-#: The committed books fixture the hermetic demonstration replays, verbatim.
-DEMO_BOOKS = REPO_ROOT / "tests" / "fixtures" / "books" / "hermetic_demo"
-
-#: The committed configuration that selects the corpus and declares the bucket.
-DEMO_CONFIG = REPO_ROOT / "tests" / "fixtures" / "config" / "hermetic-demo.yaml"
-
-#: The committed corpus that configuration names.
-DEMO_CORPUS = REPO_ROOT / "tests" / "fixtures" / "forecast" / "hermetic_corpus"
-
-#: The committed vote cassette the two shipped command lines still name. It is
-#: passed on every invocation below and never read on the emitting path, which
-#: is the point: a corpus run does not consult it.
-SHIPPED_CASSETTE = REPO_ROOT / "tests" / "fixtures" / "forecast" / "cassettes.json"
-
-#: The committed M6 evaluation artifact `windbreak evaluate-providers` writes
-#: and the loop's live-eligibility gate reads.
-DEMO_TRACK_RECORDS = (
-    REPO_ROOT / "tests" / "fixtures" / "evaluation" / "provider-track-records.json"
-)
-
-#: That artifact's filename inside a run's `--report-dir`.
-TRACK_RECORD_FILENAME = "provider-track-records.json"
-
-#: The demonstration fixture's sole market.
-TICKER = "MKT-DEMO"
+    from pathlib import Path
 
 #: The resting size, in contract-centis, on every level of the committed book.
 DEMO_QUANTITY_CENTIS = 100_000
@@ -209,7 +190,7 @@ def _run_cli(
     report_dir = tmp_path / "report"
     report_dir.mkdir(exist_ok=True)
     if track_records:
-        shutil.copy(DEMO_TRACK_RECORDS, report_dir / TRACK_RECORD_FILENAME)
+        place_track_records(report_dir)
     argv = [
         "run",
         "--process",

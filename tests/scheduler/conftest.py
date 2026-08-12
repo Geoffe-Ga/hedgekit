@@ -20,6 +20,8 @@ test that might be added later.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from windbreak.config.schema import CorrelationConfig, CorrelationTagConfig
 from windbreak.numeric import MoneyMicros
 from windbreak.riskkernel.modes import Mode, ModeStateMachine
@@ -29,6 +31,12 @@ from windbreak.riskkernel.signing import SigningKeyHandle
 from windbreak.riskkernel.tokens import TokenIssuer
 from windbreak.scheduler.exposure import ExposureProjection, project_exposure
 from windbreak.selector.correlation import BUCKET_WEATHER
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from windbreak.ledger.events import Event
+    from windbreak.ledger.store import LedgerRecord, SqliteLedgerStore
 
 #: A fixed 32-byte HMAC key shared by every mint/verify pair in this package's
 #: tests -- mirrors `tests/order_gateway/conftest.py::KEY_MATERIAL`. SPEC S10.6
@@ -190,3 +198,88 @@ def build_kernel_approval_components(
     issuer = TokenIssuer(SigningKeyHandle(key_material))
     pipeline = ApprovalPipeline(ledger, issuer, config_hash=config_hash)
     return kernel, pipeline, writer
+
+
+class ScanCountingStore:
+    """A `LedgerStore` delegate counting how often `read_all` is called.
+
+    Wraps a real, hash-chained `SqliteLedgerStore` so every answer stays
+    genuine; only the call accounting is added. Declares no optional
+    capability, so it stands in for every hand-rolled double that must keep
+    working -- and, for the bounded reads of issues #370 and #516, it is the
+    store shape whose fallback path those reads must keep answering correctly.
+
+    Attributes:
+        read_all_calls: How many times `read_all` has been called.
+    """
+
+    def __init__(self, inner: SqliteLedgerStore) -> None:
+        """Wrap `inner`, starting the scan counter at zero.
+
+        Args:
+            inner: The real store every call is delegated to.
+        """
+        self._inner = inner
+        self.read_all_calls = 0
+
+    def append(self, event: Event) -> int:
+        """Delegate the append.
+
+        Args:
+            event: The event to persist.
+
+        Returns:
+            The sequence number the inner store assigned.
+        """
+        return self._inner.append(event)
+
+    def read_all(self) -> list[LedgerRecord]:
+        """Delegate the full scan, counting the call.
+
+        Returns:
+            Every persisted record in ascending sequence order.
+        """
+        self.read_all_calls += 1
+        return self._inner.read_all()
+
+    def verify_chain(self) -> None:
+        """Delegate chain verification."""
+        self._inner.verify_chain()
+
+    def close(self) -> None:
+        """Delegate the close."""
+        self._inner.close()
+
+
+class WalkCountingStore(ScanCountingStore):
+    """A `ScanCountingStore` that also declares the bounded reverse walk.
+
+    Counts records as they are *yielded*, one at a time, so the count measures
+    what the consumer actually pulled rather than what the query could have
+    returned -- which is precisely the bound issues #370 and #516 pin.
+
+    Attributes:
+        records_walked: How many records the consumer has pulled from the walk.
+    """
+
+    def __init__(self, inner: SqliteLedgerStore) -> None:
+        """Wrap `inner`, starting both counters at zero.
+
+        Args:
+            inner: The real store every call is delegated to.
+        """
+        super().__init__(inner)
+        self.records_walked = 0
+
+    def iter_records_of_type_reversed(self, event_type: str) -> Iterator[LedgerRecord]:
+        """Delegate the newest-first walk, counting each record pulled.
+
+        Args:
+            event_type: The single event type to walk.
+
+        Yields:
+            The matching records, newest first.
+        """
+        for record in self._inner.iter_records_of_type_reversed(event_type):
+            self.records_walked += 1
+            yield record

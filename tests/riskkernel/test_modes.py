@@ -314,6 +314,94 @@ def test_from_config_rejects_non_ceiling_tokens(token: str) -> None:
         Mode.from_config(token)
 
 
+def test_may_trade_answers_for_every_mode_and_partitions_the_enum() -> None:
+    """`Mode.may_trade` is total over `Mode` and splits it exactly (issue #526).
+
+    Asserted as a partition of the *whole enum* rather than as a handful of
+    spot checks, so a mode added later has to be classified rather than
+    silently falling into the non-trading half by default. The two halves are
+    named as exact sets and their union is `set(Mode)`, which is what makes
+    this a definition rather than a sample.
+
+    This is the single predicate two very different callers ask: the kernel's
+    `mode_permission_ceiling` check, which vetoes an intent, and
+    `run_single_tick`'s walk gate, which decides whether the loop *spends
+    research money*. Issue #526 is what happened when the second one restated
+    the set instead of asking.
+    """
+    trading = {mode for mode in Mode if mode.may_trade()}
+    non_trading = {mode for mode in Mode if not mode.may_trade()}
+
+    assert trading == {Mode.PAPER, Mode.LIVE_MICRO, Mode.LIVE}
+    assert non_trading == {
+        Mode.RESEARCH,
+        Mode.PAUSED,
+        Mode.HALT,
+        Mode.KILLED,
+    }
+    assert trading | non_trading == set(Mode)
+    assert trading & non_trading == set()
+
+
+def test_may_research_answers_for_every_mode_and_partitions_the_enum() -> None:
+    """`Mode.may_research` is total over `Mode` and splits it exactly (#526).
+
+    The predicate the tick's walk gate asks before spending research money.
+    Asserted as a partition of the whole enum, for the same reason
+    `may_trade`'s is: a mode added later must be classified rather than
+    drifting into a half by default.
+
+    The researching half is exactly the promotable ladder, which is the
+    property that makes the definition derivable from `_SAFETY_MODES` instead
+    of listed -- so it is asserted here rather than left as a comment.
+    """
+    researching = {mode for mode in Mode if mode.may_research()}
+    idle = {mode for mode in Mode if not mode.may_research()}
+
+    assert researching == {Mode.RESEARCH, Mode.PAPER, Mode.LIVE_MICRO, Mode.LIVE}
+    assert idle == {Mode.PAUSED, Mode.HALT, Mode.KILLED}
+    assert researching | idle == set(Mode)
+    assert researching & idle == set()
+
+
+def test_may_trade_and_may_research_diverge_at_exactly_one_mode() -> None:
+    """The two predicates differ on `RESEARCH` and nowhere else (issue #526).
+
+    This is the test that exists because the answer was got wrong in review.
+    The walk gate was first written against `may_trade`, which is a *different
+    question* -- "may an order be routed" rather than "is a forecast worth
+    buying" -- and the two agree on six of the seven modes, so nothing caught
+    it: seventeen mutants moved `PAUSED`, `HALT` and `KILLED`, where the two
+    questions give the same answer, and every one of them died for the wrong
+    reason.
+
+    `RESEARCH` is the whole divergence. It may not trade and must research:
+    SPEC S5.1's bottom rung produces forecasts so that promotion out of it is
+    earned, and `_research_to_paper_gate`'s `research_min_forecasts` criterion
+    reads that production. Collapsing the two predicates strands it.
+
+    The divergence set is *computed*, not listed, so this cannot pass by
+    agreeing with a hand-written expectation that was itself edited to match a
+    regression.
+    """
+    divergence = {mode for mode in Mode if mode.may_trade() != mode.may_research()}
+
+    assert divergence == {Mode.RESEARCH}
+    assert Mode.RESEARCH.may_research() is True
+    assert Mode.RESEARCH.may_trade() is False
+
+
+def test_no_mode_that_may_trade_is_barred_from_researching() -> None:
+    """Trading implies researching, so the divergence can only ever be one-way.
+
+    A mode permitted to route orders but forbidden to buy the forecasts those
+    orders are struck on would be incoherent, and would also be invisible to
+    the divergence test above, which only asserts *which* modes differ and not
+    in which direction. Stated as an implication over the whole enum.
+    """
+    assert all(mode.may_research() for mode in Mode if mode.may_trade())
+
+
 def test_from_config_matches_the_default_windbreak_config_mode_ceiling() -> None:
     """`WindbreakConfig()`'s default `mode_ceiling` ("paper") parses to
     `Mode.PAPER` -- the config schema and the mode machine agree on the

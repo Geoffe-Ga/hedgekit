@@ -58,7 +58,9 @@ Follow-ups filed: <#N, or "none">
 ## Review mode
 
 When invoked by ralph-code-review-orchestrator: assess whether new code is genuinely
-covered (≥90% line / ≥80% branch backend, ≥90% Jest frontend), whether assertions
+covered (backend: ≥90% coverage, computed over line **and** branch outcomes
+combined — branch outcomes are folded into that single figure and have no floor
+of their own), whether assertions
 would **kill mutants**, and whether error/edge cases are tested. Report findings
 as `file:line` with severity; never weaken a threshold to "pass."
 

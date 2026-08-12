@@ -125,6 +125,10 @@ def anchor_gate_evidence(
     ``GateEvidence`` (frozen) is left untouched -- a new instance is returned via
     :func:`dataclasses.replace`.
 
+    **No code under ``windbreak/`` calls this function**, so nothing in the
+    shipped system anchors evidence -- because nothing in the shipped system
+    builds evidence or requests a promotion at all (issue #542).
+
     Args:
         evidence: The promotion-readiness snapshot whose ``paper_window_days``
             is to be anchored. Not mutated.

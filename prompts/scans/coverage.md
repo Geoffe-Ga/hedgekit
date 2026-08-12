@@ -13,12 +13,14 @@ scan-issue-writer as a finding with the exact uncovered lines/branches.
 ## Goal
 Produce one issue per under-covered module, naming the specific uncovered lines
 and branches and a concrete test plan to close them — measured against the
-≥90% line / ≥80% branch backend gate and the ≥90% Jest frontend gate.
+backend gate of ≥90% coverage over line **and** branch outcomes combined
+(branch outcomes fold into that single figure; there is no separate branch
+floor).
 
 ## Context
 - Title-slug prefix: `[scan:coverage]`. Priority `P2` (passed by the workflow).
 - Tools (read-only):
-  - Backend: `scripts/backend/coverage.sh` (or `pytest --cov=src
+  - Backend: `scripts/coverage.sh` (or `pytest --cov=src
     --cov-report=term-missing --cov-branch`) — parse the term-missing output for
     modules below the gate and their uncovered line/branch ranges.
   - Frontend: `npm test --prefix frontend -- --coverage` — parse the Jest

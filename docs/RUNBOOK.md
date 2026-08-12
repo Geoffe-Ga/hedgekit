@@ -63,6 +63,68 @@ windbreak run \
   logs the shutdown reason. `--max-beats N` stops it automatically after `N`
   heartbeats (useful for a bounded smoke run).
 
+### The evidence-starvation warning (issue #485)
+
+Every start folds the **effective** research evidence source into the log, so
+you never have to infer it from a configuration file you may not have written:
+
+```
+INFO    research evidence source=replay-corpus
+INFO    research evidence source=live-search
+```
+
+If this deployment composed **no** evidence source at all — no replay corpus and
+no live research — there is no fold line. Instead the loop logs, once, at
+`WARNING`:
+
+```
+DEGRADED: this PAPER loop composed no research evidence source, so every
+forecast it makes must abstain on no_verified_citations before a single vote
+and it can never emit an order intent -- it will keep beating, and keep
+reporting healthy, for as long as it runs. REMEDY: either replay a committed
+corpus (set forecast.replay_corpus.mode to 'replay' and
+forecast.replay_corpus.corpus_dir to that directory), or configure live research
+(set forecast.provider_transport.mode to 'live' and
+forecast.research.search_endpoint_url to your search endpoint). WHAT THIS DOES
+NOT CLAIM: it reads the research wiring this process actually composed and
+nothing else. Its implication runs one way -- no evidence source means no
+intent, ever -- and it proves nothing about a deployment that has one, because
+the depth floor, the resolution horizon, the correlation declaration and the
+provider track record are judged per tick against the books and this guard reads
+none of them.
+```
+
+**The shipped default is that configuration**, deliberately, so a bare
+`docker compose up` warns on every start until you select an evidence source.
+That is the honest reading of the shipped default: it is the offline loop that
+cannot trade.
+
+**It warns; it does not refuse.** Three reasons, and they are load-bearing
+rather than stylistic:
+
+- Fail closed on the **capability**, never on the process. A starved loop is
+  already failing closed on the capability — it emits no intent. Refusing to
+  start would additionally cost you the kill file, the ledger, and the
+  verification cycle. A deployment that cannot produce evidence is not the same
+  as one that cannot be stopped.
+- The default composition must keep starting. Turning `docker compose up` into
+  a hard failure would be a regression, not a fix.
+- Configuration **contradictions** do still refuse — an unknown
+  `forecast.replay_corpus.mode`, a `replay` mode naming no directory, a corpus
+  selected alongside the live transport, a live mode with no live seam. An
+  evidence-starved deployment has contradicted nothing; it has configured less
+  than it needed, and the two must not read alike.
+
+**What it cannot detect.** It is a deliberately partial guard. It proves the
+implication in one direction only. A deployment that *has* an evidence source
+can still abstain or screen out on every tick forever, and this check will say
+nothing, because the depth floor, the resolution horizon, the correlation
+declaration (see "Declaring correlation buckets") and the provider track record
+are judged per tick against the books rather than at startup. An **injected**
+research bundle (a test seam; not reachable from `windbreak run`) folds as
+`source=injected` and is never warned about — the guard does not know what a
+caller's own tools find.
+
 ### Running against live venue books (issue #343)
 
 Adding one optional fifth flag points the loop at the exchange's **real,
@@ -172,18 +234,18 @@ windbreak run --paper-books-dir ... --cassette-path ... --ledger-path ... \
   `research.search_api_key_env` are therefore **required** for any
   evidence-producing run, not optional.
 
-  No concrete end-to-end working configuration can be named here yet, and the
-  reason is not research. Configuring research clears one of six barriers
-  between an activated PAPER loop and a single order intent; the decisive one
-  is arithmetic and unconditional -- every full-pipeline forecast books a flat
-  $3.00 research charge, and the selector amortizes the whole of it over a
-  fixed 1.00-contract entry probe, so `net_edge_min` is unreachable for any
-  market, at any price, with any capital (issue #483). Until that is resolved,
-  an activated PAPER loop cannot emit an order intent regardless of how
-  research is configured, and nothing in the loop refuses to start or says so
-  (issue #485). `tests/scheduler/test_paper_intent_barriers.py` drives the real
-  tick over the real shipped composition and pins each barrier with the exact
-  values it records.
+  Configuring research clears **one** of the six barriers issue #481 mapped
+  between an activated PAPER loop and a single order intent, so do not read a
+  configured search endpoint as a working deployment. The end-to-end
+  composition that does reach an intent is the offline one in "Demonstrating
+  the whole stack offline (the replay corpus)" (issue #510); it clears the
+  remaining barriers with committed books, a declared correlation bucket and a
+  committed track-record artifact, and the flat-charge barrier was closed by
+  issue #483. A loop that clears *none* of them says so at startup — see "The
+  evidence-starvation warning" — but only for this one barrier, and it makes no
+  claim about the other five. `tests/scheduler/test_paper_intent_barriers.py`
+  drives the real tick over the real shipped composition and pins each barrier
+  with the exact values it records.
 - **Every live vote is retried and priced.** `RetryingProvider` bounds attempts,
   the total deadline, backoff, and spend from the `retry` block above, and
   charges each failed attempt against the `prices` table. The cassette path is
@@ -350,10 +412,14 @@ venue's own opening state, and the ledger records no fill amounts that could
 update it. So the first tick after any real paper fill grades a `BREACH`: the
 kernel transitions to `HALT` (issue #32), records `VerificationMismatch` and
 `VerificationMismatchHalt`, the per-tick `ModeHeartbeat` starts reporting
-`HALT` instead of `PAPER`, and `TickOutcome.kernel_halted` is `True`. Every
-later approval then vetoes on the halted mode. **Watch `kernel_halted`**: a
-halted loop keeps ticking and keeps ledgering, but it is no longer a trading
-loop, and only a restart re-baselines it. That is the fail-closed reading of
+`HALT` instead of `PAPER`, and `TickOutcome.kernel_halted` is `True`. From that
+tick onward -- **including the tick that discovered the breach** -- the loop
+walks no markets, runs no forecast, and spends no research money, for the same
+reason a killed loop does not (issue #526): a mode that may not trade must not
+buy forecasts nothing can act on. **Watch `kernel_halted`**: a halted loop
+keeps ticking, keeps reconciling and keeps ledgering, but it is no longer a
+trading loop, and only a restart re-baselines it. That is the fail-closed
+reading of
 "our books cannot account for the venue" -- the alternative, re-reading the
 expectation off the same connector each cycle, would make all three
 reconciliation dimensions structurally incapable of failing.
@@ -374,7 +440,12 @@ On the next beat the loop:
 - transitions its kernel to `KILLED` and stamps `KILLED` on the `ModeHeartbeat`
   row and the heartbeat log line, so a killed loop is never reported healthy;
 - walks no markets at all -- no forecast is run and no research money is spent,
-  which is stronger than vetoing the intents afterwards;
+  which is stronger than vetoing the intents afterwards. Since issue #526 that
+  is not special to `KILLED`: the tick asks whether the current mode *may spend
+  research money*, so the three safety modes -- `KILLED`, `PAUSED` and `HALT`
+  -- all buy nothing. It is deliberately **not** the same question the approval
+  check asks: `RESEARCH` may not trade and *must* research, since producing
+  forecasts without routing them is what that rung is for;
 - **holds every position**, cancelling only resting orders (ledgered as one
   `CancelAllDirective`; see the caveat below) and releasing its capital
   reservations;
@@ -395,9 +466,64 @@ the run. The first breach still drives the kernel to `HALT` (SPEC §32); a
 sustained run of them kills.
 
 To re-arm, type the phrase for the engaged kill's sequence number verbatim (see
-the re-arm procedure below). Stopping the process with a signal remains
-available, but it is not equivalent: a signal provides none of hold-positions,
-durable state, or manual re-arm.
+"Re-arming, and why it needs a restart" below). Stopping the process with a
+signal remains available, but it is not equivalent: a signal provides none of
+hold-positions, durable state, or manual re-arm.
+
+### Re-arming, and why it needs a restart (issue #526)
+
+```bash
+windbreak rearm --state-dir <dir>
+```
+
+then type, on stdin, the phrase for the **engaged kill's sequence number**,
+verbatim and un-case-folded:
+
+```
+RE-ARM KILL <n>: I ACCEPT FULL RESPONSIBILITY
+```
+
+Read `<n>` off the ledger's own `KillEngaged` row, not off a note: the sequence
+is monotonic and replayed from the chain, so a phrase typed for an earlier kill
+cannot re-arm a later one.
+
+**A re-arm does not resume trading.** It exits `KILLED` into `PAUSED`, and that
+is deliberate -- the kill switch's confirmation step would be worth nothing if
+typing one phrase put a loop straight back on the venue. `PAUSED` is not a
+trading mode, so on the next beat the loop reports `mode=PAUSED`, reconciles,
+heartbeats, samples equity, and **researches and trades nothing**. Since issue
+#526 it also spends nothing: a paused beat buys no forecasts, so the day's
+research ceiling is still there when you come back.
+
+**To return the loop to `PAPER`, restart the process.** There is no verb that
+does it, and this is not an oversight in the CLI: the mode machine has no
+transition from `PAPER`'s side of `PAUSED` at all. `mode=PAUSED` on the
+heartbeat line is the signal to look for -- a re-armed loop that nobody
+restarted looks healthy in every other respect.
+
+Which modes a *running* process can still reach, one transition at a time. Every
+row is replayed against `ModeStateMachine` itself by
+`tests/docs/test_mode_recovery_claims.py`, so this table cannot drift away from
+the code:
+
+<!-- BEGIN in-process mode successors -->
+
+| Mode | Modes it can still reach, same process |
+| --- | --- |
+| `RESEARCH` | `PAPER`, `PAUSED`, `HALT`, `KILLED` |
+| `PAPER` | `LIVE_MICRO`, `PAUSED`, `HALT`, `KILLED` |
+| `LIVE_MICRO` | `LIVE`, `PAUSED`, `HALT`, `KILLED` |
+| `LIVE` | `PAUSED`, `HALT`, `KILLED` |
+| `PAUSED` | `HALT`, `KILLED` |
+| `HALT` | `PAUSED`, `KILLED` |
+| `KILLED` | `PAUSED` (by `windbreak rearm` only) |
+
+<!-- END in-process mode successors -->
+
+Read the bottom three rows together: `PAUSED`, `HALT` and `KILLED` reach only
+each other. Once a running loop is in any of them, no sequence of transitions
+returns it to a trading mode, so a restart is the only way back for a re-arm and
+for a verification halt alike.
 
 **Resting orders are cancelled, and the row says whether they were.** The
 `CancelAllDirective` a kill emits is delivered to the venue, not merely
@@ -647,6 +773,15 @@ already-written file untouched). The stub carries markdown section headers
 -- populating the real bodies from ledgered data is a later documentation
 pass.
 
+If `--report-dir` is not a directory -- a volume that came back as a regular
+file, which is what a bad bind mount looks like -- the tick fails with a single
+`WeeklyReportDirectoryError` naming **that directory**, whichever of the write's
+two syscalls notices the fault (issue #551). One physical fault therefore files
+under one heading in alert history rather than two, and the message never names
+the dated report file, which is merely downstream of the directory that is
+wrong. The failure is escalated and survivable, not fatal: the beat is ledgered
+`TICK_FAILED` and alerted, and the loop keeps beating (issues #443/#444/#447).
+
 ### Ingesting a resolved outcome (issue #439)
 
 **Nothing in the running system learns that a market settled on its own.** There
@@ -788,15 +923,20 @@ verb removes, reached one command later.
   `visible_depth=None` (so `participation_cap_compliance` vetoes). So no PAPER
   tick fills yet: expect vetoes, not fills, in the ledger and dashboard.
 - A verification `BREACH` HALTs the kernel and it stays halted for the life of
-  the process (see "What one PAPER tick actually does"). Watch
+  the process (see "What one PAPER tick actually does"), and a halted loop
+  researches nothing from that tick onward (issue #526). Watch
   `TickOutcome.kernel_halted` and the `ModeHeartbeat` mode.
 - On a **live Kalshi** path the jurisdiction check vetoes for an additional
   reason: Kalshi publishes no eligibility signal, so `normalize_market` stamps
   every market `jurisdiction_status="unknown"`, which fails closed by design
   (SPEC §20 Q3, unresolved). Only a market carrying real eligibility metadata --
   as the paper fixture books do -- can clear that check.
-- `windbreak kill`/`windbreak rearm` do stop and re-arm the PAPER loop (issue
-  #441), provided `--state-dir` is the directory `config.ops.state_dir` names.
+- `windbreak kill` stops the PAPER loop and `windbreak rearm` releases the kill
+  (issue #441), provided `--state-dir` is the directory `config.ops.state_dir`
+  names. **A re-arm does not resume trading**: it exits `KILLED` into `PAUSED`,
+  and only a **process restart** returns a running loop to `PAPER`. No shipped
+  verb does it. Watch for `mode=PAUSED` on the heartbeat line -- see "Re-arming,
+  and why it needs a restart" (issue #526).
   The cancel-all a kill emits is delivered to the venue, so resting orders are
   actually cancelled (issue #480); check the `CancelAllDirective` row's
   `delivery.outcome` — anything but `delivered` means orders may still be live,
@@ -936,6 +1076,10 @@ INFO    forecast replay corpus mode=disabled source=default
 did and you are on the shipped, offline, cannot-trade path. The corpus line is
 a **WARNING** on purpose: a replaying run must not be discoverable only by
 reading configuration.
+
+Beside it, `research evidence source=replay-corpus` folds the *effective*
+research wiring the corpus selected. On the `disabled` path that line is
+replaced by the degraded-mode warning — see "The evidence-starvation warning".
 
 ### What a corpus is, and why it is not a cassette
 

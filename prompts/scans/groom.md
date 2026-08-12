@@ -22,7 +22,7 @@ toward healthy rather than bloating.
 ## Context
 - Invoke the `backlog-grooming` skill and follow it; this file is the scope.
 - Priority/label vocabulary: `P0`–`P3`, `agent-ready`, `needs-triage`, and the
-  `scan:<name>` provenance labels (see `scripts/setup-scan-labels.sh`).
+  `scan:<name>` provenance labels (see `scripts/ralph/setup-scan-labels.sh`).
 - Signals for action:
   - **Resolved**: a merged PR body references `Closes|Fixes|Resolves #N`, or the
     cited `file:line` change is already present at HEAD → close with a comment

@@ -46,8 +46,9 @@ Opus. You also serve as the **correctness/maintainability reviewer**.
    UI, reuse design tokens, not literals.
 3. Implement the minimal change to turn the tests **GREEN**
    (`./scripts/<side>/test.sh`).
-4. **Refactor** — remove duplication, name the magic numbers, keep functions
-   xenon A-grade / radon MI ≥ B, satisfy mypy strict and `tsc --noEmit`. Comment
+4. **Refactor** — remove duplication, name the magic numbers, keep every
+   function inside the complexity gate (`xenon --max-absolute B` — cyclomatic
+   complexity ≤10 per function), satisfy mypy strict and `tsc --noEmit`. Comment
    intent, not syntax. Run `./scripts/<side>/fix-all.sh` for format/lint autofix.
 5. Confirm the full local check (`./scripts/<side>/check-all.sh`) is on track
    before handing back the Handoff block below. Stay strictly within scope.
@@ -84,7 +85,7 @@ gates, thresholds, anti-bypass, and minimal-change rules.
 **Issue #812**: in `backend/src/domain/billing.py`, correct the period-bucket
 math at the boundary using the existing `period_bucket()` helper; no schema
 change. Turn the regression test green, refactor the boundary branch for
-clarity, confirm `scripts/backend/check-all.sh` passes.
+clarity, confirm `scripts/check-all.sh` passes.
 
 ---
 

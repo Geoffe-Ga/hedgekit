@@ -73,7 +73,7 @@ gh issue create --title "[scan:<name>] <specific finding>" \
 ```
 
 If any of the labels do not exist yet, create them first (see
-`scripts/setup-scan-labels.sh` for the canonical set), then retry.
+`scripts/ralph/setup-scan-labels.sh` for the canonical set), then retry.
 
 ### Step 6 — Report
 Append a run summary to `$GITHUB_STEP_SUMMARY` (or print it, when run locally):

@@ -52,6 +52,7 @@ from windbreak.forecast.pipeline import (
     outside_view_base_rate,
     run_pipeline,
 )
+from windbreak.forecast.providers.base import screen_market_metadata
 from windbreak.forecast.records import ForecastRecord
 from windbreak.timekeeping import iso_z
 
@@ -600,12 +601,22 @@ def run_triaged_pipeline(
         The produced, immutable forecast record.
 
     Raises:
+        ProviderMarketMetadataRejectedError: If the market's own free-text
+            metadata fails the S8.5 screen (issue #525). Raised first of all --
+            before the day is opened, before the paid Stage-0 call, and before
+            ``charge_stage`` stamps the ticker onto a budget event. This is a
+            *second door* into :class:`~windbreak.forecast.records.ForecastRecord`
+            (the STOP path builds one directly, never reaching
+            :func:`~windbreak.forecast.pipeline.run_pipeline`), so it needs its
+            own call to the same screen; without it the record's own guard would
+            fire here as an untyped ``ValueError`` from deep inside the run.
         DailyBudgetExhaustedError: If ``budget``'s UTC day is already exhausted;
             raised before the Stage-0 call, so no research is paid for.
         PerForecastBudgetExceededError: If the run's total research cost --
             Stage-0 plus, on the PROCEED path, the full pipeline -- exceeds the
             per-forecast ceiling.
     """
+    screen_market_metadata(market)
     budget.ensure_day_open(at=created_at)
     prior = run_stage0_prior(
         market, baseline, transport=triage_transport, model=triage_model

@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, cast
 
 from windbreak.connector.snapshot import SCREEN_DECISION_EVENT
+from windbreak.forecast.pipeline import ledger_safe_ticker
 from windbreak.ledger.events import ScreenDecisionRecorded
 
 if TYPE_CHECKING:
@@ -133,6 +134,22 @@ class ScreenLedgerWriter:
         trail is asked for, and widening the schema is a migration rather than a
         wiring change.
 
+        The ticker crosses through
+        :func:`~windbreak.forecast.pipeline.ledger_safe_ticker` (issue #530).
+        This is the *widest* route attacker-chosen text had into
+        the append-only chain: one row is appended for every market the screen
+        **examines**, so -- unlike the ``ForecastCreated`` route issue #525
+        closed -- a market does not even have to screen in to reach it, and
+        nothing written here can ever be redacted.
+
+        The row is kept and the bytes refused, rather than the market being
+        dropped before it is screened at all. Dropping it would be a silent gap
+        in the one record that says *which markets were looked at*, which is the
+        same audit hole this method already refuses to open by raising on an
+        event it cannot translate. Nothing routes on this ticker, so the digest
+        costs no downstream truth; the digest is stable, so the row still
+        correlates with the market's other rows.
+
         Args:
             event: The screener's connector event.
 
@@ -150,7 +167,7 @@ class ScreenLedgerWriter:
         self._store.append(
             ScreenDecisionRecorded(
                 component=self._component,
-                ticker=cast("str", payload["ticker"]),
+                ticker=ledger_safe_ticker(cast("str", payload["ticker"])),
                 eligible=cast("bool", payload["eligible"]),
                 blocked_by=list(cast("list[str]", payload["blocked_by"])),
             )

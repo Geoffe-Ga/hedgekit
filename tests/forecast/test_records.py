@@ -14,7 +14,9 @@ Gate 1 RED state for issue #22.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -25,6 +27,12 @@ from windbreak.forecast.records import (
     ForecastRecord,
     ModelVote,
     forecast_record_to_payload,
+)
+from windbreak.forecast.sanitize import (
+    DATA_BLOCK_BEGIN,
+    DATA_BLOCK_END,
+    TOOL_CALL_MARKERS,
+    screen_single_line_text,
 )
 
 _VALID_MODEL_VOTE_KWARGS: dict[str, object] = {
@@ -423,3 +431,90 @@ def test_forecast_record_to_payload_contains_no_float_leaf() -> None:
     payload = forecast_record_to_payload(record)
 
     _assert_no_float_leaf(payload)
+
+
+# --- The ticker cannot be unscreened, by construction (issue #525) ----------------
+#
+# `windbreak/scheduler/loop.py` appends `ForecastCreated(market_ticker=
+# forecast.market_ticker)` straight off the record, into an append-only hash
+# chain nothing can ever redact. Screening at that append would be coverage by
+# convention -- one call, deletable, and re-added by hand for every future
+# consumer. Screening here makes it coverage by construction: no `ForecastRecord`
+# exists carrying a ticker the provider seam would refuse, so no consumer of one
+# can leak it.
+#
+# The corpus below is derived from `sanitize`'s own public constants, so a screen
+# that learns a new artifact is exercised here without this file being edited.
+
+_HOSTILE_TICKER_CANDIDATES: tuple[str, ...] = (
+    f"KXFED{DATA_BLOCK_BEGIN}",
+    f"KXFED{DATA_BLOCK_END}",
+    *(f"KXFED{marker}" for marker in sorted(TOOL_CALL_MARKERS)),
+    "KXFED\n24DEC",
+    "KXFED\r24DEC",
+)
+
+_CLEAN_TICKER_CANDIDATES: tuple[str, ...] = ("KXFED-24DEC", "MKT-ISO-A", "A")
+
+_TICKER_CANDIDATES: tuple[str, ...] = (
+    *_CLEAN_TICKER_CANDIDATES,
+    *_HOSTILE_TICKER_CANDIDATES,
+)
+
+
+def test_the_ticker_corpus_exercises_both_verdicts() -> None:
+    """Guard the parametrization itself: both arms below are really reached.
+
+    A corpus that screened clean on every entry would make the equivalence test
+    vacuously true, and a corpus that screened hostile on every entry would let
+    a record type that refuses *everything* pass. Both halves are asserted
+    against the screen, not against a hand-written count.
+    """
+    verdicts = {
+        ticker: screen_single_line_text(ticker) for ticker in _TICKER_CANDIDATES
+    }
+
+    assert {ticker for ticker, v in verdicts.items() if v is None} == set(
+        _CLEAN_TICKER_CANDIDATES
+    )
+    assert {ticker for ticker, v in verdicts.items() if v is not None} == set(
+        _HOSTILE_TICKER_CANDIDATES
+    )
+
+
+@pytest.mark.parametrize("ticker", _TICKER_CANDIDATES)
+def test_a_record_admits_a_ticker_exactly_when_the_seam_screen_does(
+    ticker: str,
+) -> None:
+    """`ForecastRecord` accepts a ticker iff `screen_single_line_text` does.
+
+    Stated as an equivalence against the screen rather than as a list of banned
+    strings: a guard wired to a *narrower* check would leak exactly the
+    artifacts the provider seam already knows are hostile, and would still pass
+    a test that only listed today's tokens.
+    """
+    verdict = screen_single_line_text(ticker)
+
+    if verdict is None:
+        assert _record(market_ticker=ticker).market_ticker == ticker
+        return
+    with pytest.raises(ValueError, match=re.escape(f"market_ticker: {verdict}")):
+        _record(market_ticker=ticker)
+
+
+def test_a_refused_ticker_is_never_echoed_into_the_error_message() -> None:
+    """The refusal names the verdict and a digest, never the attacker's bytes.
+
+    An exception message travels into logs and, via a caller that formats it,
+    could travel further. Repeating the ticker there would defeat the point of
+    keeping it off the chain.
+    """
+    ticker = f"KXFED{DATA_BLOCK_BEGIN} MKT-EVIL-9F3"
+
+    with pytest.raises(ValueError) as refusal:
+        _record(market_ticker=ticker)
+
+    message = str(refusal.value)
+    assert "MKT-EVIL-9F3" not in message
+    assert DATA_BLOCK_BEGIN not in message
+    assert hashlib.sha256(ticker.encode("utf-8")).hexdigest() in message

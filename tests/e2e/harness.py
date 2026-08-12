@@ -23,6 +23,7 @@ into the state epic #465 describes:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -646,6 +647,33 @@ def read_ledger_records(ledger_path: Path) -> list[LedgerRecord]:
         return store.read_all()
     finally:
         store.close()
+
+
+def ledger_payloads(
+    ledger_path: Path, event_type: str, *, component: str | None = None
+) -> list[dict[str, object]]:
+    """Read one event type's ``data`` payloads off a ledger another wrote.
+
+    The store is opened on the live file rather than a copy, so rows still in
+    the write-ahead log are read through SQLite itself; a byte-level read of
+    ``ledger.db`` alone would miss them, and a cross-process reader would then
+    silently see a stale file.
+
+    Args:
+        ledger_path: Path to the ledger database.
+        event_type: The event type wanted.
+        component: The component whose rows are wanted, or ``None`` for every
+            component's.
+
+    Returns:
+        Each matching row's ``data`` payload, in chain order.
+    """
+    return [
+        dict(json.loads(record.payload_json)["data"])
+        for record in read_ledger_records(ledger_path)
+        if record.event_type == event_type
+        and (component is None or record.component == component)
+    ]
 
 
 def ledger_event_types(ledger_path: Path) -> list[str]:

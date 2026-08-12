@@ -472,7 +472,7 @@ class _ModePermissionCeiling:
             LIVE_MICRO or for any order in a permitted non-LIVE_MICRO mode; else
             an approval when the cap is respected.
         """
-        if context.mode not in {Mode.PAPER, Mode.LIVE_MICRO, Mode.LIVE}:
+        if not context.mode.may_trade():
             return _veto(f"mode {context.mode.name} may not trade")
         if context.mode is not Mode.LIVE_MICRO:
             return _approve()

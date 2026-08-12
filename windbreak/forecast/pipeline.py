@@ -41,6 +41,8 @@ from windbreak.forecast.providers.base import (
     ProviderRateLimitedError,
     ProviderTimeoutError,
     ProviderVoteError,
+    fingerprint_response,
+    screen_market_metadata,
 )
 from windbreak.forecast.providers.retry import is_retryable_status
 from windbreak.forecast.pubdate import extract_publication_date
@@ -55,6 +57,7 @@ from windbreak.forecast.sanitize import (
     ResearchQuote,
     extract_quote,
     sanitize_content,
+    screen_single_line_text,
 )
 from windbreak.timekeeping import iso_z
 
@@ -312,6 +315,106 @@ class InMemoryForecastLedger:
         return tuple(event for event in self._events if event.event_type == event_type)
 
 
+#: Prefix of the value written into a ledgered payload's ``market_ticker`` in
+#: place of a ticker that fails the market-metadata screen (issue #464). An
+#: explicit, self-describing digest rather than a shortened or stripped ticker:
+#: a scrubbed value that still *looks* like a ticker is worse than a refusal,
+#: because a reader cannot tell it was ever edited. The digest is carried inside
+#: the value, not only in a sibling key, because a composition root folding this
+#: payload into a durable row projects a fixed set of keys -- so a sibling key
+#: alone would be dropped on the way to the chain and correlation would be lost.
+#: The key itself is always present, and always a ``str``, so no fold breaks.
+REJECTED_TICKER_PREFIX: Final = "<rejected-ticker:sha256:"
+
+#: Payload key carrying the sha256 digest of a ticker that failed the screen.
+#: Its presence -- not the value of ``market_ticker`` -- is what tells a reader a
+#: substitution happened, and the digest is stable for a given ticker, so
+#: correlation across events survives the substitution.
+REJECTED_TICKER_FINGERPRINT_KEY: Final = "market_ticker_fingerprint"
+
+#: Payload key carrying the screen verdict that rejected the ticker, so a reader
+#: can tell a delimiter forgery from a line forgery after the fact.
+REJECTED_TICKER_FAILURE_KEY: Final = "market_ticker_screen_failure"
+
+
+def ledger_safe_ticker(market_ticker: str) -> str:
+    """Return a market ticker in the only form a ledger row may carry (#530).
+
+    The single renderer of a refused ticker. A clean ticker -- one
+    :func:`~windbreak.forecast.sanitize.screen_single_line_text` accepts, the
+    identical screen the provider seam refuses a market on -- is returned
+    verbatim, so a clean run's rows are byte-identical to what they were before
+    this existed. Anything the screen rejects is replaced by
+    :data:`REJECTED_TICKER_PREFIX` plus the ticker's sha256 digest: the bytes are
+    refused, and the digest is stable for a given ticker, so a reader can still
+    correlate every row a refused market produced.
+
+    Refusal (raising) is deliberately *not* the answer here, and this is the one
+    place that decision differs from issue #525's. There, the guard sits on
+    ``ForecastRecord``, whose ``market_ticker`` is the record's identity -- the
+    selector and the order gateway route on it, so a digest would make the record
+    lie downstream, and the market can simply not be forecast. The rows this
+    renders are pure audit rows on the tick's *unconditional* path: raising would
+    convert a hostile market into a crashed tick that never ledgers its
+    heartbeat, its equity or its positions -- the denial of service issue #525
+    had to add a graceful skip to avoid. Nothing routes on either ticker, so
+    keeping the row and refusing the bytes costs nothing and loses no audit.
+
+    A clean ticker that happens to *look* like a substitution is ledgered
+    verbatim, and is therefore indistinguishable from one. That is a reporting
+    ambiguity, not a leak: such a ticker passed the screen, so no text the screen
+    rejects ever reaches the chain either way, which is the property under test.
+
+    Args:
+        market_ticker: The market's own, untrusted ticker.
+
+    Returns:
+        The ticker verbatim, or its ``<rejected-ticker:sha256:...>`` digest form.
+    """
+    if screen_single_line_text(market_ticker) is None:
+        return market_ticker
+    return f"{REJECTED_TICKER_PREFIX}{fingerprint_response(market_ticker)}>"
+
+
+def _ticker_payload(market_ticker: str) -> dict[str, object]:
+    """Return the ledger-safe ``market_ticker`` payload fragment (issue #464).
+
+    The forecast package's event payloads are folded into an append-only hash
+    chain by the composition root, and nothing written there can ever be
+    redacted -- so attacker-chosen text must not reach it. A ticker is screened
+    with :func:`~windbreak.forecast.sanitize.screen_single_line_text`, the same
+    screen the provider seam refuses the market on, so anything refused upstream
+    is also substituted here; a guard wired to a narrower check would leak
+    exactly the artifacts the seam already knows are hostile.
+
+    A clean ticker is returned verbatim under the sole ``market_ticker`` key, so
+    a clean run's payloads are byte-identical to what they were before this
+    existed.
+
+    The substituted *value* is rendered by :func:`ledger_safe_ticker`, the one
+    renderer the whole codebase shares (issue #530), so the payload keys below
+    and the bare-string rows the scheduler ledgers can never drift into two
+    spellings of the same substitution. This fragment adds the two sibling keys
+    on top, which a free-form payload can carry and a typed ledger row -- whose
+    key set is fixed by its schema -- cannot.
+
+    Args:
+        market_ticker: The market's own, untrusted ticker.
+
+    Returns:
+        The payload fragment to splice in ahead of the event's other keys.
+    """
+    screen_failure = screen_single_line_text(market_ticker)
+    if screen_failure is None:
+        return {"market_ticker": market_ticker}
+    digest = fingerprint_response(market_ticker)
+    return {
+        "market_ticker": ledger_safe_ticker(market_ticker),
+        REJECTED_TICKER_FINGERPRINT_KEY: digest,
+        REJECTED_TICKER_FAILURE_KEY: screen_failure,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class _DiscardRecorder:
     """Binds a ledger writer to a fixed timestamp for discard events.
@@ -341,7 +444,9 @@ class _DiscardRecorder:
 
         The raw response never enters the payload -- only its sha256 fingerprint
         (computed by the provider and passed in here) does -- so a tainted
-        response cannot leak through the audit trail.
+        response cannot leak through the audit trail. The market's *own* ticker
+        is held to the same rule by :func:`_ticker_payload`: a hostile one is
+        ledgered as a digest, never verbatim (issue #464).
 
         Args:
             market_ticker: The forecast market's ticker.
@@ -351,7 +456,7 @@ class _DiscardRecorder:
             response_fingerprint: The rejected response's sha256 fingerprint.
         """
         payload: dict[str, object] = {
-            "market_ticker": market_ticker,
+            **_ticker_payload(market_ticker),
             "provider": member.provider,
             "model_version": member.model_version,
             "vote_index": vote_index,
@@ -380,6 +485,11 @@ class _DiscardRecorder:
         Unlike :meth:`record_discard`, this never carries a response
         fingerprint: it is a cost/outcome signal, not a tainted-response audit.
 
+        It *is* the payload a composition root folds into a durable
+        append-only row, so it screens ``market_ticker`` through
+        :func:`_ticker_payload` on exactly the same terms as
+        :meth:`record_discard` (issue #464).
+
         Args:
             market_ticker: The forecast market's ticker.
             member: The ensemble member whose vote this cost belongs to.
@@ -391,7 +501,7 @@ class _DiscardRecorder:
             failure_code: The discard failure code, or ``""`` for a non-discard.
         """
         payload: dict[str, object] = {
-            "market_ticker": market_ticker,
+            **_ticker_payload(market_ticker),
             "provider": member.provider,
             "model_version": member.model_version,
             "vote_index": vote_index,
@@ -843,6 +953,12 @@ def _collect_provider_forecasts(
     for index, member in enumerate(members):
         provider = _build_provider(provider_factory, transport, member)
         try:
+            # The seam, not the prompt builder (issue #462): screening here
+            # covers every provider -- including one that assembles its own
+            # request body and never calls `build_vote_prompt` -- so coverage
+            # is opt-out rather than opt-in. Inside the `try` so the refusal is
+            # discarded per-vote like any other `ProviderVoteError`.
+            screen_market_metadata(market)
             forecast = provider.forecast(market, baseline, index, quotes)
         except ProviderVoteError as failed:
             discarded_cost_micros += failed.cost_micros
@@ -1865,6 +1981,13 @@ def run_pipeline(
     Raises:
         ValueError: If ``min_ensemble_votes`` is below ``1``; a usage error
             rejected loudly before any stage runs.
+        ProviderMarketMetadataRejectedError: If the market's own free-text
+            metadata fails the S8.5 screen (issue #525). Raised at entry, before
+            any budget day is opened or any research is paid for, so a market
+            that could only ever produce an abstention costs nothing. Refusing
+            the *market* -- rather than every vote for it in turn -- is what
+            keeps an unscreened ticker out of the caller's ledger: there is no
+            record to append.
         DailyBudgetExhaustedError: If ``budget`` is supplied and the run's UTC
             day is already exhausted; raised before any research.
         PerForecastBudgetExceededError: If ``budget`` is supplied and the run's
@@ -1876,6 +1999,16 @@ def run_pipeline(
     if min_ensemble_votes < 1:
         msg = f"min_ensemble_votes must be at least 1, got {min_ensemble_votes}"
         raise ValueError(msg)
+    # Refuse the whole market here, before any stage (issue #525). The seam
+    # screen inside `_collect_provider_forecasts` refuses a hostile market
+    # *per vote*, which discards every vote and still returns an abstention
+    # record -- and `ForecastRecord.__post_init__` now refuses to build one,
+    # so without this the run would die with an untyped `ValueError` deep in
+    # aggregation instead of a typed refusal a composition root can handle.
+    # First, deliberately: it is a pure comparison over metadata the caller
+    # already holds, so a market that can never be forecast opens no budget
+    # day and pays for no research.
+    screen_market_metadata(market)
     max_pages = _open_budget_day(budget, created_at)
     question_hash = normalize_question(market)
     criteria = extract_resolution_criteria(market)

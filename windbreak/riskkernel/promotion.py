@@ -11,7 +11,9 @@ This module is deliberately pure data plus evaluation: it imports no ledger
 machinery, so it can be unit-tested and reasoned about in isolation. The
 kernel-level entrypoints (:meth:`RiskKernel.request_promotion` and the ledgered
 significance override) live in :mod:`windbreak.riskkernel.process` and build on
-these primitives.
+these primitives. Note that nothing under ``windbreak/`` constructs a
+:class:`GateEvidence` or calls ``request_promotion``, so no shipped path
+evaluates any of these gates against real evidence (issue #542).
 
 The PAPER -> LIVE_MICRO gate's three plan-sourced thresholds (resolved-count,
 independent-event-group, and Brier-skill) are no longer read from a live

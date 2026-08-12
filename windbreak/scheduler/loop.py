@@ -68,10 +68,12 @@ reconciles against is frozen at startup from the venue's own opening state
 (``LedgerExpectationSource``; see :func:`_build_verifier` for why freezing it
 is what makes the comparison falsifiable at all), and the ledger carries no
 fill amounts that could update it. So the first tick after a fill grades a
-``BREACH``, the kernel transitions to ``HALT``, and every later approval vetoes
-on the halted mode. That is the honest fail-closed reading of "our books cannot
-account for the venue" -- and it is the reason an always-on PAPER deployment
-must watch :attr:`TickOutcome.kernel_halted`.
+``BREACH`` and the kernel transitions to ``HALT``. From that tick onward the
+loop walks no candidates, so it buys no research and mints no intent for an
+approval to veto (issue #526); ``HALT`` has no transition back to a trading
+mode, so only a restart clears it. That is the honest fail-closed reading of
+"our books cannot account for the venue" -- and it is the reason an always-on
+PAPER deployment must watch :attr:`TickOutcome.kernel_halted`.
 
 Money and equity fields are scaled integers (micros/centis/pips), never floats
 (SPEC S6.1); this package is on ``scripts/lint_no_floats.py``'s denylist.
@@ -84,7 +86,7 @@ import json
 import logging
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
@@ -117,8 +119,10 @@ from windbreak.forecast.pipeline import (
     PROVIDER_GATE_HELD_EVENT,
     PROVIDER_VOTE_COSTED_EVENT,
     InMemoryForecastLedger,
+    ledger_safe_ticker,
     run_pipeline,
 )
+from windbreak.forecast.providers.base import ProviderMarketMetadataRejectedError
 from windbreak.forecast.providers.track_record import (
     InMemoryTrackRecordSource,
     ProviderTrackRecordGate,
@@ -260,6 +264,59 @@ _LOGGER = logging.getLogger("windbreak.scheduler")
 
 #: The component label stamped on every scheduler-authored ledger event.
 _COMPONENT = "scheduler"
+
+#: Evidence source token for a research bundle the caller handed in. Not
+#: reachable from ``windbreak run`` -- ``build_paper_deps``'s ``research_tools``
+#: parameter is a test seam -- and deliberately *not* classified: this guard
+#: cannot know whether an injected bundle finds anything.
+RESEARCH_EVIDENCE_INJECTED: Final = "injected"
+
+#: Evidence source token for the committed replay corpus (issue #510), the one
+#: source a shipped command line can select without a network.
+RESEARCH_EVIDENCE_CORPUS: Final = "replay-corpus"
+
+#: Evidence source token for the live search/fetch transports (issue #344).
+RESEARCH_EVIDENCE_LIVE: Final = "live-search"
+
+#: Evidence source token for the offline bundle whose search finds nothing by
+#: construction. A run wired to it must abstain on ``no_verified_citations``
+#: before a single vote, every tick, forever.
+RESEARCH_EVIDENCE_NONE: Final = "none"
+
+#: Every evidence source token, in the order :func:`_resolve_research_tools`
+#: decides them. Enumerated here so a caller reasons over the set rather than
+#: restating it.
+RESEARCH_EVIDENCE_SOURCES: Final = (
+    RESEARCH_EVIDENCE_INJECTED,
+    RESEARCH_EVIDENCE_CORPUS,
+    RESEARCH_EVIDENCE_LIVE,
+    RESEARCH_EVIDENCE_NONE,
+)
+
+#: What an operator is told, once at startup, when this deployment composed no
+#: source of research evidence at all (issue #485).
+#:
+#: It is a constant with **no interpolation site**: the guard reports
+#: configuration, and every leaf that can select an evidence source sits beside
+#: one naming a credential's environment variable, so a message assembled from
+#: values would be one refactor away from carrying a secret into a log
+#: aggregator and, via ``AlertEmitted``, into the append-only ledger.
+EVIDENCE_STARVED_MESSAGE: Final = (
+    "DEGRADED: this PAPER loop composed no research evidence source, so every "
+    "forecast it makes must abstain on no_verified_citations before a single "
+    "vote and it can never emit an order intent -- it will keep beating, and "
+    "keep reporting healthy, for as long as it runs. "
+    "REMEDY: either replay a committed corpus (set forecast.replay_corpus.mode "
+    "to 'replay' and forecast.replay_corpus.corpus_dir to that directory), or "
+    "configure live research (set forecast.provider_transport.mode to 'live' "
+    "and forecast.research.search_endpoint_url to your search endpoint). "
+    "WHAT THIS DOES NOT CLAIM: it reads the research wiring this process "
+    "actually composed and nothing else. Its implication runs one way -- no "
+    "evidence source means no intent, ever -- and it proves nothing about a "
+    "deployment that has one, because the depth floor, the resolution horizon, "
+    "the correlation declaration and the provider track record are judged per "
+    "tick against the books and this guard reads none of them."
+)
 
 #: The per-UTC-day research ceiling a budget opens with when this ledger's
 #: research rows cannot be folded. Zero, so every market halts on the budget
@@ -628,8 +685,22 @@ def market_snapshot_event_to_record(
     Carries the top-of-book best bid/ask in pips (never a float), each ``None``
     for a missing (empty) book side rather than a fabricated zero price.
 
+    The ticker crosses through
+    :func:`~windbreak.forecast.pipeline.ledger_safe_ticker` (issue #530).
+    :func:`_snapshot_stage` appends this row for every screened candidate,
+    *before* :func:`_forecast_stage` runs -- so the entry screen issue #525
+    added to ``run_pipeline`` refuses the market too late to keep its bytes off
+    an append-only chain. Substituting here, at the sole place this event is
+    constructed, is what closes that window.
+
+    Nothing reads this ticker back, so the digest costs no downstream truth;
+    it is the same stable digest the market's ``ScreenDecisionRecorded`` row
+    carries, so the two still correlate.
+
     Args:
-        ticker: The market the snapshot is for.
+        ticker: The market the snapshot is for. Ledgered as a digest when it
+            fails the S8.5 screen, so the returned record's ``ticker`` and its
+            payload agree and neither carries the raw bytes.
         order_book: The book snapshot to project.
         component: The component label stamped on the event.
 
@@ -638,7 +709,7 @@ def market_snapshot_event_to_record(
     """
     return MarketSnapshotRecorded(
         component=component,
-        ticker=ticker,
+        ticker=ledger_safe_ticker(ticker),
         best_bid_pips=_best_bid_pips(order_book),
         best_ask_pips=_best_ask_pips(order_book),
         fetched_at_epoch_s=int(order_book.fetched_at.timestamp()),
@@ -887,21 +958,104 @@ def _curve_samples(records: Iterable[LedgerRecord]) -> Iterator[tuple[int, int]]
             yield record.sequence_number, equity_micros
 
 
-def _fold_equity_curve(samples: Iterable[tuple[int, int]]) -> EquityCurve | None:
-    """Fold ``samples`` into the all-time peak and the newest reading.
+@dataclass(slots=True)
+class EquityCurveCursor:
+    """The per-process memo that bounds :func:`read_equity_curve`'s cost.
+
+    A high-water mark is a *maximum* over an all-time series, so unlike the
+    day's baseline (issue #370) it has no recency predicate a walk can stop on:
+    truncating the walk to a recent window would silently lower the mark, and
+    ``trailing_drawdown_limit``'s threshold is a ppm share *of* that mark, so a
+    lower mark is a looser cap -- the exact failure #513/#514 were filed for.
+
+    What this remembers instead is a *watermark*, which is a stopping predicate
+    that costs nothing: ``curve`` is the exact fold of every sample up to and
+    including ``covered_through``, so the next read only has to walk the rows
+    above it. The answer stays exactly the unbounded one because
+
+        max(all samples) == max(max(samples <= w), max(samples > w))
+
+    for any ``w`` -- an identity, not an approximation. The same holds for the
+    newest reading, which is selected by ``sequence_number`` and so can only
+    come from the rows above the watermark or from the memo (issue #516).
+
+    It is a memo and never a store: it lives for the life of one process, so a
+    restarted loop starts cold and re-folds the mark from the ledger's own rows
+    rather than resetting to whatever it samples first. That is the same
+    durability :func:`read_equity_curve` had when it re-folded on every tick,
+    at one whole-series fold per *process* instead of one per beat.
+
+    Mutable on purpose, and held by the frozen :class:`PaperTickDeps` the way
+    ``budget`` is: the bundle forbids rebinding the field, not advancing the
+    object, which is what lets the memo span every tick of one deployment.
+
+    Attributes:
+        curve: The fold of every sample at or below ``covered_through``, or
+            ``None`` while nothing has been folded.
+        covered_through: The highest ``sequence_number`` already folded in.
+            Zero on a cold cursor -- below every real sequence number, which
+            start at one -- so a cold read folds the whole series.
+    """
+
+    curve: EquityCurve | None = None
+    covered_through: int = 0
+
+
+def _samples_above_the_watermark(
+    store: ReverseTypeScan, covered_through: int
+) -> Iterator[tuple[int, int]]:
+    """Yield samples newest-first, stopping at ``covered_through``.
+
+    Walks ``EquitySampled`` rows alone, newest first, and stops at the first
+    row whose ``sequence_number`` is at or below the watermark: everything from
+    there down is already folded into the cursor's remembered maximum, so
+    re-reading it could not change the answer. The walk therefore costs
+    O(samples appended since the last read) -- one per tick in the steady state
+    -- rather than O(samples since ledger inception).
+
+    Args:
+        store: The ledger, declaring the reverse-walk capability.
+        covered_through: The highest ``sequence_number`` already folded. Zero
+            means nothing is, and the whole series is walked.
+
+    Yields:
+        One ``(sequence_number, equity_micros)`` pair per row above the
+        watermark.
+    """
+    for record in store.iter_records_of_type_reversed(_EQUITY_SAMPLED_EVENT_TYPE):
+        if record.sequence_number <= covered_through:
+            return
+        _, equity_micros = _equity_sample(record)
+        yield record.sequence_number, equity_micros
+
+
+def _fold_equity_curve(
+    samples: Iterable[tuple[int, int]], into: EquityCurveCursor
+) -> None:
+    """Fold ``samples`` into ``into``, advancing it to cover them.
 
     Order-free: the peak is a maximum and the newest reading is selected by
     ``sequence_number``, so the newest-first walk and the oldest-first fold
-    reach the same pair.
+    reach the same pair. Re-folding a sample already covered is therefore a
+    no-op too, which is what lets the ``read_all`` fallback path resume from a
+    warm cursor without double-counting anything.
 
     Args:
         samples: The ``(sequence_number, equity_micros)`` pairs to fold, in any
             order.
-
-    Returns:
-        The :class:`EquityCurve`, or ``None`` when no sample exists at all.
+        into: The cursor the fold starts from and is written back into. A cold
+            cursor (the default-constructed one) makes this a fold from
+            scratch; a warm one resumes from its remembered maximum.
     """
-    state: tuple[int, int, int] | None = None
+    state: tuple[int, int, int] | None = (
+        None
+        if into.curve is None
+        else (
+            into.curve.high_water_mark.value,
+            into.covered_through,
+            into.curve.latest.value,
+        )
+    )
     for sequence_number, equity_micros in samples:
         if state is None:
             state = (equity_micros, sequence_number, equity_micros)
@@ -911,10 +1065,11 @@ def _fold_equity_curve(samples: Iterable[tuple[int, int]]) -> EquityCurve | None
             latest_sequence_number, latest = sequence_number, equity_micros
         state = (max(peak, equity_micros), latest_sequence_number, latest)
     if state is None:
-        return None
-    return EquityCurve(
+        return
+    into.curve = EquityCurve(
         high_water_mark=MoneyMicros(state[0]), latest=MoneyMicros(state[2])
     )
+    into.covered_through = state[1]
 
 
 def equity_curve_micros(records: Iterable[LedgerRecord]) -> EquityCurve | None:
@@ -935,40 +1090,56 @@ def equity_curve_micros(records: Iterable[LedgerRecord]) -> EquityCurve | None:
         KeyError: If an ``EquitySampled`` payload is missing the field this
             reads -- a loud shape drift, never a silently zeroed mark.
     """
-    return _fold_equity_curve(_curve_samples(records))
+    folded = EquityCurveCursor()
+    _fold_equity_curve(_curve_samples(records), folded)
+    return folded.curve
 
 
-def read_equity_curve(store: LedgerStore) -> EquityCurve | None:
+def read_equity_curve(
+    store: LedgerStore, *, cursor: EquityCurveCursor | None = None
+) -> EquityCurve | None:
     """Read the account's peak and current equity from ``store``.
 
     The tick's entry point for ``trailing_drawdown_limit``'s two terms, and the
-    one fold in this module that deliberately does **not** stop at a boundary:
-    a maximum over an all-time series has no recency predicate to stop on, and
-    a mark that stopped at one would not be a high-water mark. A store
-    declaring :class:`~windbreak.ledger.store.ReverseTypeScan` therefore pays
-    one indexed pass over the ``EquitySampled`` rows alone -- the same
-    complexity :func:`read_notional_today_micros` already pays over the booked
-    fills, for the same reason (a sum, like a maximum, cannot be truncated
-    safely) -- and every other store falls back to the whole-ledger fold.
+    one fold in this module whose bound is **not** a recency predicate: a
+    maximum over an all-time series has none, and a mark that stopped at one
+    would not be a high-water mark -- it would be a lower number, and so a
+    looser cap, which is the failure #513/#514 were filed for.
 
-    Re-folding from the ledger on each tick is also what makes the mark survive
-    a process restart: it is never held in memory, so a loop that stops and
-    starts recovers exactly the peak its own rows attest to, rather than
-    resetting to whatever the first tick after the restart happens to sample.
+    What bounds it instead is ``cursor``, the caller's per-process
+    :class:`EquityCurveCursor`. Given one, a store declaring
+    :class:`~windbreak.ledger.store.ReverseTypeScan` walks only the
+    ``EquitySampled`` rows appended since the last read -- one per tick in the
+    steady state -- and folds them into the remembered maximum, which is
+    *exactly* the unbounded answer rather than an approximation of it (see the
+    identity on :class:`EquityCurveCursor`). Without one, or on a store lacking
+    the capability, this is PR #515's whole-series fold unchanged: correct,
+    and O(samples since ledger inception) as it always was.
+
+    The mark still survives a process restart, because the cursor is a memo and
+    not a store: a fresh process starts cold and re-folds from the ledger's own
+    rows, recovering exactly the peak they attest to rather than resetting to
+    whatever the first tick after the restart happens to sample. Issue #516
+    moved that fold from once per beat to once per process; it did not move it
+    off the ledger.
 
     Args:
         store: The ledger to read the equity samples out of.
+        cursor: The per-process memo to resume from and advance, or ``None``
+            (the default) to fold the whole series afresh.
 
     Returns:
         The :class:`EquityCurve`, or ``None`` when the ledger holds no sample
         at all.
     """
-    records: Iterable[LedgerRecord] = (
-        store.iter_records_of_type_reversed(_EQUITY_SAMPLED_EVENT_TYPE)
+    resumed = EquityCurveCursor() if cursor is None else cursor
+    samples: Iterable[tuple[int, int]] = (
+        _samples_above_the_watermark(store, resumed.covered_through)
         if isinstance(store, ReverseTypeScan)
-        else store.read_all()
+        else _curve_samples(store.read_all())
     )
-    return _fold_equity_curve(_curve_samples(records))
+    _fold_equity_curve(samples, resumed)
+    return resumed.curve
 
 
 def start_of_day_equity_micros(
@@ -2304,6 +2475,19 @@ class PaperTickDeps:
             have built itself, keeping the cassette path byte-identical; see
             :mod:`windbreak.scheduler.provider_wiring` for why only the live
             path is wrapped.
+        equity_curve_cursor: The per-process memo :func:`read_equity_curve`
+            resumes its high-water fold from (issue #516). The bundle's second
+            deliberately *mutable* member, for the same reason as ``budget``:
+            the frozen dataclass forbids rebinding the field, not advancing the
+            object, and one instance per process is exactly what turns a fold
+            over every ``EquitySampled`` row ever written -- paid on every beat
+            of a loop epic #455 means to run for a week -- into a walk over the
+            rows appended since the previous beat. :func:`dataclasses.replace`
+            shares the same instance by design, so swapping the ``approval``
+            seam cannot silently restore the unbounded cost. It is defaulted
+            rather than required because a cold cursor is always a correct one:
+            the first read through it folds the whole series, exactly as
+            before, and only the reads after that are bounded.
     """
 
     config: WindbreakConfig
@@ -2324,6 +2508,7 @@ class PaperTickDeps:
     budget: ResearchBudget
     provider_gate: ProviderTrackRecordGate
     provider_factory: ProviderFactory
+    equity_curve_cursor: EquityCurveCursor = field(default_factory=EquityCurveCursor)
 
 
 def _default_clock() -> int:
@@ -2473,8 +2658,8 @@ def _resolve_research_tools(
     config: WindbreakConfig,
     provider_http: LiveProviderHttp | None,
     corpus: ReplayCorpus | None = None,
-) -> ResearchTools:
-    """Return the supplied research tools, or the mode's own default.
+) -> tuple[str, ResearchTools]:
+    """Return this run's evidence source token and the research tools for it.
 
     An explicitly supplied bundle always wins, so a test can drive counted or
     doubled transports through either mode. Otherwise the default follows the
@@ -2495,16 +2680,90 @@ def _resolve_research_tools(
             before either can be built.
 
     Returns:
-        A sandboxed :class:`~windbreak.forecast.sandbox.ResearchTools`.
+        The branch's :data:`RESEARCH_EVIDENCE_SOURCES` token paired with the
+        sandboxed :class:`~windbreak.forecast.sandbox.ResearchTools` it built.
+        The token is returned *from here* rather than re-derived from config by
+        the guard that consumes it (issue #485), so the two cannot disagree:
+        dropping ``corpus`` from this function's call site moves the reported
+        source to :data:`RESEARCH_EVIDENCE_NONE` in the same edit. A guard that
+        re-read configuration instead would keep reporting a corpus that the
+        wiring no longer passed -- the composition trap, wearing a safety label.
+
+        The live branch's token keys on the same ``search``/``fetch`` pair
+        :func:`~windbreak.scheduler.provider_wiring.build_live_research_tools`
+        keys its own offline fallback on, so a live deployment that pinned an
+        LLM but never named a search endpoint is reported as having no evidence
+        source -- which is exactly what it has.
     """
     cache_dir = ledger_path.parent.joinpath("research-cache")
     if research_tools is not None:
-        return research_tools
+        return RESEARCH_EVIDENCE_INJECTED, research_tools
     if corpus is not None:
-        return build_corpus_research_tools(corpus, cache_dir)
+        return RESEARCH_EVIDENCE_CORPUS, build_corpus_research_tools(corpus, cache_dir)
     if provider_http is not None:
-        return build_live_research_tools(config, provider_http, cache_dir)
-    return offline_research_tools(cache_dir)
+        tools = build_live_research_tools(config, provider_http, cache_dir)
+        if provider_http.search is None or provider_http.fetch is None:
+            return RESEARCH_EVIDENCE_NONE, tools
+        return RESEARCH_EVIDENCE_LIVE, tools
+    return RESEARCH_EVIDENCE_NONE, offline_research_tools(cache_dir)
+
+
+def research_evidence_fold(source: str) -> str:
+    """Return the startup fold line reporting the effective evidence source.
+
+    PR #487 established the shape: an operator must be able to read the
+    *effective* value out of the log rather than infer it from configuration
+    they may not have written. One formatter, used by the emitter and by the
+    tests that pin it, so the line an operator greps for is the line asserted.
+
+    Args:
+        source: One of :data:`RESEARCH_EVIDENCE_SOURCES`.
+
+    Returns:
+        The rendered fold line.
+    """
+    return f"research evidence source={source}"
+
+
+def _log_research_evidence(source: str) -> None:
+    """Fold this run's evidence source into the log, loudly when there is none.
+
+    Issue #438 asked for a startup failure when the PAPER loop is activated in a
+    composition that can only abstain; issue #485 carried that forward and the
+    owner deferred it twice, because until PR #522 (#510) made a corpus
+    selectable from a command line, *every* configuration was such a
+    composition and this signal would have fired on every start. A signal that
+    always fires teaches operators to ignore it, which is worse than none.
+
+    It **warns and continues** rather than refusing, which is the deliberate
+    deviation from #438's wording:
+
+    * PR #487's standard is fail closed on the capability, never on the
+      process. A starved loop already fails closed on the capability -- it
+      emits no intent. Refusing the process would additionally cost the
+      operator the kill file, the ledger and the verification cycle; a
+      deployment that cannot produce evidence is not one that must not be
+      stoppable.
+    * The shipped default *is* the starved composition, on purpose, and #522
+      proved it stays that way. Refusing it would turn ``docker compose up``
+      into a hard failure -- a regression dressed as a fix.
+    * Configuration *contradictions* do refuse, here and next door:
+      :func:`_resolve_replay_corpus` rejects an unknown mode, a replay mode
+      naming no directory, and a corpus selected alongside the live transport.
+      An evidence-starved deployment has contradicted nothing; it has merely
+      configured less than it needed, and the two must not read alike.
+
+    An injected bundle (:data:`RESEARCH_EVIDENCE_INJECTED`) folds like any other
+    source and is never warned on: a caller that handed in its own tools knows
+    what they find, and this function does not.
+
+    Args:
+        source: The token :func:`_resolve_research_tools` returned.
+    """
+    if source == RESEARCH_EVIDENCE_NONE:
+        _LOGGER.warning(EVIDENCE_STARVED_MESSAGE)
+        return
+    _LOGGER.info(research_evidence_fold(source))
 
 
 def _resolved_dispatcher(dispatcher: AlertDispatcher | None) -> AlertDispatcher:
@@ -3226,6 +3485,14 @@ def build_paper_deps(
     transport, live = _resolve_forecast_transport(
         config, cassette_path, provider_http, corpus
     )
+    # Resolved and folded here, beside the other two evidence decisions and
+    # before the ledger database or any exchange session exists, so an operator
+    # reads what this deployment can produce from the first lines of its log
+    # rather than inferring it from a tick that never forecasts (issue #485).
+    evidence_source, resolved_research_tools = _resolve_research_tools(
+        research_tools, ledger_path, config, provider_http, corpus
+    )
+    _log_research_evidence(evidence_source)
     # The exchange must observe on the same clock the tick reads, or its status
     # attestation drifts against `now_epoch_s` and `exchange_status_ok` judges
     # freshness against two unrelated timelines (issue #342).
@@ -3287,9 +3554,7 @@ def build_paper_deps(
         kernel=kernel,
         verification_key=key,
         transport=transport,
-        research_tools=_resolve_research_tools(
-            research_tools, ledger_path, config, provider_http, corpus
-        ),
+        research_tools=resolved_research_tools,
         report_dir=report_dir,
         clock=resolved_clock,
         budget=_build_research_budget(store, config),
@@ -3337,9 +3602,11 @@ class TickOutcome:
             markets reached before the ceiling bit.
         kernel_halted: Whether the Risk Kernel is in ``HALT`` at the end of this
             tick -- today only a verification ``BREACH`` puts it there (issue
-            #32). A halted kernel vetoes every later intent, so an always-on
-            driver must treat this as "stop and get a human", not as a
-            transient. Reported per tick rather than raised, because the tick
+            #32). A halted kernel cannot trade and cannot transition back to
+            a mode that can, so an always-on driver must treat this as "stop
+            and get a human", not as a transient; since issue #526 it also
+            stops paying for research from the halting tick onward. Reported
+            per tick rather than raised, because the tick
             must still finish ledgering its heartbeat, equity, and positions:
             the halt is exactly when that audit trail matters most.
     """
@@ -4037,7 +4304,7 @@ def _approve_stage(
         realized_loss_today=read_realized_loss_today_micros(
             deps.store, now_epoch_s=now_epoch_s
         ),
-        equity_curve=read_equity_curve(deps.store),
+        equity_curve=read_equity_curve(deps.store, cursor=deps.equity_curve_cursor),
         visible_depth=visible_depth_centis(order_book),
         exposure=exposure,
         notional_today=read_notional_today_micros(deps.store, now_epoch_s=now_epoch_s),
@@ -4367,6 +4634,18 @@ def _run_universe(
     nothing the first one did not: an exhausted day is a property of the day,
     not of the market that happened to discover it.
 
+    A market **refused** on its own hostile free-text metadata is the opposite
+    case and gets the opposite answer: the walk *continues* (issue #525). Being
+    unforecastable is a property of that one market, so stopping the walk would
+    let a single forged ticker in the venue's universe deny service to every
+    market behind it. ``run_pipeline`` raises
+    :class:`~windbreak.forecast.providers.base.ProviderMarketMetadataRejectedError`
+    at entry for such a market, which is the only way that error can reach here:
+    the vote-collection loop discards its own per-vote refusals internally. The
+    market contributes no ``ForecastCreated``, no ``SelectorDecisionRecorded``
+    and no approval row -- which is exactly the point, since its ticker would
+    otherwise be written verbatim into an append-only chain.
+
     Args:
         deps: The tick's dependency bundle.
         candidates: The screened markets, in processing order.
@@ -4382,7 +4661,10 @@ def _run_universe(
     filled_centis = 0
     halted = False
     for candidate in candidates:
-        result = _run_candidate(deps, candidate, created_at, heartbeat_epoch_s)
+        try:
+            result = _run_candidate(deps, candidate, created_at, heartbeat_epoch_s)
+        except ProviderMarketMetadataRejectedError:
+            continue
         if result is None:
             halted = True
             break
@@ -4505,29 +4787,57 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
 
     A cycle that grades a ``BREACH`` halts the kernel instead (issue #32); the
     tick still completes and still ledgers its heartbeat, equity sample, and
-    positions snapshot, but every later approval vetoes on the halted mode, and
+    positions snapshot, but it walks no candidates from that tick onward and
     :attr:`TickOutcome.kernel_halted` says so.
 
     Since issue #441 the tick *opens* by polling the operator's kill/re-arm
     files (:func:`_kill_stage`) and walks **no** candidates at all while the
-    kernel is ``KILLED``. Two triggers reach that state and both stop the same
-    tick: the ``KILL`` file ``windbreak kill`` writes, read before anything else
-    happens, and the ``AUTO_RECONCILIATION`` auto-kill that fires inside the
-    verification cycle once ``risk.kill_after_consecutive_mismatches``
-    consecutive breaches have accumulated. The mode is therefore read *after*
-    that cycle, so neither trigger needs its own path.
+    kernel may not trade. Three triggers reach such a mode and all stop the
+    same tick: the ``KILL`` file ``windbreak kill`` writes, read before
+    anything else happens; the ``AUTO_RECONCILIATION`` auto-kill that fires
+    inside the verification cycle once
+    ``risk.kill_after_consecutive_mismatches`` consecutive breaches have
+    accumulated; and that same cycle's single-breach ``HALT``. The mode is
+    therefore read *after* the cycle, so none of them needs its own path.
 
-    A killed tick is not a skipped tick. It still screens (the screen is free
-    and its rows are the honest record of what was examined), still stamps its
-    pipeline heartbeat, still reconciles the venue, still samples equity and
+    Since issue #526 the gate is not the kill switch's alone. What it asks is
+    :meth:`~windbreak.riskkernel.modes.Mode.may_research` -- "may this mode
+    spend research money" -- so ``HALT`` and ``PAUSED`` walk no candidates
+    either. Restating the mode set here is exactly what #526 cost:
+    ``KillSwitch.rearm`` exits ``KILLED`` into ``PAUSED``, so a re-armed loop
+    bought a forecast per market per beat and then vetoed every intent it had
+    paid for on ``mode PAUSED may not trade``, drawing down a per-UTC-day
+    ceiling that is durable since #442/#483 -- so the waste outlived the
+    process, and the next day opened short.
+
+    It is deliberately **not**
+    :meth:`~windbreak.riskkernel.modes.Mode.may_trade`, and the difference is
+    one mode. ``RESEARCH`` may not trade and must research: SPEC S5.1's bottom
+    rung produces forecasts precisely so that promotion out of it can be
+    earned, and ``_research_to_paper_gate``'s ``research_min_forecasts``
+    criterion reads that production. Gating the walk on "may an order be
+    routed" would therefore stop a ``RESEARCH`` loop from ever producing the
+    evidence that promotes it -- research without trading is what the rung is
+    *for*. A ``RESEARCH`` tick walks, snapshots, forecasts, pays, and reaches
+    the approval seam exactly as a ``PAPER`` tick does; only the approval
+    differs, vetoing on ``mode RESEARCH may not trade``.
+
+    ``HALT`` used to be excluded on the grounds that "a halted kernel is
+    expected to recover and its approvals veto individually". It does not
+    recover: ``_ALLOWED_TRANSITIONS[Mode.HALT]`` is ``{PAUSED, KILLED}`` and
+    :meth:`~windbreak.riskkernel.process.RiskKernel.from_events` never replays
+    ``HALT``, so a halt lasts the life of the process exactly as a re-arm's
+    ``PAUSED`` does. Both now cost nothing.
+
+    A non-trading tick is not a skipped tick. It still screens (the screen is
+    free and its rows are the honest record of what was examined), still stamps
+    its pipeline heartbeat, still reconciles the venue, still samples equity and
     positions, and still writes the week's report -- an always-on loop must stay
     observably alive and flat while dead, not fall silent. What it does not do
     is research or route: the walk is where money is spent, and a kernel that
     can approve nothing must not pay for forecasts it cannot act on.
-    ``ModeHeartbeat`` carries ``KILLED``, so the ledger and the heartbeat line
-    both say so. ``HALT`` deliberately does *not* skip the walk -- a halted
-    kernel is expected to recover and its approvals veto individually -- so this
-    is the kill switch's dead hand, not a general mode gate.
+    ``ModeHeartbeat`` carries the real mode, so the ledger and the heartbeat
+    line both say which one stopped the walk.
 
     A market whose per-forecast or per-UTC-day research budget is exhausted
     halts fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row,
@@ -4558,6 +4868,21 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     ``tests/integration/test_paper_universe.py``, so this description is
     checkable rather than prose that can drift away from the code.
 
+    A market **refused** on hostile free-text metadata (issue #525) leaves a
+    third shape, and the walk does not stop for it (see :func:`_run_universe`).
+    It keeps its ``ScreenDecisionRecorded`` and its ``MarketSnapshotRecorded``,
+    both appended before the forecast stage is reached, and loses everything
+    from ``ForecastCreated`` onward -- no research is paid for, so it leaves no
+    ``ResearchSpendRecorded`` either. Every candidate behind it still runs.
+    Both surviving rows carry the market's ticker as a stable
+    ``<rejected-ticker:sha256:...>`` digest rather than its bytes (issue #530),
+    so the two rows still correlate with each other and with nothing attacker-
+    chosen reaching the chain. A market the §16 screen turns *away* leaves only
+    the first of those two rows, digest included, and never reaches the forecast
+    stage at all -- a strictly wider population, since it need not screen in.
+    ``tests/integration/test_paper_hostile_ticker.py`` pins every one of these
+    shapes by reading the chain back from disk.
+
     Args:
         deps: The fully wired dependency bundle.
         beat: The 1-based tick sequence number, stamped on the heartbeat.
@@ -4574,11 +4899,25 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     _verification_stage(deps)
     # Read *after* the verification cycle, so the reconciliation auto-kill that
     # fires inside it stops this tick by the same door the operator's KILL file
-    # does. A killed kernel walks no candidates at all: its `evaluate_intent`
-    # would hard-veto every intent anyway, but the walk is where the loop spends
-    # research money, and a dead kernel paying for forecasts it can never act on
-    # is the one failure a kill switch exists to prevent.
-    tradeable = () if deps.kernel.mode is Mode.KILLED else candidates
+    # does. The question asked is `Mode.may_research` -- "may this mode spend
+    # research money" -- and deliberately **not** `may_trade` (issue #526).
+    # The walk is where forecasts are bought, so the gate must ask whether a
+    # forecast is worth buying, not whether an order may be routed. The two
+    # answers agree on every mode but `RESEARCH`, which may not trade and must
+    # research: it is SPEC S5.1's bottom rung, and gating it on `may_trade`
+    # would stop the very forecast production `_research_to_paper_gate` reads
+    # to promote out of `RESEARCH`. See `Mode.may_research` for both failures.
+    #
+    # Placement is load-bearing and belongs *here*, before `_run_universe`.
+    # Every research charge is levied inside `run_pipeline`, which the walk
+    # reaches through `_forecast_stage`; `ResearchBudget.ensure_day_open` and
+    # `charge_stage` are both downstream of this line. Moving the gate any
+    # later -- into `_run_universe`'s loop body, or into `_run_candidate` after
+    # the forecast -- would charge the day first and refuse afterwards, which
+    # is the defect, not the fix. Gating *before* the screen would be wrong in
+    # the other direction: the screen is free and its rows are the honest
+    # record of what a non-trading loop examined.
+    tradeable = candidates if deps.kernel.mode.may_research() else ()
     universe = _run_universe(deps, tradeable, created_at, heartbeat_epoch_s)
     # The kernel's *real* mode, never a hardcoded PAPER: a verification breach
     # drives it to HALT mid-tick, and a heartbeat still claiming PAPER would be

@@ -13,8 +13,9 @@
 ## Role
 You are a [senior backend | senior frontend] engineer working in this
 project's codebase, following its existing conventions (TDD via stay-green,
-check-all.sh gates, ≥90% line / ≥80% branch backend coverage, ≥90% Jest
-frontend, zero lint/type suppressions).
+check-all.sh gates, ≥90% backend coverage over line **and** branch outcomes
+combined — branch outcomes have no separate floor — zero lint/type
+suppressions).
 
 ## Goal
 [One sentence. Specific, measurable, verifiable. e.g. "Eliminate the N+1 query
@@ -30,9 +31,7 @@ assertion test."]
 
 ## Output Format
 A single PR that: (1) adds a failing test first, (2) makes it pass, (3) passes
-the relevant `./scripts/<side>/check-all.sh` — `scripts/backend/check-all.sh`
-for backend changes, `scripts/frontend/check-all.sh` for frontend changes, both
-if the change is cross-cutting — and (4) references this issue with "Closes #N".
+`./scripts/check-all.sh` — and (4) references this issue with "Closes #N".
 
 ## Examples
 [One concrete before/after sketch — e.g. the current loop-with-query vs. the
