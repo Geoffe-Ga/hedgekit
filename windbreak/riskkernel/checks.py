@@ -682,7 +682,19 @@ class _DailyLossLimit:
 
 
 class _TrailingDrawdownLimit:
-    """Veto once drawdown from the high-water mark reaches its limit."""
+    """Veto once drawdown from the high-water mark reaches its limit.
+
+    Both terms are points on the ledger's own equity series
+    (:class:`~windbreak.riskkernel.context.AccountState.sampled_equity` and the
+    running maximum over it), because a drawdown is the distance between two
+    readings of *one* quantity. It is deliberately not measured against
+    worst-case equity: that figure assumes every open position resolves against
+    us, so it falls by a position's full cost the instant one is opened, and a
+    drawdown taken from the sampled peak down to it would report a 12.5%
+    "drawdown" for an account that had merely deployed 12.5% of its equity --
+    vetoing on deployment rather than on loss, and pre-empting the configured
+    concentration caps at a fraction of their reach (issue #514).
+    """
 
     name = "trailing_drawdown_limit"
 
@@ -691,15 +703,18 @@ class _TrailingDrawdownLimit:
 
         Args:
             intent: The order intent (unused).
-            context: The evaluation context supplying the mark and the limit.
+            context: The evaluation context supplying the mark, the current
+                sampled equity, and the limit.
 
         Returns:
-            A vetoing result once ``high_water_mark - worst_case_equity``
-            reaches (``>=``) the floored ppm share of the mark, else approval.
+            A vetoing result once ``high_water_mark - sampled_equity`` reaches
+            (``>=``) the floored ppm share of the mark, else approval. An
+            account with no ledgered sample carries both terms as zero, so
+            ``0 >= 0`` vetoes until the first sample lands.
         """
         del intent
         mark = context.account.equity_high_water_mark.value
-        drawdown = mark - _equity_of(context.account).value
+        drawdown = mark - context.account.sampled_equity.value
         threshold = _ppm_of(mark, context.limits.max_drawdown_pct_ppm)
         if drawdown >= threshold:
             return _veto("trailing drawdown limit reached")

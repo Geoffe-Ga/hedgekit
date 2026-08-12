@@ -44,6 +44,7 @@ from windbreak.numeric import (
 from windbreak.riskkernel.checks import DEFAULT_CHECKS, OrderIntent
 from windbreak.riskkernel.context import EvaluationContext, ExchangeTradingStatus
 from windbreak.scheduler.loop import (
+    EquityCurve,
     build_evaluation_context,
     notional_today_micros,
     read_notional_today_micros,
@@ -203,6 +204,10 @@ def _context(notional_today: MoneyMicros | None) -> EvaluationContext:
         forecast_epoch_s=_NOW_EPOCH_S,
         open_position=None,
         equity_start_of_day=MoneyMicros(500_000_000),
+        realized_loss_today=MoneyMicros(0),
+        equity_curve=EquityCurve(
+            high_water_mark=MoneyMicros(500_000_000), latest=MoneyMicros(500_000_000)
+        ),
         visible_depth=ContractCentis(1_000_000),
         exposure=None,
         notional_today=notional_today,

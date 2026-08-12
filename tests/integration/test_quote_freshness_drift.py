@@ -107,8 +107,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tests.scheduler.test_paper_intent_barriers import (
-    DAILY_LOSS_VETO_REASON,
     FIXED_NOW_EPOCH_S,
+    FRESH_LEDGER_VETO_REASONS,
     SHIPPED_BOOKS,
     SHIPPED_CASSETTE,
     SIZED_FILL_CENTIS,
@@ -375,10 +375,11 @@ def _run_two_beats(deps: PaperTickDeps, clock: _DriftingClock, drift_s: int) -> 
     """Run beat 1 undrifted, then beat 2 with ``drift_s`` charged to its votes.
 
     Beat 1 is deliberately undrifted and deliberately present. It vetoes on
-    ``daily_loss_limit`` -- a fresh ledger carries no ``EquitySampled`` row, so
-    the day has no equity baseline -- and ledgers the sample beat 2 measures
-    against. Without it, every beat-2 reason list below would carry that
-    transient too and the sweep would be reading two effects at once.
+    ``daily_loss_limit`` and ``trailing_drawdown_limit`` alike -- a fresh
+    ledger carries no ``EquitySampled`` row, so the day has no equity baseline
+    and the account has no high-water mark -- and it ledgers the sample beat 2
+    measures against. Without it, every beat-2 reason list below would carry
+    both transients too and the sweep would be reading three effects at once.
 
     Args:
         deps: The wired dependencies.
@@ -443,7 +444,7 @@ def test_the_quote_veto_fires_only_past_the_ttl_under_a_drifting_clock(
     _assert_book_and_stage_instants(deps, drift_s=drift_s)
     vetoes = _payloads(deps, "IntentVetoed")
     assert len(vetoes) == 2
-    assert vetoes[0]["reasons"] == [DAILY_LOSS_VETO_REASON]
+    assert vetoes[0]["reasons"] == FRESH_LEDGER_VETO_REASONS
     assert vetoes[1]["reasons"] == VETO_REASONS_BY_DRIFT[drift_s]
     # The veto really stopped the order: nothing was reserved, no token minted,
     # and nothing filled on either beat.
@@ -476,9 +477,9 @@ def test_no_drift_fills_through_the_same_slow_vote_harness(tmp_path: Path) -> No
     _assert_book_and_stage_instants(deps, drift_s=0)
     assert clock.now == FIXED_NOW_EPOCH_S
     assert filled == SIZED_FILL_CENTIS
-    # Beat 1's daily-loss transient is the only veto across both beats.
+    # Beat 1's fresh-ledger transient is the only veto across both beats.
     assert [payload["reasons"] for payload in _payloads(deps, "IntentVetoed")] == [
-        [DAILY_LOSS_VETO_REASON]
+        FRESH_LEDGER_VETO_REASONS
     ]
     assert [payload["reasons"] for payload in _payloads(deps, "IntentApproved")] == [[]]
     assert len(_payloads(deps, "ApprovalTokenIssued")) == 1

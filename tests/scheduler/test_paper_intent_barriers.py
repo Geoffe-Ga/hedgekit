@@ -289,6 +289,17 @@ SIZED_FILL_CENTIS = 25000
 #: The kernel's veto reason on the first beat of a fresh ledger.
 DAILY_LOSS_VETO_REASON = "daily loss limit reached"
 
+#: The second one, added by issue #514. A fresh ledger carries no
+#: `EquitySampled` row at all, so the trailing drawdown limit has neither a
+#: high-water mark nor a current reading and refuses for want of evidence --
+#: the same unknown-baseline shape as the loss limit beside it, and it lifts on
+#: the very next beat.
+DRAWDOWN_VETO_REASON = "trailing drawdown limit reached"
+
+#: Both fail-closed vetoes the first beat of a fresh ledger carries, in the
+#: order `DEFAULT_CHECKS` evaluates them.
+FRESH_LEDGER_VETO_REASONS = [DAILY_LOSS_VETO_REASON, DRAWDOWN_VETO_REASON]
+
 
 class _FindingResearchTransport:
     """A search/fetch double that always finds one clean, verifiable article."""
@@ -1189,6 +1200,15 @@ def test_the_intent_is_vetoed_on_beat_one_and_fills_on_beat_two(
     fires unconditionally on a fresh ledger, so it is pinned rather than left
     as prose: the first beat of every new UTC day can never place an order.
 
+    Since issue #514 the trailing drawdown limit joins it on beat 1, and only
+    on beat 1: a ledger with no equity sample has no high-water mark *and* no
+    current reading, so that check refuses on ``0 >= 0`` for the same want of
+    evidence. It is not the day boundary that lifts it -- the mark is all-time
+    -- but the first sample, which is why it is absent from beat 2 below while
+    the loss limit's own veto is too. Before that issue the check could not
+    veto at any drawdown for any solvent account, so its silence here was not
+    evidence of a healthy account.
+
     Beat 2 then runs against the equity the first beat sampled, the same intent
     is approved, and the paper venue fills it. Pinning both beats is what keeps
     the barrier list honest in the other direction too -- barrier 6 is a claim
@@ -1217,7 +1237,7 @@ def test_the_intent_is_vetoed_on_beat_one_and_fills_on_beat_two(
     rows = _rows(deps)
     assert first.intent_count == 1
     assert first.filled_centis == 0
-    assert _only(rows, "IntentVetoed")["reasons"] == [DAILY_LOSS_VETO_REASON]
+    assert _only(rows, "IntentVetoed")["reasons"] == FRESH_LEDGER_VETO_REASONS
     assert second.intent_count == 1
     assert second.filled_centis == SIZED_FILL_CENTIS
     assert _only(rows, "IntentApproved")["reasons"] == []

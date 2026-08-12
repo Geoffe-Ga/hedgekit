@@ -162,8 +162,8 @@ def make_intent(
 #: default (zero age, zero skew).
 DEFAULT_NOW_EPOCH_S = 1_700_000_000
 
-#: `AccountState.exchange_verified_available_cash` /
-#: `.equity_start_of_day` / `.equity_high_water_mark` default: $1,000, in
+#: `AccountState.exchange_verified_available_cash` / `.equity_start_of_day` /
+#: `.equity_high_water_mark` / `.sampled_equity` default: $1,000, in
 #: micros. Large relative to the default intent's ~$0.50 notional
 #: (5000 pips * 1000 centis == 5_000_000 micros) so every equity-relative
 #: check (floor, concentration, drawdown, loss) passes by default.
@@ -220,6 +220,7 @@ _DEFAULT_ACCOUNT = AccountState(
     reconciliation_uncertainty_buffer=MoneyMicros(0),
     equity_start_of_day=MoneyMicros(_DEFAULT_EQUITY_MICROS),
     equity_high_water_mark=MoneyMicros(_DEFAULT_EQUITY_MICROS),
+    sampled_equity=MoneyMicros(_DEFAULT_EQUITY_MICROS),
     realized_loss_today=MoneyMicros(0),
     market_exposure=MoneyMicros(0),
     event_exposure=MoneyMicros(0),

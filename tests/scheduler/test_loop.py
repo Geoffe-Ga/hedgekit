@@ -233,6 +233,8 @@ def test_build_evaluation_context_maps_capital_floor_from_config() -> None:
         forecast_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -267,6 +269,8 @@ def test_build_evaluation_context_maps_risk_thresholds_from_config() -> None:
         forecast_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -302,6 +306,8 @@ def test_build_evaluation_context_fails_closed_on_verification_none() -> None:
         forecast_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -341,6 +347,8 @@ def test_build_evaluation_context_fails_closed_on_exchange_status_and_heartbeat(
         forecast_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -371,6 +379,8 @@ def test_build_evaluation_context_stamps_now_epoch_s_verbatim() -> None:
         forecast_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -417,6 +427,8 @@ def test_build_evaluation_context_never_stamps_the_quote_with_its_own_clock(
         forecast_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -692,6 +704,8 @@ def _context_with(*, status, status_epoch_s: int | None, heartbeat_epoch_s: int 
         forecast_epoch_s=None,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -961,7 +975,7 @@ def test_visible_depth_centis_is_zero_for_a_one_sided_book() -> None:
     assert depth == ContractCentis(0)
 
 
-def _exposure_context(*, equity_start_of_day, visible_depth):
+def _exposure_context(*, equity_start_of_day, visible_depth, realized_loss_today=None):
     """Build a PAPER context carrying the given exposure evidence.
 
     Every other feed is the loop's own production wiring; only the two figures
@@ -972,6 +986,9 @@ def _exposure_context(*, equity_start_of_day, visible_depth):
             when no sample exists for the current UTC day.
         visible_depth: The `ContractCentis` visible book depth, or `None` when
             the book could not be read.
+        realized_loss_today: The `MoneyMicros` loss the day has realized, or
+            `None` when the day carries no sample -- the same unprovable case
+            as an absent baseline (issue #513).
 
     Returns:
         The composed `EvaluationContext`.
@@ -994,6 +1011,8 @@ def _exposure_context(*, equity_start_of_day, visible_depth):
         forecast_epoch_s=None,
         open_position=None,
         equity_start_of_day=equity_start_of_day,
+        realized_loss_today=realized_loss_today,
+        equity_curve=None,
         visible_depth=visible_depth,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -1389,6 +1408,8 @@ def _position_context(open_position):
         forecast_epoch_s=DEFAULT_NOW_EPOCH_S,
         open_position=open_position,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -1547,6 +1568,8 @@ def _skew_context(exchange_clock_epoch_s):
         forecast_epoch_s=DEFAULT_NOW_EPOCH_S,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
@@ -1733,6 +1756,8 @@ def _forecast_context(forecast_epoch_s):
         forecast_epoch_s=forecast_epoch_s,
         open_position=None,
         equity_start_of_day=None,
+        realized_loss_today=None,
+        equity_curve=None,
         visible_depth=None,
         exposure=proven_flat_exposure(),
         notional_today=proven_untraded_day(),
