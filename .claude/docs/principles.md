@@ -77,6 +77,15 @@ Follow the gated workflow rigorously (3 automated gates + a manual pre-v1.0.0 mu
 score ≥80% via `./scripts/mutation.sh` or `mutation-gate.yml` (owner directive,
 issue #107).
 
+**The one exception** covers checks whose subject is live GitHub repository
+configuration — state a pull request cannot change, so a rename of it cannot be
+atomic with the commit requiring the new name. It is stated in full, with its
+five conjunctive conditions and the complete list of checks it covers, in
+[Workflow §2.4](workflow.md#24-exception-checks-whose-subject-is-live-repository-state).
+Deliberately not restated here: two copies of a rule labelled non-negotiable is
+how they come to differ. Nothing else is exempt — an ordinary failing test fails
+the first condition (issue #534).
+
 See [Workflow](workflow.md) for complete documentation.
 
 ---

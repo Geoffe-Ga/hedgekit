@@ -51,6 +51,10 @@ Quality engineering is not a checkbox—it's a continuous commitment:
 
 If CI shows red, the work is not done. Period.
 
+The one exception, for checks whose subject is live repository configuration
+rather than code, is stated in full in [§2.4](#24-exception-checks-whose-subject-is-live-repository-state)
+and nowhere else. It is narrower than it looks: five conditions, all required.
+
 ### 1.5 Maximum Quality is a Personality Trait
 
 For those committed to maximum quality engineering:
@@ -122,6 +126,67 @@ Before a v1.0.0 release only:
 ❌ **Don't** lower quality thresholds to pass
 ❌ **Don't** ignore review feedback
 ❌ **Don't** merge without LGTM
+
+### 2.4 Exception: checks whose subject is live repository state
+
+Everything above is unqualified for every check whose subject is **code in this
+tree**, which is every check but one. If `./scripts/check-all.sh` is red because
+of one of those, the work is not done — §1.4 and §2.3 mean exactly what they say.
+
+A check whose subject is **live GitHub repository configuration** is a different
+animal, because the thing it asserts on cannot be changed by a pull request.
+Renaming a required status check therefore has an unavoidable red window: the
+job's `name:` changes in a commit, the required-context set changes through an
+API call, and the two cannot land together. Issue #509 / PR #533 is the worked
+example — Gate 1 returned `1 failed, 6337 passed`, and the one failure was the
+guard correctly reporting that the renamed job did not yet gate merge. The swap
+(drop the stale context → merge → re-add under the full name) ran after the
+merge, and the guard then passed against `main`.
+
+**Such a failure does not block a review request only when every one of these
+holds:**
+
+- **(LS1) Subject.** The assertion's subject is repository state that a pull
+  request cannot change — branch protection, the required status-check set,
+  repository settings. Not code, not a config file, not anything in this tree.
+- **(LS2) Loud skip, never a silent pass.** Where the check cannot read that
+  state — no admin-scoped token, no `gh` on `PATH` — it skips with a reason
+  saying it asserted nothing. It never passes on an unread or empty answer.
+- **(LS3) Transient and two-sided.** The red is one half of a change that has
+  to be made in two places that cannot be changed together, and the PR body
+  carries the ordered swap sequence that closes it.
+- **(LS4) The red is the point.** The check is not skipped, `xfail`-ed,
+  deleted, or weakened to make the run green. Passing while the repository is
+  still misconfigured is the defect this exception exists to avoid, so it can
+  never be a way of satisfying it.
+- **(LS5) Nothing else is red.** Every other Gate 1 check exits 0, and the
+  failures are exactly the checks named below.
+
+The conditions are conjunctive — the exception applies only when
+`LS1 AND LS2 AND LS3 AND LS4 AND LS5`. Failing any single one makes the run an
+ordinary Gate 1 failure, and it blocks. An ordinary red test can satisfy LS4
+(the author left it failing rather than skipping it) and LS5 (it is the only
+failure) and is still not covered, because it fails LS1 at the first hurdle.
+
+**The checks this exception covers, in full:**
+
+- `tests/e2e/test_tier_selection_contract.py::test_the_container_job_is_a_required_status_check`
+
+That list is not decorative and not maintained by hand alone.
+`tests/toolchain/test_live_state_gate_exception.py` derives the set of
+live-repository-state checks from the tree and fails if the two disagree in
+either direction: a name here that no such check answers to, or a check in the
+tree this list does not name. It also parses the conditions and the combinator
+above and evaluates them over worked examples, so a sixth condition, or an `OR`,
+cannot be added as prose alone (issue #534).
+
+Two shapes were considered and rejected. Moving the check out of Gate 1 into a
+manual step buys a green run by making the assertion optional, and the four
+false-green defects this repo has removed (#351, #359, #401, #411) were all
+optional assertions. Weakening it to something always satisfiable — "some
+context is required" — passes in exactly the state it exists to detect, when
+the tier runs but gates nothing. A mid-swap marker file was rejected as a
+switch that turns the guard off, held green by whoever remembers to remove it.
 
 ---
 
