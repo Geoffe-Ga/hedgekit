@@ -876,3 +876,72 @@ def test_the_entry_refusal_is_the_whole_metadata_screen_not_a_ticker_check(
 
     assert refusal.value.field_name == "title"
     assert tools.reached is False
+
+
+def test_the_triaged_entry_point_refuses_a_hostile_market_too(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    research_tools: object,
+    research_budget: object,
+) -> None:
+    """`run_triaged_pipeline` refuses a hostile market on the same terms.
+
+    Its STOP path builds a `ForecastRecord` directly
+    (`triage.py::_build_triage_only_record`) without ever reaching
+    `run_pipeline`, so the record's own guard would fire there as a bare,
+    undocumented `ValueError` from deep inside the run -- exactly the failure
+    mode the entry screen exists to replace. It is also the *first* thing that
+    happens, before `budget.ensure_day_open`, before the paid Stage-0 call, and
+    before `charge_stage` stamps the ticker onto a budget event.
+
+    A second entry point needs a second call because `run_triaged_pipeline` is
+    a second door into the record, not because the screen is duplicated: both
+    doors call the same `screen_market_metadata`.
+    """
+    from windbreak.forecast.triage import InMemoryTriageLedger, run_triaged_pipeline
+
+    triage_ledger = InMemoryTriageLedger()
+    triage_transport = _CountingTransport("460000")
+
+    with pytest.raises(ProviderMarketMetadataRejectedError) as refusal:
+        run_triaged_pipeline(
+            _hostile_market(market),
+            baseline,
+            triage_transport=triage_transport,
+            full_transport=_CountingTransport(),
+            ledger=triage_ledger,
+            created_at=created_at,
+            research_tools=research_tools,
+            budget=research_budget,
+        )
+
+    assert refusal.value.field_name == "ticker"
+    assert triage_transport.calls == 0
+
+
+def test_the_triaged_entry_point_still_runs_a_clean_market(
+    market: NormalizedMarket,
+    baseline: BaselineQuoteSnapshot,
+    created_at: datetime,
+    research_tools: object,
+    research_budget: object,
+) -> None:
+    """The positive control for the refusal above: a clean market still triages."""
+    from windbreak.forecast.triage import InMemoryTriageLedger, run_triaged_pipeline
+
+    triage_transport = _CountingTransport("460000")
+
+    record = run_triaged_pipeline(
+        market,
+        baseline,
+        triage_transport=triage_transport,
+        full_transport=_CountingTransport(),
+        ledger=InMemoryTriageLedger(),
+        created_at=created_at,
+        research_tools=research_tools,
+        budget=research_budget,
+    )
+
+    assert record.market_ticker == market.ticker
+    assert triage_transport.calls == 1
