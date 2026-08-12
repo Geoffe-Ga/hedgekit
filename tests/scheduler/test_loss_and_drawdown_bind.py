@@ -779,10 +779,19 @@ class TestTheLoopFeedsTheEquityHighWaterMark:
     def test_the_mark_survives_a_process_restart(self, tmp_path: Path) -> None:
         """A high-water mark that resets on restart is not a high-water mark.
 
-        It is not held in memory: it is re-folded from the ledger's own rows,
-        so a second store object opened on the same database recovers exactly
-        the same peak. That is the durability the #442 daily-budget lesson asks
-        for, without a second place to keep state.
+        It is never *stored* anywhere but the ledger: it is re-folded from the
+        ledger's own rows, so a second store object opened on the same database
+        recovers exactly the same peak. That is the durability the #442
+        daily-budget lesson asks for, without a second place to keep state.
+
+        Issue #516 memoized the fold per process (`EquityCurveCursor`) so the
+        walk that produces it stops growing; it did not move the mark off the
+        ledger, and the memo a restarted process gets is a cold one. Both
+        halves are pinned: this call passes no cursor at all, and
+        `tests/scheduler/test_equity_curve_bounded_read.py::
+        TestTheBoundedMarkEqualsTheUnboundedFold::
+        test_a_restarted_process_recovers_the_same_mark` reopens the database
+        behind a fresh cursor and asserts the same micros.
         """
         _store(tmp_path, _day(_LATEST_AT_LIMIT_MICROS))
         reopened = SqliteLedgerStore(tmp_path / "ledger.db")
