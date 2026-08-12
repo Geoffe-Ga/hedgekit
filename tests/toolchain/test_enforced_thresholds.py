@@ -57,9 +57,10 @@ gate                         authority
 
 and the claimed side comes only from the prose corpus PR #548 established.
 :func:`test_no_threshold_authority_is_a_document_in_the_scanned_corpus` asserts
-the two file sets are disjoint MECHANICALLY -- an authority is not a `*.md`, is
-not `CLAUDE.md`, and lies under no corpus root -- so repointing an extractor at
-the prose it is supposed to check turns this suite red rather than green.
+the two file sets are disjoint MECHANICALLY -- an authority is not markdown, and
+is not one of the files the corpus roots contain whatever its suffix -- so
+repointing an extractor at the prose it is supposed to check turns this suite
+red rather than green.
 
 THE ABSENCE CASE, WHICH IS NOT A NUMBER COMPARISON
 
@@ -816,6 +817,23 @@ def _bounds_in(document: Path, text: str) -> list[_Bound]:
     return bounds
 
 
+def _corpus_neighbourhood() -> frozenset[Path]:
+    """List every file the prose corpus is made of, whatever its suffix.
+
+    The claim reader takes only `*.md`, but the roots hold scripts and data
+    beside them. An authority parked in that neighbourhood is one widening of
+    the walk away from being read as prose by the very module that calls it the
+    enforcing side, and its suffix would not give it away.
+
+    Returns:
+        Every regular file under a corpus root, plus `CLAUDE.md`.
+    """
+    return frozenset(
+        {_CLAUDE_MD}
+        | {path for root in _CORPUS_ROOTS for path in root.rglob("*") if path.is_file()}
+    )
+
+
 def _claimed_bounds() -> tuple[_Bound, ...]:
     """Read every threshold the governing corpus states.
 
@@ -889,6 +907,24 @@ _DISCLAIMED_CLAIM = (
 #: stayed silent, the control above would be passing because the detector never
 #: saw the number rather than because the disclaimer was honoured.
 _UNDISCLAIMED_CLAIM = "- **Maintainability Index**: aim >=20"
+
+#: A wrong number on a REAL gate, in a block that also disclaims an ungated one.
+#: The disclaimer is true and belongs there; it must not travel to the sentence
+#: beside it. This is the composition trap -- two rules that are each right and
+#: whose interaction is not.
+_DISCLAIMER_BESIDE_A_REAL_GATE = (
+    "Nothing enforces the maintainability index, so treat it as guidance.\n"
+    "Coverage, though, must be >= 85% before review."
+)
+
+#: Three claims in one sentence, the third about a gate this repository does not
+#: have. `>=90% Jest frontend` sat immediately after `>=80% branch backend` in
+#: four documents; a reader that lets a bound borrow the keyword of a clause
+#: which already has a bound of its own charges 90 to `branch-coverage` and
+#: reports a violation nobody can act on.
+_UNATTRIBUTABLE_CLAIM = (
+    "covered (>=90% line / >=80% branch backend, >=90% Jest frontend), whether"
+)
 
 
 def _control_bounds(text: str) -> list[_Bound]:
@@ -1079,6 +1115,58 @@ def test_an_ungated_dimension_may_be_discussed_when_the_prose_says_so() -> None:
     )
 
 
+def test_a_disclaimer_does_not_excuse_a_wrong_number_on_a_gate_that_is_real() -> None:
+    """The exemption reaches the ungated dimension and stops there.
+
+    "Nothing enforces the maintainability index" is a true sentence, and a
+    document is entitled to write it beside a coverage figure. If saying it
+    quietened the coverage figure too, one honest clause would license every
+    wrong number in the block -- the composition trap, where two rules that are
+    each correct produce a hole between them. `>= 85%` is five points off
+    `fail_under` and must still be reported.
+    """
+    bounds = _control_bounds(_DISCLAIMER_BESIDE_A_REAL_GATE)
+    coverage = [bound for bound in bounds if bound.gate == "coverage"]
+
+    assert [bound.value for bound in coverage] == [Decimal(85)], (
+        f"the reader took {[(b.gate, b.value) for b in bounds]} out of a block "
+        "whose second sentence states a coverage floor of 85%."
+    )
+    assert coverage[0].disclaimed, (
+        "the block does not read as disclaimed at all, so its silence would "
+        "prove nothing about whether the exemption is confined to ungated "
+        "dimensions."
+    )
+    assert _violations(bounds), (
+        "a coverage floor of 85% went unreported because the block also said, "
+        "correctly, that nothing enforces the maintainability index. The "
+        "exemption is leaking across dimensions."
+    )
+
+
+def test_a_bound_whose_clause_names_no_gate_is_not_charged_to_a_neighbour() -> None:
+    """A bound may go unattributed; it may not be charged to someone else's gate.
+
+    This is trap #4 -- a guard comparing the wrong dimension -- in its exact
+    historical form. `>=90% Jest frontend` followed `>=80% branch backend` in
+    four documents. A reader that reaches into the previous clause for a keyword
+    finds `branch`, reports 90 against a dimension this repository does not
+    gate, and sends whoever reads it to fix the wrong sentence. Frontend
+    thresholds are out of this module's scope; being out of scope has to mean
+    silence, not misattribution.
+    """
+    bounds = _control_bounds(_UNATTRIBUTABLE_CLAIM)
+
+    assert [(bound.gate, bound.value) for bound in bounds] == [
+        ("coverage", Decimal(90)),
+        ("branch-coverage", Decimal(80)),
+    ], (
+        f"the reader took {[(b.gate, b.value) for b in bounds]} out of a "
+        "sentence stating three figures. The third names Jest, which this "
+        "repository does not run, and belongs to no gate here."
+    )
+
+
 def test_a_reported_measurement_is_not_a_claimed_threshold() -> None:
     """The negative control that decides whether this rule survives contact.
 
@@ -1141,11 +1229,20 @@ def test_no_threshold_authority_is_a_document_in_the_scanned_corpus() -> None:
     from, the suite would be measuring a document against itself -- the
     coincidence trap, which has hidden a real defect eight times in this session.
 
-    Three independent ways an authority could drift into the corpus are all
-    closed: it is not markdown, it is not `CLAUDE.md`, and it lies under no
-    corpus root.
+    Two checks, deliberately not three: neither subsumes the other, and each
+    fails on cases the other waves through.
+
+    * **It is not markdown.** `CLAUDE.md` is exactly the file that would make
+      this suite measure a table against itself, and it sits at the repository
+      root, outside every corpus root -- so only the suffix catches it.
+    * **It is not a file the corpus roots contain, whatever its suffix.**
+      `.claude/skills/de-slopify/scripts/*.sh` is a shell script living inside
+      the prose corpus; its suffix would wave it through, and one widening of
+      the walk turns it into prose this module still calls the enforcing side.
+      The neighbourhood is every FILE under a root plus `CLAUDE.md`, which is
+      why a separate "lies under no corpus root" assertion would add nothing.
     """
-    corpus = set(_corpus_documents())
+    neighbourhood = _corpus_neighbourhood()
 
     for gate in _GATES:
         authority = gate.authority
@@ -1158,16 +1255,38 @@ def test_no_threshold_authority_is_a_document_in_the_scanned_corpus() -> None:
             "Enforcement lives in configuration and scripts; reading a "
             "threshold out of prose and comparing it to prose proves nothing."
         )
-        assert authority != _CLAUDE_MD
-        assert authority not in corpus, (
-            f"{gate.name}'s authority {authority} is itself one of the "
-            f"{len(corpus)} documents this module scans for claims."
+        assert authority not in neighbourhood, (
+            f"{gate.name}'s authority {authority} is one of the "
+            f"{len(neighbourhood)} files the prose corpus is made of. Its "
+            "suffix alone would not have caught that: the corpus roots hold "
+            "scripts too, and a widening of the walk would start reading it as "
+            "prose while this module went on calling it the enforcing side."
         )
-        assert not any(root in authority.parents for root in _CORPUS_ROOTS), (
-            f"{gate.name}'s authority {authority} lies under a corpus root, so "
-            "a future widening of the corpus would silently make the claimed "
-            "and enforced sides the same file."
-        )
+
+
+def test_the_floors_in_this_module_are_floors_and_not_decoration() -> None:
+    """A floor of zero is not a floor.
+
+    Every bound below is an anti-vacuity guard: it exists to notice a scan that
+    has stopped scanning. Zeroing one leaves the assertion in place, green, and
+    inert -- `len(bounds) >= 0` -- which is trap #8 and the same shape of
+    unfailable check this whole module was written to remove. The guards are
+    therefore asserted to be capable of failing at all.
+    """
+    floors = {
+        "_CLAIM_FLOOR": _CLAIM_FLOOR,
+        "_CLAIMING_DOCUMENT_FLOOR": _CLAIMING_DOCUMENT_FLOOR,
+        "_GATE_FLOOR": _GATE_FLOOR,
+        "_ROOT_CLAIM_FLOOR": _ROOT_CLAIM_FLOOR,
+    }
+
+    inert = sorted(name for name, value in floors.items() if value < 1)
+
+    assert inert == [], (
+        f"{inert} are set below 1, so the assertions that cite them cannot "
+        "fail. An anti-vacuity guard that admits the empty set is the defect it "
+        "was written to catch."
+    )
 
 
 def test_the_corpus_states_thresholds_across_several_documents_and_gates() -> None:
