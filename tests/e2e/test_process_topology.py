@@ -90,12 +90,14 @@ What running the real topology found
 Two product defects, both reported rather than repaired here, since this is a
 test-tier change:
 
-* **#328** -- opening the shared ledger is itself a write and no ``busy_timeout``
-  is set, so a process started while a sibling holds the write lock dies on an
-  unhandled ``sqlite3.OperationalError`` before it exists. This is how this
-  module first went red;
-  :func:`test_a_process_opening_a_write_locked_ledger_dies_unhandled` now pins it
-  deterministically, and :func:`_start_topology` documents the ordering it forces.
+* **#328** -- opening the shared ledger is itself a write, so a process started
+  while a sibling held the write lock died on an unhandled
+  ``sqlite3.OperationalError`` before it existed. This is how this module first
+  went red. **Fixed** in ``windbreak/ledger/store.py``: the open now waits for
+  the lock and, if the budget runs out, fails closed with a ``FATAL`` line
+  instead of a bare traceback.
+  :func:`test_a_process_opening_a_write_locked_ledger_waits_and_then_starts` is
+  the same reproduction inverted, asserting the process survives the wait.
 * **#510** -- the abstention gap above.
 
 Waiting is bounded and always on a real condition (:func:`wait_until`); there is
@@ -122,7 +124,6 @@ from tests.e2e.harness import (
     pid_alive,
     port_is_serving,
     read_ledger_records,
-    run_windbreak,
     verify_ledger_chain,
     wait_until,
 )
@@ -212,6 +213,12 @@ DECISION_EVENT = "SelectorDecisionRecorded"
 #: The row every ``run`` invocation given ``--ledger-path`` appends at startup,
 #: stamped with its own ``--process`` token.
 CONFIG_LOADED_EVENT = "ConfigLoaded"
+
+#: The line ``windbreak.main._load_and_ledger_config`` logs after the config has
+#: loaded cleanly and immediately *before* it opens the ledger. Waiting on it is
+#: how :func:`test_a_process_opening_a_write_locked_ledger_waits_and_then_starts`
+#: knows the child has reached the contended open without sleeping on a guess.
+CONFIG_LOADED_LOG_LINE = "config loaded source="
 
 #: The kernel's per-beat liveness row.
 MODE_HEARTBEAT_EVENT = "ModeHeartbeat"
@@ -676,15 +683,18 @@ def _start_topology(
 
     **The start order and the waiting between are not style.** Opening the ledger
     is itself a write -- ``SqliteLedgerStore.__init__`` issues ``PRAGMA
-    journal_mode=WAL`` and a ``CREATE TABLE`` -- and no ``busy_timeout`` is set
-    (issue #328), so a process that opens the shared ledger while a sibling holds
-    the write lock dies at once with an unhandled ``sqlite3.OperationalError``.
-    That is a defect of the shipped product, not of this test:
-    :func:`test_a_process_opening_a_write_locked_ledger_dies_unhandled` pins it
-    deterministically, and it is reported rather than worked around in the
-    product. Starting the readers and light writers before the pipeline -- the
-    only heavy writer -- and waiting for each to land its own row keeps this
-    module from *racing* a defect it has already pinned.
+    journal_mode=WAL`` and a ``CREATE TABLE`` -- and until issue #328 was fixed a
+    process that opened the shared ledger while a sibling held the write lock
+    died at once with an unhandled ``sqlite3.OperationalError``. That was a
+    defect of the shipped product, not of this test, and it is now repaired in
+    ``windbreak/ledger/store.py``: the open waits for the lock.
+
+    The sequencing therefore no longer *has* to be here, and is kept in this
+    change only because retiring it is a question about this tier rather than
+    about the ledger -- it also makes each process's startup individually
+    observable, which the assertions below rely on.
+    :func:`test_a_process_opening_a_write_locked_ledger_waits_and_then_starts`
+    is what now holds the ledger's side of the contract.
 
     Args:
         launcher: The launcher that reaps every child.
@@ -971,61 +981,64 @@ def test_killing_the_pipeline_leaves_the_other_three_alive_and_still_working(
     verify_ledger_chain(run_root.ledger_path)
 
 
-def test_a_process_opening_a_write_locked_ledger_dies_unhandled(
-    run_root: RunRoot,
+def test_a_process_opening_a_write_locked_ledger_waits_and_then_starts(
+    launcher: ProcessLauncher, run_root: RunRoot
 ) -> None:
-    """The defect this tier found: the shared volume is not safely shared (#328).
+    """The defect this tier found, now from the other side (#328).
 
-    Opening the ledger is a *write*: ``SqliteLedgerStore.__init__``
-    (``windbreak/ledger/store.py:370``) connects and immediately issues ``PRAGMA
-    journal_mode=WAL``, and no ``busy_timeout`` is ever set, so SQLite's default
-    of zero applies. A ``windbreak run`` given ``--ledger-path`` while any
-    sibling holds the write lock therefore does not wait, does not retry, and
-    does not fail closed with the ``FATAL`` line every other startup error gets:
-    it dies on an unhandled ``sqlite3.OperationalError`` before the process
-    exists at all.
+    Opening the ledger is a *write*: ``SqliteLedgerStore.__init__`` issues
+    ``PRAGMA journal_mode=WAL``, a ``CREATE TABLE`` and a ``CREATE INDEX``. This
+    test used to pin what that cost -- a ``windbreak run`` given
+    ``--ledger-path`` while any sibling held the write lock died on an unhandled
+    ``sqlite3.OperationalError``, exit 1, with no ``FATAL`` line, before the
+    process existed at all. It was pinned rather than worked around because the
+    repair belonged in ``windbreak/ledger/store.py``, not in a test tier.
 
-    That is not a hypothetical. It is how this module first went red, when the
-    dashboard was started while the pipeline was mid-tick. It matters far beyond
-    the tests: ``deploy/docker-compose.yml`` starts all four services at once
-    under ``restart: on-failure``, so on a busy ledger the shipped stack
-    crash-loops -- three of "four isolated processes sharing only the ledger
-    volume" taken down by the fourth merely *writing*, which is the same
-    ``ARCHITECTURE.md:10`` claim this module tests, failing from the other
-    direction.
+    It has been repaired, so the pin is inverted rather than removed: the same
+    reproduction, asserting the behaviour that replaced it. The store now waits
+    ``LEDGER_BUSY_TIMEOUT_MILLIS`` for the lock, so the started process is
+    **still alive** while the lock is held -- asserted before the release, which
+    is the assertion the old defect could not have survived -- and lands its own
+    ``ConfigLoaded`` row once the lock frees.
 
-    Pinned here rather than worked around, and reported rather than fixed: this
-    is a test-tier change, and the repair belongs in
-    ``windbreak/ledger/store.py``. The lock is held by an ordinary second
-    connection -- exactly what a sibling process is -- so nothing about this
-    reproduction is special to a test.
+    That the failure is now loud rather than silent is proved at the unit seam
+    (``tests/ledger/test_ledger_open_contention.py``), where the budget can be
+    taken to zero without a wall-clock wait. Here the point is the process: it
+    does not die.
+
+    It matters far beyond the tests: ``deploy/docker-compose.yml`` starts all
+    four services at once under ``restart: on-failure``, so on a busy ledger the
+    shipped stack used to crash-loop -- three of "four isolated processes
+    sharing only the ledger volume" taken down by the fourth merely *writing*,
+    which is the same ``ARCHITECTURE.md:10`` claim this module tests, failing
+    from the other direction.
+
+    The lock is held by an ordinary second connection -- exactly what a sibling
+    process is -- so nothing about this reproduction is special to a test.
 
     Args:
+        launcher: The launcher that reaps the child.
         run_root: This test's isolated run root.
     """
     ledger_path = run_root.ledger_path
     holder = sqlite3.connect(ledger_path, isolation_level=None)
+    holder.execute("PRAGMA journal_mode=WAL")
+    holder.execute("BEGIN IMMEDIATE")
     try:
-        holder.execute("PRAGMA journal_mode=WAL")
-        holder.execute("BEGIN IMMEDIATE")
-        completed = run_windbreak(
-            "run",
-            "--process",
-            "order_gateway",
-            "--ledger-path",
-            str(ledger_path),
-            "--max-beats",
-            ONE_BEAT,
-            "--heartbeat-interval",
-            GATEWAY_BEAT_INTERVAL,
+        gateway = _spawn_order_gateway(launcher, run_root, ledger_path=ledger_path)
+        wait_until(
+            lambda: CONFIG_LOADED_LOG_LINE in _process_log(gateway),
+            timeout=STARTUP_TIMEOUT_SECONDS,
+            description="the Order Gateway process to reach the ledger open",
         )
+        # Nothing may read the ledger here: this process would take the same
+        # contended open the child is sitting in, and wait out the same budget.
+        assert gateway.is_running()
     finally:
         holder.rollback()
         holder.close()
 
-    assert completed.returncode == 1
-    assert completed.stderr.rstrip().endswith(
-        "sqlite3.OperationalError: database is locked"
-    )
-    assert "FATAL" not in completed.stderr
-    assert read_ledger_records(ledger_path) == []
+    _await_component_on_the_ledger(ledger_path, "order_gateway")
+    assert gateway.is_running()
+    assert "FATAL" not in _process_log(gateway)
+    verify_ledger_chain(ledger_path)
