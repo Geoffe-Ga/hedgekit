@@ -314,6 +314,35 @@ def test_from_config_rejects_non_ceiling_tokens(token: str) -> None:
         Mode.from_config(token)
 
 
+def test_may_trade_answers_for_every_mode_and_partitions_the_enum() -> None:
+    """`Mode.may_trade` is total over `Mode` and splits it exactly (issue #526).
+
+    Asserted as a partition of the *whole enum* rather than as a handful of
+    spot checks, so a mode added later has to be classified rather than
+    silently falling into the non-trading half by default. The two halves are
+    named as exact sets and their union is `set(Mode)`, which is what makes
+    this a definition rather than a sample.
+
+    This is the single predicate two very different callers ask: the kernel's
+    `mode_permission_ceiling` check, which vetoes an intent, and
+    `run_single_tick`'s walk gate, which decides whether the loop *spends
+    research money*. Issue #526 is what happened when the second one restated
+    the set instead of asking.
+    """
+    trading = {mode for mode in Mode if mode.may_trade()}
+    non_trading = {mode for mode in Mode if not mode.may_trade()}
+
+    assert trading == {Mode.PAPER, Mode.LIVE_MICRO, Mode.LIVE}
+    assert non_trading == {
+        Mode.RESEARCH,
+        Mode.PAUSED,
+        Mode.HALT,
+        Mode.KILLED,
+    }
+    assert trading | non_trading == set(Mode)
+    assert trading & non_trading == set()
+
+
 def test_from_config_matches_the_default_windbreak_config_mode_ceiling() -> None:
     """`WindbreakConfig()`'s default `mode_ceiling` ("paper") parses to
     `Mode.PAPER` -- the config schema and the mode machine agree on the

@@ -987,8 +987,9 @@ class BeatReport:
             a hardcoded constant, which is exactly what #447 found in the
             heartbeat line.
         halted: Whether the Risk Kernel is in ``HALT`` after the tick
-            (``TickOutcome.kernel_halted``). A halted kernel vetoes every later
-            intent, so the loop escalates it rather than beating on quietly.
+            (``TickOutcome.kernel_halted``). A halted kernel may not trade and
+            has no transition back to a mode that may, so the loop escalates it
+            rather than beating on quietly.
         research_halted: Whether the tick's research stopped on a budget ceiling
             (``TickOutcome.research_halted``). Deliberately *not* folded into
             ``halted``: a spent research budget is an expected, self-clearing

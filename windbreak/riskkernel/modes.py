@@ -80,6 +80,41 @@ class Mode(enum.Enum):
         except KeyError:
             raise ValueError(f"not a valid mode_ceiling token: {token!r}") from None
 
+    def may_trade(self) -> bool:
+        """Return whether an order may be routed while the kernel is in this mode.
+
+        The single definition of "this mode can trade", so no caller has to
+        restate the set (issue #526). Two of them ask the question for very
+        different reasons and must never be able to disagree:
+
+        * :class:`~windbreak.riskkernel.checks._ModePermissionCeiling` vetoes
+          an intent minted in a non-trading mode.
+        * :func:`~windbreak.scheduler.loop.run_single_tick` decides whether to
+          walk the screened universe at all -- which is where the loop *spends
+          research money*.
+
+        Restating the set at the second site is what issue #526 cost: the walk
+        gate named ``KILLED`` alone, so a re-armed loop sitting in ``PAUSED``
+        bought a forecast per market per beat and then vetoed every intent
+        those forecasts produced, drawing the whole day down against the
+        durable per-UTC-day research ceiling (issues #442/#483) for a day in
+        which nothing could be traded.
+
+        ``RESEARCH`` is a non-trading mode by the same rule and needs no
+        special case: SPEC S5.1's bottom rung researches, and the ladder exists
+        so that trading is *earned*.
+
+        Returns:
+            True for the three trading modes (``PAPER``, ``LIVE_MICRO``,
+            ``LIVE``); False for ``RESEARCH`` and every safety mode.
+        """
+        return self in TRADING_MODES
+
+
+#: The modes an order may be routed in. The one definition of that set; read it
+#: through :meth:`Mode.may_trade` rather than by membership, so the question is
+#: asked the same way everywhere (issue #526).
+TRADING_MODES: frozenset[Mode] = frozenset({Mode.PAPER, Mode.LIVE_MICRO, Mode.LIVE})
 
 #: The promotable ladder, low to high. Position is the promotion rank used for
 #: one-step-up checks and ceiling comparison; the safety modes are off-ladder.

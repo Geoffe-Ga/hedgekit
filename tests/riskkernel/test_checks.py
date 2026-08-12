@@ -383,6 +383,34 @@ def test_mode_permission_ceiling_vetoes_for_each_unpermitted_mode(mode: Mode) ->
     assert result.vetoed is True
 
 
+@pytest.mark.parametrize("mode", list(Mode), ids=lambda mode: mode.name)
+def test_mode_permission_ceilings_gate_is_exactly_may_trade(mode: Mode) -> None:
+    """This check's mode gate and `Mode.may_trade` answer identically (#526).
+
+    The two parametrized tests above name their mode sets by hand, which is
+    fine as a specification but cannot notice the two definitions drifting
+    apart -- and drift is what issue #526 cost: `run_single_tick`'s walk gate
+    restated the trading set as `KILLED` alone, so a `PAUSED` loop paid for
+    forecasts this very check then vetoed. Both call sites now ask
+    `Mode.may_trade`, and this compares the predicate against the observable
+    verdict over every member of the enum, so neither can move alone.
+
+    The comparison is against the *mode* reason specifically, not against
+    `result.vetoed`: this check also vetoes a LIVE_MICRO order over its
+    exposure cap, and a test that merely read the boolean would confuse the
+    two. The cap is set far above the intent's cost here so that the only
+    veto reachable is the mode one.
+
+    Args:
+        mode: The mode under test.
+    """
+    context = make_context(mode=mode, micro_cap=MoneyMicros(1_000_000_000_000))
+
+    result = _real_check("mode_permission_ceiling")(make_intent(), context)
+
+    assert (result.reason == f"mode {mode.name} may not trade") is not mode.may_trade()
+
+
 def test_mode_permission_ceiling_live_micro_passes_at_exact_micro_cap() -> None:
     """In LIVE_MICRO, `total_exposure + worst_case_cost == micro_cap` passes
     (the cap is inclusive): default intent cost is 5_000_000 micros.

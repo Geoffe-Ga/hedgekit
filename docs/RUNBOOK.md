@@ -412,10 +412,14 @@ venue's own opening state, and the ledger records no fill amounts that could
 update it. So the first tick after any real paper fill grades a `BREACH`: the
 kernel transitions to `HALT` (issue #32), records `VerificationMismatch` and
 `VerificationMismatchHalt`, the per-tick `ModeHeartbeat` starts reporting
-`HALT` instead of `PAPER`, and `TickOutcome.kernel_halted` is `True`. Every
-later approval then vetoes on the halted mode. **Watch `kernel_halted`**: a
-halted loop keeps ticking and keeps ledgering, but it is no longer a trading
-loop, and only a restart re-baselines it. That is the fail-closed reading of
+`HALT` instead of `PAPER`, and `TickOutcome.kernel_halted` is `True`. From that
+tick onward -- **including the tick that discovered the breach** -- the loop
+walks no markets, runs no forecast, and spends no research money, for the same
+reason a killed loop does not (issue #526): a mode that may not trade must not
+buy forecasts nothing can act on. **Watch `kernel_halted`**: a halted loop
+keeps ticking, keeps reconciling and keeps ledgering, but it is no longer a
+trading loop, and only a restart re-baselines it. That is the fail-closed
+reading of
 "our books cannot account for the venue" -- the alternative, re-reading the
 expectation off the same connector each cycle, would make all three
 reconciliation dimensions structurally incapable of failing.
@@ -436,7 +440,10 @@ On the next beat the loop:
 - transitions its kernel to `KILLED` and stamps `KILLED` on the `ModeHeartbeat`
   row and the heartbeat log line, so a killed loop is never reported healthy;
 - walks no markets at all -- no forecast is run and no research money is spent,
-  which is stronger than vetoing the intents afterwards;
+  which is stronger than vetoing the intents afterwards. Since issue #526 that
+  is not special to `KILLED`: the tick asks whether the current mode *may
+  trade*, the same question the kernel's own approval check asks, so `PAUSED`
+  and `HALT` buy nothing either;
 - **holds every position**, cancelling only resting orders (ledgered as one
   `CancelAllDirective`; see the caveat below) and releasing its capital
   reservations;
@@ -457,9 +464,64 @@ the run. The first breach still drives the kernel to `HALT` (SPEC §32); a
 sustained run of them kills.
 
 To re-arm, type the phrase for the engaged kill's sequence number verbatim (see
-the re-arm procedure below). Stopping the process with a signal remains
-available, but it is not equivalent: a signal provides none of hold-positions,
-durable state, or manual re-arm.
+"Re-arming, and why it needs a restart" below). Stopping the process with a
+signal remains available, but it is not equivalent: a signal provides none of
+hold-positions, durable state, or manual re-arm.
+
+### Re-arming, and why it needs a restart (issue #526)
+
+```bash
+windbreak rearm --state-dir <dir>
+```
+
+then type, on stdin, the phrase for the **engaged kill's sequence number**,
+verbatim and un-case-folded:
+
+```
+RE-ARM KILL <n>: I ACCEPT FULL RESPONSIBILITY
+```
+
+Read `<n>` off the ledger's own `KillEngaged` row, not off a note: the sequence
+is monotonic and replayed from the chain, so a phrase typed for an earlier kill
+cannot re-arm a later one.
+
+**A re-arm does not resume trading.** It exits `KILLED` into `PAUSED`, and that
+is deliberate -- the kill switch's confirmation step would be worth nothing if
+typing one phrase put a loop straight back on the venue. `PAUSED` is not a
+trading mode, so on the next beat the loop reports `mode=PAUSED`, reconciles,
+heartbeats, samples equity, and **researches and trades nothing**. Since issue
+#526 it also spends nothing: a paused beat buys no forecasts, so the day's
+research ceiling is still there when you come back.
+
+**To return the loop to `PAPER`, restart the process.** There is no verb that
+does it, and this is not an oversight in the CLI: the mode machine has no
+transition from `PAPER`'s side of `PAUSED` at all. `mode=PAUSED` on the
+heartbeat line is the signal to look for -- a re-armed loop that nobody
+restarted looks healthy in every other respect.
+
+Which modes a *running* process can still reach, one transition at a time. Every
+row is replayed against `ModeStateMachine` itself by
+`tests/docs/test_mode_recovery_claims.py`, so this table cannot drift away from
+the code:
+
+<!-- BEGIN in-process mode successors -->
+
+| Mode | Modes it can still reach, same process |
+| --- | --- |
+| `RESEARCH` | `PAPER`, `PAUSED`, `HALT`, `KILLED` |
+| `PAPER` | `LIVE_MICRO`, `PAUSED`, `HALT`, `KILLED` |
+| `LIVE_MICRO` | `LIVE`, `PAUSED`, `HALT`, `KILLED` |
+| `LIVE` | `PAUSED`, `HALT`, `KILLED` |
+| `PAUSED` | `HALT`, `KILLED` |
+| `HALT` | `PAUSED`, `KILLED` |
+| `KILLED` | `PAUSED` (by `windbreak rearm` only) |
+
+<!-- END in-process mode successors -->
+
+Read the bottom three rows together: `PAUSED`, `HALT` and `KILLED` reach only
+each other. Once a running loop is in any of them, no sequence of transitions
+returns it to a trading mode, so a restart is the only way back for a re-arm and
+for a verification halt alike.
 
 **Resting orders are cancelled, and the row says whether they were.** The
 `CancelAllDirective` a kill emits is delivered to the venue, not merely
@@ -850,15 +912,20 @@ verb removes, reached one command later.
   `visible_depth=None` (so `participation_cap_compliance` vetoes). So no PAPER
   tick fills yet: expect vetoes, not fills, in the ledger and dashboard.
 - A verification `BREACH` HALTs the kernel and it stays halted for the life of
-  the process (see "What one PAPER tick actually does"). Watch
+  the process (see "What one PAPER tick actually does"), and a halted loop
+  researches nothing from that tick onward (issue #526). Watch
   `TickOutcome.kernel_halted` and the `ModeHeartbeat` mode.
 - On a **live Kalshi** path the jurisdiction check vetoes for an additional
   reason: Kalshi publishes no eligibility signal, so `normalize_market` stamps
   every market `jurisdiction_status="unknown"`, which fails closed by design
   (SPEC §20 Q3, unresolved). Only a market carrying real eligibility metadata --
   as the paper fixture books do -- can clear that check.
-- `windbreak kill`/`windbreak rearm` do stop and re-arm the PAPER loop (issue
-  #441), provided `--state-dir` is the directory `config.ops.state_dir` names.
+- `windbreak kill` stops the PAPER loop and `windbreak rearm` releases the kill
+  (issue #441), provided `--state-dir` is the directory `config.ops.state_dir`
+  names. **A re-arm does not resume trading**: it exits `KILLED` into `PAUSED`,
+  and only a **process restart** returns a running loop to `PAPER`. No shipped
+  verb does it. Watch for `mode=PAUSED` on the heartbeat line -- see "Re-arming,
+  and why it needs a restart" (issue #526).
   The cancel-all a kill emits is delivered to the venue, so resting orders are
   actually cancelled (issue #480); check the `CancelAllDirective` row's
   `delivery.outcome` — anything but `delivered` means orders may still be live,

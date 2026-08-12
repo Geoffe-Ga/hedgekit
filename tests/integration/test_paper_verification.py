@@ -47,6 +47,7 @@ remainder from being misread as a fill:
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING
 
 from tests.integration.conftest import ledger_path_for
@@ -56,6 +57,7 @@ from tests.scheduler.conftest import (
     proven_idle_hour,
     proven_untraded_day,
 )
+from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
 from windbreak.numeric.types import ContractCentis
 from windbreak.riskkernel.modes import Mode
 
@@ -259,6 +261,43 @@ def _build_deps(
         research_tools=research_tools_factory(),
         clock=_fixed_clock,
     )
+
+
+def _research_micros(deps) -> int:
+    """Return every research micro charged on this bundle's ledger so far.
+
+    Read through the bundle's own store rather than a second connection: this
+    module's ticks are driven directly rather than through the CLI, so there is
+    no other process's handle to distrust, and the chain is verified by the
+    caller. The figure is a running total, so a per-beat charge is the
+    difference between two readings.
+
+    Args:
+        deps: The wired `PaperTickDeps` whose ledger is read.
+
+    Returns:
+        The sum of every `ResearchSpendRecorded.cost_micros`, in micros.
+    """
+    import json
+
+    return sum(
+        int(json.loads(record.payload_json)["data"]["cost_micros"])
+        for record in deps.store.read_all()
+        if record.event_type == "ResearchSpendRecorded"
+    )
+
+
+def _event_counts(deps) -> Counter[str]:
+    """Return how many rows of each event type the bundle's ledger holds.
+
+    Args:
+        deps: The wired `PaperTickDeps` whose ledger is read.
+
+    Returns:
+        A counter keyed by event type. Absent types count zero, so an
+        assertion cannot pass by naming a row that never existed.
+    """
+    return Counter(str(record.event_type) for record in deps.store.read_all())
 
 
 def test_paper_tick_runs_a_read_only_verification_cycle_and_clears_the_vetoes(
@@ -486,6 +525,89 @@ def test_paper_verification_mismatch_halts_the_kernel_and_ledgers_the_breach(
     assert "VerificationMismatchHalt" in event_types
     assert deps.kernel.mode is Mode.HALT
     assert outcome.kernel_halted is True
+    deps.store.verify_chain()
+
+
+def test_a_halted_kernel_buys_no_research_on_the_tick_that_halted_it(
+    books_dir: Path,
+    cassette_path: Path,
+    report_dir: Path,
+    paper_config: WindbreakConfig,
+    research_tools_factory,
+    tmp_path: Path,
+) -> None:
+    """A `HALT` costs nothing in research, from the halting tick onward (#526).
+
+    The same divergence the test above drives, asked as a money question. Until
+    issue #526 the tick's walk gate named `KILLED` alone, so a halted kernel
+    kept buying a forecast per market per beat and vetoing every intent those
+    forecasts produced on `mode HALT may not trade` -- the identical waste the
+    kill switch's own gate exists to prevent, differing only in which mode
+    reached it. The gate now asks `Mode.may_trade`, the same predicate the
+    kernel's `mode_permission_ceiling` check vetoes on, so the two cannot
+    disagree about a mode again.
+
+    The stated reason `HALT` was excluded -- "a halted kernel is expected to
+    recover" -- does not hold: `_ALLOWED_TRANSITIONS[Mode.HALT]` is
+    `{PAUSED, KILLED}`, so no transition returns a halted kernel to a trading
+    mode, and `RiskKernel.from_events` never replays `HALT`, which is why
+    `docs/RUNBOOK.md` says a halt "stays halted for the life of the process".
+    Recovery is a restart, exactly as it is for a re-arm.
+
+    Ordering is the assertion's whole point. The mode is read *after* the
+    verification cycle, so the tick that discovers the breach is the first tick
+    that must not pay: `_run_universe` -> `_forecast_stage` -> `run_pipeline` is
+    where `ResearchBudget.ensure_day_open` and every `charge_stage` live, and
+    all of them sit downstream of that read. A gate placed one stage later
+    would charge this tick and refuse the next.
+
+    Exact micros both sides, never a bound: beat 1 charges a whole beat and
+    beat 2 charges zero, and those two integers were *the same integer* before
+    the fix -- which is precisely why an assertion satisfied by both would have
+    certified the defect.
+
+    Args:
+        books_dir: The shared books-fixture directory.
+        cassette_path: The empty recorded-cassette path.
+        report_dir: Where weekly-report stubs would be written.
+        paper_config: The PAPER-ceilinged configuration.
+        research_tools_factory: Builds the offline research tools double.
+        tmp_path: The pytest scratch directory.
+    """
+    from windbreak.numeric.types import MoneyMicros
+    from windbreak.scheduler.loop import run_single_tick
+
+    ledger_path = ledger_path_for(tmp_path)
+    deps = _build_deps(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path,
+        report_dir=report_dir,
+        config=paper_config,
+        research_tools_factory=research_tools_factory,
+    )
+    run_single_tick(deps, beat=1)
+    trading_beat_micros = _research_micros(deps)
+
+    opening = deps.exchange.balances
+    deps.exchange.balances = type(opening)(
+        total=MoneyMicros(opening.total.value - 7_000_000),
+        available=MoneyMicros(opening.available.value - 7_000_000),
+        fetched_at=opening.fetched_at,
+    )
+    run_single_tick(deps, beat=2)
+    halting_beat_micros = _research_micros(deps) - trading_beat_micros
+    run_single_tick(deps, beat=3)
+    after_the_halt_micros = (
+        _research_micros(deps) - trading_beat_micros - halting_beat_micros
+    )
+
+    assert deps.kernel.mode is Mode.HALT
+    assert trading_beat_micros == FULL_PIPELINE_RESEARCH_COST_MICROS
+    assert halting_beat_micros == 0
+    assert after_the_halt_micros == 0
+    assert _event_counts(deps)["ForecastCreated"] == 1
+    assert _event_counts(deps)["ScreenDecisionRecorded"] == 3
     deps.store.verify_chain()
 
 
