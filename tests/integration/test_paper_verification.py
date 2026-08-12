@@ -172,8 +172,10 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
     from windbreak.scheduler.eligibility import project_exchange_status
     from windbreak.scheduler.loop import (
         build_evaluation_context,
+        equity_curve_micros,
         read_exchange_clock_epoch_s,
         read_open_position_centis,
+        realized_loss_today_micros,
         start_of_day_equity_micros,
         visible_depth_centis,
     )
@@ -197,6 +199,10 @@ def _production_context(deps, *, now_epoch_s: int = DEFAULT_NOW_EPOCH_S):
         equity_start_of_day=start_of_day_equity_micros(
             deps.store.read_all(), now_epoch_s=now_epoch_s
         ),
+        realized_loss_today=realized_loss_today_micros(
+            deps.store.read_all(), now_epoch_s=now_epoch_s
+        ),
+        equity_curve=equity_curve_micros(deps.store.read_all()),
         visible_depth=visible_depth_centis(order_book),
         exposure=proven_flat_exposure(_TICKER),
         notional_today=proven_untraded_day(),

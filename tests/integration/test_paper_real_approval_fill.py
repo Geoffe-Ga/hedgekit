@@ -65,13 +65,18 @@ under, so a claim here that stops being true fails there.
   venue's fee model supplies both bounds.
 * ``concentration_limits`` -- the account is flat and the order's 12 500 000
   micros is a 0.125% share of equity, far inside every ppm cap.
-* ``daily_loss_limit`` -- **this is the one that fails on beat 1**, on
+* ``daily_loss_limit`` -- **one of the two that fail on beat 1**, on
   ``realized_loss_today (0) >= threshold (0)``, because the threshold is a ppm
   share of ``equity_start_of_day`` and no ``EquitySampled`` row exists yet on a
   fresh ledger. Beat 1 ledgers one, so beat 2 measures against a real baseline
-  and the check passes. That transient is issue #481's finding and is pinned,
-  not fixed, here.
-* ``trailing_drawdown_limit`` -- same baseline, and nothing has drawn down.
+  and against the day's own realized loss, and the check passes. That transient
+  is issue #481's finding and is pinned, not fixed, here.
+* ``trailing_drawdown_limit`` -- **the other one**, since issue #514. The same
+  absent ``EquitySampled`` row leaves it with neither a high-water mark nor a
+  current reading, so it refuses on ``0 >= 0`` for want of evidence and lifts
+  on beat 2, where the mark and the reading are the same sample and nothing has
+  drawn down. Before #514 it passed on beat 1 -- but so it would have at any
+  drawdown whatsoever, because the mark it was fed was hardcoded to zero.
 * ``velocity_limits`` -- one order in the hour, and the day's notional is the
   12 500 000 this order adds.
 * ``quote_freshness`` -- the book's own ``fetched_at`` is the injected fixed
@@ -157,7 +162,7 @@ from typing import TYPE_CHECKING
 from tests.integration.conftest import read_event_type_payload_pairs
 from tests.scheduler.test_paper_intent_barriers import (
     BEST_CASE_ASK_PIPS,
-    DAILY_LOSS_VETO_REASON,
+    FRESH_LEDGER_VETO_REASONS,
     SHIPPED_BOOKS,
     SHIPPED_CASSETTE,
     SIZED_FILL_CENTIS,
@@ -183,9 +188,13 @@ if TYPE_CHECKING:
     from windbreak.riskkernel.reservations import ApprovalOutcome
     from windbreak.scheduler.loop import ApprovalSeam, PaperTickDeps
 
-#: The SPEC S10.3 check that vetoes on the first beat of a fresh ledger, and the
-#: only one that ever does in this scenario.
-BEAT_ONE_VETOING_CHECK = "daily_loss_limit"
+#: The SPEC S10.3 checks that veto on the first beat of a fresh ledger, and the
+#: only ones that ever do in this scenario. Both refuse for want of the same
+#: evidence -- a ledger with no `EquitySampled` row has neither a day baseline
+#: (#481) nor a high-water mark (#514) -- and both lift on beat 2, once the
+#: first beat's own sample exists. They are listed in `DEFAULT_CHECKS` order,
+#: which is the order the kernel records their reasons in.
+BEAT_ONE_VETOING_CHECKS = ("daily_loss_limit", "trailing_drawdown_limit")
 
 #: The approval token's sequence number: the first (and only) token the
 #: pipeline mints across both beats, since beat 1 vetoed before reserving.
@@ -444,7 +453,7 @@ def test_a_real_kernel_approval_fills_and_ledgers_a_golden_sequence(
     assert first.filled_centis == 0
     assert second.intent_count == 1
     assert second.filled_centis == SIZED_FILL_CENTIS
-    assert _only(rows, "IntentVetoed")["reasons"] == [DAILY_LOSS_VETO_REASON]
+    assert _only(rows, "IntentVetoed")["reasons"] == FRESH_LEDGER_VETO_REASONS
     approved = _only(rows, "IntentApproved")
     assert approved["reasons"] == []
     token = _only(rows, "ApprovalTokenIssued")
@@ -468,7 +477,7 @@ def test_a_real_kernel_approval_fills_and_ledgers_a_golden_sequence(
 def test_every_spec_10_3_check_passes_under_the_context_the_fill_used(
     tmp_path: Path,
 ) -> None:
-    """All 24 checks pass on beat 2; exactly one vetoes on beat 1.
+    """All 24 checks pass on beat 2; exactly two veto on beat 1.
 
     Issue #450's acceptance criterion 3, measured rather than described. The
     approval seam is wrapped in a pass-through observer that forwards every call
@@ -498,22 +507,22 @@ def test_every_spec_10_3_check_passes_under_the_context_the_fill_used(
 
     check_names = tuple(check.name for check in DEFAULT_CHECKS)
     assert check_names != (), "no checks scanned: every verdict below is vacuous"
-    assert BEAT_ONE_VETOING_CHECK in check_names
+    assert set(BEAT_ONE_VETOING_CHECKS) <= set(check_names)
     assert len(recorder.calls) == 2
     (beat_one, beat_two) = recorder.calls
     assert beat_one[2].token is None
     assert beat_two[2].token is not None
     first_passing, first_vetoing = _check_verdicts(beat_one[0], beat_one[1])
     second_passing, second_vetoing = _check_verdicts(beat_two[0], beat_two[1])
-    assert first_vetoing == (BEAT_ONE_VETOING_CHECK,)
+    assert first_vetoing == BEAT_ONE_VETOING_CHECKS
     assert first_passing == tuple(
-        name for name in check_names if name != BEAT_ONE_VETOING_CHECK
+        name for name in check_names if name not in BEAT_ONE_VETOING_CHECKS
     )
     assert second_vetoing == ()
     assert second_passing == check_names
     # The kernel's own audit rows must agree with the recomputation above.
     rows = _rows(observed)
-    assert _only(rows, "IntentVetoed")["reasons"] == [DAILY_LOSS_VETO_REASON]
+    assert _only(rows, "IntentVetoed")["reasons"] == FRESH_LEDGER_VETO_REASONS
     assert _only(rows, "IntentApproved")["reasons"] == []
     assert second.filled_centis == SIZED_FILL_CENTIS
 

@@ -140,8 +140,25 @@ class AccountState:
         reconciliation_uncertainty_buffer: Buffer covering unreconciled state,
             in micros.
         equity_start_of_day: Equity at the start of the trading day, in micros.
-        equity_high_water_mark: The highest equity reached, in micros.
-        realized_loss_today: Loss realized so far today, in micros.
+        equity_high_water_mark: The highest equity ever reached, in micros.
+            All-time and ratcheting: a *trailing* drawdown trails a peak that
+            never resets, so a mark rebuilt each day would forgive every
+            drawdown at midnight.
+        sampled_equity: The account's most recently sampled equity, in micros
+            -- cash plus the marked value of open positions, the same series
+            ``equity_start_of_day`` and ``equity_high_water_mark`` are points
+            on. ``trailing_drawdown_limit`` measures against this rather than
+            against worst-case equity (§10.4) because a drawdown is the
+            distance between two readings of *one* quantity: worst-case equity
+            assumes every open position resolves against us, so it falls by a
+            position's full cost the moment one is opened, and a "drawdown"
+            measured from the sampled peak down to it would fire on capital
+            deployment rather than on loss (issue #514).
+        realized_loss_today: Loss realized so far today, in micros: the
+            distance from ``equity_start_of_day`` down to the day's lowest
+            sample. Measured to the trough rather than to the latest reading so
+            a rebound cannot un-book a breach SPEC S10.10 pauses to the next
+            UTC day (issue #513).
         market_exposure: Current exposure to the single market, in micros.
         event_exposure: Current exposure to the parent event, in micros.
         bucket_exposure: Current exposure to the correlation bucket, in micros.
@@ -157,6 +174,7 @@ class AccountState:
     reconciliation_uncertainty_buffer: MoneyMicros
     equity_start_of_day: MoneyMicros
     equity_high_water_mark: MoneyMicros
+    sampled_equity: MoneyMicros
     realized_loss_today: MoneyMicros
     market_exposure: MoneyMicros
     event_exposure: MoneyMicros

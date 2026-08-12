@@ -225,7 +225,7 @@ from windbreak.selector.types import (
 from windbreak.timekeeping import require_aware
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Callable, Iterable, Iterator, Mapping
     from datetime import date
 
     from windbreak.config.schema import WindbreakConfig
@@ -651,6 +651,320 @@ def _utc_day(epoch_s: int) -> date:
     return datetime.fromtimestamp(epoch_s, UTC).date()
 
 
+@dataclass(frozen=True, slots=True)
+class DayEquity:
+    """The two points of the current UTC day's equity series the caps read.
+
+    Folded together, in one walk, on purpose: ``daily_loss_limit`` measures the
+    day's loss *from* the day's baseline and compares it against a ppm share
+    *of that same baseline*, so a fix that folded the two separately could let
+    a clock anomaly move one without the other and report a loss against an
+    equity the account never opened at.
+
+    Attributes:
+        baseline: The day's earliest sampled equity -- the reference
+            ``daily_loss_limit``'s threshold is a share of (issue #364).
+        trough: The day's lowest sampled equity. The loss is measured to the
+            trough rather than to the latest sample because SPEC S10.10 pauses
+            a daily-loss breach *to the next UTC day*: a loss that un-booked
+            itself the moment the mark recovered would let a volatile day cross
+            the limit repeatedly and trade on every rebound (issue #513).
+    """
+
+    baseline: MoneyMicros
+    trough: MoneyMicros
+
+    @property
+    def realized_loss(self) -> MoneyMicros:
+        """Return the day's realized loss, in micros.
+
+        Never negative: the trough is a minimum taken over a set that includes
+        the baseline, so ``baseline >= trough`` holds by construction and no
+        clamp is needed (a clamp here would be a branch production cannot
+        reach).
+
+        In this system the difference is *realized* rather than merely marked:
+        :func:`_position_value_micros` marks every holding at its own average
+        entry price, so opening a position moves cash and position value by
+        equal and opposite amounts and leaves equity unchanged but for the fee.
+        The equity curve therefore only steps down when something is actually
+        booked -- a fee, a fill closing below cost, a settlement.
+
+        Returns:
+            ``baseline - trough``, in micros.
+        """
+        return MoneyMicros(self.baseline.value - self.trough.value)
+
+
+@dataclass(frozen=True, slots=True)
+class EquityCurve:
+    """The account's peak and current equity, folded from the whole series.
+
+    Both are points on the *same* series -- the ledger's own ``EquitySampled``
+    rows -- which is what makes their difference a drawdown at all (issue
+    #514). See :class:`~windbreak.riskkernel.context.AccountState` for why
+    worst-case equity is not the comparand.
+
+    Attributes:
+        high_water_mark: The highest equity ever sampled on this ledger. The
+            mark is all-time and ratchets: a "trailing" drawdown trails a peak
+            that never resets, so a mark rebuilt from one day's samples would
+            forgive every drawdown at UTC midnight.
+        latest: The newest sampled equity, taken by ``sequence_number`` -- the
+            row the loop appended last, not the highest stamp. Append order is
+            the ledger's own chained order and no clock can reorder it.
+    """
+
+    high_water_mark: MoneyMicros
+    latest: MoneyMicros
+
+
+def _day_samples(records: Iterable[LedgerRecord]) -> Iterator[tuple[int, int]]:
+    """Yield each ``EquitySampled`` row's ``(epoch_s, equity_micros)`` pair.
+
+    Args:
+        records: The ledger read, in any order. Rows of other types are
+            ignored.
+
+    Yields:
+        One ``(epoch_s, equity_micros)`` pair per sample.
+    """
+    for record in records:
+        if record.event_type == _EQUITY_SAMPLED_EVENT_TYPE:
+            yield _equity_sample(record)
+
+
+def _samples_back_to_the_day_boundary(
+    store: ReverseTypeScan, today: date
+) -> Iterator[tuple[int, int]]:
+    """Yield today's samples from a newest-first walk, stopping at the boundary.
+
+    Walks ``EquitySampled`` rows alone, newest first, and stops at the first
+    one stamped on an *earlier* UTC day: everything beyond it is older still,
+    so nothing there can belong to today. The cost is therefore O(samples taken
+    today) -- bounded by ticks-per-day -- rather than O(ledger), with no new
+    index and no change to what the answer means (issue #370).
+
+    A sample stamped on a *later* day -- a forward clock blip -- is yielded
+    rather than treated as the boundary; the fold discards it by day like any
+    other non-today row. Stopping there would discard today's genuine baseline
+    for as long as the blip sat at the head of the ledger.
+
+    Args:
+        store: The ledger, declaring the reverse-walk capability.
+        today: The UTC calendar day the walk is bounded to.
+
+    Yields:
+        One ``(epoch_s, equity_micros)`` pair per row down to the boundary.
+    """
+    for record in store.iter_records_of_type_reversed(_EQUITY_SAMPLED_EVENT_TYPE):
+        epoch_s, equity_micros = _equity_sample(record)
+        if _utc_day(epoch_s) < today:
+            return
+        yield epoch_s, equity_micros
+
+
+def _fold_day_equity(
+    samples: Iterable[tuple[int, int]], today: date
+) -> DayEquity | None:
+    """Fold ``samples`` into the day's baseline and trough, or ``None``.
+
+    The shared body of both read paths, so the bounded walk and the
+    whole-ledger fold can never answer differently.
+
+    The earliest sample is chosen by comparing stamped ``epoch_s`` values
+    rather than by taking the first row the iteration surfaces, so neither
+    append order nor a clock that steps backwards mid-day can promote a later
+    sample to the baseline.
+
+    Args:
+        samples: The ``(epoch_s, equity_micros)`` pairs to fold, in any order.
+        today: The UTC calendar day being measured.
+
+    Returns:
+        The day's :class:`DayEquity`, or ``None`` when the day carries no
+        sample at all.
+    """
+    state: tuple[int, int, int] | None = None
+    for epoch_s, equity_micros in samples:
+        if _utc_day(epoch_s) != today:
+            continue
+        if state is None:
+            state = (epoch_s, equity_micros, equity_micros)
+            continue
+        earliest_epoch_s, baseline, trough = state
+        if epoch_s < earliest_epoch_s:
+            earliest_epoch_s, baseline = epoch_s, equity_micros
+        state = (earliest_epoch_s, baseline, min(trough, equity_micros))
+    if state is None:
+        return None
+    return DayEquity(baseline=MoneyMicros(state[1]), trough=MoneyMicros(state[2]))
+
+
+def day_equity_micros(
+    records: Iterable[LedgerRecord], *, now_epoch_s: int
+) -> DayEquity | None:
+    """Fold the current UTC day's equity samples out of a whole ledger read.
+
+    The reference definition of the answer both read paths must produce, and
+    the fallback for any store without the bounded reverse walk.
+
+    Samples are matched by their own ``epoch_s`` payload field rather than by
+    the row's ``created_at`` wall clock, because only the payload is stamped
+    from the loop's injected clock. That also means neither figure here has an
+    offsetless-timestamp failure mode: unlike ``FillAccounted`` (issue #415)
+    and ``OrderTransitionLedgered`` (issue #491), ``EquitySampled`` carries its
+    own instant, so there is no host-dependent stamp to refuse.
+
+    An absent answer is deliberately ``None`` and never a zero: the caller maps
+    it onto the fail-closed account (see :func:`_account_from_verification`),
+    and a numeric default here would be indistinguishable from a genuine
+    reading.
+
+    Args:
+        records: The ledger read (``SqliteLedgerStore.read_all()``), in append
+            order. Non-``EquitySampled`` rows are ignored.
+        now_epoch_s: The instant whose UTC day is the "current" one.
+
+    Returns:
+        The day's :class:`DayEquity`, or ``None`` when the day carries no
+        sample at all.
+
+    Raises:
+        KeyError: If an ``EquitySampled`` payload is missing either field this
+            reads -- a loud shape drift, never a silently zeroed baseline.
+    """
+    return _fold_day_equity(_day_samples(records), _utc_day(now_epoch_s))
+
+
+def read_day_equity(store: LedgerStore, *, now_epoch_s: int) -> DayEquity | None:
+    """Read the current UTC day's baseline and trough equity from ``store``.
+
+    The tick's entry point, and the reason it is not simply
+    ``day_equity_micros(store.read_all(), ...)``: ``_approve_stage`` asks this
+    on *every* tick of a loop built to run for weeks, while the ledger only
+    grows and every tick appends to it, so a full fold would cost more each
+    beat without bound (issue #370). A store declaring the optional
+    :class:`~windbreak.ledger.store.ReverseTypeScan` capability answers it with
+    a walk bounded at the day boundary instead; any other store, including
+    every hand-rolled :class:`~windbreak.ledger.store.LedgerStore` double,
+    falls back to the whole-ledger fold. The two paths return the same answer,
+    so the dispatch is a pure optimization and never a behavioral fork.
+
+    Args:
+        store: The ledger to read the day's samples out of.
+        now_epoch_s: The instant whose UTC day is the "current" one.
+
+    Returns:
+        The day's :class:`DayEquity`, or ``None`` when the day carries no
+        sample at all -- which keeps ``daily_loss_limit`` vetoing.
+    """
+    if isinstance(store, ReverseTypeScan):
+        today = _utc_day(now_epoch_s)
+        return _fold_day_equity(_samples_back_to_the_day_boundary(store, today), today)
+    return day_equity_micros(store.read_all(), now_epoch_s=now_epoch_s)
+
+
+def _curve_samples(records: Iterable[LedgerRecord]) -> Iterator[tuple[int, int]]:
+    """Yield each sample's ``(sequence_number, equity_micros)`` pair.
+
+    Args:
+        records: The ledger read, in any order. Rows of other types are
+            ignored.
+
+    Yields:
+        One ``(sequence_number, equity_micros)`` pair per sample.
+    """
+    for record in records:
+        if record.event_type == _EQUITY_SAMPLED_EVENT_TYPE:
+            _, equity_micros = _equity_sample(record)
+            yield record.sequence_number, equity_micros
+
+
+def _fold_equity_curve(samples: Iterable[tuple[int, int]]) -> EquityCurve | None:
+    """Fold ``samples`` into the all-time peak and the newest reading.
+
+    Order-free: the peak is a maximum and the newest reading is selected by
+    ``sequence_number``, so the newest-first walk and the oldest-first fold
+    reach the same pair.
+
+    Args:
+        samples: The ``(sequence_number, equity_micros)`` pairs to fold, in any
+            order.
+
+    Returns:
+        The :class:`EquityCurve`, or ``None`` when no sample exists at all.
+    """
+    state: tuple[int, int, int] | None = None
+    for sequence_number, equity_micros in samples:
+        if state is None:
+            state = (equity_micros, sequence_number, equity_micros)
+            continue
+        peak, latest_sequence_number, latest = state
+        if sequence_number > latest_sequence_number:
+            latest_sequence_number, latest = sequence_number, equity_micros
+        state = (max(peak, equity_micros), latest_sequence_number, latest)
+    if state is None:
+        return None
+    return EquityCurve(
+        high_water_mark=MoneyMicros(state[0]), latest=MoneyMicros(state[2])
+    )
+
+
+def equity_curve_micros(records: Iterable[LedgerRecord]) -> EquityCurve | None:
+    """Fold the whole ledger's equity samples into a peak and a latest reading.
+
+    The reference definition of the answer both read paths must produce, and
+    the fallback for any store without the reverse walk.
+
+    Args:
+        records: The ledger read (``SqliteLedgerStore.read_all()``), in any
+            order. Non-``EquitySampled`` rows are ignored.
+
+    Returns:
+        The :class:`EquityCurve`, or ``None`` when the ledger holds no sample
+        at all -- which keeps ``trailing_drawdown_limit`` vetoing.
+
+    Raises:
+        KeyError: If an ``EquitySampled`` payload is missing the field this
+            reads -- a loud shape drift, never a silently zeroed mark.
+    """
+    return _fold_equity_curve(_curve_samples(records))
+
+
+def read_equity_curve(store: LedgerStore) -> EquityCurve | None:
+    """Read the account's peak and current equity from ``store``.
+
+    The tick's entry point for ``trailing_drawdown_limit``'s two terms, and the
+    one fold in this module that deliberately does **not** stop at a boundary:
+    a maximum over an all-time series has no recency predicate to stop on, and
+    a mark that stopped at one would not be a high-water mark. A store
+    declaring :class:`~windbreak.ledger.store.ReverseTypeScan` therefore pays
+    one indexed pass over the ``EquitySampled`` rows alone -- the same
+    complexity :func:`read_notional_today_micros` already pays over the booked
+    fills, for the same reason (a sum, like a maximum, cannot be truncated
+    safely) -- and every other store falls back to the whole-ledger fold.
+
+    Re-folding from the ledger on each tick is also what makes the mark survive
+    a process restart: it is never held in memory, so a loop that stops and
+    starts recovers exactly the peak its own rows attest to, rather than
+    resetting to whatever the first tick after the restart happens to sample.
+
+    Args:
+        store: The ledger to read the equity samples out of.
+
+    Returns:
+        The :class:`EquityCurve`, or ``None`` when the ledger holds no sample
+        at all.
+    """
+    records: Iterable[LedgerRecord] = (
+        store.iter_records_of_type_reversed(_EQUITY_SAMPLED_EVENT_TYPE)
+        if isinstance(store, ReverseTypeScan)
+        else store.read_all()
+    )
+    return _fold_equity_curve(_curve_samples(records))
+
+
 def start_of_day_equity_micros(
     records: Iterable[LedgerRecord], *, now_epoch_s: int
 ) -> MoneyMicros | None:
@@ -680,11 +994,9 @@ def start_of_day_equity_micros(
     same-day hit, for the clock reason above: append order is not proof of
     chronological order.
 
-    That makes this fold O(ledger), which is why the tick no longer reaches it
-    directly: :func:`read_start_of_day_equity_micros` is the entry point, and it
-    prefers a bounded reverse walk on any store offering one (issue #370). This
-    fold remains the fallback for stores without that capability -- and the
-    reference definition of the answer both paths must produce.
+    The baseline half of :func:`day_equity_micros`, which folds it in the same
+    pass as the day's trough (issue #513) so the threshold and the loss
+    measured against it can never come from different rows.
 
     Args:
         records: The ledger read (``SqliteLedgerStore.read_all()``), in append
@@ -699,17 +1011,34 @@ def start_of_day_equity_micros(
         KeyError: If an ``EquitySampled`` payload is missing either field this
             reads -- a loud shape drift, never a silently zeroed baseline.
     """
-    today = _utc_day(now_epoch_s)
-    earliest: tuple[int, int] | None = None
-    for record in records:
-        if record.event_type != _EQUITY_SAMPLED_EVENT_TYPE:
-            continue
-        epoch_s, equity_micros = _equity_sample(record)
-        if _utc_day(epoch_s) != today:
-            continue
-        if earliest is None or epoch_s < earliest[0]:
-            earliest = (epoch_s, equity_micros)
-    return MoneyMicros(earliest[1]) if earliest is not None else None
+    day = day_equity_micros(records, now_epoch_s=now_epoch_s)
+    return day.baseline if day is not None else None
+
+
+def realized_loss_today_micros(
+    records: Iterable[LedgerRecord], *, now_epoch_s: int
+) -> MoneyMicros | None:
+    """Return the loss the current UTC day has realized, or ``None``.
+
+    The realized-loss half of :func:`day_equity_micros`, folded in the same
+    pass as the baseline it is measured from (issue #513), and the records-side
+    sibling of :func:`read_realized_loss_today_micros`.
+
+    Args:
+        records: The ledger read (``SqliteLedgerStore.read_all()``), in append
+            order. Non-``EquitySampled`` rows are ignored.
+        now_epoch_s: The instant whose UTC day is the "current" one.
+
+    Returns:
+        The day's realized loss in micros, or ``None`` when the day carries no
+        sample at all.
+
+    Raises:
+        KeyError: If an ``EquitySampled`` payload is missing either field this
+            reads -- a loud shape drift, never a silently zeroed loss.
+    """
+    day = day_equity_micros(records, now_epoch_s=now_epoch_s)
+    return day.realized_loss if day is not None else None
 
 
 def _equity_sample(record: LedgerRecord) -> tuple[int, int]:
@@ -743,7 +1072,7 @@ def read_start_of_day_equity_micros(
     A store declaring the optional
     :class:`~windbreak.ledger.store.ReverseTypeScan` capability answers it with a
     bounded walk instead -- see
-    :func:`_bounded_start_of_day_equity_micros` -- and any other store,
+    :func:`_samples_back_to_the_day_boundary` -- and any other store,
     including every hand-rolled :class:`~windbreak.ledger.store.LedgerStore`
     double, falls back to the original whole-ledger fold. The two paths return
     the same baseline, so the dispatch is a pure optimization and never a
@@ -757,64 +1086,36 @@ def read_start_of_day_equity_micros(
         The day's earliest sampled equity, in micros, or ``None`` when the day
         carries no sample at all -- which keeps ``daily_loss_limit`` vetoing.
     """
-    if isinstance(store, ReverseTypeScan):
-        return _bounded_start_of_day_equity_micros(store, now_epoch_s=now_epoch_s)
-    return start_of_day_equity_micros(store.read_all(), now_epoch_s=now_epoch_s)
+    day = read_day_equity(store, now_epoch_s=now_epoch_s)
+    return day.baseline if day is not None else None
 
 
-def _bounded_start_of_day_equity_micros(
-    store: ReverseTypeScan, *, now_epoch_s: int
+def read_realized_loss_today_micros(
+    store: LedgerStore, *, now_epoch_s: int
 ) -> MoneyMicros | None:
-    """Derive the baseline from a newest-first walk that stops at the day boundary.
+    """Read the loss the current UTC day has realized, from ``store``.
 
-    Walks ``EquitySampled`` rows alone, newest first, and stops at the first one
-    stamped on an *earlier* UTC day: everything older is older still, so nothing
-    beyond it can be today's earliest. The cost is therefore O(samples taken
-    today) -- bounded by ticks-per-day -- rather than O(ledger), with no new
-    index and no change to what the answer means.
+    The term ``daily_loss_limit`` was fed a hardcoded zero (issue #513), which
+    made the cap unable to veto at any loss for any account whose day had a
+    ledgered baseline -- the loop's normal steady state, since the check's
+    threshold is a ppm share of that same baseline and ``0 >= threshold`` is
+    false for every positive one.
 
-    Two subtleties keep it faithful to the full fold it replaces:
-
-    * The earliest of today's samples is chosen by comparing stamped
-      ``epoch_s`` values, not by taking the first row the walk happens to
-      surface, so a clock that steps backwards mid-day cannot promote a later
-      sample to the baseline (the walk arrives newest-first, so seizing its
-      first hit would be exactly the latest-of-day reading this must not do).
-    * A sample stamped on a *later* day -- a forward clock blip -- is skipped
-      rather than treated as the boundary. Only predating today ends the walk;
-      stopping on a future stamp would discard today's genuine baseline for as
-      long as the blip sat at the head of the ledger.
-
-    The one case where this can diverge from the full fold is a clock that
-    rewinds *across* midnight and then jumps forward again, burying a still
-    earlier same-day sample beneath a previous-day one. That ordering makes the
-    samples mutually contradictory anyway, and the walk keeps the invariant that
-    matters here: it never reports a baseline that no sample carried.
+    The loss is the distance from the day's baseline down to its trough, both
+    read from the same walk (:func:`read_day_equity`), so the figure and the
+    threshold it is measured against always describe one day's rows.
 
     Args:
-        store: The ledger, declaring the reverse-walk capability.
+        store: The ledger to read the day's samples out of.
         now_epoch_s: The instant whose UTC day is the "current" one.
 
     Returns:
-        The day's earliest sampled equity, in micros, or ``None`` when the walk
-        reaches the day boundary (or the end of the ledger) without a sample.
-
-    Raises:
-        KeyError: If an ``EquitySampled`` payload is missing either field this
-            reads -- a loud shape drift, never a silently zeroed baseline.
+        The day's realized loss in micros, or ``None`` when the day carries no
+        sample at all -- the same unprovable case that leaves the baseline
+        absent, and which keeps ``daily_loss_limit`` vetoing.
     """
-    today = _utc_day(now_epoch_s)
-    earliest: tuple[int, int] | None = None
-    for record in store.iter_records_of_type_reversed(_EQUITY_SAMPLED_EVENT_TYPE):
-        epoch_s, equity_micros = _equity_sample(record)
-        sample_day = _utc_day(epoch_s)
-        if sample_day < today:
-            break
-        if sample_day > today:
-            continue
-        if earliest is None or epoch_s < earliest[0]:
-            earliest = (epoch_s, equity_micros)
-    return MoneyMicros(earliest[1]) if earliest is not None else None
+    day = read_day_equity(store, now_epoch_s=now_epoch_s)
+    return day.realized_loss if day is not None else None
 
 
 def _fill_utc_day(record: LedgerRecord) -> date | None:
@@ -1425,9 +1726,114 @@ def _build_limits(
     )
 
 
+def _exposure_terms(
+    exposure: ExposureProjection | None,
+) -> tuple[MoneyMicros, MoneyMicros, MoneyMicros, MoneyMicros]:
+    """Return the four concentration terms, or four fail-closed zeros.
+
+    Extracted from :func:`_account_from_verification` so that function stays
+    inside the ``xenon --max-absolute B`` ceiling as the last two hardcoded
+    zeros are replaced (issues #513/#514, and the decomposition issue #492
+    names). The four zeros are only safe paired with :func:`_build_limits`'
+    zeroed concentration caps -- see that function.
+
+    Args:
+        exposure: The tick's projected exposure, or ``None`` when it could not
+            be established.
+
+    Returns:
+        The market, event, bucket and total exposure terms, in that order.
+    """
+    if exposure is None:
+        zero = MoneyMicros(0)
+        return (zero, zero, zero, zero)
+    return (
+        exposure.market_exposure,
+        exposure.event_exposure,
+        exposure.bucket_exposure,
+        exposure.total_exposure,
+    )
+
+
+def _equity_terms(
+    equity_start_of_day: MoneyMicros | None,
+    realized_loss_today: MoneyMicros | None,
+    equity_curve: EquityCurve | None,
+) -> tuple[MoneyMicros, MoneyMicros, MoneyMicros, MoneyMicros]:
+    """Return the four equity-series terms, mapping absent evidence onto zero.
+
+    All four are points on the ledger's own ``EquitySampled`` curve, and the
+    zeros they fall back to are fail-*closed* rather than permissive -- which
+    is a property of how they pair, not of the number itself:
+
+    * A zero baseline floors ``daily_loss_limit``'s threshold at zero, which
+      the zero loss beside it already reaches, so the check keeps vetoing on an
+      unsampled day exactly as PR #481 pinned. That is a veto for the *unknown
+      baseline*; issue #513's defect was the loss term, which was zero even
+      when the day was fully sampled.
+    * A zero mark floors ``trailing_drawdown_limit``'s threshold at zero, and
+      the zero current reading beside it makes the drawdown zero, so
+      ``0 >= 0`` vetoes. Zeroing only one side is what left that check inert:
+      with a real worst-case equity opposite a zero mark the drawdown was
+      *negative* and the cap could not bind at all (issue #514).
+
+    Both pairs come from one fold each, so a caller cannot supply half a pair.
+
+    Args:
+        equity_start_of_day: The day's first ledgered equity sample, or
+            ``None``.
+        realized_loss_today: The day's realized loss, or ``None``.
+        equity_curve: The all-time peak and newest sample, or ``None`` when the
+            ledger holds no sample at all.
+
+    Returns:
+        The start-of-day equity, realized loss, high-water mark and newest
+        sampled equity, in that order.
+    """
+    zero = MoneyMicros(0)
+    mark = equity_curve.high_water_mark if equity_curve is not None else zero
+    sampled = equity_curve.latest if equity_curve is not None else zero
+    return (
+        equity_start_of_day if equity_start_of_day is not None else zero,
+        realized_loss_today if realized_loss_today is not None else zero,
+        mark,
+        sampled,
+    )
+
+
+def _velocity_terms(
+    orders_last_hour: int | None, notional_today: MoneyMicros | None
+) -> tuple[int, MoneyMicros]:
+    """Return ``velocity_limits``' two terms, or their fail-closed zeros.
+
+    Both halves of one check, resolved in one place so neither can be wired
+    differently from the other: the hourly order count (issue #491) and the
+    day's booked notional (issue #415). Each falls back to zero *only* because
+    :func:`_build_limits` has simultaneously zeroed the cap that reads it --
+    ``max_orders_per_hour`` and ``max_notional_per_day`` respectively -- so the
+    zero is never the permissive reading it replaced. Neither half is correct
+    alone; see :func:`_build_limits` for the other one.
+
+    Args:
+        orders_last_hour: The trailing hour's routed-order count, or ``None``
+            when the hour's routing history could not be established.
+        notional_today: The current UTC day's booked notional, or ``None`` when
+            the day's spend could not be established.
+
+    Returns:
+        The routed-order count and the day's booked notional, in that order.
+    """
+    return (
+        orders_last_hour if orders_last_hour is not None else 0,
+        notional_today if notional_today is not None else MoneyMicros(0),
+    )
+
+
 def _account_from_verification(
     verification: VerificationSnapshot | None,
     equity_start_of_day: MoneyMicros | None,
+    realized_loss_today: MoneyMicros | None,
+    equity_curve: EquityCurve | None,
     exposure: ExposureProjection | None,
     notional_today: MoneyMicros | None,
     orders_last_hour: int | None,
@@ -1487,9 +1893,9 @@ def _account_from_verification(
     to carry "unprovable" with, so the fact is stated in the limits instead of
     fabricated into the account. Neither half is correct alone.
 
-    ``orders_last_hour`` closes the same shape for the last time (issue #491).
-    It was hardcoded to zero, and zero is *permissive* in the strongest possible
-    sense for ``velocity_limits``' hourly cap: the gate reads ``0 + 1 >
+    ``orders_last_hour`` closes the same shape for ``velocity_limits``' other
+    half (issue #491). It was hardcoded to zero, and zero is *permissive* in the
+    strongest possible sense for the hourly cap: the gate reads ``0 + 1 >
     max_orders_per_hour``, which is false for every configured maximum of one or
     more, so the runaway-order protection could not veto at any order rate
     whatsoever. :func:`read_orders_last_hour` now folds it out of the ledger's
@@ -1503,15 +1909,37 @@ def _account_from_verification(
     the same paired reading ``exposure`` and ``notional_today`` use, and for the
     same reason. Neither half is correct alone; here that is especially true,
     since the zero this term falls back to is the exact defect being removed.
+    Both of ``velocity_limits``' terms are resolved together by
+    :func:`_velocity_terms`, so neither can be wired differently from the other.
 
-    ``equity_high_water_mark`` stays zero for a related but distinct reason:
-    no ledgered high-water history exists to fold.
+    ``realized_loss_today`` comes from ``realized_loss_today`` (issue #513) and
+    ``equity_high_water_mark``/``sampled_equity`` from ``equity_curve`` (issue
+    #514). Both were hardcoded zero, and both zeros were permissive:
+
+    * ``0 >= _ppm_of(equity_start_of_day, daily_loss_limit_pct_ppm)`` is false
+      for every positive baseline, so ``daily_loss_limit`` could not veto at
+      any realized loss once the day had a ledgered sample.
+    * ``0 - worst_case_equity >= _ppm_of(0, ...)`` is ``negative >= 0``, false
+      for every solvent account, so ``trailing_drawdown_limit`` could not veto
+      at any drawdown until equity had already reached zero.
+
+    :func:`read_realized_loss_today_micros` and :func:`read_equity_curve` now
+    fold all three out of the ledger's own ``EquitySampled`` rows.
+    :func:`_equity_terms` documents why their ``None`` maps onto zero here
+    rather than onto a zeroed limit the way ``exposure`` and ``notional_today``
+    do: for these two caps *both* sides of the comparison come off the same
+    fold, so the paired zeros already veto, and a zeroed cap would be a branch
+    no input could reach.
 
     Args:
         verification: The tick's verification snapshot, or ``None`` when no
             cycle has produced one (the fail-closed reading).
         equity_start_of_day: The current UTC day's first ledgered equity
             sample, or ``None`` when the day has none yet (also fail-closed).
+        realized_loss_today: The loss the current UTC day has realized, or
+            ``None`` when the day carries no sample at all.
+        equity_curve: The all-time high-water mark and the newest sampled
+            equity, or ``None`` when the ledger holds no sample at all.
         exposure: The tick's projected exposure, or ``None`` when it could not
             be established -- in which case the caller must also have zeroed
             the concentration caps, as above.
@@ -1532,7 +1960,11 @@ def _account_from_verification(
         else zero
     )
     drift = verification.cash_drift if verification is not None else zero
-    baseline = equity_start_of_day if equity_start_of_day is not None else zero
+    baseline, loss, mark, sampled = _equity_terms(
+        equity_start_of_day, realized_loss_today, equity_curve
+    )
+    market, event, bucket, total = _exposure_terms(exposure)
+    routed, day_notional = _velocity_terms(orders_last_hour, notional_today)
     return AccountState(
         exchange_verified_available_cash=verified_cash,
         guaranteed_terminal_value_of_positions=zero,
@@ -1540,14 +1972,15 @@ def _account_from_verification(
         unresolved_fee_upper_bounds=zero,
         reconciliation_uncertainty_buffer=drift,
         equity_start_of_day=baseline,
-        equity_high_water_mark=zero,
-        realized_loss_today=zero,
-        market_exposure=exposure.market_exposure if exposure is not None else zero,
-        event_exposure=exposure.event_exposure if exposure is not None else zero,
-        bucket_exposure=exposure.bucket_exposure if exposure is not None else zero,
-        total_exposure=exposure.total_exposure if exposure is not None else zero,
-        orders_last_hour=orders_last_hour if orders_last_hour is not None else 0,
-        notional_today=notional_today if notional_today is not None else zero,
+        equity_high_water_mark=mark,
+        sampled_equity=sampled,
+        realized_loss_today=loss,
+        market_exposure=market,
+        event_exposure=event,
+        bucket_exposure=bucket,
+        total_exposure=total,
+        orders_last_hour=routed,
+        notional_today=day_notional,
     )
 
 
@@ -1566,6 +1999,8 @@ def build_evaluation_context(
     forecast_epoch_s: int | None,
     open_position: ContractCentis | None,
     equity_start_of_day: MoneyMicros | None,
+    realized_loss_today: MoneyMicros | None,
+    equity_curve: EquityCurve | None,
     visible_depth: ContractCentis | None,
     exposure: ExposureProjection | None,
     notional_today: MoneyMicros | None,
@@ -1686,6 +2121,18 @@ def build_evaluation_context(
         equity_start_of_day: The current UTC day's first ledgered equity
             sample, or ``None`` when the day has none yet -- which fails closed
             (issue #364).
+        realized_loss_today: The loss the current UTC day has realized, from
+            :func:`read_realized_loss_today_micros`, or ``None`` when the day
+            carries no sample at all (issue #513). Caller-supplied for the same
+            reason as the baseline: it was hardcoded to zero, and an account
+            that looks to have lost nothing has its whole daily allowance left
+            however much it has actually lost.
+        equity_curve: The all-time high-water mark and the newest sampled
+            equity, from :func:`read_equity_curve`, or ``None`` when the ledger
+            holds no sample at all (issue #514). One argument for both terms
+            because a drawdown is the distance between two readings of one
+            series; supplying a mark without the reading it is measured
+            against is what left that cap inert.
         visible_depth: The visible book depth, in contract-centis, or ``None``
             when no book could be read -- which fails closed (issue #364). A
             genuinely empty book is ``0``, not ``None``: an observed absence of
@@ -1754,6 +2201,8 @@ def build_evaluation_context(
         account=_account_from_verification(
             verification,
             equity_start_of_day,
+            realized_loss_today,
+            equity_curve,
             exposure,
             notional_today,
             orders_last_hour,
@@ -3486,6 +3935,10 @@ def _approve_stage(
         equity_start_of_day=read_start_of_day_equity_micros(
             deps.store, now_epoch_s=now_epoch_s
         ),
+        realized_loss_today=read_realized_loss_today_micros(
+            deps.store, now_epoch_s=now_epoch_s
+        ),
+        equity_curve=read_equity_curve(deps.store),
         visible_depth=visible_depth_centis(order_book),
         exposure=exposure,
         notional_today=read_notional_today_micros(deps.store, now_epoch_s=now_epoch_s),

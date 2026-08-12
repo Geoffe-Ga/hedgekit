@@ -38,7 +38,7 @@ from windbreak.numeric import (
 from windbreak.riskkernel.checks import DEFAULT_CHECKS, OrderIntent
 from windbreak.riskkernel.context import ExchangeTradingStatus
 from windbreak.scheduler.exposure import HeldMarket, project_exposure
-from windbreak.scheduler.loop import build_evaluation_context
+from windbreak.scheduler.loop import EquityCurve, build_evaluation_context
 from windbreak.selector.correlation import BUCKET_WEATHER
 
 #: The offset-aware instant every declared tag below carries.
@@ -167,6 +167,11 @@ def _verdict(peer_micros: int) -> str | None:
         forecast_epoch_s=_NOW_EPOCH_S,
         open_position=None,
         equity_start_of_day=MoneyMicros(_EQUITY_MICROS),
+        realized_loss_today=MoneyMicros(0),
+        equity_curve=EquityCurve(
+            high_water_mark=MoneyMicros(_EQUITY_MICROS),
+            latest=MoneyMicros(_EQUITY_MICROS),
+        ),
         visible_depth=ContractCentis(1_000_000),
         exposure=projection,
         notional_today=MoneyMicros(0),
@@ -280,6 +285,11 @@ class TestUnprovableExposureFailsClosed:
             forecast_epoch_s=_NOW_EPOCH_S,
             open_position=None,
             equity_start_of_day=MoneyMicros(_EQUITY_MICROS),
+            realized_loss_today=MoneyMicros(0),
+            equity_curve=EquityCurve(
+                high_water_mark=MoneyMicros(_EQUITY_MICROS),
+                latest=MoneyMicros(_EQUITY_MICROS),
+            ),
             visible_depth=ContractCentis(1_000_000),
             exposure=projection,
             notional_today=MoneyMicros(0),
@@ -313,6 +323,11 @@ class TestUnprovableExposureFailsClosed:
             forecast_epoch_s=_NOW_EPOCH_S,
             open_position=None,
             equity_start_of_day=MoneyMicros(_EQUITY_MICROS),
+            realized_loss_today=MoneyMicros(0),
+            equity_curve=EquityCurve(
+                high_water_mark=MoneyMicros(_EQUITY_MICROS),
+                latest=MoneyMicros(_EQUITY_MICROS),
+            ),
             visible_depth=ContractCentis(1_000_000),
             exposure=projection,
             notional_today=MoneyMicros(0),

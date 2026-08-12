@@ -1071,11 +1071,17 @@ def test_daily_loss_limit_vetoes_at_exact_threshold() -> None:
 
 
 def test_trailing_drawdown_limit_passes_one_micro_below_threshold() -> None:
-    """Reducing cash by 99_999_999 (from the default $1,000 high-water mark)
-    keeps drawdown one micro below the 10% threshold (100_000_000)."""
+    """Sampled equity 99_999_999 below the default $1,000 high-water mark
+    keeps drawdown one micro below the 10% threshold (100_000_000).
+
+    Driven through `sampled_equity` rather than through cash: the drawdown is
+    measured between two readings of the ledger's own equity series, because
+    worst-case equity falls by a position's full cost the moment one is opened
+    and would report deployment as drawdown (issue #514).
+    """
     context = make_context(
         max_drawdown_pct_ppm=100_000,
-        exchange_verified_available_cash=MoneyMicros(900_000_001),
+        sampled_equity=MoneyMicros(900_000_001),
     )
 
     result = _real_check("trailing_drawdown_limit")(make_intent(), context)
@@ -1088,12 +1094,30 @@ def test_trailing_drawdown_limit_vetoes_at_exact_threshold() -> None:
     `daily_loss_limit`'s boundary sense)."""
     context = make_context(
         max_drawdown_pct_ppm=100_000,
-        exchange_verified_available_cash=MoneyMicros(900_000_000),
+        sampled_equity=MoneyMicros(900_000_000),
     )
 
     result = _real_check("trailing_drawdown_limit")(make_intent(), context)
 
     assert result.vetoed is True
+
+
+def test_trailing_drawdown_limit_ignores_capital_merely_deployed() -> None:
+    """Opening a position is not a drawdown, however much cash it consumes.
+
+    Worst-case equity here is zero -- every open position is assumed to resolve
+    against us -- while the sampled equity still stands at the high-water mark.
+    Measured against worst-case equity the cap would veto at a full 100%
+    "drawdown"; measured on the equity series it has nothing to bind on.
+    """
+    context = make_context(
+        max_drawdown_pct_ppm=100_000,
+        exchange_verified_available_cash=MoneyMicros(0),
+    )
+
+    result = _real_check("trailing_drawdown_limit")(make_intent(), context)
+
+    assert result.vetoed is False
 
 
 # --- velocity_limits ------------------------------------------------------------------
