@@ -78,6 +78,7 @@ from windbreak.forecast.providers.base import (
     ProviderRateLimitedError,
     ProviderTimeoutError,
     ProviderVoteError,
+    provider_performs_own_research,
 )
 
 if TYPE_CHECKING:
@@ -243,6 +244,21 @@ class RetryingProvider:
         self._rate_table = rate_table
         self._monotonic_ms = monotonic_ms
         self._sleep_ms = sleep_ms
+
+    @property
+    def performs_own_research(self) -> bool:
+        """Return the wrapped provider's own self-research declaration (#556).
+
+        Forwarded, never re-decided. The composition root wraps *every* live
+        provider in this decorator, so a wrapper that answered for itself would
+        make the pipeline's research-skip inert exactly where it is meant to
+        fire -- a research forecaster would be wrapped back into paying for
+        research it ignores.
+
+        Returns:
+            The inner provider's ``performs_own_research`` declaration.
+        """
+        return provider_performs_own_research(self._inner)
 
     def forecast(
         self,

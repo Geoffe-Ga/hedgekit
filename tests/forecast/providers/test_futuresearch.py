@@ -43,6 +43,7 @@ from windbreak.forecast.pipeline import (
     run_pipeline,
 )
 from windbreak.forecast.providers import (
+    DEFAULT_VOTE_ENSEMBLE,
     EnsembleMember,
     EnsembleMemberLike,
     ForbiddenLiveHttpTransport,
@@ -1212,11 +1213,17 @@ def test_run_pipeline_provider_citations_do_not_inflate_verified_count_or_eligib
     research_tools: ResearchTools,
     make_fake_vote_transport: Callable[..., object],
 ) -> None:
-    """A run driven through `provider_factory` carries exactly as many
-    independently-verified (non-`provider_reported`) citations, and the same
-    `eligible_for_live` outcome, as the equivalent default-path run -- the
-    provider's own reported citations are audit-only and never inflate the
-    live-eligibility gate (SPEC S8.8).
+    """A research-forecaster run's own reported citations never stand in for
+    independently-verified ones, so it cannot reach live eligibility on them
+    (SPEC S8.8).
+
+    Since #556 the pipeline does not research at all for an ensemble that
+    researches for itself, which makes this the sharper reading of the same
+    invariant rather than a weaker one: the provider-driven run has *zero*
+    independently-verified citations, reports one of its own, and is live-
+    ineligible -- while the default-path control, which did research, verifies
+    several and is eligible. A run that let a reported citation count would show
+    up here as an eligible record with no verified citation behind it.
     """
     baseline_record = run_pipeline(
         market,
@@ -1256,8 +1263,16 @@ def test_run_pipeline_provider_citations_do_not_inflate_verified_count_or_eligib
         for citation in provider_record.citations
         if citation.source_type != PROVIDER_REPORTED_SOURCE_TYPE
     ]
-    assert len(provider_verified) == len(baseline_verified)
-    assert provider_record.eligible_for_live == baseline_record.eligible_for_live
+    provider_reported = [
+        citation
+        for citation in provider_record.citations
+        if citation.source_type == PROVIDER_REPORTED_SOURCE_TYPE
+    ]
+    assert baseline_verified != []
+    assert baseline_record.eligible_for_live is True
+    assert provider_verified == []
+    assert len(provider_reported) == len(DEFAULT_VOTE_ENSEMBLE)
+    assert provider_record.eligible_for_live is False
 
 
 # --- Pipeline integration: sibling errors discard the vote, not the run (#189) --

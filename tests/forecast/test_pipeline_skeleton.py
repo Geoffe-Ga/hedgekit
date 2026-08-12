@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
 from windbreak.forecast.cassettes import (
     CassetteMissError,
     Completion,
@@ -278,6 +279,7 @@ def test_build_forecast_record_incoherent_and_eligible_raises_value_error(
             source_notes=(),
             rationale="## Rationale\n\nStub rationale for issue #25 RED test.\n",
             coherence_sum=1_500_000,
+            research_cost_micros=FULL_PIPELINE_RESEARCH_COST_MICROS,
         )
 
 

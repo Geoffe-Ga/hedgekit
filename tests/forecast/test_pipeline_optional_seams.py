@@ -388,6 +388,7 @@ def test_build_abstention_record_refuses_a_reason_with_no_registered_rationale(
             question_hash=normalize_question(market),
             citations=(),
             abstention_reason=_UNREGISTERED_ABSTENTION_REASON,
+            research_cost_micros=FULL_PIPELINE_RESEARCH_COST_MICROS,
         )
 
     error = excinfo.value
@@ -419,6 +420,7 @@ def test_build_abstention_record_gives_each_registered_reason_its_own_rationale(
             question_hash=question_hash,
             citations=(),
             abstention_reason=reason,
+            research_cost_micros=FULL_PIPELINE_RESEARCH_COST_MICROS,
         )
         for reason in _REGISTERED_ABSTENTION_REASONS
     }

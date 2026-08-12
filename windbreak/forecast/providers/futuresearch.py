@@ -425,6 +425,14 @@ def _extract_cost_micros(payload: dict[str, object], ceiling_micros: int) -> int
 class FutureSearchProvider:
     """A hosted research-forecaster :class:`ForecastProvider` over HTTP."""
 
+    #: This provider researches server-side and never reads the pipeline's
+    #: quotes (ADR-0005 S1(b)) -- the same fact ``forecast`` states by deleting
+    #: its ``quotes`` argument, declared here where the pipeline can read it
+    #: *before* deciding whether to research at all (issue #556). The two must
+    #: agree: a provider that consumed ``quotes`` while declaring this would
+    #: vote on evidence the pipeline was told not to gather.
+    performs_own_research = True
+
     def __init__(
         self, transport: HttpTransport, config: FutureSearchProviderConfig
     ) -> None:
