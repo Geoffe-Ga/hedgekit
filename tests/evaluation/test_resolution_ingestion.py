@@ -360,9 +360,10 @@ def test_ingested_resolutions_fails_closed_on_a_contradicting_re_ingest() -> Non
 
     Silently letting the later row win would let a mis-typed outcome overwrite
     a correct one with no trace in the report. The message quotes both claims
-    exactly and names no remedy that does not exist: there is no settlement
-    reversal to perform (issue #484), and the verb refuses this append before
-    it is ever written.
+    exactly and names the remedy that now exists: `windbreak
+    correct-resolution` supersedes the wrong row explicitly (issue #484),
+    which is a different act from contradicting it by re-ingesting -- and the
+    verb refuses this append before it is ever written either way.
     """
     records = [
         _record(
@@ -390,8 +391,10 @@ def test_ingested_resolutions_fails_closed_on_a_contradicting_re_ingest() -> Non
         "outcome='yes' resolved_at=2026-03-01T12:00:00.000000Z. "
         "`windbreak ingest-resolution` refuses a conflicting append before "
         "writing anything, so a ledger carrying both rows was not written by "
-        "it; the ledger is append-only and neither row can be un-written. See "
-        "docs/RUNBOOK.md, 'Ingesting a resolved outcome'."
+        "it; the ledger is append-only and neither row can be un-written. A "
+        "genuinely wrong recorded outcome is superseded with `windbreak "
+        "correct-resolution`, never re-ingested. See docs/RUNBOOK.md, "
+        "'Ingesting a resolved outcome'."
     )
     assert "settlement reversal" not in str(exc_info.value)
 

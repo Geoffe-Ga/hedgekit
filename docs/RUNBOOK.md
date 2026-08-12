@@ -686,17 +686,74 @@ resolved on this ledger with a different outcome or a different instant.
   fold runs on *every* tick, which would leave the loop reporting
   `mode=TICK_FAILED` forever with no recovery.
 - **You ingested a wrong outcome and it is the only row for that market**:
-  nothing refuses this, because nothing contradicts it, and **there is no
-  correction path today** — issue #484 tracks the settlement-reversal mechanism.
-  Do not attempt to correct it by ingesting again; that will be refused, and
-  would be terminal if it were not. Until #484 ships, treat the wrong row as
-  permanent and discount that market's contribution to the track record by
-  hand.
+  nothing refuses this, because nothing contradicts it. Correct it with
+  `windbreak correct-resolution` — see the next section. Do **not** try to
+  correct it by ingesting again: that is refused, and it is the right refusal,
+  because a second contradicting row could never be un-written.
 
 To see what a ledger currently believes resolved, read the report the next tick
 writes into `--report-dir`: the `## Cost meter` section's `resolved forecasts`
 count and the `== rejections ==` ledger under `## Evaluation` are both derived
 from these rows.
+
+### Correcting a wrong resolution (issue #484)
+
+A wrong `--outcome` or `--resolved-at` on the **first** ingest is not caught by
+anything, because nothing contradicts it — and from that moment every weekly
+report scores every forecast on that market against a false outcome. This verb
+is how you take it back.
+
+**Nothing is deleted.** The ledger is hash-chained and append-only, so the wrong
+row stays exactly where it is, forever. What this verb appends is a *later row
+that supersedes it*, naming the superseded row's `sequence_number` explicitly:
+
+```bash
+windbreak correct-resolution \
+  --ledger-path /path/to/state/ledger.db \
+  --market-ticker KXPRES-26-DJT \
+  --superseded-sequence-number 41 \
+  --outcome yes \
+  --resolved-at 2026-03-01T12:00:00+00:00 \
+  --source "kalshi settlement correction notice, retrieved 2026-03-05"
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--superseded-sequence-number` | The ledger row carrying this market's **current** claim: its first ingest, or its most recent correction. Get it from the `sequence=N` the verb logged, or from the refusal below, which names it for you. |
+| `--outcome` | The **corrected** outcome. |
+| `--resolved-at` | The **corrected** settlement instant. A correction may move the instant as well as the answer, and the temporal gate re-adjudicates against the corrected one — so a forecast that was scored can become `backdated`, and one that was `backdated` can become scored. |
+| `--source` | Where you read the *correction* — its own provenance, not the original row's. Overturning a settled outcome is the one act on this ledger that most needs attribution. |
+
+The other flags mean exactly what they mean for `ingest-resolution`.
+
+The verb exits `0` and logs `resolution corrected … sequence=N`. It exits `1`
+and writes **nothing** when:
+
+- `--superseded-sequence-number` does not name the row carrying that market's
+  current claim — including a row you have **already** corrected. The refusal
+  names the sequence number you should have typed, so re-running is one edit.
+- the market has no resolution on this ledger at all (use `ingest-resolution`).
+- the corrected `--outcome` **and** `--resolved-at` are exactly what the
+  superseded row already carries. A correction that changes nothing would put
+  an unexplained reversal in the audit trail without moving a metric.
+- `--resolved-at` carries no UTC offset or is not ISO-8601, or `--source` /
+  `--market-ticker` is blank.
+
+**You can correct a correction.** Name the correction's own row the second time.
+A path that could be walked exactly once would be the same permanent trap this
+verb removes, reached one command later.
+
+#### How a reader tells a correction from a first ingest
+
+- **On the chain**: the rows carry different `event_type` values —
+  `MarketResolved` for an ingest, `SettlementReversed` for a correction — and a
+  correction additionally carries `superseded_sequence_number`. A corrected
+  outcome can never be mistaken for one that was right all along.
+- **In the weekly report**: a `## Resolution corrections` section appears at the
+  top, above the metrics, with one `RESOLUTION_CORRECTED` line per correction
+  naming both ledger rows, both outcomes and both instants. That section is
+  **absent** from a report with no corrections — its presence is the signal, so
+  it is never a heading you learn to skip.
 
 ### Known limitations (summary)
 
@@ -732,8 +789,9 @@ from these rows.
 - Evaluation metrics only move if an operator runs `windbreak
   ingest-resolution` (see "Ingesting a resolved outcome"). There is no venue
   settlement feed, so an otherwise-unattended loop still needs this one manual
-  step per settled market, and a wrong outcome ingested that way cannot be
-  corrected yet (issue #484).
+  step per settled market. A wrong outcome ingested that way is correctable
+  since issue #484 — see "Correcting a wrong resolution" — but only by an
+  operator who notices it, since nothing cross-checks the claim.
 
 ### Declaring correlation buckets (required to size anything)
 

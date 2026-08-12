@@ -41,9 +41,10 @@ from windbreak.drills.catalog import DRILL_NAMES
 from windbreak.drills.context import bind_paper_context, bind_production_context
 from windbreak.evaluation.ingest import (
     MarketResolved,
+    SettlementReversed,
     describe_resolution_claim,
+    fold_resolutions,
     ingested_resolution_of,
-    ingested_resolutions_from_records,
     parse_resolution_instant,
     resolutions_conflict,
 )
@@ -85,6 +86,7 @@ if TYPE_CHECKING:
     from windbreak.connector.interface import MarketConnector
     from windbreak.connector.live import MarketDataSource
     from windbreak.dashboard.app import DashboardStatus
+    from windbreak.evaluation.ingest import IngestedResolution, ResolutionFold
     from windbreak.forecast.providers.track_record import ProviderTrackRecord
     from windbreak.ledger import Event, LedgerStore
     from windbreak.net.live_http import LiveHttpTransport
@@ -554,6 +556,58 @@ def _add_ingest_resolution_arguments(ingest_parser: argparse.ArgumentParser) -> 
     )
 
 
+def _add_correct_resolution_arguments(
+    correct_parser: argparse.ArgumentParser,
+) -> None:
+    """Register the ``correct-resolution`` subcommand's options (issue #484).
+
+    Every option is required, including ``--superseded-sequence-number``: a
+    correction that defaulted to "whatever row is current" would be an
+    unreviewable act in a hash-chained audit trail, and naming the row makes
+    the operator confirm which claim they mean to overturn.
+
+    Args:
+        correct_parser: The ``correct-resolution`` subparser to populate.
+    """
+    correct_parser.add_argument(
+        "--ledger-path",
+        type=Path,
+        required=True,
+        help="Path to the SQLite ledger database to append the correction to.",
+    )
+    correct_parser.add_argument(
+        "--market-ticker",
+        required=True,
+        help="Ticker of the market whose settlement was recorded wrongly.",
+    )
+    correct_parser.add_argument(
+        "--superseded-sequence-number",
+        type=int,
+        required=True,
+        help="Ledger sequence_number of the row this correction supersedes: "
+        "the market's first ingest, or its most recent correction. A refusal "
+        "names the right one.",
+    )
+    correct_parser.add_argument(
+        "--outcome",
+        required=True,
+        choices=[member.value for member in ResolutionOutcome],
+        help="The CORRECTED ground-truth outcome.",
+    )
+    correct_parser.add_argument(
+        "--resolved-at",
+        required=True,
+        help="The CORRECTED ISO-8601 settlement instant, WITH a UTC offset "
+        "(e.g. 2026-03-01T12:00:00+00:00). An offsetless instant is refused.",
+    )
+    correct_parser.add_argument(
+        "--source",
+        required=True,
+        help="Where the correction was read (the correction's own provenance), "
+        "recorded verbatim in the ledgered event.",
+    )
+
+
 def _add_set_research_budget_arguments(
     budget_parser: argparse.ArgumentParser,
 ) -> None:
@@ -750,7 +804,10 @@ def build_parser() -> argparse.ArgumentParser:
         anchor file); an ``ingest-resolution`` subcommand exposing
         ``--ledger-path``, ``--market-ticker``, ``--outcome``, ``--resolved-at``
         and ``--source`` (record that a market settled, so forecasts on it can
-        be scored); an ``evaluate-providers`` subcommand exposing
+        be scored); a ``correct-resolution`` subcommand exposing those five
+        plus ``--superseded-sequence-number`` (supersede a wrongly recorded
+        resolution with the right one, issue #484); an ``evaluate-providers``
+        subcommand exposing
         ``--ledger-path`` and ``--report-dir`` (score each provider's resolved
         forecasts into the live-eligibility gate's artifact, issue #440); a
         ``set-research-budget`` subcommand exposing
@@ -791,6 +848,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers.add_parser(
             "ingest-resolution",
             help="Record that a market settled, so forecasts on it can be scored.",
+        )
+    )
+    _add_correct_resolution_arguments(
+        subparsers.add_parser(
+            "correct-resolution",
+            help="Supersede a wrongly recorded resolution with the right one.",
         )
     )
     _add_set_research_budget_arguments(
@@ -1673,22 +1736,48 @@ def _run_alert_test(args: argparse.Namespace) -> int:
     return 0
 
 
-def _unfoldable_ledger_refusal(market_ticker: str, reason: str) -> str:
+def _unfoldable_ledger_refusal(action: str, market_ticker: str, reason: str) -> str:
     """Phrase the refusal for a ledger whose existing rows cannot be folded.
 
     Args:
-        market_ticker: The market this call was trying to ingest.
+        action: The verb's own word for what it was about to do (``"ingest"``
+            or ``"correct"``), so the operator reads back the command they ran.
+        market_ticker: The market this call was about.
         reason: The fold's own message, quoted verbatim.
 
     Returns:
         The operator-facing refusal.
     """
     return (
-        f"refusing to ingest market_ticker={market_ticker!r}: this ledger's "
+        f"refusing to {action} market_ticker={market_ticker!r}: this ledger's "
         f"existing MarketResolved rows cannot be folded -- {reason} Until that "
         "is resolved the weekly report cannot be built at all, and appending "
         "another row would not help. Nothing was written."
     )
+
+
+def _folded_or_refusal(
+    store: SqliteLedgerStore, action: str, market_ticker: str
+) -> tuple[ResolutionFold | None, str]:
+    """Fold the ledger's ground truth, or explain why it cannot be folded.
+
+    Both resolution verbs read the ledger back through the *same* fold the
+    weekly tick uses, so "this verb refuses exactly what the tick would refuse
+    to read" holds by construction rather than by a parallel reimplementation
+    that can drift.
+
+    Args:
+        store: The open ledger store, read but not yet written.
+        action: The verb's own word for what it was about to do.
+        market_ticker: The market this call was about.
+
+    Returns:
+        The fold paired with ``""``, or ``None`` paired with the refusal.
+    """
+    try:
+        return fold_resolutions(store.read_all()), ""
+    except ValueError as exc:
+        return None, _unfoldable_ledger_refusal(action, market_ticker, str(exc))
 
 
 def _conflicting_ingest_refusal(store: SqliteLedgerStore, event: MarketResolved) -> str:
@@ -1715,20 +1804,13 @@ def _conflicting_ingest_refusal(store: SqliteLedgerStore, event: MarketResolved)
         The operator-facing refusal, or ``""`` when the append is safe.
     """
     candidate = ingested_resolution_of(event)
-    try:
-        already = ingested_resolutions_from_records(store.read_all())
-    except ValueError as exc:
-        return _unfoldable_ledger_refusal(candidate.market_ticker, str(exc))
-    existing = next(
-        (
-            resolution
-            for resolution in already
-            if resolution.market_ticker == candidate.market_ticker
-        ),
-        None,
-    )
+    fold, refusal = _folded_or_refusal(store, "ingest", candidate.market_ticker)
+    if fold is None:
+        return refusal
+    existing = fold.resolution_of(candidate.market_ticker)
     if existing is None or not resolutions_conflict(existing, candidate):
         return ""
+    target = fold.claim_sequence_numbers[candidate.market_ticker]
     return (
         f"refusing to ingest market_ticker={candidate.market_ticker!r}: it "
         f"already resolved on this ledger with "
@@ -1736,10 +1818,10 @@ def _conflicting_ingest_refusal(store: SqliteLedgerStore, event: MarketResolved)
         f"{describe_resolution_claim(candidate)}. The ledger is append-only, so "
         "a contradicting row could never be un-written and every later weekly "
         "fold -- one per tick -- would refuse to read it. Nothing was written. "
-        "Re-run with the values the ledger already carries; correcting a "
-        "genuinely wrong recorded outcome needs the settlement-reversal path, "
-        "which does not exist yet (issue #484) and cannot be improvised by "
-        "ingesting again."
+        "Re-run with the values the ledger already carries; a genuinely wrong "
+        "recorded outcome is corrected with `windbreak correct-resolution "
+        f"--superseded-sequence-number {target}`, which supersedes that row "
+        "rather than contradicting it, and never by ingesting again."
     )
 
 
@@ -1796,6 +1878,171 @@ def _run_ingest_resolution(args: argparse.Namespace) -> int:
     _LOGGER.info(
         "resolution ingested ticker=%s outcome=%s resolved_at=%s source=%s sequence=%d",
         event.market_ticker,
+        event.outcome.value,
+        event.payload["resolved_at"],
+        event.source,
+        sequence_number,
+    )
+    return 0
+
+
+def _no_resolution_refusal(market_ticker: str) -> str:
+    """Phrase the refusal for correcting a market that never resolved.
+
+    Args:
+        market_ticker: The market this call named.
+
+    Returns:
+        The operator-facing refusal, naming the verb that *would* apply.
+    """
+    return (
+        f"refusing to correct market_ticker={market_ticker!r}: this ledger "
+        "carries no resolution for that market, so there is nothing to "
+        "supersede. Record it with `windbreak ingest-resolution` instead. "
+        "Nothing was written."
+    )
+
+
+def _wrong_target_refusal(
+    market_ticker: str, named: int, target: int, current: IngestedResolution
+) -> str:
+    """Phrase the refusal for a correction naming the wrong ledger row.
+
+    Args:
+        market_ticker: The market this call named.
+        named: The ``--superseded-sequence-number`` the operator typed.
+        target: The position that actually carries the market's claim.
+        current: The claim that row makes.
+
+    Returns:
+        The operator-facing refusal. It names the correct position rather than
+        only rejecting the wrong one: a refusal with no way forward is the trap
+        this verb exists to remove, and a stale target is exactly what an
+        operator correcting an already-corrected market will type.
+    """
+    return (
+        f"refusing to correct market_ticker={market_ticker!r}: "
+        f"--superseded-sequence-number={named} does not name the row carrying "
+        f"this market's current resolution, which is sequence_number={target} "
+        f"({describe_resolution_claim(current)}). A correction supersedes "
+        "exactly the row it names, so naming any other position would leave "
+        "two rows claiming one market with no rule for which wins. Nothing "
+        f"was written. Re-run with --superseded-sequence-number={target}."
+    )
+
+
+def _no_op_correction_refusal(
+    market_ticker: str, target: int, claim: IngestedResolution
+) -> str:
+    """Phrase the refusal for a correction that changes nothing.
+
+    Args:
+        market_ticker: The market this call named.
+        target: The position being superseded.
+        claim: The claim both the ledger and this call make.
+
+    Returns:
+        The operator-facing refusal.
+    """
+    return (
+        f"refusing to correct market_ticker={market_ticker!r}: this call "
+        f"claims {describe_resolution_claim(claim)}, which is exactly what "
+        f"sequence_number={target} already carries. A correction that changes "
+        "nothing would record an unexplained reversal in an append-only audit "
+        "trail without moving a single metric. Nothing was written."
+    )
+
+
+def _correction_refusal(store: SqliteLedgerStore, event: SettlementReversed) -> str:
+    """Explain why this correction must not be appended, or return ``""``.
+
+    The read-back that makes ``correct-resolution`` safe, on #482's principle:
+    refuse at the verb, never at the fold. The ledger is append-only and
+    :func:`~windbreak.scheduler.weekly_data.weekly_report_body` folds it on
+    *every* tick, so a correction naming a row that does not carry the market's
+    claim would not be a bad record -- it would be a permanent stop on the
+    always-on loop, reachable through a well-formed CLI call. Every refusal
+    here costs the operator one retyped command and names the row to retype.
+
+    Args:
+        store: The open ledger store, read but not yet written.
+        event: The ``SettlementReversed`` event this call would append.
+
+    Returns:
+        The operator-facing refusal, or ``""`` when the append is safe.
+    """
+    ticker = event.market_ticker
+    fold, refusal = _folded_or_refusal(store, "correct", ticker)
+    if fold is None:
+        return refusal
+    current = fold.resolution_of(ticker)
+    if current is None:
+        return _no_resolution_refusal(ticker)
+    target = fold.claim_sequence_numbers[ticker]
+    if target != event.superseded_sequence_number:
+        return _wrong_target_refusal(
+            ticker, event.superseded_sequence_number, target, current
+        )
+    corrected = ingested_resolution_of(event)
+    if not resolutions_conflict(current, corrected):
+        return _no_op_correction_refusal(ticker, target, corrected)
+    return ""
+
+
+def _run_correct_resolution(args: argparse.Namespace) -> int:
+    """Append one ``SettlementReversed`` row superseding a wrong resolution.
+
+    The correction path issue #484 asked for. Before it, a *first*
+    ``ingest-resolution`` call with a wrong ``--outcome`` exited 0, nothing
+    contradicted it, and the append-only ledger carried that false settlement
+    forever -- with every weekly metric folded from it wrong, permanently.
+
+    Nothing is redacted, because nothing on a hash-chained ledger can be: the
+    wrong row stays exactly where it is, and this row supersedes it by naming
+    its ``sequence_number``. Both are visible afterwards, and the weekly
+    report's ``## Resolution corrections`` section names the superseded claim,
+    so a corrected outcome can never be mistaken for one that was right all
+    along.
+
+    The event's own fields are validated *before* the ledger is opened, then
+    the correction is checked *against the ledger* (:func:`_correction_refusal`)
+    before anything is appended.
+
+    Args:
+        args: Parsed ``correct-resolution`` arguments carrying ``ledger_path``,
+            ``market_ticker``, ``superseded_sequence_number``, ``outcome``,
+            ``resolved_at`` and ``source``.
+
+    Returns:
+        The process exit code: 0 once the row is appended, 1 on a refused
+        correction (with the reason logged as a ``FATAL`` critical).
+    """
+    try:
+        event = SettlementReversed(
+            component=_RESOLUTION_INGEST_COMPONENT,
+            market_ticker=args.market_ticker,
+            superseded_sequence_number=args.superseded_sequence_number,
+            outcome=ResolutionOutcome(args.outcome),
+            resolved_at=parse_resolution_instant(args.resolved_at),
+            source=args.source,
+        )
+    except ValueError as exc:
+        _LOGGER.critical("FATAL: %s", exc)
+        return 1
+    store = SqliteLedgerStore(args.ledger_path)
+    try:
+        refusal = _correction_refusal(store, event)
+        if refusal:
+            _LOGGER.critical("FATAL: %s", refusal)
+            return 1
+        sequence_number = store.append(event)
+    finally:
+        store.close()
+    _LOGGER.info(
+        "resolution corrected ticker=%s superseded=%d outcome=%s resolved_at=%s "
+        "source=%s sequence=%d",
+        event.market_ticker,
+        event.superseded_sequence_number,
         event.outcome.value,
         event.payload["resolved_at"],
         event.source,
@@ -3470,6 +3717,7 @@ _COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "anchor": anchor_command,
     "verify": verify_command,
     "ingest-resolution": _run_ingest_resolution,
+    "correct-resolution": _run_correct_resolution,
     "evaluate-providers": _run_evaluate_providers,
     "set-research-budget": _run_set_research_budget,
     "kill": _run_kill,

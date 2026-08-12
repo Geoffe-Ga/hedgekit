@@ -374,9 +374,10 @@ def test_a_contradicting_ingest_exits_one_and_appends_nothing(
         "append-only, so a contradicting row could never be un-written and "
         "every later weekly fold -- one per tick -- would refuse to read it. "
         "Nothing was written. Re-run with the values the ledger already "
-        "carries; correcting a genuinely wrong recorded outcome needs the "
-        "settlement-reversal path, which does not exist yet (issue #484) and "
-        "cannot be improvised by ingesting again."
+        "carries; a genuinely wrong recorded outcome is corrected with "
+        "`windbreak correct-resolution --superseded-sequence-number 1`, which "
+        "supersedes that row rather than contradicting it, and never by "
+        "ingesting again."
     )
 
 
