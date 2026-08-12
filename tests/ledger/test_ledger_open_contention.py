@@ -29,18 +29,21 @@ closed -- loudly, with the cause readable -- when it does not.
 Determinism
 -----------
 
-Nothing here sleeps and nothing asserts on elapsed wall-clock. The lock holder
-is released on a real signal from the opening thread, and every wait is bounded
-by :data:`JOIN_TIMEOUT_SECONDS` with the assertion made on the *outcome*. The
-negative direction needs no timing at all: the budget is zero and the lock is
-never freed, so the refusal is immediate by construction.
+Nothing here sleeps and nothing asserts on elapsed wall-clock. Every wait is
+bounded by :data:`JOIN_TIMEOUT_SECONDS` and every assertion is made on the
+*outcome*.
 
-The one thing these tests do **not** claim: they cannot prove the opener was
-already blocked inside SQLite at the instant the lock was freed, because no
-portable API exposes that. What they do prove is that the opener had not
-finished while the lock was held (it cannot -- the assertion is made before the
-release), that it then succeeded, and that the same setup with the waiting
-removed fails instead.
+The rendezvous is causal rather than hopeful, which matters: a test that simply
+signalled "about to open" and freed the lock could lose the race to a store that
+never waited, and would then pass against the unfixed store. So the holder is
+freed only once SQLite's own statement trace reports the opening thread
+*beginning* the contended statement -- the trace fires as a statement starts,
+before it blocks. In the WAL direction the awaited statement is the retry's own
+``BEGIN IMMEDIATE`` wait, which exists only because the conversion was refused,
+so reaching it *is* the retry having run.
+
+The negative direction needs no rendezvous at all: the budget is zero and the
+lock is never freed, so the refusal is immediate by construction.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -58,8 +61,21 @@ from windbreak.ledger.store import (
     LedgerLockedError,
     SqliteLedgerStore,
 )
+from windbreak.ledger.store import (
+    _CREATE_EVENT_TYPE_INDEX_SQL as CREATE_INDEX_SQL,
+)
+from windbreak.ledger.store import (
+    _CREATE_TABLE_SQL as CREATE_TABLE_SQL,
+)
+from windbreak.ledger.store import (
+    _JOURNAL_MODE_WAL_SQL as JOURNAL_MODE_WAL_SQL,
+)
+from windbreak.ledger.store import (
+    _TAKE_WRITE_LOCK_SQL as TAKE_WRITE_LOCK_SQL,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 #: Bound on every wait in this module. Generous on purpose: it is a deadlock
@@ -104,10 +120,47 @@ def _held_write_lock(db_path: Path, *, in_wal: bool) -> sqlite3.Connection:
     return holder
 
 
-def _assert_opens_and_works_while_locked(
-    db_path: Path, holder: sqlite3.Connection
+def _trace_every_new_connection(
+    monkeypatch: pytest.MonkeyPatch, trace: Callable[[str], None]
 ) -> None:
-    """Open and exercise the contended ledger, freeing ``holder`` once in.
+    """Install ``trace`` on every SQLite connection opened from here on.
+
+    The store makes its own connection, so this is the only way to watch the
+    statements it really executes. Applied *after* a test's lock holder is
+    already open, so the holder is never traced.
+
+    Args:
+        monkeypatch: pytest's attribute patcher, scoped to one test.
+        trace: Called with each SQL statement as SQLite begins running it --
+            crucially *before* the statement blocks, which is what makes it
+            usable as a rendezvous.
+    """
+    real_connect = sqlite3.connect
+
+    def tracing_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        """Open a connection and attach the trace callback to it."""
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracing_connect)
+
+
+def _assert_opens_and_works_while_locked(
+    db_path: Path,
+    holder: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    blocks_on: str,
+) -> None:
+    """Open and exercise the contended ledger, freeing ``holder`` once it blocks.
+
+    The rendezvous is causal, not a guess. SQLite's statement trace fires as a
+    statement *begins* running, so waiting for ``blocks_on`` proves the opening
+    thread has reached the contended statement and is about to sit on the lock
+    this thread still holds. Only then is the lock freed. Without that, a
+    release could win the race to a store that never waited at all, and the test
+    would pass on an unfixed store.
 
     The store's whole lifetime stays on the opening thread: a SQLite connection
     may only be used from the thread that made it, so a store handed back across
@@ -121,18 +174,29 @@ def _assert_opens_and_works_while_locked(
     Args:
         db_path: The contended ledger.
         holder: The connection holding the write lock, freed and closed here.
+        monkeypatch: pytest's attribute patcher, used to trace the store's own
+            connection.
+        blocks_on: The exact statement the opener must reach before the lock is
+            freed -- the statement this direction is about.
     """
     outcome: list[str] = []
     failures: list[Exception] = []
-    entering = threading.Event()
+    reached = threading.Event()
+
+    def note(statement: str) -> None:
+        """Signal once the opener reaches the statement under test."""
+        if statement == blocks_on:
+            reached.set()
+
+    _trace_every_new_connection(monkeypatch, note)
 
     def open_and_use_the_ledger() -> None:
         """Open the contended ledger, append to it, and verify its chain."""
-        entering.set()
         try:
             store = SqliteLedgerStore(db_path)
         except Exception as exc:
             failures.append(exc)
+            reached.set()
             return
         try:
             store.append(ConfigLoaded(component=COMPONENT, config_hash="a", diff={}))
@@ -147,10 +211,10 @@ def _assert_opens_and_works_while_locked(
     opener = threading.Thread(target=open_and_use_the_ledger, name="ledger-opener")
     opener.start()
     try:
-        assert entering.wait(timeout=JOIN_TIMEOUT_SECONDS)
-        # It cannot have finished: this thread still holds the write lock every
-        # statement in the constructor needs. Asserted *before* the release, so
-        # a store that died on contention is caught here rather than below.
+        assert reached.wait(timeout=JOIN_TIMEOUT_SECONDS)
+        # It cannot have finished: this thread still holds the write lock the
+        # statement it just reached needs. Asserted *before* the release, so a
+        # store that died on contention is caught here rather than below.
         assert opener.is_alive()
         holder.rollback()
     finally:
@@ -196,8 +260,66 @@ def test_the_open_busy_timeout_is_windbreaks_own_value_not_the_standard_librarys
         store.close()
 
 
-def test_an_opener_waits_out_a_sibling_holding_the_lock_over_the_schema_create(
+def test_the_open_emits_exactly_these_statements_in_exactly_this_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order of the open sequence is the fix, so it is asserted as a whole.
+
+    ``PRAGMA busy_timeout`` has to come **first**: every statement after it can
+    contend, and the two ``CREATE ... IF NOT EXISTS`` statements wait on it. Set
+    later it would still be readable off the finished connection while having
+    protected nothing, which is the shape of a fix that is not one.
+
+    The sequence is compared for equality, from the real ``__init__``, against
+    the production statement constants rather than a restatement of them -- so a
+    reordering, an extra statement, or a missing one all fail here.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        monkeypatch: pytest's attribute patcher, used to trace the statements.
+    """
+    statements: list[str] = []
+    _trace_every_new_connection(monkeypatch, statements.append)
+
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    store.close()
+
+    assert statements == [
+        f"PRAGMA busy_timeout={LEDGER_BUSY_TIMEOUT_MILLIS}",
+        JOURNAL_MODE_WAL_SQL,
+        CREATE_TABLE_SQL,
+        CREATE_INDEX_SQL,
+    ]
+
+
+def test_the_open_budget_is_the_value_this_deployment_was_sized_for(
     tmp_path: Path,
+) -> None:
+    """Ten seconds, pinned: changing it must be a decision, not a drift.
+
+    Chosen against two bounds, both of which a silent edit would break. It must
+    be far longer than anything windbreak itself holds the write lock for --
+    every write in this package is one row inside its own transaction, and a
+    four-way contended open measured while fixing #328 cleared in at most two
+    attempts and a few milliseconds -- or the shipped simultaneous start fails.
+    And it must be far shorter than an operator's patience with a service that
+    never comes up, because under a restart policy a hang produces no log line
+    at all while a bounded refusal produces one every cycle.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    assert LEDGER_BUSY_TIMEOUT_MILLIS == 10_000
+
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    try:
+        assert store._conn.execute("PRAGMA busy_timeout").fetchone() == (10_000,)
+    finally:
+        store.close()
+
+
+def test_an_opener_waits_out_a_sibling_holding_the_lock_over_the_schema_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A WAL ledger whose table is missing: the opener waits, then opens.
 
@@ -208,14 +330,17 @@ def test_an_opener_waits_out_a_sibling_holding_the_lock_over_the_schema_create(
 
     Args:
         tmp_path: pytest's per-test temporary directory.
+        monkeypatch: pytest's attribute patcher, used for the rendezvous.
     """
     db_path = tmp_path / "ledger.db"
     holder = _held_write_lock(db_path, in_wal=True)
-    _assert_opens_and_works_while_locked(db_path, holder)
+    _assert_opens_and_works_while_locked(
+        db_path, holder, monkeypatch, blocks_on=CREATE_TABLE_SQL
+    )
 
 
 def test_an_opener_waits_out_a_sibling_holding_the_lock_over_the_wal_conversion(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A rollback-journal ledger under a held lock: the opener waits, then opens.
 
@@ -228,10 +353,15 @@ def test_an_opener_waits_out_a_sibling_holding_the_lock_over_the_wal_conversion(
 
     Args:
         tmp_path: pytest's per-test temporary directory.
+        monkeypatch: pytest's attribute patcher, used for the rendezvous.
     """
     db_path = tmp_path / "ledger.db"
     holder = _held_write_lock(db_path, in_wal=False)
-    _assert_opens_and_works_while_locked(db_path, holder)
+    # The rendezvous is the retry's own wait statement, which exists only
+    # because the conversion was refused: reaching it *is* the retry running.
+    _assert_opens_and_works_while_locked(
+        db_path, holder, monkeypatch, blocks_on=TAKE_WRITE_LOCK_SQL
+    )
 
 
 def test_a_lock_that_never_frees_fails_closed_and_loudly_on_the_schema_create(
