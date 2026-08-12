@@ -16,7 +16,8 @@ When all CI checks pass with zero warnings, zero errors, and maximum quality met
 - ✅ Linting: 0 errors, 0 warnings
 - ✅ Type checking: 0 errors
 - ✅ Security: 0 vulnerabilities
-- ✅ Docstring coverage: ≥95%
+- ✅ Docstring coverage: every public symbol, enforced per symbol by ruff `D1`
+  (issue #351) — a presence rule, not a percentage
 - 🏁 Mutation score: ≥80% — **manual pre-v1.0.0 release gate**, not part of the
   automated CI green check (owner directive, issue #107)
 

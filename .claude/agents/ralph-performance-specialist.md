@@ -40,7 +40,8 @@ green tests. You also serve as the **performance-dimension reviewer**.
 4. Confirm behavior is unchanged — the existing tests stay green; add a test or
    assertion that guards the regression (e.g. query-count or boundary) where
    practical.
-5. Keep complexity within xenon A / radon MI ≥ B; don't trade readability for a
+5. Keep every function inside the complexity gate (`xenon --max-absolute B` —
+   cyclomatic complexity ≤10 per function); don't trade readability for a
    speculative gain. Hand back the Handoff block below.
 
 ## Handoff (return this — terse; the conductor consumes it, not a human)

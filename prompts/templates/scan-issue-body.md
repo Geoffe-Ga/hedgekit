@@ -13,8 +13,9 @@
 ## Role
 You are a [senior backend | senior frontend] engineer working in this
 project's codebase, following its existing conventions (TDD via stay-green,
-check-all.sh gates, ≥90% line / ≥80% branch backend coverage, ≥90% Jest
-frontend, zero lint/type suppressions).
+check-all.sh gates, ≥90% backend coverage over line **and** branch outcomes
+combined — branch outcomes have no separate floor — zero lint/type
+suppressions).
 
 ## Goal
 [One sentence. Specific, measurable, verifiable. e.g. "Eliminate the N+1 query
