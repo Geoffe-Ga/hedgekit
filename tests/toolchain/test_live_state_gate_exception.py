@@ -37,7 +37,10 @@ held in a module-level constant is attributed to no function, a value merely
 named in a failure message is a description rather than a read (which is what
 this module's own positive control was flagged for on its first run), and a
 helper in one module called from a test in another is not followed across the
-module boundary. The last hole is made loud rather than left silent --
+module boundary. Functions are keyed by bare name, so two sharing one are
+merged rather than resolved -- deliberately over-attributing, since the
+alternative silently drops one of them. The cross-module hole is made loud
+rather than left silent --
 :func:`test_no_live_state_read_is_unattributed` fails on any module holding a
 live-state read that none of its own tests reach -- but a live-state read
 performed through a module-level constant and a non-subprocess HTTP client
@@ -368,8 +371,30 @@ def _reaches(start: str, calls: Mapping[str, set[str]], seeds: frozenset[str]) -
     return False
 
 
+def _called_names(node: ast.AST) -> set[str]:
+    """Name every function a scope calls, as written.
+
+    Args:
+        node: The scope to read.
+
+    Returns:
+        The callee names, unresolved -- a bare name is all a call site gives.
+    """
+    return {
+        _callee_name(sub.func) for sub in ast.walk(node) if isinstance(sub, ast.Call)
+    }
+
+
 def _analyze(source: str) -> _ModuleAnalysis:
     """Census one module's live-repository-state reads.
+
+    Functions are keyed by BARE NAME, because a bare name is all a call site
+    offers. Two functions in one module can share one -- two test classes with
+    a same-named helper, say -- so their entries are MERGED rather than
+    overwritten: a name is a seed if any function bearing it reads live state,
+    and it calls the union of what they all call. That resolves a collision by
+    over-attributing rather than by losing one side, which is the only safe
+    direction here; the opposite makes a live read invisible.
 
     Args:
         source: The module's source text.
@@ -379,25 +404,20 @@ def _analyze(source: str) -> _ModuleAnalysis:
     """
     tree = ast.parse(source)
     docstrings = _docstring_ids(tree)
-    functions = {
-        node.name: node
+    functions = [
+        node
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
+    ]
     seeds = frozenset(
-        name for name, node in functions.items() if _reads_live_state(node, docstrings)
+        node.name for node in functions if _reads_live_state(node, docstrings)
     )
-    calls = {
-        name: {
-            _callee_name(sub.func)
-            for sub in ast.walk(node)
-            if isinstance(sub, ast.Call)
-        }
-        for name, node in functions.items()
-    }
+    calls: dict[str, set[str]] = {}
+    for node in functions:
+        calls.setdefault(node.name, set()).update(_called_names(node))
     tests = frozenset(
         name
-        for name in functions
+        for name in calls
         if name.startswith("test_") and _reaches(name, calls, seeds)
     )
     return _ModuleAnalysis(seeds=seeds, live_state_tests=tests)
@@ -569,6 +589,71 @@ def test_a_ruleset_gates_main():
     assert _rulesets()
 '''
 
+#: Two colliding helper names, carrying the live read in OPPOSITE definition
+#: orders: `_alpha`'s live half is written first, `_beta`'s second. A census
+#: keyed by bare name that keeps one node per name therefore loses exactly one
+#: of them whichever way it resolves -- last write wins loses `_alpha`, first
+#: write wins loses `_beta` -- and only merging keeps both.
+#: `test_a_name_collision_cannot_hide_a_live_read` pins that it does.
+_COLLISION_CONTROL = '''
+"""Two colliding helper names, one live read in each definition order."""
+
+import subprocess
+
+
+class TestAlphaLive:
+    """Holds the live half of the `_alpha` collision, defined FIRST."""
+
+    def _alpha(self):
+        """Read live repository state."""
+        return subprocess.run(
+            ["gh", "api", "repos/{owner}/{repo}/rulesets"], check=False
+        )
+
+    def test_alpha_live(self):
+        """Assert on the live read."""
+        assert self._alpha()
+
+
+class TestAlphaLocal:
+    """Holds the local half of the `_alpha` collision, defined SECOND."""
+
+    def _alpha(self):
+        """Read something local."""
+        return "pyproject.toml"
+
+    def test_alpha_local(self):
+        """Assert on the local read."""
+        assert self._alpha()
+
+
+class TestBetaLocal:
+    """Holds the local half of the `_beta` collision, defined FIRST."""
+
+    def _beta(self):
+        """Read something local."""
+        return "pyproject.toml"
+
+    def test_beta_local(self):
+        """Assert on the local read."""
+        assert self._beta()
+
+
+class TestBetaLive:
+    """Holds the live half of the `_beta` collision, defined SECOND."""
+
+    def _beta(self):
+        """Read live repository state."""
+        return subprocess.run(
+            ["gh", "api", "repos/{owner}/{repo}/branches/main/protection"],
+            check=False,
+        )
+
+    def test_beta_live(self):
+        """Assert on the live read."""
+        assert self._beta()
+'''
+
 #: A module that talks about live reads without performing one. The prose here
 #: is denser than the real module's, on purpose: a substring detector reports
 #: this as a live-state check, and an AST detector does not. The second test is
@@ -621,6 +706,37 @@ def test_the_detector_fires_on_a_live_repository_state_read() -> None:
         "the detector did not attribute the live read to the test that calls "
         f"it; it reported {sorted(analysis.live_state_tests)}. Call-graph "
         "propagation is broken, so only tests reading state inline count."
+    )
+
+
+def test_a_name_collision_cannot_hide_a_live_read() -> None:
+    """Two functions sharing a name merge, so neither side can be dropped.
+
+    Functions are keyed by bare name, because a bare name is all a call site
+    gives. A plain `{node.name: node}` census keeps one node per name, and the
+    live read would vanish from the census while the suite went on performing
+    it -- the silent gap this module exists to close, reappearing inside the
+    module itself. The control carries the live half of one collision first and
+    of the other second, so no single-winner rule can pass this: last write
+    wins loses `_alpha`, first write wins loses `_beta`.
+    """
+    analysis = _analyze(_COLLISION_CONTROL)
+
+    assert analysis.seeds == frozenset({"_alpha", "_beta"}), (
+        f"the detector reported seeds {sorted(analysis.seeds)}; both `_alpha` "
+        "and `_beta` name a function that reads live state. A missing one "
+        "means the census keeps a single node per name and drops the rest, so "
+        "which read is visible depends on definition order."
+    )
+    assert analysis.live_state_tests == frozenset(
+        {"test_alpha_live", "test_alpha_local", "test_beta_live", "test_beta_local"}
+    ), (
+        "merging resolves a collision by over-attributing: all four tests call "
+        "a name that some function bearing it reads live state through, and a "
+        "bare name cannot tell the callees apart. Naming all four costs a "
+        "documentation line; naming fewer means guessing, and a wrong guess "
+        f"loses a read. The detector reported "
+        f"{sorted(analysis.live_state_tests)}."
     )
 
 
