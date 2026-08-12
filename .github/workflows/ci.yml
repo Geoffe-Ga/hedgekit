@@ -135,6 +135,28 @@ jobs:
         run: pytest -m chaos --no-cov -v
 
   container:
+    # THE NAME BELOW IS TRUNCATED ON PURPOSE, AND MUST NOT BE "FIXED" ALONE.
+    #
+    # In YAML a `#` preceded by whitespace opens a comment inside an unquoted
+    # scalar, so `End-to-End Container Tier (epic #465)` parses as
+    # `End-to-End Container Tier (epic`. Measured, not inferred: `gh api
+    # .../actions/runs/<id>/jobs` reports the check run under the truncated
+    # string, and `job.name` is what GitHub matches required status checks
+    # against. Branch protection therefore requires the truncated context,
+    # because that is the only context this job will ever report.
+    #
+    # Quoting the scalar here -- the obvious tidy-up -- silently renames the
+    # check run. The required context would then be one no job produces, and
+    # EVERY pull request on this repository would block forever on a check
+    # that simply never appears. Both halves have to move together, and the
+    # protection setting is not editable from a pull request, so the only safe
+    # order is: (1) the repo owner drops the container context from branch
+    # protection, (2) the quoting change merges, (3) the owner re-adds the
+    # context under the full quoted name.
+    #
+    # tests/e2e/test_tier_selection_contract.py reads this name and the live
+    # protection contexts and fails if they ever disagree, in either
+    # direction. That guard is what makes the truncation safe to leave.
     name: End-to-End Container Tier (epic #465)
     runs-on: ubuntu-latest
     steps:
@@ -156,14 +178,31 @@ jobs:
           pip install -c constraints-quality.txt -r requirements-dev.txt
           pip install -e . -c constraints-quality.txt
 
+      - name: Build the distribution the wheel tier installs (issue #467)
+        # tests/e2e/test_installed_wheel.py asserts on the WHEEL, in a clean
+        # virtualenv -- not on the checkout. It therefore needs `dist/` to hold
+        # exactly one wheel before pytest starts. The `build` job below produces
+        # its own copy for `twine check` and the release artifact; duplicating
+        # ~10s of `python -m build` here is cheaper than making this job wait on
+        # that one, which would put a second job on the critical path of every
+        # merge to serialise two things that have no real dependency.
+        run: |
+          pip install build
+          python -m build --outdir dist
+          ls -l dist/
+
       - name: Report the runtimes this job actually has
-        # Printed, not asserted. The tier SKIPS where a runtime is absent, so a
-        # silent skip would otherwise read as a pass; this line is what makes
-        # the log answer "did it really run?" without opening the test output.
+        # Printed, not asserted. This job's tests skip where a runtime is
+        # absent, so a silent skip would otherwise read as a pass; this line is
+        # what makes the log answer "did it really run?" without opening the
+        # test output. WINDBREAK_E2E_REQUIRE_RUNTIME below is the enforcement
+        # that goes with it.
         run: |
           docker info --format 'docker daemon: {{.ServerVersion}}' || echo 'docker daemon: UNAVAILABLE'
           test -d /run/systemd/system && echo 'systemd: running' || echo 'systemd: NOT running'
           command -v systemd-analyze >/dev/null && echo 'systemd-analyze: present' || echo 'systemd-analyze: absent'
+          ls dist/*.whl >/dev/null 2>&1 && echo "built wheel: $(ls dist/*.whl)" || echo 'built wheel: ABSENT'
+          echo "fail-closed on a missing runtime: WINDBREAK_E2E_REQUIRE_RUNTIME=1"
 
       - name: Container tier (docker / systemd end-to-end)
         # This is NOT a gate weakening, and it is the same reasoning the chaos
@@ -187,6 +226,17 @@ jobs:
         # addopts, because pytest takes the LAST -m it is given. --strict-markers
         # and --strict-config stay active (we deliberately avoid --override-ini
         # and -o addopts=, which would silently drop them).
+        env:
+          # THE SKIP HAZARD, decided deliberately (issues #467, #468). This job
+          # is a REQUIRED check under branch protection, and a required check
+          # that skips reports success — the CI-level form of a corpus scan
+          # asserting over zero hits. Locally a skip is right: not every
+          # developer has a docker daemon, and a tier that errored there would
+          # simply be deleted. Here the runtimes are provisioned deliberately,
+          # so a missing one means the provisioning broke and the gate quietly
+          # stopped gating. This flag makes `tests.e2e.harness.require_runtime`
+          # FAIL instead of skip, naming what was missing.
+          WINDBREAK_E2E_REQUIRE_RUNTIME: "1"
         run: pytest -m container --no-cov -v
 
   build:

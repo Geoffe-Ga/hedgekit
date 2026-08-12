@@ -50,7 +50,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tests.deploy import artifacts
-from tests.e2e.harness import RUNTIME_PROBE_TIMEOUT_SECONDS, systemd_skip_reason
+from tests.e2e.harness import (
+    RUNTIME_PROBE_TIMEOUT_SECONDS,
+    require_runtime,
+    systemd_skip_reason,
+)
 from windbreak.main import PROCESS_CHOICES, build_parser
 
 if TYPE_CHECKING:
@@ -292,14 +296,27 @@ def test_exactly_one_process_activates_the_paper_loop() -> None:
 
 @pytest.fixture
 def _systemd_runtime() -> Iterator[None]:
-    """Skip the requesting test unless systemd is the running init system.
+    """Gate the requesting test on systemd being the running init system.
+
+    Routed through :func:`tests.e2e.harness.require_runtime` rather than
+    calling `pytest.skip` directly, and the difference is the whole point.
+    These tests carry the `container` marker, so their only CI home is the
+    container job -- a REQUIRED status check, which sets
+    ``WINDBREAK_E2E_REQUIRE_RUNTIME=1``. A required check that skips reports
+    success. Calling `pytest.skip` here meant `systemd-analyze verify` over the
+    four shipped units would vanish silently the day a runner stopped running
+    systemd, and the gate would go on reporting green over four fewer
+    assertions.
+
+    That was latent, not theoretical: `harness.py` documents the fail-closed
+    flag as making it "impossible" for any gate in the tier to skip, and this
+    fixture was the counterexample that made the claim false. One call site,
+    one universal quantifier restored.
 
     Yields:
         ``None``, once the runtime has been confirmed present.
     """
-    reason = systemd_skip_reason()
-    if reason is not None:
-        pytest.skip(reason)
+    require_runtime(systemd_skip_reason())
     yield
 
 
