@@ -63,7 +63,8 @@ from typing import TYPE_CHECKING
 
 from windbreak.evaluation.costs import aggregate_research_costs
 from windbreak.evaluation.ingest import (
-    ingested_resolutions_from_records,
+    fold_resolutions,
+    render_correction_lines,
     resolution_instants,
     resolution_outcomes,
 )
@@ -303,7 +304,10 @@ def weekly_report_body(records: list[LedgerRecord], *, today: date) -> str:
 
     Every ``ForecastCreated`` record is folded into a :class:`FixtureForecast`
     and a research-cost source; non-forecast records are ignored. Every
-    ``MarketResolved`` record is folded into the run's ground truth, and every
+    ``MarketResolved`` record is folded into the run's ground truth -- with
+    every ``SettlementReversed`` correction applied on top, and each superseded
+    claim named in the report's ``## Resolution corrections`` section, which
+    appears only when a correction exists (issue #484) -- and every
     forecast is then gated against it: one whose market never resolved is still
     rejected ``UNRESOLVED``, one created after its market settled is rejected
     ``BACKDATED``, and one that predates the ledger's deployment marker is
@@ -342,7 +346,8 @@ def weekly_report_body(records: list[LedgerRecord], *, today: date) -> str:
         forecast, cost_row = _forecast_from_record(record)
         forecasts.append(forecast)
         cost_rows.append(cost_row)
-    resolutions = ingested_resolutions_from_records(records)
+    fold = fold_resolutions(records)
+    resolutions = fold.resolutions
     outcomes = resolution_outcomes(resolutions)
     inputs = EvaluationInputs(
         forecasts=tuple(forecasts),
@@ -359,4 +364,5 @@ def weekly_report_body(records: list[LedgerRecord], *, today: date) -> str:
         equity_lines=render_equity_lines(equity_curve_read_model(records)),
         position_lines=render_position_lines(positions_read_model(records)),
         decision_lines=render_decision_lines(selector_decisions_read_model(records)),
+        correction_lines=render_correction_lines(fold.corrections),
     )

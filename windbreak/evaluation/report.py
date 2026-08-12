@@ -730,6 +730,7 @@ def render_weekly_report(
     equity_lines: str | None = None,
     position_lines: str | None = None,
     decision_lines: str | None = None,
+    correction_lines: str | None = None,
 ) -> str:
     """Render the weekly PAPER-loop report as markdown (pure, no I/O).
 
@@ -762,6 +763,15 @@ def render_weekly_report(
         decision_lines: The pre-rendered ``## Decisions`` body (from
             :func:`windbreak.reports.sections.render_decision_lines`) embedded
             verbatim, or ``None`` for the ``No data yet.`` fallback.
+        correction_lines: The pre-rendered ``## Resolution corrections`` body
+            (from
+            :func:`windbreak.evaluation.ingest.render_correction_lines`), or
+            ``None`` to omit the section **entirely**. This is the one section
+            with no ``No data yet.`` fallback, deliberately (issue #484):
+            overturning a settled outcome is an extraordinary act, and a
+            heading that appears on every report -- almost always empty -- is a
+            heading operators learn to skip. Its presence is the signal. It is
+            rendered first, above the metrics its corrections moved.
 
     Returns:
         The rendered markdown body.
@@ -770,8 +780,12 @@ def render_weekly_report(
     equity_body = _NO_DATA_YET if equity_lines is None else equity_lines
     position_body = _NO_DATA_YET if position_lines is None else position_lines
     decision_body = _NO_DATA_YET if decision_lines is None else decision_lines
-    sections = [
-        f"# Weekly report {stamp}",
+    sections = [f"# Weekly report {stamp}"]
+    if correction_lines is not None:
+        sections.append(
+            _render_weekly_section("Resolution corrections", correction_lines)
+        )
+    sections += [
         _render_weekly_section("Equity vs floor", equity_body),
         _render_weekly_section("Positions", position_body),
         _render_weekly_section("Decisions", decision_body),
