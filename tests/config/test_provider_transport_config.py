@@ -66,29 +66,57 @@ def test_retry_defaults_mirror_the_forecast_engines_own_constants() -> None:
     assert retry.backoff_base_ms == DEFAULT_BACKOFF_BASE_MS
 
 
-def test_price_defaults_agree_with_the_engines_default_price_table() -> None:
-    """Where the two tables overlap they must not disagree on a price."""
+def test_price_defaults_are_mirror_equal_to_the_engines_default_price_table() -> None:
+    """The two tables state the same providers at the same prices, both ways.
+
+    Strengthened from a one-directional overlap check by issue #555. An overlap
+    check passes whenever one table prices a provider the other omits, which is
+    exactly the disagreement #555 found: the engine priced ``futuresearch`` at
+    ``500_000`` while the configuration deliberately omitted it, so the engine
+    could price a call this configuration never budgeted for. Comparing the
+    whole mappings is the only form of this assertion that can fail on that.
+    """
     configured = {
         price.provider: price.price_micros for price in ProviderTransportConfig().prices
     }
     engine = dict(DEFAULT_PROVIDER_PRICE_TABLE.prices_micros)
 
-    assert all(engine[provider] == price for provider, price in configured.items())
+    assert configured == engine
 
 
-def test_price_defaults_cover_exactly_the_live_routable_providers() -> None:
-    """The default table must not advertise a provider the root would refuse.
+def test_price_defaults_cover_exactly_the_completion_routed_providers() -> None:
+    """The table prices exactly the providers a per-attempt price is charged for.
 
-    ``futuresearch`` is priced by the *engine's* table but has no routed
-    completion transport (its provider does its own research and is not an
-    ``LlmTransport``), so listing it here would imply live support that startup
-    validation then rejects.
+    A per-attempt list price is the affordability estimate
+    ``RetryingProvider`` gates on, and only a vote riding the routed completion
+    seam is wrapped in that layer. ``futuresearch`` is live-routable since #555
+    but is *not* completion-routed: it reports its own ``cost_usd`` and falls
+    back to ``forecast.futuresearch.per_call_ceiling_micros``, so a list price
+    for it would be a figure nothing ever charges.
     """
-    from windbreak.scheduler.provider_wiring import routable_live_providers
+    from windbreak.scheduler.provider_wiring import completion_routed_providers
 
     configured = {price.provider for price in ProviderTransportConfig().prices}
 
-    assert configured == routable_live_providers()
+    assert configured == completion_routed_providers()
+
+
+def test_the_research_forecaster_is_routable_but_unpriced_by_this_table() -> None:
+    """Pins the two sets apart, so neither can silently absorb the other.
+
+    Without this, widening ``completion_routed_providers`` to equal
+    ``routable_live_providers`` would leave the test above green while
+    reintroducing the per-attempt price #555 removed.
+    """
+    from windbreak.scheduler.provider_wiring import (
+        FUTURESEARCH_PROVIDER,
+        completion_routed_providers,
+        routable_live_providers,
+    )
+
+    assert FUTURESEARCH_PROVIDER in routable_live_providers()
+    assert FUTURESEARCH_PROVIDER not in completion_routed_providers()
+    assert FUTURESEARCH_PROVIDER not in DEFAULT_PROVIDER_PRICE_TABLE.prices_micros
 
 
 def test_token_rate_defaults_mirror_the_engines_own_rate_table() -> None:

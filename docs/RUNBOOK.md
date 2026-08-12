@@ -246,11 +246,15 @@ windbreak run --paper-books-dir ... --cassette-path ... --ledger-path ... \
   claim about the other five. `tests/scheduler/test_paper_intent_barriers.py`
   drives the real tick over the real shipped composition and pins each barrier
   with the exact values it records.
-- **Every live vote is retried and priced.** `RetryingProvider` bounds attempts,
-  the total deadline, backoff, and spend from the `retry` block above, and
-  charges each failed attempt against the `prices` table. The cassette path is
-  deliberately *not* wrapped: billing a list price for a replayed call would
-  corrupt the cost accounting the table exists to keep honest.
+- **Every live completion-seam vote is retried and priced.** `RetryingProvider`
+  bounds attempts, the total deadline, backoff, and spend from the `retry` block
+  above, and charges each failed attempt against the `prices` table. The
+  cassette path is deliberately *not* wrapped: billing a list price for a
+  replayed call would corrupt the cost accounting the table exists to keep
+  honest. A hosted research forecaster is not wrapped either, for a different
+  reason -- it prices itself; see "Running a hosted research forecaster" below.
+  `prices` therefore covers exactly the providers riding the completion seam,
+  mirror-equal to the forecast engine's own default table.
 - **Budget headroom.** `forecast.budget.per_forecast_micros` defaults to
   `6060000` -- the Stage-0 triage prior (`60000`) plus the fixed research charge
   (`3000000`) plus the default three-member ensemble's worst case, which
@@ -261,6 +265,86 @@ windbreak run --paper-books-dir ... --cassette-path ... --ledger-path ... \
   forecast at all. Raising either money ceiling also changes
   `screener.max_candidates_per_tick`, which is derived as
   `per_day_micros // per_forecast_micros`.
+
+### Running a hosted research forecaster (issue #555)
+
+A **research forecaster** is the second family of ensemble member (ADR-0005):
+instead of voting on the quotes the pipeline already gathered and verified, it
+does its own research server-side and returns one structured probability. It is
+selected the same way any other member is -- by name, in
+`forecast.vote_ensemble` -- and it is the only vote in the system whose cost is
+a **reported actual** rather than a flat constant.
+
+```yaml
+forecast:
+  vote_ensemble:
+    - {provider: futuresearch, model_version: "fs-2026-06-01", training_cutoff: "server-managed"}
+    - {provider: anthropic, model_version: "claude-sonnet-4-5-20250929", training_cutoff: "2025-07-31"}
+    - {provider: openai, model_version: "gpt-5-2025-08-07", training_cutoff: "2024-09-30"}
+
+  futuresearch:
+    endpoint_url: "https://your-forecaster.example/v1/forecast"
+    # Must contain every `model_version` a futuresearch member above pins.
+    pinned_forecaster_versions: ["fs-2026-06-01"]
+    api_key_env: FUTURESEARCH_API_KEY
+    # Charged when a response reports no cost of its own. Never zero.
+    per_call_ceiling_micros: 2000000
+    reject_on_version_drift: true
+
+  provider_transport:
+    mode: live
+```
+
+```bash
+export FUTURESEARCH_API_KEY=replace-with-a-real-key
+```
+
+A committed, runnable example of this arrangement lives at
+`tests/fixtures/config/research-forecaster.yaml`; the tick it drives end to end
+is pinned by `tests/integration/test_paper_research_forecaster.py`.
+
+- **It rides its own seam, not the completion transport.** The pinned-LLM
+  members go through one routed completion transport; a research forecaster is
+  a `ForecastProvider` over its own credentialed, single-host HTTP transport.
+  That is why it is absent from `provider_transport.prices` (see below) and why
+  it has its own config section rather than a `prices` row.
+- **Its cost is measured, not assumed.** The response's own `cost_usd` is
+  converted round-ceiling to micros and booked. A response that reports no
+  usable cost is charged `config.forecast.futuresearch.per_call_ceiling_micros`
+  -- fail-closed, never zero, so an unmeasurable call can never read as free.
+  Set that ceiling to the most one call could plausibly cost.
+- **It is deliberately not wrapped in `RetryingProvider`.** That wrapper exists
+  because an LLM vote cannot price itself; it charges a completed vote the rate
+  table's fail-closed `unmetered_micros` when a response reports no token
+  counts. A research response reports *dollars*, so wrapping would add a flat
+  constant on top of a measurement. The consequence to know: a research
+  forecaster gets **no bounded retry and no per-attempt affordability pre-gate**
+  -- a transient upstream fault discards that one vote rather than retrying it.
+  Its spend is still bounded, by `per_call_ceiling_micros` per call and by
+  `forecast.budget.per_forecast_micros` / `per_day_micros` overall.
+- **It counts as an ordinary ensemble member.** It counts toward the two-vote
+  quorum, joins the median, and widens or narrows dispersion exactly like a
+  no-tools LLM vote -- ADR-0005's whole point is that the pipeline cannot tell
+  the two families apart.
+- **It is gated on its own track record.** `forecast.provider_gate` is keyed by
+  provider, so `futuresearch` needs its own `min_resolved` resolved forecasts
+  before any forecast it backs is live-eligible. Until then the tick still
+  produces forecasts; they are simply not live-eligible, and a
+  `ProviderGateHeld` row says so.
+- **Both fields must agree before egress opens.** Its endpoint host reaches the
+  outbound allowlist only when a `vote_ensemble` member names the provider *and*
+  `config.forecast.futuresearch.endpoint_url` parses to a host. Writing the
+  endpoint down alone admits nothing.
+- **A half-configuration refuses to start, naming the leaf.** A placeholder
+  `endpoint_url`, a blank `api_key_env`, a member `model_version` absent from
+  `pinned_forecaster_versions`, or a non-positive `per_call_ceiling_micros` each
+  abort composition with the dotted key to fix. The version check is not
+  pedantry: the vote ledger stamps the *member's* pinned version while the
+  forecast record stamps the version the *response* reported, so letting them
+  differ writes two different models into one forecast's audit trail.
+- **Configuration names the variable; it never holds the key.** As with every
+  other provider, `api_key_env` carries a variable *name* and only
+  `windbreak.main` reads its value.
 
 ### Sizing the research fetch cache (issue #453)
 

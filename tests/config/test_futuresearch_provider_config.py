@@ -172,3 +172,60 @@ def test_unknown_key_under_futuresearch_is_fatal(
     message = str(excinfo.value)
     assert "forecast.futuresearch.bogus_key" in message
     assert "unknown keys are fatal per SPEC §16" in message
+
+
+# --- The section names a variable; it never holds a key (issue #555) -----------
+
+
+def test_the_api_key_leaf_names_an_environment_variable_not_a_secret() -> None:
+    """The key leaf is an env-var *name*, matching the repo's ``*_api_key_env``.
+
+    Asserted by shape rather than against a literal: an upper-snake-case
+    identifier is what an environment variable name looks like, and no real
+    credential does. Since issue #555 this section is actually consumed by the
+    composition root, so the rule now has teeth it did not have while the
+    section was inert -- a value here would be flattened verbatim into the
+    hash-chained ``ConfigLoaded`` event and be unremovable from the audit trail.
+    """
+    variable = FutureSearchProviderSettings().api_key_env
+
+    assert variable.isupper()
+    assert variable.replace("_", "").isalnum()
+    assert "FUTURESEARCH" in variable
+
+
+def test_no_futuresearch_leaf_is_spelled_as_a_bare_secret() -> None:
+    """No leaf name suggests it holds a key itself rather than naming its var."""
+    suspicious = [
+        field.name
+        for field in dataclasses.fields(FutureSearchProviderSettings)
+        if ("key" in field.name or "token" in field.name or "secret" in field.name)
+        and not field.name.endswith("_env")
+    ]
+
+    assert suspicious == []
+
+
+def test_only_the_cli_composition_root_reads_the_key_variables_value() -> None:
+    """``os.environ`` is reachable from ``windbreak.main`` alone on this path.
+
+    The rule the alert sinks and the LLM transports already follow, restated as
+    a corpus scan so a later edit cannot quietly move the read into the
+    scheduler or the forecast engine, where the value would sit beside the
+    ledger writer. The scan is anchored on a module that *does* match, so it
+    cannot pass by finding nothing.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "windbreak"
+    pattern = re.compile(r"\bapi_key_env\b")
+    sources = {
+        path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+        for path in root.rglob("*.py")
+    }
+    mentions = {name for name, text in sources.items() if pattern.search(text)}
+    readers = {name for name in mentions if "os.environ" in sources[name]}
+
+    assert mentions, "the corpus scan found no `api_key_env` at all"
+    assert readers == {"main.py"}

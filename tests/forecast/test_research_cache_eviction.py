@@ -728,7 +728,12 @@ def _live_provider_http(body: str) -> LiveProviderHttp:
     Returns:
         A `LiveProviderHttp` with no LLM routes and canned research seams.
     """
-    return LiveProviderHttp(llm={}, search=_CannedHttp(body), fetch=_CannedHttp(body))
+    return LiveProviderHttp(
+        llm={},
+        search=_CannedHttp(body),
+        fetch=_CannedHttp(body),
+        futuresearch=None,
+    )
 
 
 def _config_with_cache_cap(cap: int) -> WindbreakConfig:
