@@ -76,8 +76,8 @@ recall) is identical in both modes. Wherever the steps below say
 | `references/detection-playbook.md` | The Two-Signal Rule, the toolbox→category map, grep recipes, the weekly run procedure, and the precision calibration. |
 | `references/issue-templates.md` | Standalone-finding and epic templates, the exact labels Ralph's picker honors, `gh` filing recipes, and the pre-file checklist. |
 
-`scripts/collect-evidence.sh` runs the read-only toolbox and writes a complete
-evidence bundle to the scratchpad.
+`.claude/skills/de-slopify/scripts/collect-evidence.sh` runs the read-only
+toolbox and writes a complete evidence bundle to the scratchpad.
 
 ## Instructions
 
@@ -94,8 +94,10 @@ and playbook). Understand the NOT-slop guard list before you flag anything.
 EVID=$(bash .claude/skills/de-slopify/scripts/collect-evidence.sh | tail -1)
 ```
 
-This runs ruff, vulture, radon, mypy, bandit, interrogate, pip-audit (backend);
-eslint, tsc (frontend); the grep heuristics; and git churn — capturing each
+`.claude/skills/de-slopify/scripts/collect-evidence.sh` runs ruff (including
+`--select D1` for missing docstrings), vulture, radon, mypy, bandit, pip-audit
+and detect-secrets (backend); eslint, tsc (frontend); the grep heuristics; and
+git churn — capturing each
 into `$EVID`. It never modifies files and never aborts on a tool error. Read
 `$EVID/README.txt`, then work through every output file. Supplement with
 targeted `Grep`/`Read` as candidates emerge.

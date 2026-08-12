@@ -84,7 +84,7 @@ gates, thresholds, anti-bypass, and minimal-change rules.
 **Issue #812**: in `backend/src/domain/billing.py`, correct the period-bucket
 math at the boundary using the existing `period_bucket()` helper; no schema
 change. Turn the regression test green, refactor the boundary branch for
-clarity, confirm `scripts/backend/check-all.sh` passes.
+clarity, confirm `scripts/check-all.sh` passes.
 
 ---
 
