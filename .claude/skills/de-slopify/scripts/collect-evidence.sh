@@ -8,11 +8,12 @@
 # a complete evidence bundle to corroborate against.
 #
 # Usage:
-#   scripts/collect-evidence.sh [OUTPUT_DIR]
+#   .claude/skills/de-slopify/scripts/collect-evidence.sh [OUTPUT_DIR]
 #
 # OUTPUT_DIR defaults to "$SCRATCHPAD/deslop-evidence" if SCRATCHPAD is set,
 # else a mktemp dir. The chosen directory is printed on the last line so a
-# caller can capture it:  EVID=$(scripts/collect-evidence.sh | tail -1)
+# caller can capture it:
+#   EVID=$(.claude/skills/de-slopify/scripts/collect-evidence.sh | tail -1)
 #
 # Exit codes: 0 always (collection is best-effort). 2 only on a setup error
 # (no git repo / cannot create output dir).
@@ -80,7 +81,9 @@ if [[ -d "$PY_SRC" ]]; then
   run radon-mi.txt         radon mi "$PY_SRC" -s
   run mypy.txt             mypy "$PY_SRC" --config-file="$BACKEND/pyproject.toml"
   run bandit.json          bandit -r "$PY_SRC" -f json -c "$BACKEND/.bandit"
-  run interrogate.txt      interrogate "$PY_SRC" -v
+  # Docstring presence is ruff's D1 family, not interrogate: this repo chose
+  # ruff over a second tool that measures the same thing (issue #351).
+  run ruff-docstrings.txt  ruff check "$PY_SRC" --select D1 --output-format=concise
   run pip-audit.txt        pip-audit -r "$BACKEND/requirements.txt"
   run detect-secrets.txt   detect-secrets scan "$PY_SRC"
 fi
