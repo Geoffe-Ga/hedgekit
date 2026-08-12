@@ -426,6 +426,32 @@ def test_the_normal_write_path_is_byte_identical(tmp_path: Path) -> None:
     ]
 
 
+def test_write_weekly_stub_creates_a_missing_parent_of_the_report_directory(
+    tmp_path: Path,
+) -> None:
+    """A nested report directory is created whole, parents included.
+
+    An operator's `--report-dir` is routinely more than one level below
+    anything that exists (`/var/lib/windbreak/reports`), and the `mkdir` that
+    creates it is the call the unified guard now wraps. Pinned because nothing
+    else observed it: every other test hands `write_weekly_stub` a path whose
+    parent already exists, so dropping `parents=True` changed no assertion --
+    a surviving mutant found while mutating this module for #551.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    from windbreak.reports.weekly import write_weekly_stub
+
+    report_dir = tmp_path / "var" / "lib" / "windbreak" / "reports"
+    assert not report_dir.parent.exists()
+
+    path = write_weekly_stub(report_dir, today=_A_WEDNESDAY)
+
+    assert report_dir.is_dir()
+    assert path.read_bytes() == _A_WEDNESDAY_STUB.encode("utf-8")
+
+
 def test_a_body_factory_failure_is_never_diagnosed_as_a_directory_fault(
     tmp_path: Path,
 ) -> None:
