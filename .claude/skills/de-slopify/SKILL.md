@@ -97,8 +97,8 @@ EVID=$(bash .claude/skills/de-slopify/scripts/collect-evidence.sh | tail -1)
 `.claude/skills/de-slopify/scripts/collect-evidence.sh` runs ruff (including
 `--select D1` for missing docstrings), vulture, radon, mypy, bandit, pip-audit
 and detect-secrets (backend); eslint, tsc (frontend); the grep heuristics; and
-git churn — capturing each
-into `$EVID`. It never modifies files and never aborts on a tool error. Read
+git churn — capturing each into `$EVID`. It never modifies files and never
+aborts on a tool error. Read
 `$EVID/README.txt`, then work through every output file. Supplement with
 targeted `Grep`/`Read` as candidates emerge.
 

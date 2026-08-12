@@ -22,9 +22,8 @@ as the **documentation-dimension reviewer**.
 - **Owns**: Python docstrings (Google style, per `[tool.ruff.lint.pydocstyle]`;
   ruff `D1` requires one on **every** public module, class, method and function —
   there is no percentage to fall below), TypeScript TSDoc on exported APIs,
-  README/module docs for new
-  surfaces, usage examples, and ADRs for architectural decisions. Apply the repo
-  `documentation` skill.
+  README/module docs for new surfaces, usage examples, and ADRs for
+  architectural decisions. Apply the repo `documentation` skill.
 - **Does NOT own**: code logic (→ ralph-implementation-specialist) or design decisions
   (→ ralph-chief-architect). You document what is, accurately.
 
