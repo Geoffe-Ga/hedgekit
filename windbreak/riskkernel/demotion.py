@@ -16,7 +16,9 @@ Resolution is table-driven, mirroring the ``_ALLOWED_TRANSITIONS`` style of
   ``KILLED``).
 
 The kernel-level :meth:`RiskKernel.fire_demotion_trigger` builds on this pure
-resolver to ledger each firing.
+resolver to ledger each firing. That method has no production caller, so while
+this resolver is correct and exhaustively tested, no shipped path fires a
+trigger through it (issue #542).
 """
 
 from __future__ import annotations

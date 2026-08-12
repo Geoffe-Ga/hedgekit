@@ -478,9 +478,14 @@ class RiskKernel:
         rest -- stays caller-supplied; callers must run
         :func:`windbreak.riskkernel.evidence.anchor_gate_evidence` before
         building evidence, which re-derives ``paper_window_days`` from the
-        registered plan's ``paper_clock_start`` (SPEC S13.6). The CLI
-        composition root (:func:`windbreak.main._build_risk_kernel`) hands the
-        kernel the same ``--ledger-path`` store as its ``gate_plan_store``, so a
+        registered plan's ``paper_clock_start`` (SPEC S13.6). That obligation is
+        currently vacuous: **no code under ``windbreak/`` calls this method**, so
+        the ladder never promotes itself in the shipped system and the only
+        callers are tests (issue #542, which asks the owner to decide whether
+        promotion should be automatic, operator-invoked, or stay deferred). The
+        CLI composition root (:func:`windbreak.main._build_risk_kernel`) hands
+        the kernel the same ``--ledger-path`` store as its ``gate_plan_store``,
+        so a
         ``--process riskkernel`` run reads that registration rather than failing
         closed (issue #246).
 
@@ -638,6 +643,11 @@ class RiskKernel:
         one-rung ladder demotion moves via ``demote_one_rung``. Never raises
         from a safety mode -- every trigger resolves cleanly (possibly to a
         no-op) -- and a ``KILLED`` kernel stays ``KILLED``.
+
+        **No code under ``windbreak/`` calls this method.** The obvious caller,
+        :func:`windbreak.evaluation.live_divergence.monitor_live_divergence`,
+        has no production caller either, so no shipped path demotes the kernel;
+        the callers are tests (issue #542).
 
         Args:
             trigger: The demotion trigger to fire.
