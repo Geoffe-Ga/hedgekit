@@ -511,6 +511,9 @@ def test_the_stale_status_veto_names_the_intent_this_tick_struck(
     vetoes = _payloads(deps, "IntentVetoed")
     assert tickers == [TICKER, TICKER]
     assert len(forecasts) == 2
+    # Counted before it is indexed: without this a tick that stopped vetoing
+    # would fail below with an `IndexError` rather than saying what went wrong.
+    assert len(vetoes) == 2
     assert vetoes[1]["intent_id"] == f"{forecasts[1]['forecast_id']}:yes:buy:sized"
     second_status = _nth_index(events, "ExchangeStatusObserved", 2)
     assert _nth_index(events, "IntentVetoed", 2) > second_status
