@@ -581,6 +581,54 @@ def _anchor_sessions(
     }
 
 
+def _anchor_markets(
+    markets: Mapping[str, NormalizedMarket], offset: timedelta | None
+) -> dict[str, NormalizedMarket]:
+    """Re-date every market's calendar by the recording's own offset (#510).
+
+    A re-enactment moves the whole recording, and a market's ``close_time`` is
+    part of the recording: it was captured at the same instant the leading book
+    was, and it means "this many days after that book". Leaving it at its
+    literal while the books move re-dates the tape and not the calendar, which
+    is what made a committed fixture structurally unable to hold a horizon --
+    :func:`~windbreak.screener.filters.horizon_filter` measures the close
+    against the run's clock, so a fixed literal drifts out of the configured
+    window and stays out, forever, whatever the recording said.
+
+    Shifting it preserves the recorded interval exactly, for the same reason
+    :func:`_anchor_sessions` preserves inter-step deltas: one offset, applied
+    to every recorded instant. ``expected_resolution_time`` moves with it, so
+    the "resolution is not before the close" invariant
+    :class:`~windbreak.connector.models.NormalizedMarket` enforces survives the
+    move rather than being newly violated by it.
+
+    A verbatim replay declares no mapping onto the run's clock and so re-dates
+    nothing -- which is also the live branch, where the venue's own metadata
+    must reach the screen exactly as the venue reported it.
+
+    Args:
+        markets: The loaded ticker-keyed markets.
+        offset: The whole recording's shift, or ``None`` to replay verbatim.
+
+    Returns:
+        The re-dated markets, unchanged when there is no offset to apply.
+    """
+    if offset is None:
+        return dict(markets)
+    return {
+        ticker: replace(
+            market,
+            close_time=market.close_time + offset,
+            expected_resolution_time=(
+                None
+                if market.expected_resolution_time is None
+                else market.expected_resolution_time + offset
+            ),
+        )
+        for ticker, market in markets.items()
+    }
+
+
 class PaperExchange:
     """A replay-driven, pessimistic paper-trading :class:`MarketConnector`.
 
@@ -593,7 +641,9 @@ class PaperExchange:
     semantics this connector advertises is the one it implements.
 
     Attributes:
-        markets: Ticker-keyed normalized markets.
+        markets: Ticker-keyed normalized markets, re-dated onto
+            ``replay_anchor`` when one was given (issue #510) so a recorded
+            horizon is re-enacted rather than left behind as a stale literal.
         sessions: Ticker-keyed replay steps, re-dated onto ``replay_anchor``
             when one was given (issue #369).
         exchange_status: The exchange's trading status.
@@ -639,11 +689,12 @@ class PaperExchange:
             max_participation_ppm: The participation cap on recorded depth, in ppm.
             replay_anchor: The instant this recording is declared to be
                 re-enacted from, or ``None`` to replay its recorded timestamps
-                verbatim (issue #369). When given, every book, trade print, and
-                the venue clock (issue #377) shifts by the single offset that
-                puts the earliest recorded book on the anchor, so the
-                recording's internal timing is preserved while its absolute
-                dates become measurable against the run's own clock.
+                verbatim (issue #369). When given, every book, trade print, the
+                venue clock (issue #377), and every market's calendar (issue
+                #510) shifts by the single offset that puts the earliest
+                recorded book on the anchor, so the recording's internal timing
+                is preserved while its absolute dates become measurable against
+                the run's own clock.
 
         Raises:
             ValueError: If ``balance_semantics`` answers any question in
@@ -655,7 +706,7 @@ class PaperExchange:
         """
         _require_implemented_semantics(balance_semantics)
         offset = _replay_offset(sessions, replay_anchor)
-        self.markets = markets
+        self.markets = _anchor_markets(markets, offset)
         self.sessions = _anchor_sessions(sessions, offset)
         self.exchange_status = exchange_status
         self.exchange_time = exchange_time if offset is None else exchange_time + offset

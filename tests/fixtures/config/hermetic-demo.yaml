@@ -1,0 +1,38 @@
+# A hermetic PAPER demonstration (issue #510).
+#
+# What this file changes, and nothing else:
+#
+#   * `forecast.replay_corpus` selects the committed research/vote corpus, so a
+#     `windbreak run --process pipeline` reaches a non-abstaining forecast
+#     without a network. Both halves of that -- the research bundle and the vote
+#     transport -- come from the one token, because closing research alone turns
+#     a graceful abstention into a `CassetteMissError` out of the tick.
+#   * `correlation.tags` declares a bucket for the demonstration market, which
+#     `project_exposure` requires before the selector will project any exposure
+#     at all.
+#
+# Every risk threshold, price band, depth floor and horizon window is left at
+# its shipped default and is NOT restated here; `tests/integration/
+# test_shipped_cli_hermetic_forecast.py` asserts that by diffing this
+# configuration against `WindbreakConfig()`.
+#
+# THE FORECASTS THIS PRODUCES ARE RECORDED MATERIAL, NOT MEASUREMENTS. The
+# corpus replays committed pages and committed per-member votes, so a run in
+# this mode demonstrates that the stack composes end to end and says nothing
+# about edge. The loop logs a WARNING naming the mode, the directory and the
+# source on every start for exactly that reason. Never point a live deployment
+# at it.
+#
+# `corpus_dir` is resolved against the process's working directory; run from the
+# repository root, as `docs/RUNBOOK.md` describes.
+forecast:
+  replay_corpus:
+    mode: "replay"
+    corpus_dir: tests/fixtures/forecast/hermetic_corpus
+
+correlation:
+  tags:
+    - ticker: MKT-DEMO
+      bucket_ids:
+        - fed-policy
+      tagged_at: "2025-01-01T00:00:00+00:00"

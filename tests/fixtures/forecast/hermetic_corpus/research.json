@@ -1,0 +1,27 @@
+{
+  "documents": [
+    {
+      "url": "https://corpus.local/base-rate",
+      "body": "<html><head><script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"@type\": \"NewsArticle\", \"datePublished\": \"2024-11-15T08:00:00Z\"}</script></head><body><p>Historical base rates for this class of question have been recorded and reviewed by independent observers over several prior periods.</p></body></html>"
+    },
+    {
+      "url": "https://corpus.local/recent-evidence",
+      "body": "<html><head><script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"@type\": \"NewsArticle\", \"datePublished\": \"2024-12-02T09:30:00Z\"}</script></head><body><p>Recent reporting describes conditions consistent with the question resolving affirmatively, with no unusual disruptions noted this period.</p></body></html>"
+    },
+    {
+      "url": "https://corpus.local/counter-signal",
+      "body": "<html><head><script type=\"application/ld+json\">{\"@context\": \"https://schema.org\", \"@type\": \"NewsArticle\", \"datePublished\": \"2024-12-20T11:45:00Z\"}</script></head><body><p>Dissenting analysis notes one counter signal, judged minor by the same independent observers who reviewed the base rate above.</p></body></html>"
+    }
+  ],
+  "results": {
+    "Base rate for Hermetic demonstration market": [
+      "https://corpus.local/base-rate"
+    ],
+    "Recent evidence on Hermetic demonstration market": [
+      "https://corpus.local/recent-evidence"
+    ],
+    "Counter-signal for Hermetic demonstration market": [
+      "https://corpus.local/counter-signal"
+    ]
+  }
+}

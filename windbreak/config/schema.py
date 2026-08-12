@@ -550,6 +550,74 @@ PROVIDER_TRANSPORT_CASSETTE = "cassette"
 PROVIDER_TRANSPORT_LIVE = "live"
 
 
+#: Replay-corpus selection token naming *no* corpus: the research bundle finds
+#: nothing and the vote transport is the recorded prompt-hash cassette. The
+#: shipped default (issue #510), so an omitted section is always the offline,
+#: never-trades one -- and so CI, which builds ``WindbreakConfig()``, keeps
+#: measuring the composition an operator gets by omission.
+#:
+#: Deliberately not spelled ``off``. YAML 1.1 reads a bare ``off`` as the
+#: boolean ``False``, so an operator writing the obvious thing would meet
+#: "expected a string, got bool" from the loader rather than the disabled mode
+#: they asked for. ``disabled`` has no such reading in any YAML version.
+REPLAY_CORPUS_DISABLED = "disabled"
+
+#: Replay-corpus selection token naming a committed corpus directory, replayed
+#: for **both** the research bundle and the vote transport (issue #510). Opt-in
+#: only, and deliberately one token rather than two: closing the research half
+#: alone converts a graceful ``no_verified_citations`` abstention into a
+#: :class:`~windbreak.forecast.cassettes.CassetteMissError` raised out of the
+#: tick, because the prompt-hash cassette cannot answer the first real vote. The
+#: two halves are therefore not independently selectable.
+REPLAY_CORPUS_REPLAY = "replay"
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayCorpusConfig:
+    """Which committed research/vote corpus a hermetic run replays (issue #510).
+
+    The shipped PAPER loop could not reach a non-abstaining forecast from any
+    entry point an operator can type. Two independent seams were reachable only
+    by a test injecting into :func:`windbreak.scheduler.loop.build_paper_deps`:
+    the research bundle (``offline_research_tools`` finds nothing by
+    construction, so ``run_pipeline`` abstains on zero verified citations before
+    a single vote) and the vote transport (the committed prompt-hash cassette
+    holds placeholders). This section makes both reachable from configuration,
+    *together*, so a hermetic run can be **composed** rather than doubled.
+
+    Why a corpus rather than a better cassette. A cassette key is
+    :meth:`~windbreak.forecast.cassettes.LlmRequest.request_hash` over a prompt
+    that interpolates ``market.close_time.isoformat()``, while the SPEC §16
+    horizon filter measures that same close against the run's clock -- so a
+    market that keeps clearing the screen must carry a close that moves, and a
+    key that moves cannot be committed. That contradiction is proved by
+    ``tests/scheduler/test_paper_intent_barriers.py::\
+test_static_vote_cassette_and_horizon_filter_are_mutually_exclusive``. A corpus
+    sidesteps it by keying on what does *not* move: the subquestion text for
+    research (built from the market title alone), and the
+    ``provider:model_version`` pair for votes.
+
+    **This is not a live capability and never dials out.** Both replayed
+    transports read committed files and hold no endpoint, no credential, and no
+    session; there is nothing here for the outbound allowlist to screen because
+    nothing here can leave the host. A corpus is also not a forecast: it
+    replays recorded material, so a run in this mode demonstrates the *stack*,
+    never a measured edge.
+
+    Attributes:
+        mode: :data:`REPLAY_CORPUS_DISABLED` (the default) or
+            :data:`REPLAY_CORPUS_REPLAY`.
+        corpus_dir: The directory holding ``research.json`` and ``votes.json``.
+            Has no safe real-world default, so it ships as the
+            :data:`UNCONFIGURED_PLACEHOLDER` idiom and fails *closed*: selecting
+            :data:`REPLAY_CORPUS_REPLAY` without naming a directory refuses to
+            start rather than inventing a plausible-looking path.
+    """
+
+    mode: str = REPLAY_CORPUS_DISABLED
+    corpus_dir: str = UNCONFIGURED_PLACEHOLDER
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderRetryConfig:
     """The config-schema mirror of the provider retry policy (issue #269).
@@ -798,6 +866,7 @@ class ForecastConfig:
     provider_transport: ProviderTransportConfig = field(
         default_factory=ProviderTransportConfig
     )
+    replay_corpus: ReplayCorpusConfig = field(default_factory=ReplayCorpusConfig)
 
 
 @dataclass(frozen=True, slots=True)

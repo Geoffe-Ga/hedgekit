@@ -861,6 +861,119 @@ It defaults to `1000000` -- 100% of worst-case equity -- which preserves the
 previous ceiling rather than choosing a tighter appetite on your behalf. It is a
 live cap either way now that total exposure is fed real figures.
 
+## Demonstrating the whole stack offline (the replay corpus)
+
+**What this is for.** Bringing up the shipped stack produces heartbeats and
+screen decisions and never a trade, because two seams are closed by
+construction: the offline research bundle finds nothing (so every forecast
+abstains on `no_verified_citations` before a single vote is cast), and the
+committed vote cassette holds placeholders. That is the correct default — an
+offline loop must not invent evidence — but it means an operator has no way to
+see an intent, an approval or a fill cross the stack before trusting it with a
+live key. `forecast.replay_corpus` is that way (issue #510).
+
+**What it is not.** A replayed forecast is recorded material, not a
+measurement. A run in this mode demonstrates that the pipeline composes end to
+end and tells you **nothing whatever about edge**. Never point a production
+deployment at a corpus, and never read a replayed `ForecastCreated` as a
+forecast.
+
+### Turning it on
+
+The committed example is `tests/fixtures/config/hermetic-demo.yaml`, and it is
+this, in full:
+
+```yaml
+forecast:
+  replay_corpus:
+    mode: "replay"                                    # default: "disabled"
+    corpus_dir: tests/fixtures/forecast/hermetic_corpus
+
+correlation:
+  tags:
+    - ticker: MKT-DEMO
+      bucket_ids: [fed-policy]
+      tagged_at: "2025-01-01T00:00:00+00:00"
+```
+
+```bash
+# From the repository root: `corpus_dir` is resolved against the working
+# directory. The M6 track-record artifact has to be in --report-dir first, or
+# every provider is unproven and no forecast is live-eligible.
+mkdir -p /tmp/wb-demo/report
+cp tests/fixtures/evaluation/provider-track-records.json /tmp/wb-demo/report/
+
+python -m windbreak run --process pipeline --max-beats 2 \
+  --heartbeat-interval 0 \
+  --ledger-path /tmp/wb-demo/ledger.db \
+  --paper-books-dir tests/fixtures/books/hermetic_demo \
+  --cassette-path tests/fixtures/forecast/cassettes.json \
+  --report-dir /tmp/wb-demo/report \
+  --config tests/fixtures/config/hermetic-demo.yaml
+```
+
+The ledger then carries `ScreenDecisionRecorded` (eligible), a
+`ForecastCreated` with **no** `abstention_reason`, three `ProviderVoteRecorded`
+rows, a `SelectorDecisionRecorded` with `intent_count: 1`, and — on the second
+beat — `IntentApproved`, `ApprovalTokenIssued` and the four
+`OrderTransitionLedgered` edges `APPROVE → REQUEST_SUBMISSION → SUBMIT → ACK`.
+Two beats, not one: on the first beat of a fresh ledger the risk kernel vetoes,
+because `equity_start_of_day` is 0 until that beat's own `EquitySampled` row
+exists.
+
+### Reading the startup line
+
+Every start logs the mode in force and the source that chose it:
+
+```
+WARNING forecast replay corpus mode=replay dir=... source=configuration
+        documents=3 votes=3; forecasts on this run replay recorded material and
+        measure nothing
+INFO    forecast replay corpus mode=disabled source=default
+```
+
+`source=configuration` means a file selected it; `source=default` means nothing
+did and you are on the shipped, offline, cannot-trade path. The corpus line is
+a **WARNING** on purpose: a replaying run must not be discoverable only by
+reading configuration.
+
+### What a corpus is, and why it is not a cassette
+
+A corpus directory holds two files:
+
+- `research.json` — `documents` (a `url`/`body` pair per recorded page) and
+  `results` (recorded candidate URLs per recorded subquestion).
+- `votes.json` — one recorded completion per ensemble member, keyed
+  `provider:model_version`, in the same entry shape as a cassette.
+
+It is not keyed by prompt hash, and could not be. A cassette key digests the
+vote prompt, which interpolates the market's close time; the screen measures
+that same close against the run's clock. A market that keeps clearing the screen
+must carry a close that moves, and a key that moves cannot be committed. A
+corpus keys on what does not move: the subquestion text (built from the market
+title alone) and the ensemble member's own identity.
+
+### Failure modes
+
+- **Both halves come from one token.** There is no way to replay research
+  without replaying votes. Doing only the first turns a graceful abstention into
+  a `CassetteMissError` raised out of the tick.
+- **A malformed or missing corpus refuses to start**, naming the file and the
+  problem — including a `results` entry pointing at a URL the corpus holds no
+  document for, which would otherwise surface much later as an unexplained
+  abstention.
+- **Misses degrade, they do not crash.** A subquestion the corpus never recorded
+  finds nothing (the forecast abstains); a URL it lacks reads as an unreachable
+  page (that citation is lost); an ensemble member it lacks discards that one
+  vote (the others still form the two-of-three quorum).
+- **`mode: replay` alongside `forecast.provider_transport.mode: live` is
+  refused.** A run reads recorded material or the world, never both.
+- **Write `disabled`, not `off`.** YAML reads a bare `off` as the boolean
+  `false`, and the loader will reject it as a non-string.
+- **Nothing here dials out.** Both transports read committed files; they hold no
+  endpoint, no credential and no session, so no key is required and none is
+  read.
+
 ## Operator alerts
 
 Alerts reach you only through the sinks `config.alerts` declares. Until you

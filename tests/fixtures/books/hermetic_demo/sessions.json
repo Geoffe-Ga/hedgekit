@@ -1,0 +1,58 @@
+{
+  "MKT-DEMO": [
+    {
+      "book": {
+        "fetched_at": "2025-01-01T00:00:00.000000Z",
+        "yes_bids": [
+          {
+            "price": 490,
+            "quantity": 100000
+          }
+        ],
+        "yes_asks": [
+          {
+            "price": 500,
+            "quantity": 100000
+          }
+        ]
+      },
+      "trades": []
+    },
+    {
+      "book": {
+        "fetched_at": "2025-01-01T00:05:00.000000Z",
+        "yes_bids": [
+          {
+            "price": 490,
+            "quantity": 100000
+          }
+        ],
+        "yes_asks": [
+          {
+            "price": 500,
+            "quantity": 100000
+          }
+        ]
+      },
+      "trades": []
+    },
+    {
+      "book": {
+        "fetched_at": "2025-01-01T00:10:00.000000Z",
+        "yes_bids": [
+          {
+            "price": 490,
+            "quantity": 100000
+          }
+        ],
+        "yes_asks": [
+          {
+            "price": 500,
+            "quantity": 100000
+          }
+        ]
+      },
+      "trades": []
+    }
+  ]
+}

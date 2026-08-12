@@ -1,0 +1,10 @@
+{
+  "open_order_collateral_in_total": "INCLUDED",
+  "open_order_collateral_in_available": "DEDUCTED_FROM_AVAILABLE",
+  "fee_debit_timing": "AT_EXECUTION",
+  "fee_rounding": "EXACT",
+  "partial_fill_representation": "PER_FILL_RECORDS",
+  "cancel_collateral_release": "IMMEDIATE",
+  "unsettled_proceeds": "INCLUDED_IMMEDIATELY",
+  "halted_market_behavior": "NEW_ORDERS_ACCEPTED"
+}

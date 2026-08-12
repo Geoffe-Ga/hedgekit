@@ -60,17 +60,28 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from windbreak.config.schema import (
     DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     PROVIDER_TRANSPORT_CASSETTE,
     PROVIDER_TRANSPORT_LIVE,
+    REPLAY_CORPUS_DISABLED,
+    REPLAY_CORPUS_REPLAY,
+    UNCONFIGURED_PLACEHOLDER,
+    ReplayCorpusConfig,
 )
 from windbreak.forecast.budget import (
     ModelRateTable,
     ModelTokenRate,
     ProviderPriceTable,
+)
+from windbreak.forecast.corpus import (
+    CorpusResearchTransport,
+    CorpusVoteTransport,
+    ReplayCorpus,
+    load_replay_corpus,
 )
 from windbreak.forecast.providers import (
     ANTHROPIC_MESSAGES_ENDPOINT,
@@ -90,7 +101,6 @@ from windbreak.net.live_http import RoutingLlmTransport, monotonic_ms, sleep_ms
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
     from windbreak.config.schema import WindbreakConfig
     from windbreak.forecast.cassettes import LlmTransport
@@ -114,6 +124,14 @@ OPENAI_PROVIDER = "openai"
 
 #: How many candidate URLs a live search requests per subquestion.
 _SEARCH_MAX_RESULTS = 10
+
+#: ``source=`` token logged when a configuration file selected this run's
+#: replay-corpus section.
+REPLAY_CORPUS_SOURCE_CONFIGURED = "configuration"
+
+#: ``source=`` token logged when nothing selected it and the shipped default --
+#: no corpus, an offline loop that cannot trade -- stands.
+REPLAY_CORPUS_SOURCE_DEFAULT = "default"
 
 #: The research egress host allowlisted for the offline default research tools.
 #: The offline default never actually searches, so nothing is ever fetched
@@ -222,6 +240,136 @@ def offline_research_tools(cache_dir: Path) -> ResearchTools:
         fetch_transport=transport,
         max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
     )
+
+
+def replay_corpus_directory(config: WindbreakConfig) -> Path | None:
+    """Return the committed corpus directory this deployment replays, or none.
+
+    The one place ``forecast.replay_corpus`` is read into a decision, so the
+    research half and the vote half of a corpus run can never disagree about
+    whether one is selected -- which is the whole reason the two are a single
+    token (issue #510). Closing research alone converts a graceful
+    ``no_verified_citations`` abstention into a
+    :class:`~windbreak.forecast.cassettes.CassetteMissError` out of the tick.
+
+    Args:
+        config: The active configuration.
+
+    Returns:
+        The corpus directory when :data:`REPLAY_CORPUS_REPLAY` is selected, else
+        ``None``.
+
+    Raises:
+        ValueError: If the mode is unrecognized, or the replay mode is selected
+            without naming a directory. Both refuse to start rather than
+            silently degrading to the offline default, which would leave an
+            operator who asked for a demonstrable run watching a loop that
+            abstains forever and says nothing about why.
+    """
+    settings = config.forecast.replay_corpus
+    if settings.mode == REPLAY_CORPUS_DISABLED:
+        return None
+    if settings.mode != REPLAY_CORPUS_REPLAY:
+        msg = (
+            f"unknown forecast.replay_corpus.mode {settings.mode!r}; expected "
+            f"{REPLAY_CORPUS_DISABLED!r} or {REPLAY_CORPUS_REPLAY!r}"
+        )
+        raise ValueError(msg)
+    if settings.corpus_dir == UNCONFIGURED_PLACEHOLDER:
+        msg = (
+            f"forecast.replay_corpus.mode is {REPLAY_CORPUS_REPLAY!r} but "
+            f"forecast.replay_corpus.corpus_dir is still "
+            f"{UNCONFIGURED_PLACEHOLDER!r}; name the committed corpus directory "
+            f"or select {REPLAY_CORPUS_DISABLED!r}"
+        )
+        raise ValueError(msg)
+    return Path(settings.corpus_dir)
+
+
+def replay_corpus_source(config: WindbreakConfig) -> str:
+    """Return which source decided this run's replay-corpus section.
+
+    A configuration-only leaf has exactly two sources, and an operator reading
+    the startup line needs to know which one they got: a section that differs
+    from the shipped default was written down somewhere, and one that matches it
+    was not written down at all. Derived by comparison against
+    :class:`~windbreak.config.schema.ReplayCorpusConfig`'s own defaults rather
+    than by a flag the loader would have to remember to set.
+
+    Args:
+        config: The active configuration.
+
+    Returns:
+        :data:`REPLAY_CORPUS_SOURCE_CONFIGURED` or
+        :data:`REPLAY_CORPUS_SOURCE_DEFAULT`.
+    """
+    if config.forecast.replay_corpus == ReplayCorpusConfig():
+        return REPLAY_CORPUS_SOURCE_DEFAULT
+    return REPLAY_CORPUS_SOURCE_CONFIGURED
+
+
+def load_corpus(directory: Path) -> ReplayCorpus:
+    """Load the committed corpus at ``directory``.
+
+    A thin re-export so the composition root reaches the loader through this
+    module, beside the other two transport choices, rather than importing the
+    forecast engine's file layout directly.
+
+    Args:
+        directory: The corpus directory.
+
+    Returns:
+        The loaded corpus.
+
+    Raises:
+        CorpusFormatError: If the directory is not a well-formed corpus; see
+            :func:`~windbreak.forecast.corpus.load_replay_corpus`.
+    """
+    return load_replay_corpus(directory)
+
+
+def build_corpus_research_tools(corpus: ReplayCorpus, cache_dir: Path) -> ResearchTools:
+    """Build the sandboxed research bundle over a committed corpus.
+
+    The sandbox's egress allowlist is **derived from the corpus itself** --
+    exactly the hosts it holds recorded documents for -- rather than configured
+    beside it. A second, transcribed host list could grant a host the corpus
+    cannot serve, and there is nothing for it to grant: these transports read
+    committed files and never open a socket.
+
+    The cache bound is the shipped default rather than the operator's
+    ``forecast.research.cache_max_bytes``, for the same reason
+    :func:`offline_research_tools` takes it: a replayed fetch writes a bounded,
+    committed body, so this path cannot grow the cache the way a live one can,
+    and taking the live ceiling here would imply otherwise.
+
+    Args:
+        corpus: The loaded corpus to serve.
+        cache_dir: The root the fetch cache is jailed to.
+
+    Returns:
+        A capability-closed :class:`~windbreak.forecast.sandbox.ResearchTools`.
+    """
+    transport = CorpusResearchTransport(corpus)
+    return build_research_tools(
+        allowed_hosts=corpus.hosts(),
+        cache_dir=cache_dir,
+        search_transport=transport,
+        fetch_transport=transport,
+        max_bytes=DEFAULT_RESEARCH_CACHE_MAX_BYTES,
+    )
+
+
+def build_corpus_vote_transport(corpus: ReplayCorpus) -> LlmTransport:
+    """Build the vote transport serving a committed corpus's recorded votes.
+
+    Args:
+        corpus: The loaded corpus to serve.
+
+    Returns:
+        A :class:`~windbreak.forecast.corpus.CorpusVoteTransport`.
+    """
+    return CorpusVoteTransport(corpus)
 
 
 def is_live_mode(config: WindbreakConfig) -> bool:
