@@ -21,6 +21,26 @@ floor invariant blunting the "wind" of catastrophic loss so entry into
 prediction-market trading is safer and lower-risk than going in unprotected.
 If it works, it's meant to be someone's windfall, their big break.
 
+## The goal
+
+**A durable edge, produced cheaply enough that an ordinary person can run it.**
+Those are one goal, not two. An edge that costs more to produce than it earns is
+not an edge for anyone outside an institution — it is a subscription. And cheap
+infrastructure that forecasts badly is not worth running at any price. windbreak
+aims at both halves at once: research spend held far below the returns it is
+chasing, and a forecasting path good enough that those returns are real.
+
+Cost is therefore a first-class design constraint here, not an afterthought.
+Every forecast books its spend to the hash-chained ledger, the weekly report
+carries a cost meter reporting **cost-adjusted expectancy**, and the daily
+research ceiling is a durable, operator-adjustable governor. The intent is that
+an operator can always answer "is this earning more than it costs?" from their
+own ledger rather than from a vendor's marketing.
+
+This is an aim pursued by measurement, not a promise of results. The
+disclaimers below are what that aim looks like before the evidence is in, and
+they stand until pre-registered evidence says otherwise.
+
 ## What this is
 
 `windbreak` is a local-first daemon that:
