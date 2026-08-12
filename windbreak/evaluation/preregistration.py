@@ -933,10 +933,13 @@ def latest_gate_plan_registration(store: LedgerStore) -> GatePlanRegistration | 
 def _latest_registration_record(store: LedgerStore) -> LedgerRecord | None:
     """Find the newest ``GatePlanRegistered``/``GatePlanChanged`` row.
 
-    ``RiskKernel.request_promotion`` drives this at least twice per PAPER
-    promotion attempt, so the cost matters (issue #246): a store declaring the
-    optional :class:`~windbreak.ledger.store.LatestRecordLookup` capability
-    answers it with a single index-backed reverse read, while any other store --
+    ``RiskKernel.request_promotion`` would drive this at least twice per PAPER
+    promotion attempt, so the cost was made to matter (issue #246) -- though no
+    production code calls ``request_promotion`` today, so that path is currently
+    exercised only by tests and the optimization is latent (issue #542): a store
+    declaring the optional :class:`~windbreak.ledger.store.LatestRecordLookup`
+    capability answers it with a single index-backed reverse read, while any
+    other store --
     including every hand-rolled :class:`~windbreak.ledger.store.LedgerStore`
     double, which is exactly why that capability is a separate protocol rather
     than a widening of ``LedgerStore`` -- falls back to the original full scan.

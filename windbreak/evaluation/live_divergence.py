@@ -4,7 +4,15 @@
 ``live_slippage_ratio`` (cost slippage of real fills vs the paper model) and
 ``live_brier_degradation`` (rolling LIVE-over-PAPER forecast-skill decay) --
 against a pre-registered :class:`~windbreak.evaluation.preregistration.GatePlan`'s
-thresholds, and turns a breach into a promotion-ladder demotion.
+thresholds, and turns a breach into a call on the ``fire_trigger`` seam its
+caller injects.
+
+**Nothing under ``windbreak/`` calls :func:`monitor_live_divergence` today**, and
+nothing passes it a kernel method, so no shipped path turns a divergence breach
+into an actual demotion: the monitor is exercised only by the test suite (issue
+#542). Whether this monitor should demote the kernel automatically, or surface
+the breach for an operator to act on, is an open decision recorded on #542;
+until it is made, read every "demotes" below as "would demote, once wired".
 
 Every call appends exactly one :class:`LiveDivergenceSampled` (both series
 values -- sentinels rendered by name -- thresholds, window size, cohort counts,
@@ -76,12 +84,14 @@ class AlertHook(Protocol):
 
 
 class DemotionFirer(Protocol):
-    """A one-argument callable firing a demotion trigger (the kernel's method).
+    """A one-argument callable firing a demotion trigger.
 
     Structurally matches
     :meth:`windbreak.riskkernel.process.RiskKernel.fire_demotion_trigger`, so a
-    bound kernel method passes directly, while a test double is an ordinary
-    callable -- keeping the risk-kernel edge a thin, leaf dependency.
+    bound kernel method *would* pass directly, while a test double is an
+    ordinary callable -- keeping the risk-kernel edge a thin, leaf dependency.
+    No production code currently supplies either: the only implementations are
+    test doubles (issue #542).
     """
 
     def __call__(self, trigger: DemotionTrigger) -> Mode | None:
@@ -300,7 +310,9 @@ def _emit_breach(
         snapshot: The scored run snapshot the breach is stamped with.
         store: The append-only ledger the breach event is written to.
         alert: The sink the single critical alert is fired into.
-        fire_trigger: The demotion firer (the kernel's own method in production).
+        fire_trigger: The demotion firer supplied by the caller. No production
+            caller exists today, so in the shipped system this is never the
+            kernel's own method (issue #542).
         component: The producing component recorded on the event.
     """
     store.append(
@@ -324,7 +336,7 @@ def monitor_live_divergence(
     fire_trigger: DemotionFirer,
     component: str,
 ) -> None:
-    """Score the live-divergence series and demote the kernel on any breach.
+    """Score the live-divergence series and fire ``fire_trigger`` on any breach.
 
     Args:
         inputs: The (temporally-admitted) evaluation inputs to score.
@@ -332,8 +344,11 @@ def monitor_live_divergence(
         store: The append-only ledger the sampled and breach events are written
             to.
         alert: The sink one critical alert is fired into per breached series.
-        fire_trigger: The demotion firer invoked once per breached series (the
-            kernel's ``fire_demotion_trigger`` in production).
+        fire_trigger: The demotion firer invoked once per breached series. It
+            would be the kernel's ``fire_demotion_trigger`` in a wired
+            deployment; no production code calls this function or supplies that
+            method today, so the demotion does not happen in the shipped system
+            (issue #542).
         component: The producing component recorded on the appended events.
 
     Raises:
