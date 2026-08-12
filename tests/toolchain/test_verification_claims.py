@@ -356,9 +356,13 @@ _INVOCATION_CLAIM = "| **interrogate** | missing docstrings | `interrogate src -
 
 #: The same tool with no obligation attached: a mention. `pyproject.toml`
 #: discusses interrogate at length for exactly this reason and must stay able to.
+#: One of the two names is in a CODE SPAN, because a name set in code is still a
+#: name -- `` `interrogate` `` is what the tool is called, `` `interrogate src
+#: -v` `` is an instruction to run it. A detector that reads the first as a
+#: command reports every document that quotes a tool name.
 _BARE_MENTION = (
     "Ruff reimplements pydocstyle's rule set natively, so neither pydocstyle nor\n"
-    "interrogate was adopted."
+    "`interrogate` was adopted."
 )
 
 #: An anti-bypass rule quoting the directive it forbids, ALONGSIDE a real
@@ -628,15 +632,34 @@ def test_the_documentation_specialist_names_the_docstring_rule_ruff_enforces() -
     The rule code is derived from ruff's own select list, so if the D1 gate
     issue #351 wired were ever removed, this fails rather than pinning a code
     that had stopped meaning anything.
+
+    The frontmatter is checked separately from the body, because they are loaded
+    separately: a subagent's `description` is in context at selection time
+    whether or not the body is ever read, which is why `interrogate ≥85%` in it
+    was the most-quoted of the five claims. Satisfying one is not satisfying the
+    other.
     """
     rule = _ruff_docstring_rule()
     text = _DOC_SPECIALIST.read_text(encoding="utf-8")
+    named = re.compile(rf"(?<![\w-]){rule}(?![\w-])")
+    _, _, after = text.partition("---\n")
+    frontmatter, _, body = after.partition("\n---")
 
-    assert re.search(rf"(?<![\w-]){rule}(?![\w-])", text), (
-        f"{_DOC_SPECIALIST.relative_to(_REPO_ROOT)} does not name ruff `{rule}`, "
-        "which is what pyproject.toml selects and therefore what actually "
-        "verifies docstring presence here. An agent whose brief names no "
-        "verifier will pick one."
+    assert frontmatter and body, (
+        f"{_DOC_SPECIALIST.relative_to(_REPO_ROOT)} has no `---` frontmatter "
+        "block, so this assertion cannot tell the always-loaded half from the "
+        "rest and would be checking the file twice over."
+    )
+    assert named.search(frontmatter), (
+        f"the frontmatter of {_DOC_SPECIALIST.relative_to(_REPO_ROOT)} does not "
+        f"name ruff `{rule}`. That block is what a conductor reads when it picks "
+        "this agent, and it is where `interrogate ≥85%` did its damage."
+    )
+    assert named.search(body), (
+        f"the body of {_DOC_SPECIALIST.relative_to(_REPO_ROOT)} does not name "
+        f"ruff `{rule}`, which is what pyproject.toml selects and therefore what "
+        "actually verifies docstring presence here. An agent whose brief names "
+        "no verifier will pick one."
     )
 
 
