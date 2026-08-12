@@ -483,9 +483,9 @@ class RiskKernel:
         the ladder never promotes itself in the shipped system and the only
         callers are tests (issue #542, which asks the owner to decide whether
         promotion should be automatic, operator-invoked, or stay deferred). The
-        CLI
-        composition root (:func:`windbreak.main._build_risk_kernel`) hands the
-        kernel the same ``--ledger-path`` store as its ``gate_plan_store``, so a
+        CLI composition root (:func:`windbreak.main._build_risk_kernel`) hands
+        the kernel the same ``--ledger-path`` store as its ``gate_plan_store``,
+        so a
         ``--process riskkernel`` run reads that registration rather than failing
         closed (issue #246).
 

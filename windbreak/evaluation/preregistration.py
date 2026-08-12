@@ -937,9 +937,9 @@ def _latest_registration_record(store: LedgerStore) -> LedgerRecord | None:
     promotion attempt, so the cost was made to matter (issue #246) -- though no
     production code calls ``request_promotion`` today, so that path is currently
     exercised only by tests and the optimization is latent (issue #542): a store
-    declaring the
-    optional :class:`~windbreak.ledger.store.LatestRecordLookup` capability
-    answers it with a single index-backed reverse read, while any other store --
+    declaring the optional :class:`~windbreak.ledger.store.LatestRecordLookup`
+    capability answers it with a single index-backed reverse read, while any
+    other store --
     including every hand-rolled :class:`~windbreak.ledger.store.LedgerStore`
     double, which is exactly why that capability is a separate protocol rather
     than a widening of ``LedgerStore`` -- falls back to the original full scan.
