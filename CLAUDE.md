@@ -42,6 +42,14 @@
 - Mutation score ≥80% via `./scripts/mutation.sh` or the `mutation-gate.yml`
   workflow (`gh workflow run mutation-gate.yml`). Owner directive, issue #107.
 
+**The one exception to Gate 1** covers checks whose subject is live GitHub
+repository configuration rather than code in this tree — today that is exactly
+one test. Five conditions, all required together, stated in full in
+[Workflow §2.4](.claude/docs/workflow.md#24-exception-checks-whose-subject-is-live-repository-state)
+and enforced by `tests/toolchain/test_live_state_gate_exception.py`, which fails
+if that section and the tree disagree. An ordinary failing test is not covered
+and never can be (issue #534).
+
 ---
 
 ## 🎯 Quality Standards (Quick Reference)
