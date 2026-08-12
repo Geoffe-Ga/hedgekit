@@ -98,6 +98,7 @@ _CLAUDE_MD = _REPO_ROOT / "CLAUDE.md"
 _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 _DOC_SPECIALIST = _AGENTS_DIR / "ralph-documentation-specialist.md"
 _WORKER_PROMPT = _RALPH_DIR / "PROMPT.md"
+_DOCS_SCAN_PROMPT = _PROMPTS_DIR / "scans" / "docs.md"
 _EVIDENCE_COLLECTOR = _SKILLS_DIR / "de-slopify" / "scripts" / "collect-evidence.sh"
 
 #: The directories whose markdown instructs an agent. Every `*.md` beneath each
@@ -566,6 +567,12 @@ def test_the_scanned_corpus_is_non_empty_and_reaches_the_agent_definitions() -> 
     this reason: a widening that silently matches nothing is indistinguishable
     from never having widened. `.claude/agents/` is this issue's widening, and
     `ralph-documentation-specialist.md` is the document it exists for.
+
+    Each root carries an ANCHOR document here, and it has to: the per-root test
+    below is parametrized over `_CORPUS_ROOTS`, so deleting a root deletes its
+    own check along with it -- a guard whose ordering makes it inert. The
+    anchors are named rather than derived because each one is a document whose
+    false claim is why its root is in the corpus at all.
     """
     documents = _corpus_documents()
     agents = [path for path in documents if _AGENTS_DIR in path.parents]
@@ -592,6 +599,11 @@ def test_the_scanned_corpus_is_non_empty_and_reaches_the_agent_definitions() -> 
         f"{_WORKER_PROMPT} is not in the scanned corpus, and it is the Ralph "
         "worker's operating contract -- the brief every lane reads before it "
         "reads anything else (issue #546)."
+    )
+    assert _DOCS_SCAN_PROMPT in documents, (
+        f"{_DOCS_SCAN_PROMPT} is not in the scanned corpus (issue #546). It "
+        "told a docs scanner that `interrogate` already gated docstring "
+        "coverage, which a scanner acts on by NOT reporting the drift."
     )
 
 
