@@ -119,6 +119,7 @@ from windbreak.forecast.pipeline import (
     InMemoryForecastLedger,
     run_pipeline,
 )
+from windbreak.forecast.providers.base import ProviderMarketMetadataRejectedError
 from windbreak.forecast.providers.track_record import (
     InMemoryTrackRecordSource,
     ProviderTrackRecordGate,
@@ -4500,6 +4501,18 @@ def _run_universe(
     nothing the first one did not: an exhausted day is a property of the day,
     not of the market that happened to discover it.
 
+    A market **refused** on its own hostile free-text metadata is the opposite
+    case and gets the opposite answer: the walk *continues* (issue #525). Being
+    unforecastable is a property of that one market, so stopping the walk would
+    let a single forged ticker in the venue's universe deny service to every
+    market behind it. ``run_pipeline`` raises
+    :class:`~windbreak.forecast.providers.base.ProviderMarketMetadataRejectedError`
+    at entry for such a market, which is the only way that error can reach here:
+    the vote-collection loop discards its own per-vote refusals internally. The
+    market contributes no ``ForecastCreated``, no ``SelectorDecisionRecorded``
+    and no approval row -- which is exactly the point, since its ticker would
+    otherwise be written verbatim into an append-only chain.
+
     Args:
         deps: The tick's dependency bundle.
         candidates: The screened markets, in processing order.
@@ -4515,7 +4528,10 @@ def _run_universe(
     filled_centis = 0
     halted = False
     for candidate in candidates:
-        result = _run_candidate(deps, candidate, created_at, heartbeat_epoch_s)
+        try:
+            result = _run_candidate(deps, candidate, created_at, heartbeat_epoch_s)
+        except ProviderMarketMetadataRejectedError:
+            continue
         if result is None:
             halted = True
             break
@@ -4690,6 +4706,15 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     Both shapes are pinned as exact golden row sequences in
     ``tests/integration/test_paper_universe.py``, so this description is
     checkable rather than prose that can drift away from the code.
+
+    A market **refused** on hostile free-text metadata (issue #525) leaves a
+    third shape, and the walk does not stop for it (see :func:`_run_universe`).
+    It keeps its ``ScreenDecisionRecorded`` and its ``MarketSnapshotRecorded``,
+    both appended before the forecast stage is reached, and loses everything
+    from ``ForecastCreated`` onward -- no research is paid for, so it leaves no
+    ``ResearchSpendRecorded`` either. Every candidate behind it still runs.
+    ``tests/integration/test_paper_hostile_ticker.py`` pins that shape by
+    reading the chain back from disk.
 
     Args:
         deps: The fully wired dependency bundle.

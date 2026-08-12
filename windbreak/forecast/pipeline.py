@@ -1935,6 +1935,13 @@ def run_pipeline(
     Raises:
         ValueError: If ``min_ensemble_votes`` is below ``1``; a usage error
             rejected loudly before any stage runs.
+        ProviderMarketMetadataRejectedError: If the market's own free-text
+            metadata fails the S8.5 screen (issue #525). Raised at entry, before
+            any budget day is opened or any research is paid for, so a market
+            that could only ever produce an abstention costs nothing. Refusing
+            the *market* -- rather than every vote for it in turn -- is what
+            keeps an unscreened ticker out of the caller's ledger: there is no
+            record to append.
         DailyBudgetExhaustedError: If ``budget`` is supplied and the run's UTC
             day is already exhausted; raised before any research.
         PerForecastBudgetExceededError: If ``budget`` is supplied and the run's
@@ -1946,6 +1953,16 @@ def run_pipeline(
     if min_ensemble_votes < 1:
         msg = f"min_ensemble_votes must be at least 1, got {min_ensemble_votes}"
         raise ValueError(msg)
+    # Refuse the whole market here, before any stage (issue #525). The seam
+    # screen inside `_collect_provider_forecasts` refuses a hostile market
+    # *per vote*, which discards every vote and still returns an abstention
+    # record -- and `ForecastRecord.__post_init__` now refuses to build one,
+    # so without this the run would die with an untyped `ValueError` deep in
+    # aggregation instead of a typed refusal a composition root can handle.
+    # First, deliberately: it is a pure comparison over metadata the caller
+    # already holds, so a market that can never be forecast opens no budget
+    # day and pays for no research.
+    screen_market_metadata(market)
     max_pages = _open_budget_day(budget, created_at)
     question_hash = normalize_question(market)
     criteria = extract_resolution_criteria(market)
