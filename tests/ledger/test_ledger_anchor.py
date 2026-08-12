@@ -338,16 +338,82 @@ def test_anchor_head_twice_appends_two_lines_first_line_byte_unchanged(
     assert lines[0] == first_line_after_first_call
 
 
-def test_anchor_head_on_empty_ledger_appends_nothing_and_raises_nothing(
+def test_anchor_head_on_empty_ledger_appends_nothing_and_returns_none(
     ledger_store_factory: Callable[..., SqliteLedgerStore], tmp_path: Path
 ) -> None:
-    """Anchoring an empty ledger is a silent no-op: no file is created, no error."""
+    """An empty ledger appends nothing, raises nothing, and returns None (#217).
+
+    The `None` is the whole signal: `anchor_head` is a library function, so it
+    reports "no head to anchor" to its caller rather than printing, and
+    `anchor_command` is what turns that into the operator-facing notice.
+    """
     db_name = "empty.db"
     ledger_store_factory(db_name)
     db_path = tmp_path / db_name
     anchor_path = tmp_path / "anchors.jsonl"
 
-    anchor_head(db_path, anchor_path)
+    anchored = anchor_head(db_path, anchor_path)
+
+    assert anchored is None
+    assert not anchor_path.exists()
+
+
+def test_anchor_head_returns_the_head_it_anchored(
+    ledger_store_factory: Callable[..., SqliteLedgerStore], tmp_path: Path
+) -> None:
+    """A populated ledger returns the very head whose hash was written (#217)."""
+    db_name = "returns_head.db"
+    store = ledger_store_factory(db_name)
+    store.append(ModeHeartbeat(component="pipeline", mode="RESEARCH", beat=1))
+    head_record = store.read_all()[-1]
+    store.close()
+    db_path = tmp_path / db_name
+    anchor_path = tmp_path / "anchors.jsonl"
+
+    anchored = anchor_head(db_path, anchor_path)
+
+    assert anchored is not None
+    assert anchored.sequence_number == head_record.sequence_number
+    assert anchored.event_hash == head_record.event_hash
+
+
+def test_anchor_head_refuses_a_missing_ledger_path_and_creates_no_database(
+    tmp_path: Path,
+) -> None:
+    """A `ledger_path` naming no file raises and creates neither DB nor anchor (#217).
+
+    Opening a `SqliteLedgerStore` creates the database, so without the guard a
+    mistyped path left a decoy empty ledger behind and anchored nothing.
+    """
+    db_path = tmp_path / "never_created.db"
+    anchor_path = tmp_path / "anchors.jsonl"
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        anchor_head(db_path, anchor_path)
+
+    assert str(exc_info.value) == (
+        f"ledger not found at {db_path}: anchor reads an existing ledger and "
+        "will not create one. Check --ledger-path, or run the pipeline first "
+        "to produce a ledger."
+    )
+    assert not db_path.exists()
+    assert not anchor_path.exists()
+
+
+def test_anchor_head_refuses_a_ledger_path_that_is_a_directory(
+    tmp_path: Path,
+) -> None:
+    """A directory at `ledger_path` is a missing ledger, not an openable one (#217).
+
+    `Path.exists()` would accept it and hand SQLite an unopenable path; the
+    guard tests `is_file()` so the operator reads the same guidance either way.
+    """
+    db_path = tmp_path / "a_directory.db"
+    db_path.mkdir()
+    anchor_path = tmp_path / "anchors.jsonl"
+
+    with pytest.raises(FileNotFoundError):
+        anchor_head(db_path, anchor_path)
 
     assert not anchor_path.exists()
 
