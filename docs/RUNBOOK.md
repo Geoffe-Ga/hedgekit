@@ -599,12 +599,33 @@ windbreak verify --ledger-path /path/to/state/ledger.db --anchor-path /path/to/a
 ```
 
 Both verify the hash chain first (a corrupted chain fails closed with the
-offending sequence number, exactly like `rebuild`); `windbreak anchor` is a
-silent no-op against an empty ledger, and never anchors a broken chain.
+offending sequence number, exactly like `rebuild`), and `windbreak anchor`
+never anchors a broken chain.
 `windbreak verify` additionally fails closed if the anchor file is missing,
 empty, or holds a malformed line, and reports the first anchored position
 whose live hash no longer matches -- or has vanished entirely -- as a
 tail-rewrite mismatch on stderr.
+
+**When `anchor` writes nothing (issue #217).** Anchoring is usually scheduled,
+so the two ways it can end up writing no anchor are reported differently and
+neither is silent -- a cron whose anchor never advances would otherwise only be
+discovered at the next `verify`, when the window it should have covered is
+already unrecoverable.
+
+| `--ledger-path` names | exit | stderr |
+| --- | --- | --- |
+| no existing file | 1 | `ledger not found at <path>: anchor reads an existing ledger and will not create one. …` |
+| a ledger with no records | 0 | `nothing anchored: the ledger at <path> holds no records, …` |
+| a ledger with a head | 0 | *(silent; one anchor line appended)* |
+
+A missing path is a refusal because `anchor` reads an existing ledger and will
+not create one -- the same contract, and the same wording, as `rebuild`. Treat
+it as a misconfiguration: check `--ledger-path` before assuming the ledger was
+lost. An existing-but-empty ledger is *not* an error (a pipeline that has not
+yet appended its first event has no head to pin), but it is announced, so an
+operator reading cron mail can tell "nothing to do yet" from "anchored". Alert
+on the exit code for the first case and on the absence of new anchor lines over
+time for the second.
 
 **Trust boundary.** The anchor file only relocates the trust root; it does
 not eliminate it. The guarantee holds only while the anchor file is

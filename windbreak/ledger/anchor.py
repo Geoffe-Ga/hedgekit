@@ -31,7 +31,12 @@ local access.
 
 ``anchor_command``/``verify_command`` adapt the two operations to the
 ``windbreak anchor`` / ``windbreak verify`` CLI verbs, returning 0 on success
-and 1 (with the offending detail on stderr) on any domain failure.
+and 1 (with the offending detail on stderr) on any domain failure. ``anchor``
+additionally separates the two ways it can end up writing no anchor at all
+(issue #217): a ``--ledger-path`` naming no existing file is refused with exit
+1, while an existing ledger holding no records exits 0 with an explicit
+"nothing anchored" notice. Neither is silent, because a scheduled anchor that
+prints nothing and exits 0 is indistinguishable from one that worked.
 """
 
 from __future__ import annotations
@@ -76,6 +81,49 @@ _FAIL_CLOSED_LINE_NUMBER = 1
 #: zero/negative value index the live-record list from the *end*
 #: (``records[seq - 1]``), checking the wrong row instead of failing closed.
 _MIN_SEQUENCE_NUMBER = 1
+
+
+def _missing_ledger_message(ledger_path: Path) -> str:
+    """Build the refusal shown when ``--ledger-path`` names no existing file.
+
+    Deliberately mirrors :func:`windbreak.ledger.rebuild.rebuild`'s
+    missing-path wording (issue #76): both verbs *read* a ledger, neither
+    creates one, and an operator who mistyped the flag should read the same
+    sentence whichever one they ran.
+
+    Args:
+        ledger_path: The path that does not name an existing file.
+
+    Returns:
+        The what/why/next refusal text.
+    """
+    return (
+        f"ledger not found at {ledger_path}: anchor reads an existing ledger "
+        "and will not create one. Check --ledger-path, or run the pipeline "
+        "first to produce a ledger."
+    )
+
+
+def _empty_ledger_message(ledger_path: Path, anchor_path: Path) -> str:
+    """Build the notice shown when the ledger exists but holds no records.
+
+    Not a refusal: a ledger that has genuinely never been appended to has no
+    head, and anchoring nothing is the correct outcome (issue #217). What was
+    wrong was doing it in silence, which read as a successful anchor.
+
+    Args:
+        ledger_path: The empty ledger that was read.
+        anchor_path: The anchor file that was consequently not written.
+
+    Returns:
+        The what/why/next notice text.
+    """
+    return (
+        f"nothing anchored: the ledger at {ledger_path} holds no records, so "
+        f"there is no head hash to pin and {anchor_path} was not written. "
+        "Re-run anchor once the pipeline has appended its first event; if you "
+        "expected records already, check --ledger-path."
+    )
 
 
 def _default_clock() -> datetime:
@@ -225,8 +273,14 @@ def _read_verified_head(ledger_path: Path) -> ChainHead | None:
         The verified chain's head, or ``None`` for an empty ledger.
 
     Raises:
+        FileNotFoundError: If ``ledger_path`` does not point at an existing
+            file. Opening a :class:`SqliteLedgerStore` *creates* the database,
+            so without this guard a mistyped ``--ledger-path`` would produce a
+            fresh empty ledger there and anchor nothing (issue #217).
         ChainIntegrityError: If the ledger's hash chain fails verification.
     """
+    if not ledger_path.is_file():
+        raise FileNotFoundError(_missing_ledger_message(ledger_path))
     store = SqliteLedgerStore(ledger_path)
     try:
         store.verify_chain()
@@ -269,14 +323,19 @@ def anchor_head(
     anchor_path: Path,
     *,
     now: Callable[[], datetime] = _default_clock,
-) -> None:
+) -> ChainHead | None:
     """Verify the ledger and append its head to the anchor file.
 
-    Verifies the hash chain first, so a broken chain raises
-    :class:`ChainIntegrityError` and nothing is appended (and no anchor file is
-    created if it did not already exist). An empty ledger is a silent no-op --
-    there is no head to anchor. Otherwise exactly one canonical-JSON line
-    pinning the head ``(sequence_number, event_hash)`` is appended.
+    Refuses a ``ledger_path`` that names no existing file, because opening the
+    store would otherwise *create* one and anchor its emptiness. Then verifies
+    the hash chain, so a broken chain raises :class:`ChainIntegrityError` and
+    nothing is appended (and no anchor file is created if it did not already
+    exist). An empty ledger appends nothing and returns ``None`` -- there is no
+    head to anchor; reporting that outcome belongs to the caller, since this is
+    a library function and the operator-facing wording is
+    :func:`anchor_command`'s (issue #217). Otherwise exactly one
+    canonical-JSON line pinning the head ``(sequence_number, event_hash)`` is
+    appended.
 
     Args:
         ledger_path: Path to the SQLite ledger database.
@@ -284,13 +343,20 @@ def anchor_head(
         now: Clock supplying the anchor's ``anchored_at`` timestamp. Injectable
             for deterministic tests.
 
+    Returns:
+        The head that was anchored, or ``None`` when the ledger held no records
+        and nothing was written.
+
     Raises:
+        FileNotFoundError: If ``ledger_path`` does not point at an existing
+            file.
         ChainIntegrityError: If the ledger's hash chain fails verification.
     """
     head = _read_verified_head(ledger_path)
     if head is None:
-        return
+        return None
     _append_anchor_line(anchor_path, head, now)
+    return head
 
 
 def _check_anchor(anchor: AnchorRecord, records: list[LedgerRecord]) -> None:
@@ -342,20 +408,39 @@ def verify_anchors(ledger_path: Path, anchor_path: Path) -> None:
 
 
 def anchor_command(args: Namespace) -> int:
-    """Run :func:`anchor_head` for the CLI, mapping failure to an exit code.
+    """Run :func:`anchor_head` for the CLI, mapping each outcome to an exit code.
+
+    Three outcomes, deliberately kept distinct (issue #217), because a
+    scheduled ``anchor`` that reports success while writing nothing is only
+    discovered at ``verify`` time, when the window it was meant to cover is
+    already gone:
+
+    * a **missing** ``--ledger-path`` is a refusal -- exit 1, nothing created,
+      the same wording ``rebuild`` uses for the same mistake;
+    * an **existing but empty** ledger is a reportable no-op -- exit 0, with an
+      explicit "nothing anchored" notice on stderr, because a ledger that has
+      genuinely never been appended to is not a failure;
+    * anything else anchors the head and stays silent.
 
     Args:
         args: Parsed CLI arguments exposing ``ledger_path`` and ``anchor_path``.
 
     Returns:
-        0 on a clean anchor; 1 if the chain fails verification (with the
-        offending ``sequence_number`` printed to stderr).
+        0 on a clean anchor and on an empty ledger (the latter with the
+        nothing-anchored notice on stderr); 1 if the ledger path does not
+        exist or the chain fails verification (with the missing-path guidance
+        or the offending ``sequence_number`` on stderr).
     """
     try:
-        anchor_head(args.ledger_path, args.anchor_path)
-    except ChainIntegrityError as error:
+        head = anchor_head(args.ledger_path, args.anchor_path)
+    except (ChainIntegrityError, FileNotFoundError) as error:
         print(str(error), file=sys.stderr)
         return 1
+    if head is None:
+        print(
+            _empty_ledger_message(args.ledger_path, args.anchor_path),
+            file=sys.stderr,
+        )
     return 0
 
 
