@@ -13,7 +13,9 @@ scan-issue-writer as a finding with the exact uncovered lines/branches.
 ## Goal
 Produce one issue per under-covered module, naming the specific uncovered lines
 and branches and a concrete test plan to close them — measured against the
-≥90% line / ≥80% branch backend gate and the ≥90% Jest frontend gate.
+backend gate of ≥90% coverage over line **and** branch outcomes combined
+(branch outcomes fold into that single figure; there is no separate branch
+floor).
 
 ## Context
 - Title-slug prefix: `[scan:coverage]`. Priority `P2` (passed by the workflow).

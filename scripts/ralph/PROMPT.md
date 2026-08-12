@@ -80,9 +80,12 @@ drives Gates 3–4. The taxonomy you dispatch is mapped in
      hand its fixes to ralph-implementation-specialist). Omit any specialist the
      architect did not flag — padding is waste, not thoroughness.
    Meet the non-negotiable thresholds in `CLAUDE.md` (and
-   `shared/house-rules.md`): ≥90% line / ≥80% branch (pytest-cov), a docstring
-   on every public symbol (ruff `D1` — presence per symbol, not a percentage),
-   xenon A, radon MI ≥ B, mypy strict, ruff `select = ["ALL"]`.
+   `shared/house-rules.md`): ≥90% coverage over line **and** branch outcomes
+   combined (pytest-cov — branch outcomes fold into that one figure; there is no
+   separate branch floor), a docstring on every public symbol (ruff `D1` —
+   presence per symbol, not a percentage), cyclomatic complexity ≤10 per
+   function (`xenon --max-absolute B`), mypy strict, and ruff's curated
+   `select` list.
 7. **Gate 2 → Gate 2.5.** Run `./scripts/check-all.sh` until exit 0
    (`./scripts/fix-all.sh` for autofixable lint/format — never bypass).
    Then dispatch **`Agent(ralph-code-review-orchestrator)`** over the diff and fix every

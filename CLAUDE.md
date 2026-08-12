@@ -234,8 +234,9 @@ Run test suite with coverage reporting.
 
 Features:
 - Unit, integration, and property-based tests
-- Branch coverage ≥85%
-- Line coverage ≥90%
+- Coverage ≥90%, measured over line **and** branch outcomes together
+  (`branch = true` plus `fail_under = 90` in `pyproject.toml`). Branch coverage
+  has no floor of its own — see the Quality Standards table above
 - HTML and XML coverage reports
 - Parallel execution with pytest-xdist
 
