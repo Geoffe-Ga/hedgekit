@@ -82,8 +82,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tests.scheduler.test_paper_intent_barriers import (
-    DAILY_LOSS_VETO_REASON,
     FIXED_NOW_EPOCH_S,
+    FRESH_LEDGER_VETO_REASONS,
     SHIPPED_BOOKS,
     SHIPPED_CASSETTE,
     SIZED_FILL_CENTIS,
@@ -351,11 +351,15 @@ def _assert_status_and_book_instants(deps: PaperTickDeps, *, latency_s: int) -> 
 def _run_two_beats(deps: PaperTickDeps) -> int:
     """Run beat 1, then beat 2, and return beat 2's fill.
 
-    Beat 1 is deliberately present. It vetoes on ``daily_loss_limit`` -- a fresh
-    ledger carries no ``EquitySampled`` row, so the day has no equity baseline --
-    and ledgers the sample beat 2 measures against. Without it every beat-2
-    reason list below would carry that transient too and the sweep would be
-    reading two effects at once.
+    Beat 1 is deliberately present. It vetoes on
+    :data:`~tests.scheduler.test_paper_intent_barriers.FRESH_LEDGER_VETO_REASONS`
+    -- a fresh ledger carries no ``EquitySampled`` row, so neither the daily
+    loss limit nor the trailing drawdown limit (issue #514) has a baseline to
+    measure against, and both refuse for want of evidence -- and it ledgers the
+    sample beat 2 measures against. Without it every beat-2 reason list below
+    would carry those transients too and the sweep would be reading three
+    effects at once. The list is imported rather than restated, so a further
+    fail-closed check joining that pair moves this harness with it.
 
     Args:
         deps: The wired dependencies.
@@ -471,7 +475,7 @@ def test_the_status_veto_fires_only_past_the_ttl_under_a_latent_venue(
     vetoes = _payloads(deps, "IntentVetoed")
     if expected == []:
         assert [payload["reasons"] for payload in approvals] == [[]]
-        assert [payload["reasons"] for payload in vetoes] == [[DAILY_LOSS_VETO_REASON]]
+        assert [payload["reasons"] for payload in vetoes] == [FRESH_LEDGER_VETO_REASONS]
         assert filled == FRESH_FILL_CENTIS
         assert len(_payloads(deps, "ApprovalTokenIssued")) == 1
     else:
