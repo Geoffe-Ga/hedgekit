@@ -117,6 +117,7 @@ from windbreak.forecast.pipeline import (
     PROVIDER_GATE_HELD_EVENT,
     PROVIDER_VOTE_COSTED_EVENT,
     InMemoryForecastLedger,
+    ledger_safe_ticker,
     run_pipeline,
 )
 from windbreak.forecast.providers.base import ProviderMarketMetadataRejectedError
@@ -682,8 +683,22 @@ def market_snapshot_event_to_record(
     Carries the top-of-book best bid/ask in pips (never a float), each ``None``
     for a missing (empty) book side rather than a fabricated zero price.
 
+    The ticker crosses through
+    :func:`~windbreak.forecast.pipeline.ledger_safe_ticker` (issue #530).
+    :func:`_snapshot_stage` appends this row for every screened candidate,
+    *before* :func:`_forecast_stage` runs -- so the entry screen issue #525
+    added to ``run_pipeline`` refuses the market too late to keep its bytes off
+    an append-only chain. Substituting here, at the sole place this event is
+    constructed, is what closes that window.
+
+    Nothing reads this ticker back, so the digest costs no downstream truth;
+    it is the same stable digest the market's ``ScreenDecisionRecorded`` row
+    carries, so the two still correlate.
+
     Args:
-        ticker: The market the snapshot is for.
+        ticker: The market the snapshot is for. Ledgered as a digest when it
+            fails the S8.5 screen, so the returned record's ``ticker`` and its
+            payload agree and neither carries the raw bytes.
         order_book: The book snapshot to project.
         component: The component label stamped on the event.
 
@@ -692,7 +707,7 @@ def market_snapshot_event_to_record(
     """
     return MarketSnapshotRecorded(
         component=component,
-        ticker=ticker,
+        ticker=ledger_safe_ticker(ticker),
         best_bid_pips=_best_bid_pips(order_book),
         best_ask_pips=_best_ask_pips(order_book),
         fetched_at_epoch_s=int(order_book.fetched_at.timestamp()),
@@ -4713,8 +4728,14 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     both appended before the forecast stage is reached, and loses everything
     from ``ForecastCreated`` onward -- no research is paid for, so it leaves no
     ``ResearchSpendRecorded`` either. Every candidate behind it still runs.
-    ``tests/integration/test_paper_hostile_ticker.py`` pins that shape by
-    reading the chain back from disk.
+    Both surviving rows carry the market's ticker as a stable
+    ``<rejected-ticker:sha256:...>`` digest rather than its bytes (issue #530),
+    so the two rows still correlate with each other and with nothing attacker-
+    chosen reaching the chain. A market the §16 screen turns *away* leaves only
+    the first of those two rows, digest included, and never reaches the forecast
+    stage at all -- a strictly wider population, since it need not screen in.
+    ``tests/integration/test_paper_hostile_ticker.py`` pins every one of these
+    shapes by reading the chain back from disk.
 
     Args:
         deps: The fully wired dependency bundle.

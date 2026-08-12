@@ -337,6 +337,45 @@ REJECTED_TICKER_FINGERPRINT_KEY: Final = "market_ticker_fingerprint"
 REJECTED_TICKER_FAILURE_KEY: Final = "market_ticker_screen_failure"
 
 
+def ledger_safe_ticker(market_ticker: str) -> str:
+    """Return a market ticker in the only form a ledger row may carry (#530).
+
+    The single renderer of a refused ticker. A clean ticker -- one
+    :func:`~windbreak.forecast.sanitize.screen_single_line_text` accepts, the
+    identical screen the provider seam refuses a market on -- is returned
+    verbatim, so a clean run's rows are byte-identical to what they were before
+    this existed. Anything the screen rejects is replaced by
+    :data:`REJECTED_TICKER_PREFIX` plus the ticker's sha256 digest: the bytes are
+    refused, and the digest is stable for a given ticker, so a reader can still
+    correlate every row a refused market produced.
+
+    Refusal (raising) is deliberately *not* the answer here, and this is the one
+    place that decision differs from issue #525's. There, the guard sits on
+    ``ForecastRecord``, whose ``market_ticker`` is the record's identity -- the
+    selector and the order gateway route on it, so a digest would make the record
+    lie downstream, and the market can simply not be forecast. The rows this
+    renders are pure audit rows on the tick's *unconditional* path: raising would
+    convert a hostile market into a crashed tick that never ledgers its
+    heartbeat, its equity or its positions -- the denial of service issue #525
+    had to add a graceful skip to avoid. Nothing routes on either ticker, so
+    keeping the row and refusing the bytes costs nothing and loses no audit.
+
+    A clean ticker that happens to *look* like a substitution is ledgered
+    verbatim, and is therefore indistinguishable from one. That is a reporting
+    ambiguity, not a leak: such a ticker passed the screen, so no text the screen
+    rejects ever reaches the chain either way, which is the property under test.
+
+    Args:
+        market_ticker: The market's own, untrusted ticker.
+
+    Returns:
+        The ticker verbatim, or its ``<rejected-ticker:sha256:...>`` digest form.
+    """
+    if screen_single_line_text(market_ticker) is None:
+        return market_ticker
+    return f"{REJECTED_TICKER_PREFIX}{fingerprint_response(market_ticker)}>"
+
+
 def _ticker_payload(market_ticker: str) -> dict[str, object]:
     """Return the ledger-safe ``market_ticker`` payload fragment (issue #464).
 
@@ -352,6 +391,13 @@ def _ticker_payload(market_ticker: str) -> dict[str, object]:
     a clean run's payloads are byte-identical to what they were before this
     existed.
 
+    The substituted *value* is rendered by :func:`ledger_safe_ticker`, the one
+    renderer the whole codebase shares (issue #530), so the payload keys below
+    and the bare-string rows the scheduler ledgers can never drift into two
+    spellings of the same substitution. This fragment adds the two sibling keys
+    on top, which a free-form payload can carry and a typed ledger row -- whose
+    key set is fixed by its schema -- cannot.
+
     Args:
         market_ticker: The market's own, untrusted ticker.
 
@@ -363,7 +409,7 @@ def _ticker_payload(market_ticker: str) -> dict[str, object]:
         return {"market_ticker": market_ticker}
     digest = fingerprint_response(market_ticker)
     return {
-        "market_ticker": f"{REJECTED_TICKER_PREFIX}{digest}>",
+        "market_ticker": ledger_safe_ticker(market_ticker),
         REJECTED_TICKER_FINGERPRINT_KEY: digest,
         REJECTED_TICKER_FAILURE_KEY: screen_failure,
     }
