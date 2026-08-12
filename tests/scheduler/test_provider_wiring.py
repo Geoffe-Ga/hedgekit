@@ -195,6 +195,7 @@ def _live_http(
         llm=llm if llm is not None else {"anthropic": stub, "openai": stub},
         search=stub if research else None,
         fetch=stub if research else None,
+        futuresearch=None,
     )
 
 
@@ -353,7 +354,7 @@ def test_a_zero_unmetered_charge_refuses_to_start() -> None:
 
 def test_the_offline_factory_builds_a_bare_fixture_provider() -> None:
     """Replaying a recording is neither priced nor retried."""
-    factory = build_provider_factory(_config(), live=False)
+    factory = build_provider_factory(_config(), live=False, provider_http=None)
 
     provider = factory(_StubLlmTransport(), _StubMember("openai"))
 
@@ -362,7 +363,9 @@ def test_the_offline_factory_builds_a_bare_fixture_provider() -> None:
 
 def test_the_live_factory_wraps_in_a_retrying_provider() -> None:
     """Every live vote runs under the configured bounded-retry policy."""
-    factory = build_provider_factory(_config(mode=PROVIDER_TRANSPORT_LIVE), live=True)
+    factory = build_provider_factory(
+        _config(mode=PROVIDER_TRANSPORT_LIVE), live=True, provider_http=_live_http()
+    )
 
     provider = factory(_StubLlmTransport(), _StubMember("openai"))
 
@@ -387,6 +390,7 @@ def test_the_live_factory_meters_a_vote_at_the_configured_token_rates() -> None:
             unmetered_response_micros=888_000,
         ),
         live=True,
+        provider_http=_live_http(),
     )
     transport = _StubLlmTransport(
         response=_VOTE_JSON, usage=TokenUsage(input_tokens=1_000, output_tokens=100)
@@ -412,6 +416,7 @@ def test_the_live_factory_fails_closed_on_a_vote_reporting_no_usage() -> None:
             unmetered_response_micros=888_000,
         ),
         live=True,
+        provider_http=_live_http(),
     )
     transport = _StubLlmTransport(response=_VOTE_JSON)
 
@@ -427,7 +432,7 @@ def test_the_factory_takes_the_transport_per_call() -> None:
     This is what keeps ``dataclasses.replace(deps, transport=...)`` reaching the
     vote stage instead of voting against whatever was wired at composition time.
     """
-    factory = build_provider_factory(_config(), live=False)
+    factory = build_provider_factory(_config(), live=False, provider_http=None)
     first, second = _StubLlmTransport(), _StubLlmTransport()
 
     assert factory(first, _StubMember("openai")) is not factory(
@@ -631,3 +636,197 @@ def test_configured_live_research_builds_the_live_transports(
     )
 
     assert tools is not None
+
+
+# --- The research forecaster's config-to-engine translation (issue #555) -------
+
+#: The version the research-forecaster members below pin, and the one the
+#: section admits, unless a test overrides one of the two.
+_RESEARCH_VERSION = "fs-2026-06-01"
+
+#: The environment variable the research-forecaster section names, and an
+#: alternate one used to prove the leaf is carried rather than defaulted. Bound
+#: to constants, never written as literals beside an ``api_key_env`` keyword:
+#: the repo's secret scanner reads that shape as a credential, and renaming the
+#: fixture is the structural fix the hook asks for (PRs #260/#282).
+_RESEARCH_ENV_VAR = "FUTURESEARCH_API_KEY"
+_ALTERNATE_ENV_VAR = "A_DIFFERENT_VARIABLE_NAME"
+
+
+def _research_forecaster_config(
+    *,
+    members: int = 1,
+    model_version: str = _RESEARCH_VERSION,
+    endpoint_url: str = "https://futuresearch.example/v1/forecast",
+    pinned_versions: tuple[str, ...] = (_RESEARCH_VERSION,),
+    env_var: str = _RESEARCH_ENV_VAR,
+    per_call_ceiling_micros: int = 1_250_000,
+    reject_on_version_drift: bool = True,
+) -> WindbreakConfig:
+    """Build a live config selecting the hosted research forecaster.
+
+    Args:
+        members: How many `futuresearch` vote-ensemble members to name.
+        model_version: The version each member pins.
+        endpoint_url: The section's endpoint.
+        pinned_versions: The versions the section admits.
+        env_var: The environment variable the section names.
+        per_call_ceiling_micros: The section's fail-closed per-call charge.
+        reject_on_version_drift: The section's drift policy.
+
+    Returns:
+        The configuration under test.
+    """
+    from windbreak.config.schema import FutureSearchProviderSettings
+
+    base = WindbreakConfig()
+    forecast = dataclasses.replace(
+        base.forecast,
+        provider_transport=ProviderTransportConfig(mode=PROVIDER_TRANSPORT_LIVE),
+        vote_ensemble=tuple(
+            EnsembleMemberConfig("futuresearch", model_version, "server-managed")
+            for _ in range(members)
+        ),
+        futuresearch=FutureSearchProviderSettings(
+            endpoint_url=endpoint_url,
+            pinned_forecaster_versions=pinned_versions,
+            api_key_env=env_var,
+            per_call_ceiling_micros=per_call_ceiling_micros,
+            reject_on_version_drift=reject_on_version_drift,
+        ),
+    )
+    return dataclasses.replace(base, forecast=forecast)
+
+
+def _research_seams(*, seam: object = None) -> LiveProviderHttp:
+    """Build a seam bundle carrying a research-forecaster transport.
+
+    Args:
+        seam: The research-forecaster HTTP transport, or `None` for a stub.
+
+    Returns:
+        The bundle under test.
+    """
+    stub = _StubHttpTransport()
+    return LiveProviderHttp(
+        llm={},
+        search=None,
+        fetch=None,
+        futuresearch=seam if seam is not None else stub,
+    )
+
+
+def test_every_configured_research_forecaster_leaf_reaches_the_engine() -> None:
+    """All five leaves cross the SPEC S8.3 boundary, none defaulted silently.
+
+    The section was read by nothing in `windbreak/` before issue #555. Asserting
+    the whole translated record -- rather than one field -- is what makes a leaf
+    dropped from this adapter a failure instead of a silent revert to the
+    engine's own dataclass default.
+    """
+    from windbreak.forecast.providers import FutureSearchProviderConfig
+    from windbreak.scheduler.provider_wiring import futuresearch_config_from_config
+
+    resolved = futuresearch_config_from_config(
+        _research_forecaster_config(
+            endpoint_url="https://pinned.example/v1/forecast",
+            pinned_versions=(_RESEARCH_VERSION, "fs-2026-07-01"),
+            env_var=_ALTERNATE_ENV_VAR,
+            per_call_ceiling_micros=1_750_000,
+            reject_on_version_drift=False,
+        )
+    )
+
+    assert resolved == FutureSearchProviderConfig(
+        endpoint_url="https://pinned.example/v1/forecast",
+        pinned_forecaster_versions=(_RESEARCH_VERSION, "fs-2026-07-01"),
+        api_key_env=_ALTERNATE_ENV_VAR,
+        per_call_ceiling_micros=1_750_000,
+        reject_on_version_drift=False,
+    )
+
+
+def test_no_translated_leaf_equals_the_engines_own_default() -> None:
+    """Guards the assertion above against a coincidence.
+
+    Every override in that test must differ from `FutureSearchProviderConfig`'s
+    own default, or an adapter that dropped the leaf entirely would still
+    produce the expected record.
+    """
+    from windbreak.forecast.providers import FutureSearchProviderConfig
+    from windbreak.scheduler.provider_wiring import futuresearch_config_from_config
+
+    resolved = futuresearch_config_from_config(
+        _research_forecaster_config(
+            endpoint_url="https://pinned.example/v1/forecast",
+            pinned_versions=(_RESEARCH_VERSION, "fs-2026-07-01"),
+            env_var=_ALTERNATE_ENV_VAR,
+            per_call_ceiling_micros=1_750_000,
+            reject_on_version_drift=False,
+        )
+    )
+    engine_default = FutureSearchProviderConfig(
+        endpoint_url="", pinned_forecaster_versions=()
+    )
+
+    assert resolved.api_key_env != engine_default.api_key_env
+    assert resolved.per_call_ceiling_micros != engine_default.per_call_ceiling_micros
+    assert resolved.reject_on_version_drift != engine_default.reject_on_version_drift
+
+
+def test_the_live_factory_builds_the_research_forecaster_for_its_member() -> None:
+    """A `futuresearch` member is routed to its own provider, not the seam."""
+    from windbreak.forecast.providers import FutureSearchProvider
+
+    factory = build_provider_factory(
+        _research_forecaster_config(), live=True, provider_http=_research_seams()
+    )
+
+    provider = factory(_StubLlmTransport(), _StubMember("futuresearch"))
+
+    assert isinstance(provider, FutureSearchProvider)
+
+
+def test_the_live_factory_still_wraps_a_completion_member_beside_it() -> None:
+    """One research forecaster in the ensemble must not unwrap the LLM members.
+
+    A guard that dispatched on the *configuration* rather than the member would
+    agree with this one for a single-family ensemble and disagree here.
+    """
+    factory = build_provider_factory(
+        _research_forecaster_config(), live=True, provider_http=_research_seams()
+    )
+
+    provider = factory(_StubLlmTransport(), _StubMember("openai"))
+
+    assert isinstance(provider, RetryingProvider)
+
+
+def test_a_live_factory_without_the_seam_bundle_refuses() -> None:
+    """A live factory that cannot reach the seams is not built at all.
+
+    Without this the composition root could drop `provider_http=` and still
+    return a factory that looks wired and silently routes no research
+    forecaster.
+    """
+    with pytest.raises(ValueError, match="provider_http"):
+        build_provider_factory(
+            _config(mode=PROVIDER_TRANSPORT_LIVE), live=True, provider_http=None
+        )
+
+
+def test_the_research_forecaster_is_not_wrapped_in_the_metering_layer() -> None:
+    """Its reported cost must reach the ledger unchanged.
+
+    `RetryingProvider._finalize_success` adds the rate table's fail-closed
+    `unmetered_micros` to any response carrying no token usage, and a research
+    response reports dollars rather than tokens -- so wrapping would add a flat
+    constant on top of a measurement.
+    """
+    factory = build_provider_factory(
+        _research_forecaster_config(), live=True, provider_http=_research_seams()
+    )
+
+    provider = factory(_StubLlmTransport(), _StubMember("futuresearch"))
+
+    assert not isinstance(provider, RetryingProvider)

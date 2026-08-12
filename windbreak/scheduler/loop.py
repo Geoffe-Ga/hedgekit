@@ -3559,7 +3559,9 @@ def build_paper_deps(
         clock=resolved_clock,
         budget=_build_research_budget(store, config),
         provider_gate=_build_provider_gate(report_dir, config),
-        provider_factory=build_provider_factory(config, live=live),
+        provider_factory=build_provider_factory(
+            config, live=live, provider_http=provider_http
+        ),
     )
 
 

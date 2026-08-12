@@ -2062,7 +2062,7 @@ def test_live_seams_without_a_search_endpoint_report_no_evidence_source(
         None,
         tmp_path / "ledger.db",
         WindbreakConfig(),
-        LiveProviderHttp(llm={}, search=None, fetch=None),
+        LiveProviderHttp(llm={}, search=None, fetch=None, futuresearch=None),
     )
 
     assert source == RESEARCH_EVIDENCE_NONE
@@ -2100,7 +2100,7 @@ def test_live_seams_with_a_search_endpoint_report_the_live_source(
         None,
         tmp_path / "ledger.db",
         WindbreakConfig(),
-        LiveProviderHttp(llm={}, search=seam, fetch=seam),
+        LiveProviderHttp(llm={}, search=seam, fetch=seam, futuresearch=None),
     )
 
     assert source == RESEARCH_EVIDENCE_LIVE
@@ -2136,7 +2136,12 @@ def test_half_a_live_research_bundle_reports_no_evidence_source(
         None,
         tmp_path / "ledger.db",
         WindbreakConfig(),
-        LiveProviderHttp(llm={}, search=ForbiddenLiveHttpTransport(), fetch=None),
+        LiveProviderHttp(
+            llm={},
+            search=ForbiddenLiveHttpTransport(),
+            fetch=None,
+            futuresearch=None,
+        ),
     )
 
     assert source == RESEARCH_EVIDENCE_NONE

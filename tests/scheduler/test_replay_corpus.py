@@ -616,7 +616,7 @@ def test_a_corpus_beside_the_live_transport_refuses_to_start() -> None:
             provider_transport=ProviderTransportConfig(mode=PROVIDER_TRANSPORT_LIVE),
         ),
     )
-    seam = LiveProviderHttp(llm={}, search=None, fetch=None)
+    seam = LiveProviderHttp(llm={}, search=None, fetch=None, futuresearch=None)
 
     with pytest.raises(ValueError) as caught:
         _resolve_replay_corpus(live, seam)

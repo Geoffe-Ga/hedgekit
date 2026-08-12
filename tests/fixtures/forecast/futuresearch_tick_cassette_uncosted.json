@@ -1,0 +1,26 @@
+{
+  "3b98210efc1724dd237670b0a234667221c15a7997112821b3fb561fcb9a174f": {
+    "request": {
+      "body": "{\"baseline_price_pips\":4600,\"resolution_criteria\":\"Test fixture; not a real resolution.\",\"ticker\":\"MKT-DEEP\",\"title\":\"Deep multi-level taker walk scenario\",\"vote_index\":1}",
+      "method": "POST",
+      "url": "https://futuresearch.example/v1/forecast"
+    },
+    "response": {
+      "body": "{\"probability\": 0.723456, \"rationale\": \"hosted research forecaster recorded response\", \"citations\": [], \"forecaster_version\": \"fs-2026-06-01\"}",
+      "content_type": "",
+      "status_code": 200
+    }
+  },
+  "c33bc1e6b1c859a11f99f9ca1fa89a31f89f3db0d642c3390caffb931c920ea0": {
+    "request": {
+      "body": "{\"baseline_price_pips\":4600,\"resolution_criteria\":\"Test fixture; not a real resolution.\",\"ticker\":\"MKT-DEEP\",\"title\":\"Deep multi-level taker walk scenario\",\"vote_index\":0}",
+      "method": "POST",
+      "url": "https://futuresearch.example/v1/forecast"
+    },
+    "response": {
+      "body": "{\"probability\": 0.723456, \"rationale\": \"hosted research forecaster recorded response\", \"citations\": [], \"forecaster_version\": \"fs-2026-06-01\"}",
+      "content_type": "",
+      "status_code": 200
+    }
+  }
+}

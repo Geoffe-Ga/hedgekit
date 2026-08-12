@@ -487,6 +487,10 @@ def test_vote_ensemble_unrecognized_provider_contributes_no_host() -> None:
     ``_FORECAST_PROVIDER_HOSTS`` contributes no host -- fail closed on an
     unrecognized provider, exactly like the legacy ``ensemble``/``triage_model``
     derivation.
+
+    Uses ``futuresearch`` with its section left at the shipped default, so the
+    fail-closed direction issue #555 preserved is the one under test: naming the
+    provider is not on its own enough to open egress.
     """
     default_forecast = WindbreakConfig().forecast
     config = dataclasses.replace(
@@ -501,6 +505,87 @@ def test_vote_ensemble_unrecognized_provider_contributes_no_host() -> None:
 
     with pytest.raises(EgressDeniedError):
         allowlist.require("https://futuresearch.example.com/v1/x")
+
+
+# --- allowlist_from_config: the research forecaster endpoint (issue #555) ------
+
+
+def _futuresearch_config(*, endpoint_url: str, selected: bool) -> WindbreakConfig:
+    """Build a config with a research-forecaster endpoint, optionally selected.
+
+    Args:
+        endpoint_url: The ``forecast.futuresearch.endpoint_url`` to set.
+        selected: Whether a ``vote_ensemble`` member names the provider.
+
+    Returns:
+        The configuration under test.
+    """
+    from windbreak.config.schema import FutureSearchProviderSettings
+
+    default_forecast = WindbreakConfig().forecast
+    ensemble = (
+        (EnsembleMemberConfig("futuresearch", "fs-1", "server-managed"),)
+        if selected
+        else default_forecast.vote_ensemble
+    )
+    return dataclasses.replace(
+        WindbreakConfig(),
+        forecast=dataclasses.replace(
+            default_forecast,
+            vote_ensemble=ensemble,
+            futuresearch=FutureSearchProviderSettings(endpoint_url=endpoint_url),
+        ),
+    )
+
+
+def test_a_selected_research_forecaster_admits_its_configured_endpoint_host() -> None:
+    """A configured, *selected* research forecaster reaches its own endpoint.
+
+    Its host cannot come from the closed provider->host table the way
+    ``anthropic``/``openai`` do: a hosted research forecaster is an
+    operator-chosen deployment, so only configuration can name it.
+    """
+    allowlist = allowlist_from_config(
+        _futuresearch_config(
+            endpoint_url="https://research.futuresearch.example/v1/forecast",
+            selected=True,
+        )
+    )
+
+    allowlist.require("https://research.futuresearch.example/v1/forecast")
+
+
+def test_an_unselected_research_forecaster_endpoint_opens_no_egress() -> None:
+    """Writing an endpoint down does not on its own admit it.
+
+    Two independent fields must agree -- a member must name the provider *and*
+    the endpoint must parse -- so a mistyped or tampered ``endpoint_url`` in a
+    deployment that never selected the research forecaster reaches nothing. This
+    is the alert sinks' "declare it twice" property, without a second host list
+    to transcribe.
+    """
+    allowlist = allowlist_from_config(
+        _futuresearch_config(
+            endpoint_url="https://research.futuresearch.example/v1/forecast",
+            selected=False,
+        )
+    )
+
+    with pytest.raises(EgressDeniedError):
+        allowlist.require("https://research.futuresearch.example/v1/forecast")
+
+
+def test_a_selected_research_forecaster_admits_only_its_own_host() -> None:
+    """The derivation adds one host, not a blanket allowance."""
+    allowlist = allowlist_from_config(
+        _futuresearch_config(
+            endpoint_url="https://research.futuresearch.example/v1/forecast",
+            selected=True,
+        )
+    )
+
+    with pytest.raises(EgressDeniedError):
+        allowlist.require("https://evil.example.com/steal")
 
 
 def test_allowlist_from_config_default_forecast_host_set_is_unchanged() -> None:

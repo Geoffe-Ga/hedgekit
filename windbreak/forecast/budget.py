@@ -405,22 +405,35 @@ _OPENAI_PROVIDER_PRICE_MICROS: Final = 200_000
 #: Per-attempt list price for the Anthropic provider, in micros.
 _ANTHROPIC_PROVIDER_PRICE_MICROS: Final = 300_000
 
-#: Per-attempt list price for the FutureSearch provider, in micros.
-_FUTURESEARCH_PROVIDER_PRICE_MICROS: Final = 500_000
-
-#: The pinned default per-attempt price table covering the three real hosted
-#: providers. The network-free fixture provider is deliberately absent: its true
-#: cost is ``0`` and rides on ``ProviderForecast.cost_micros`` directly rather
-#: than through this fail-closed (never-zero) list-price table.
+#: The pinned default per-attempt price table covering the two providers whose
+#: votes ride the routed completion seam.
+#:
+#: This table is the *pre-gate estimate* a
+#: :class:`~windbreak.forecast.providers.retry.RetryingProvider` checks
+#: affordability against before each attempt, and nothing else reads it. Two
+#: providers are therefore deliberately absent, for one shared reason: their
+#: true cost rides on ``ProviderForecast.cost_micros`` directly rather than
+#: through this fail-closed (never-zero) list-price table.
+#:
+#: * The network-free fixture provider, whose true cost is ``0``.
+#: * The hosted research forecaster (issue #555), which reports its own
+#:   ``cost_usd`` and falls back fail-closed to its configured
+#:   ``per_call_ceiling_micros`` -- never to zero. It is not wrapped in the
+#:   retry layer (``windbreak.scheduler.provider_wiring.build_provider_factory``
+#:   explains why), so a per-attempt list price for it would be a number nothing
+#:   charges. It was priced here at ``500_000`` until #555; that entry meant the
+#:   engine could price a call the composition root refused to make, and pricing
+#:   it now would mean advertising a per-attempt charge that is never applied.
 #:
 #: NOTE: sourcing these list prices from ``windbreak.config`` is a follow-up; it
 #: is deliberately NOT wired to ``config.schema`` here (SPEC S8.3 keeps the
-#: forecast engine free of any config import).
+#: forecast engine free of any config import). The configuration's own
+#: ``_default_provider_prices()`` is pinned *mirror-equal* to this table by
+#: test, so the two can never disagree about a provider or a price.
 DEFAULT_PROVIDER_PRICE_TABLE: Final[ProviderPriceTable] = ProviderPriceTable(
     prices_micros={
         "openai": _OPENAI_PROVIDER_PRICE_MICROS,
         "anthropic": _ANTHROPIC_PROVIDER_PRICE_MICROS,
-        "futuresearch": _FUTURESEARCH_PROVIDER_PRICE_MICROS,
     },
     unknown_provider_price_micros=DEFAULT_UNKNOWN_PROVIDER_PRICE_MICROS,
 )

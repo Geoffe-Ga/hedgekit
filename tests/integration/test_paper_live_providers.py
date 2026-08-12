@@ -259,6 +259,7 @@ def _live_http(
         },
         search=_NeverCalledHttpTransport(),
         fetch=_NeverCalledHttpTransport(),
+        futuresearch=None,
     )
 
 
@@ -780,8 +781,11 @@ def test_a_live_ensemble_naming_an_unroutable_provider_refuses_to_start(
 ) -> None:
     """The misconfiguration is refused at composition, not discovered mid-tick.
 
-    Reachable by an operator adding ``futuresearch`` to a live ensemble, or
-    simply typo'ing a provider name.
+    Reachable by an operator typo'ing a provider name. ``futuresearch`` was the
+    example here until issue #555 made it routable over its own HTTP seam; its
+    misconfigurations are pinned by
+    ``tests/integration/test_paper_research_forecaster.py``, which asserts each
+    refusal names the leaf rather than merely the provider.
     """
     from windbreak.config.schema import EnsembleMemberConfig
 
@@ -790,11 +794,11 @@ def test_a_live_ensemble_naming_an_unroutable_provider_refuses_to_start(
         base.forecast,
         vote_ensemble=(
             EnsembleMemberConfig("anthropic", "claude-pinned", "2025-07-31"),
-            EnsembleMemberConfig("futuresearch", "fs-pinned", "2025-07-31"),
+            EnsembleMemberConfig("anthropi", "typo-pinned", "2025-07-31"),
         ),
     )
 
-    with pytest.raises(ValueError, match="futuresearch"):
+    with pytest.raises(ValueError, match="anthropi'"):
         _build_deps(
             books_dir=books_dir,
             cassette_path=cassette_path,

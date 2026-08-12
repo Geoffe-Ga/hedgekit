@@ -1,0 +1,56 @@
+# A committed, operator-shaped configuration selecting the hosted
+# research-forecaster provider (SPEC S8.9, ADR-0005 family (b), issue #555).
+#
+# This is the configuration `tests/integration/test_paper_research_forecaster.py`
+# drives through the *real* composition root (`build_paper_deps` ->
+# `run_single_tick`), so "an operator can reach FutureSearchProvider from the
+# shipped CLI" is asserted against a file an operator could actually write --
+# not against a hand-constructed provider.
+#
+# `api_key_env` names an environment variable; it never holds a key. Every leaf
+# here is flattened verbatim into the hash-chained `ConfigLoaded` event, which
+# cannot be redacted afterwards, so only `windbreak.main` ever reads the value
+# the name points at.
+#
+# The screener and capital leaves below are fixture accommodations, not policy:
+# the committed `deep_walk` books are deliberately tiny and close on a frozen
+# 2025 literal, so the production depth/horizon floors would screen them out and
+# the tick would forecast nothing at all. See `tests/integration/conftest.py`.
+mode_ceiling: paper
+
+capital:
+  floor_micros: 0
+
+screener:
+  min_volume_24h_micros: 0
+  min_depth_contract_centis: 100
+  horizon_days: {min: 2, max: 1000}
+
+forecast:
+  # No shrink-to-market, so a ledgered probability equal to the recorded
+  # response's proves it came off that response rather than being pulled back
+  # toward the book.
+  shrink_to_market_lambda_ppm: 0
+
+  # Two research-forecaster members: `DEFAULT_MIN_ENSEMBLE_VOTES` is 2, so one
+  # member alone would abstain on quorum before any cost could be booked. The
+  # research forecaster counts toward that quorum exactly like a no-tools LLM
+  # member -- ADR-0005's whole point is that the pipeline cannot tell the two
+  # families apart.
+  vote_ensemble:
+    - {provider: futuresearch, model_version: "fs-2026-06-01", training_cutoff: "server-managed"}
+    - {provider: futuresearch, model_version: "fs-2026-06-01", training_cutoff: "server-managed"}
+
+  futuresearch:
+    endpoint_url: "https://futuresearch.example/v1/forecast"
+    pinned_forecaster_versions: ["fs-2026-06-01"]
+    api_key_env: "FUTURESEARCH_API_KEY"
+    # Deliberately unlike the schema default (2000000) and unlike either
+    # recorded `cost_usd`, so a test asserting this figure proves the
+    # *configured* ceiling was consumed rather than a constant that happens to
+    # match.
+    per_call_ceiling_micros: 1250000
+    reject_on_version_drift: true
+
+  provider_transport:
+    mode: live

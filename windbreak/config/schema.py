@@ -676,21 +676,24 @@ class ProviderPrice:
 def _default_provider_prices() -> tuple[ProviderPrice, ...]:
     """Return the default per-attempt price table (issue #269).
 
-    Covers exactly the providers the live composition root can *route* -- the
-    two pinned-LLM completion transports. Where it overlaps the forecast
-    engine's own ``DEFAULT_PROVIDER_PRICE_TABLE`` the prices are mirror-equal,
-    pinned by test.
+    Covers exactly the providers whose votes ride the *routed completion seam* --
+    the two pinned-LLM transports -- and is pinned **mirror-equal** to the
+    forecast engine's own ``DEFAULT_PROVIDER_PRICE_TABLE`` by test: same
+    providers, same prices, in both directions. A per-attempt list price is the
+    affordability estimate the retry wrapper gates on, so a provider priced in
+    one table and not the other would mean the engine could price a call this
+    configuration never budgets for.
 
-    ``futuresearch`` is deliberately absent even though the engine's table
-    prices it. Its provider is a ``ForecastProvider`` that does its own
-    research, not an ``LlmTransport``, so it does not ride the routed
-    completion seam this configuration selects; listing it here would advertise
-    a live provider the composition root would then refuse at startup. An
-    operator who wires it through the ``run_pipeline`` seam directly still gets
-    the engine's own list price. The network-free fixture provider is absent for
-    a different reason: its true cost is zero and rides on
-    ``ProviderForecast.cost_micros`` directly, never through this fail-closed
-    (never-zero) list-price table.
+    Two providers are deliberately absent from *both* tables, for one shared
+    reason: their cost rides on ``ProviderForecast.cost_micros`` directly rather
+    than through this fail-closed (never-zero) list-price table. The
+    network-free fixture provider's true cost is zero. The hosted research
+    forecaster (``futuresearch``, issue #555) reports its own ``cost_usd`` and
+    falls back to its configured ``per_call_ceiling_micros``, so it is not
+    wrapped in the retry layer at all and no per-attempt price would ever be
+    charged for it. It *is* reachable from a live ensemble since #555 -- absence
+    here is a statement about how it is priced, no longer about whether the
+    composition root would refuse it.
 
     Returns:
         The default per-provider list prices.
@@ -844,8 +847,17 @@ class ForecastConfig:
     vote purposes (ADR-0006, issue #240); it no longer sources vote-stage
     behaviour. Both fields still contribute to the outbound network allowlist.
     ``futuresearch`` (issue #189) configures the hosted research-forecaster
-    provider. ``provider_gate`` (issue #194) sets the per-provider track-record
-    thresholds a voting provider must clear to be live-eligible.
+    provider, and since issue #555 it is *consumed*: a ``vote_ensemble`` member
+    naming ``futuresearch`` is routed to
+    :class:`~windbreak.forecast.providers.futuresearch.FutureSearchProvider` by
+    :func:`windbreak.scheduler.provider_wiring.build_provider_factory`, over the
+    transport ``windbreak.main`` builds from this section's ``endpoint_url`` and
+    ``api_key_env``. A member naming it while the section is unfinished refuses
+    at startup, naming the leaf. ``provider_gate`` (issue #194) sets the
+    per-provider track-record thresholds a voting provider must clear to be
+    live-eligible -- and a research forecaster is a provider by that key like
+    any other, so it needs its own resolved history before a forecast it backs
+    is live-eligible.
     """
 
     ensemble: tuple[ModelRef, ...] = field(default_factory=_default_ensemble)

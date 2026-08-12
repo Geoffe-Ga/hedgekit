@@ -32,15 +32,26 @@ cost ledger on every replayed run. The price table exists to keep cost
 accounting honest; billing a replay would be the first thing to make it
 dishonest.
 
-The invariant that matters is the other direction, and it holds structurally:
-the live branch is the only place a live transport is ever constructed, and it
-always wraps. That is load-bearing for cost correctness, not just for retries.
-The wrapped :class:`~windbreak.forecast.providers.fixture.FixtureVoteProvider`
-reports ``cost_micros == 0`` -- truthfully for a replay, which spends nothing,
-and by design for a live call, since that provider *measures* (it threads the
+The invariant that matters is the other direction: **no live vote is ever booked
+at zero.** For a completion-seam vote that holds structurally because the live
+branch always wraps. The wrapped
+:class:`~windbreak.forecast.providers.fixture.FixtureVoteProvider` reports
+``cost_micros == 0`` -- truthfully for a replay, which spends nothing, and by
+design for a live call, since that provider *measures* (it threads the
 transport's reported token usage onto the forecast) but never prices. The retry
-wrapper is therefore the only layer that turns a live vote into money, and a
-live provider built without it would book every successful vote at zero.
+wrapper is therefore the only layer that turns such a vote into money, and one
+built without it would book every success at zero.
+
+Since issue #555 there is a second live family, and it satisfies that invariant
+a different way. The hosted research forecaster
+(:class:`~windbreak.forecast.providers.futuresearch.FutureSearchProvider`,
+ADR-0005 family (b)) prices *itself*: it converts the response's own reported
+``cost_usd`` to micros and falls back fail-closed to the configured
+``per_call_ceiling_micros`` when a response declines to say, never to zero. It
+is therefore deliberately **not** wrapped -- see :func:`build_provider_factory`
+for why wrapping it would add a fabricated constant on top of a measurement.
+The invariant is the "never zero" one; "always wraps" was only ever how the
+completion seam achieves it.
 
 Since issue #451 that wrapper needs two tables, not one, and
 :func:`build_provider_factory` supplies both:
@@ -88,6 +99,8 @@ from windbreak.forecast.providers import (
     OPENAI_CHAT_ENDPOINT,
     AnthropicMessagesTransport,
     FixtureVoteProvider,
+    FutureSearchProvider,
+    FutureSearchProviderConfig,
     LiveFetchConfig,
     LiveFetchTransport,
     LiveSearchConfig,
@@ -121,6 +134,13 @@ ProviderFactory = Callable[["LlmTransport", "EnsembleMemberLike"], "ForecastProv
 #: keys of ``windbreak.net.allowlist._FORECAST_PROVIDER_HOSTS``.
 ANTHROPIC_PROVIDER = "anthropic"
 OPENAI_PROVIDER = "openai"
+
+#: The hosted research-forecaster provider identifier (SPEC S8.9, ADR-0005
+#: family (b), issue #555). A vote-ensemble member naming it is routed to
+#: :class:`~windbreak.forecast.providers.futuresearch.FutureSearchProvider` over
+#: its *own* HTTP seam rather than through the routed completion transport the
+#: pinned-LLM members ride -- see :func:`build_provider_factory`.
+FUTURESEARCH_PROVIDER = "futuresearch"
 
 #: How many candidate URLs a live search requests per subquestion.
 _SEARCH_MAX_RESULTS = 10
@@ -176,11 +196,24 @@ class LiveProviderHttp:
             but not a search endpoint must not be forced to invent one.
         fetch: The HTTP transport live page fetches are issued over, or ``None``
             alongside ``search``.
+        futuresearch: The HTTP transport the hosted research forecaster is
+            dialed through, or ``None`` when no vote-ensemble member names it
+            (issue #555). A separate field rather than an ``llm`` entry because
+            it is a different *seam*: ``llm`` holds transports that a completion
+            adapter is built over and a
+            :class:`~windbreak.net.live_http.RoutingLlmTransport` dispatches
+            across, and a ``ForecastProvider`` rides neither. Folding it into
+            that mapping would put a transport there that
+            :func:`build_live_llm_transport` silently filters back out, which is
+            how a seam ends up looking wired while routing nothing. It carries
+            its own credential and its own single-host allowlist for the same
+            reason every ``llm`` entry does.
     """
 
     llm: Mapping[str, HttpTransport]
     search: HttpTransport | None
     fetch: HttpTransport | None
+    futuresearch: HttpTransport | None
 
 
 class OfflineResearchTransport:
@@ -400,18 +433,42 @@ def is_live_mode(config: WindbreakConfig) -> bool:
     raise ValueError(msg)
 
 
+def completion_routed_providers() -> frozenset[str]:
+    """Return every provider whose live votes ride the routed completion seam.
+
+    Exactly the providers with an ``LlmTransport`` adapter, and therefore
+    exactly the providers a vote is *list-priced* for: the per-attempt price
+    table is the affordability estimate
+    :class:`~windbreak.forecast.providers.retry.RetryingProvider` gates on, and
+    only a completion-seam vote is wrapped in that layer. The configuration's
+    own default price table is pinned equal to this set, so neither table can
+    advertise a per-attempt price nothing charges.
+
+    Returns:
+        The providers routed through :class:`RoutingLlmTransport`.
+    """
+    return frozenset(_LLM_ADAPTER_BUILDERS)
+
+
 def routable_live_providers() -> frozenset[str]:
     """Return every provider this composition root can route a live vote to.
 
     The authoritative answer to "what does ``mode: live`` actually support",
-    shared by the startup guard, its error message, and the configuration
-    defaults, so those three can never drift into advertising a provider the
-    root would refuse.
+    shared by the startup guard and its error message, so the two can never
+    drift into refusing a provider the root supports -- or naming a routable set
+    that omits one, which is how an operator ends up deleting a member that
+    would have worked.
+
+    Wider than :func:`completion_routed_providers` since issue #555: the hosted
+    research forecaster is routable without being completion-routed. It is a
+    :class:`ForecastProvider` over its own HTTP seam, so it is reachable, priced,
+    and gated by a different set of rules -- which is exactly why the two sets
+    are two functions rather than one shared list.
 
     Returns:
         The live-routable provider identifiers.
     """
-    return frozenset(_LLM_ADAPTER_BUILDERS)
+    return completion_routed_providers() | {FUTURESEARCH_PROVIDER}
 
 
 def live_vote_providers(config: WindbreakConfig) -> tuple[str, ...]:
@@ -432,28 +489,164 @@ def live_vote_providers(config: WindbreakConfig) -> tuple[str, ...]:
     )
 
 
+def futuresearch_config_from_config(
+    config: WindbreakConfig,
+) -> FutureSearchProviderConfig:
+    """Build the research forecaster's pinned engine config from configuration.
+
+    The config-to-engine adapter for ``forecast.futuresearch``, living out here
+    beside :func:`price_table_from_config` for the same reason: the forecast
+    engine may not import ``windbreak.config`` (SPEC S8.3), so every leaf of the
+    operator's section is carried across the boundary here or not at all. All
+    five leaves are carried; ``api_key_env`` travels as the variable *name* it
+    is, and is read only by ``windbreak.main``.
+
+    Callers must have validated the section first --
+    :func:`_require_research_forecaster_configured` does, at startup -- so this
+    performs no checking of its own and cannot disagree with the guard.
+
+    Args:
+        config: The active configuration supplying the research-forecaster
+            section.
+
+    Returns:
+        The pinned :class:`FutureSearchProviderConfig` for this deployment.
+    """
+    settings = config.forecast.futuresearch
+    return FutureSearchProviderConfig(
+        endpoint_url=settings.endpoint_url,
+        pinned_forecaster_versions=settings.pinned_forecaster_versions,
+        api_key_env=settings.api_key_env,
+        per_call_ceiling_micros=settings.per_call_ceiling_micros,
+        reject_on_version_drift=settings.reject_on_version_drift,
+    )
+
+
+def _futuresearch_members(config: WindbreakConfig) -> tuple[str, ...]:
+    """Return each research-forecaster member's pinned model version.
+
+    Args:
+        config: The active configuration supplying the vote ensemble.
+
+    Returns:
+        The ``model_version`` of every ``futuresearch`` member, in order.
+    """
+    return tuple(
+        member.model_version
+        for member in config.forecast.vote_ensemble
+        if member.provider == FUTURESEARCH_PROVIDER
+    )
+
+
+def _require_research_forecaster_configured(
+    config: WindbreakConfig, provider_http: LiveProviderHttp
+) -> None:
+    """Refuse a live research forecaster whose own section is unfinished.
+
+    Every refusal names the offending *leaf*, not merely the provider: an
+    operator who selected the member and left one line blank needs to be told
+    which line. The four checks are independent and each fails closed:
+
+    * **A placeholder endpoint.** The section ships with the repo's
+      "operator must fill this in" placeholder, which is not a URL. Dialing it
+      is impossible and starting anyway would mean a loop that discards every
+      research vote for the life of the run.
+    * **A blank key-variable name.** Configuration names the variable a key is
+      read from; a blank name is an unfinished deployment, not a
+      credential-free one.
+    * **A member version off the pinned set.** ``ProviderVoteRecorded`` stamps
+      the *member's* ``model_version`` while ``ModelVote`` stamps the version
+      the *response* reported, and
+      :meth:`FutureSearchProvider._resolve_model_version` admits only versions
+      inside ``pinned_forecaster_versions``. If the ensemble pins one string and
+      the section admits a different one, those two ledger rows describe
+      different models for the same forecast. Requiring them to agree at startup
+      is what keeps the audit trail coherent.
+    * **A non-positive per-call ceiling.** That figure is the fail-closed charge
+      for a response that declines to report its cost. At zero a silent response
+      books as free, which is the unbounded-spend hole the whole fail-closed
+      cost path exists to close.
+
+    Args:
+        config: The active configuration supplying the ensemble and section.
+        provider_http: The live HTTP seams supplied for it.
+
+    Raises:
+        ValueError: If the section is unconfigured, inconsistent with the
+            ensemble, or has no HTTP seam built for it.
+    """
+    settings = config.forecast.futuresearch
+    if settings.endpoint_url == UNCONFIGURED_PLACEHOLDER:
+        msg = (
+            f"forecast.vote_ensemble names {FUTURESEARCH_PROVIDER!r} but "
+            f"forecast.futuresearch.endpoint_url is still "
+            f"{UNCONFIGURED_PLACEHOLDER!r}; name the research forecaster's "
+            f"endpoint or remove the member"
+        )
+        raise ValueError(msg)
+    if not settings.api_key_env.strip():
+        msg = (
+            f"forecast.vote_ensemble names {FUTURESEARCH_PROVIDER!r} but "
+            f"forecast.futuresearch.api_key_env is blank; name the environment "
+            f"variable the key is read from (never the key itself)"
+        )
+        raise ValueError(msg)
+    pinned = settings.pinned_forecaster_versions
+    for model_version in _futuresearch_members(config):
+        if model_version not in pinned:
+            msg = (
+                f"forecast.vote_ensemble pins {FUTURESEARCH_PROVIDER!r} member "
+                f"model_version {model_version!r}, which is absent from "
+                f"forecast.futuresearch.pinned_forecaster_versions "
+                f"{sorted(pinned)}; pin the same version in both or the ledger "
+                f"records two different models for one forecast"
+            )
+            raise ValueError(msg)
+    if settings.per_call_ceiling_micros <= 0:
+        msg = (
+            f"forecast.futuresearch.per_call_ceiling_micros must be positive, "
+            f"got {settings.per_call_ceiling_micros}; it is the charge for a "
+            f"response that reports no cost, and at zero such a response books "
+            f"as free"
+        )
+        raise ValueError(msg)
+    if provider_http.futuresearch is None:
+        msg = (
+            f"forecast.vote_ensemble names {FUTURESEARCH_PROVIDER!r} but no live "
+            f"HTTP seam was built for it; supply one or remove the member"
+        )
+        raise ValueError(msg)
+
+
 def _require_routable(config: WindbreakConfig, provider_http: LiveProviderHttp) -> None:
     """Refuse a live ensemble naming a provider this deployment cannot route.
 
     ``EnsembleMemberConfig.provider`` is a free string, so nothing else stops an
-    operator adding a provider with no live adapter -- ``futuresearch``, whose
-    provider is a :class:`ForecastProvider` rather than a completion transport
-    and so does not ride this seam at all, or simply a typo. Left unchecked that
-    surfaces as a per-vote
+    operator adding a provider with no live route -- a typo, or a vendor this
+    deployment has no adapter for. Left unchecked that surfaces as a per-vote
     :class:`~windbreak.forecast.providers.base.ProviderNotRoutableError`
     mid-tick; refusing here turns it into a clean startup failure naming the
     provider, which is what an operator can actually act on.
+
+    The research forecaster is checked *first* and by its own rules
+    (:func:`_require_research_forecaster_configured`). It is routable without
+    being completion-routed, so testing it against ``_LLM_ADAPTER_BUILDERS``
+    would ask the wrong question of it and refuse a supported deployment --
+    which is precisely what this repository did before issue #555.
 
     Args:
         config: The active configuration supplying the vote ensemble.
         provider_http: The live HTTP seams supplied for it.
 
     Raises:
-        ValueError: If any ensemble provider has no live adapter, or has one but
+        ValueError: If any ensemble provider has no live route, or has one but
             no HTTP seam was built for it.
     """
     routable = sorted(routable_live_providers())
     for provider in live_vote_providers(config):
+        if provider == FUTURESEARCH_PROVIDER:
+            _require_research_forecaster_configured(config, provider_http)
+            continue
         if provider not in _LLM_ADAPTER_BUILDERS:
             msg = (
                 f"forecast.vote_ensemble names provider {provider!r}, which has "
@@ -630,18 +823,39 @@ def rate_table_from_config(config: WindbreakConfig) -> ModelRateTable:
     )
 
 
-def build_provider_factory(config: WindbreakConfig, *, live: bool) -> ProviderFactory:
+def build_provider_factory(
+    config: WindbreakConfig, *, live: bool, provider_http: LiveProviderHttp | None
+) -> ProviderFactory:
     """Build the per-member vote-provider factory the pipeline drives.
 
     In cassette mode this returns the bare
     :class:`~windbreak.forecast.providers.fixture.FixtureVoteProvider` the
     pipeline would have built for itself, so the offline path stays
-    byte-identical. In live mode every member is additionally wrapped in a
-    :class:`~windbreak.forecast.providers.retry.RetryingProvider` carrying the
-    configured policy, the configured price table, the configured per-model
-    token rate table (issue #451), and the real integer-millisecond clock/sleep
-    pair -- see this module's docstring for why the wrap is deliberately
-    live-only.
+    byte-identical. In live mode the member's own ``provider`` decides which of
+    two structurally different families it belongs to (ADR-0005):
+
+    * **A no-tools LLM member** is a ``FixtureVoteProvider`` over the routed
+      completion transport, wrapped in a
+      :class:`~windbreak.forecast.providers.retry.RetryingProvider` carrying the
+      configured policy, price table, per-model token rate table (issue #451),
+      and the real integer-millisecond clock/sleep pair.
+    * **The hosted research forecaster** is a
+      :class:`~windbreak.forecast.providers.futuresearch.FutureSearchProvider`
+      over its own HTTP seam, and is deliberately **not** wrapped (issue #555).
+      The wrapper exists because a ``FixtureVoteProvider`` cannot price itself:
+      it reports ``cost_micros == 0``, so without the metering layer a live LLM
+      vote would book as free. The research forecaster is the one provider that
+      *does* price itself -- it converts the response's reported ``cost_usd``
+      round-ceiling to micros and falls back fail-closed to
+      ``per_call_ceiling_micros``, never to zero -- so the invariant the wrapper
+      protects already holds without it. Wrapping it would add the rate table's
+      ``unmetered_micros`` on top of a reported actual, because a research
+      response reports dollars rather than token counts. That is a flat constant
+      added to a measurement: exactly the charge issue #451 removed, and exactly
+      the "constant, not a measurement" defect #483 named. Its votes are still
+      bounded -- by ``per_call_ceiling_micros`` per call, and by the
+      per-forecast and per-day research ceilings the pipeline charges every vote
+      against.
 
     The completion transport is taken *per call* rather than captured here, so
     the factory stays a policy ("how a vote is wrapped") rather than a closure
@@ -649,33 +863,66 @@ def build_provider_factory(config: WindbreakConfig, *, live: bool) -> ProviderFa
     ``dataclasses.replace(deps, transport=...)`` -- the swap seam the loop's
     tests drive a doubled vote transport through -- actually reaching the vote
     stage instead of silently voting against the transport that happened to be
-    wired at composition time.
+    wired at composition time. The research forecaster's seam is *not* taken per
+    call, because it does not ride the completion transport at all and pretending
+    otherwise would let a swapped vote transport appear to redirect it.
 
     Args:
         config: The active configuration supplying policy and prices.
         live: Whether the live provider transport is selected (keyword-only).
+        provider_http: The live HTTP seams (keyword-only), or ``None`` in
+            cassette mode. Required rather than defaulted: a live factory built
+            without it can route no research forecaster, and a default would let
+            the composition root forget to pass it and still return something
+            that looks wired.
 
     Returns:
         A factory building one provider per (transport, ensemble member) pair.
+
+    Raises:
+        ValueError: If ``live`` and no ``provider_http`` bundle was supplied.
     """
     if not live:
         return lambda transport, member: FixtureVoteProvider(transport, member)
+    if provider_http is None:
+        msg = (
+            "the live provider factory requires the live HTTP seam bundle; "
+            "supply `provider_http` or build the cassette factory"
+        )
+        raise ValueError(msg)
     policy = retry_policy_from_config(config)
     price_table = price_table_from_config(config)
     rate_table = rate_table_from_config(config)
+    research_http = provider_http.futuresearch
+    research_config = futuresearch_config_from_config(config)
 
     def _live_provider(
         transport: LlmTransport, member: EnsembleMemberLike
     ) -> ForecastProvider:
-        """Build one retried, priced live provider for ``member``.
+        """Build one live provider for ``member``, per its own family.
 
         Args:
-            transport: The completion transport the vote is obtained through.
+            transport: The completion transport an LLM vote is obtained through.
             member: The vote-ensemble member to build a provider for.
 
         Returns:
-            The wrapped provider.
+            The research forecaster for a ``futuresearch`` member, else the
+            wrapped completion-seam provider.
+
+        Raises:
+            ValueError: If the member is a research forecaster and no seam was
+                built for it -- unreachable behind
+                :func:`_require_research_forecaster_configured`, and a loud
+                failure rather than a silent completion-seam vote if it ever is.
         """
+        if member.provider == FUTURESEARCH_PROVIDER:
+            if research_http is None:
+                msg = (
+                    f"no live HTTP seam was built for "
+                    f"{FUTURESEARCH_PROVIDER!r}; cannot build its provider"
+                )
+                raise ValueError(msg)
+            return FutureSearchProvider(research_http, research_config)
         return RetryingProvider(
             FixtureVoteProvider(transport, member),
             provider_name=member.provider,

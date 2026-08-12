@@ -2794,6 +2794,7 @@ def _resolve_provider_http(config: WindbreakConfig) -> LiveProviderHttp | None:
             or unroutable.
     """
     from windbreak.scheduler.provider_wiring import (
+        FUTURESEARCH_PROVIDER,
         LiveProviderHttp,
         is_live_mode,
         live_vote_providers,
@@ -2804,8 +2805,11 @@ def _resolve_provider_http(config: WindbreakConfig) -> LiveProviderHttp | None:
         return None
     settings = config.forecast.provider_transport
     timeout_seconds = settings.request_timeout_seconds
+    providers = live_vote_providers(config)
     llm = {}
-    for provider in live_vote_providers(config):
+    for provider in providers:
+        if provider == FUTURESEARCH_PROVIDER:
+            continue
         routing = _LIVE_LLM_PROVIDERS.get(provider)
         if routing is None:
             routable = sorted(routable_live_providers())
@@ -2823,7 +2827,60 @@ def _resolve_provider_http(config: WindbreakConfig) -> LiveProviderHttp | None:
             timeout_seconds=timeout_seconds,
         )
     search, fetch = _live_research_http(config, timeout_seconds)
-    return LiveProviderHttp(llm=llm, search=search, fetch=fetch)
+    return LiveProviderHttp(
+        llm=llm,
+        search=search,
+        fetch=fetch,
+        futuresearch=_futuresearch_http(config, providers, timeout_seconds),
+    )
+
+
+def _futuresearch_http(
+    config: WindbreakConfig, providers: tuple[str, ...], timeout_seconds: int
+) -> LiveHttpTransport | None:
+    """Build the hosted research forecaster's credentialed transport (#555).
+
+    Built only when a vote-ensemble member actually names the provider, exactly
+    as the completion transports are: a deployment that has not selected the
+    research forecaster must not be asked for its key. The endpoint comes from
+    ``forecast.futuresearch.endpoint_url`` rather than a constant, because a
+    hosted research forecaster is an operator-chosen deployment rather than one
+    of two known vendors -- and it is screened against the deployment's own
+    outbound allowlist first, like every other live host (SPEC S15).
+
+    This is the only place ``forecast.futuresearch.api_key_env``'s *value* is
+    read. Configuration carries the variable's name, never the key, because
+    every leaf is flattened verbatim into the hash-chained ``ConfigLoaded``
+    event and can never be redacted afterwards -- the same rule the alert sinks
+    and the LLM transports follow.
+
+    Args:
+        config: The loaded configuration naming the endpoint and key variable.
+        providers: The distinct providers the vote ensemble draws on.
+        timeout_seconds: The whole-second dial timeout.
+
+    Returns:
+        The credentialed single-host transport, or ``None`` when no member names
+        the research forecaster.
+
+    Raises:
+        ValueError: If the named key variable is unset, or the endpoint host is
+            not on this deployment's outbound allowlist.
+    """
+    from windbreak.scheduler.provider_wiring import FUTURESEARCH_PROVIDER
+
+    if FUTURESEARCH_PROVIDER not in providers:
+        return None
+    settings = config.forecast.futuresearch
+    return _live_http_for(
+        settings.endpoint_url,
+        {
+            "authorization": f"Bearer {_read_provider_key(settings.api_key_env)}",
+            "content-type": "application/json",
+        },
+        config,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _live_research_http(

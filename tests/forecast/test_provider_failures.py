@@ -1127,13 +1127,21 @@ def test_provider_price_table_rejects_a_non_positive_ceiling(bad_ceiling: int) -
 
 
 def test_default_provider_price_table_pins_known_lookups_and_the_ceiling() -> None:
-    """`DEFAULT_PROVIDER_PRICE_TABLE` prices every documented provider above
+    """`DEFAULT_PROVIDER_PRICE_TABLE` prices every listed provider above
     zero, and an unrecognized provider prices at the pinned default ceiling.
+
+    ``futuresearch`` is asserted *absent from the mapping* rather than priced
+    above zero (issue #555). It carried a ``500_000`` list price until then, and
+    a ``price_micros(...) > 0`` assertion cannot tell that entry from its
+    removal: the fail-closed unknown-provider ceiling is also above zero, so
+    that form of the check passes either way. The research forecaster reports
+    its own cost and is not wrapped in the layer this table serves, so what
+    matters is that no per-attempt price is listed for it.
     """
     assert DEFAULT_UNKNOWN_PROVIDER_PRICE_MICROS == 1_000_000
     assert DEFAULT_PROVIDER_PRICE_TABLE.price_micros("openai") > 0
     assert DEFAULT_PROVIDER_PRICE_TABLE.price_micros("anthropic") > 0
-    assert DEFAULT_PROVIDER_PRICE_TABLE.price_micros("futuresearch") > 0
+    assert "futuresearch" not in DEFAULT_PROVIDER_PRICE_TABLE.prices_micros
     assert (
         DEFAULT_PROVIDER_PRICE_TABLE.price_micros("a-totally-unknown-provider")
         == DEFAULT_UNKNOWN_PROVIDER_PRICE_MICROS

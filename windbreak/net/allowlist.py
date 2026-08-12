@@ -94,6 +94,14 @@ _FORECAST_PROVIDER_HOSTS: dict[str, str] = {
     "openai": "api.openai.com",
 }
 
+#: The hosted research-forecaster provider identifier (issue #555). Absent from
+#: :data:`_FORECAST_PROVIDER_HOSTS` on purpose: that table maps a *vendor name*
+#: to a host this codebase knows, and a hosted research forecaster is an
+#: operator-chosen deployment whose endpoint only configuration can supply. Its
+#: host is therefore derived from ``forecast.futuresearch.endpoint_url``, the
+#: same way ``forecast.research.search_endpoint_url``'s is.
+_FUTURESEARCH_PROVIDER = "futuresearch"
+
 
 class EgressDeniedError(Exception):
     """Raised when an outbound URL targets a scheme or host off the allowlist.
@@ -275,18 +283,49 @@ def _forecast_hosts(forecast: ForecastConfig) -> frozenset[str]:
     Returns:
         One host per recognized provider across three sources -- the legacy
         ``ensemble`` triage/promotion ``ModelRef`` set, the ``triage_model``,
-        and each ``vote_ensemble`` member (issue #240) -- unioned; an
+        and each ``vote_ensemble`` member (issue #240) -- unioned with the
+        hosted research forecaster's configured endpoint host (issue #555); an
         unrecognized provider name contributes no host (fail closed).
     """
     providers = (
         *(model.provider for model in (*forecast.ensemble, forecast.triage_model)),
         *(member.provider for member in forecast.vote_ensemble),
     )
-    return frozenset(
+    known = frozenset(
         _FORECAST_PROVIDER_HOSTS[provider]
         for provider in providers
         if provider in _FORECAST_PROVIDER_HOSTS
     )
+    return known | _futuresearch_hosts(forecast)
+
+
+def _futuresearch_hosts(forecast: ForecastConfig) -> frozenset[str]:
+    """Derive the hosted research forecaster's endpoint host, if selected.
+
+    Two independent fields must agree before this opens any egress: a
+    ``vote_ensemble`` member must name the provider, *and*
+    ``forecast.futuresearch.endpoint_url`` must parse to a real host. Writing an
+    endpoint down does not on its own admit it, so a mistyped or tampered
+    ``endpoint_url`` in a deployment that never selected the research forecaster
+    reaches nothing -- the "declare it twice" property the alert sinks have, kept
+    here without a second host list to transcribe.
+
+    The default section fails closed on both counts: the shipped
+    ``vote_ensemble`` names no research forecaster, and the placeholder
+    ``endpoint_url`` parses to no host.
+
+    Args:
+        forecast: The forecast configuration section.
+
+    Returns:
+        The lowercased endpoint host as a one-element set, or an empty set.
+    """
+    if not any(
+        member.provider == _FUTURESEARCH_PROVIDER for member in forecast.vote_ensemble
+    ):
+        return frozenset()
+    host = urlsplit(forecast.futuresearch.endpoint_url).hostname
+    return frozenset({host.lower()}) if host else frozenset()
 
 
 def _research_hosts(research: ResearchSettings) -> frozenset[str]:
