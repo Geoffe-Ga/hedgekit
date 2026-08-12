@@ -86,7 +86,7 @@ import json
 import logging
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
@@ -958,21 +958,104 @@ def _curve_samples(records: Iterable[LedgerRecord]) -> Iterator[tuple[int, int]]
             yield record.sequence_number, equity_micros
 
 
-def _fold_equity_curve(samples: Iterable[tuple[int, int]]) -> EquityCurve | None:
-    """Fold ``samples`` into the all-time peak and the newest reading.
+@dataclass(slots=True)
+class EquityCurveCursor:
+    """The per-process memo that bounds :func:`read_equity_curve`'s cost.
+
+    A high-water mark is a *maximum* over an all-time series, so unlike the
+    day's baseline (issue #370) it has no recency predicate a walk can stop on:
+    truncating the walk to a recent window would silently lower the mark, and
+    ``trailing_drawdown_limit``'s threshold is a ppm share *of* that mark, so a
+    lower mark is a looser cap -- the exact failure #513/#514 were filed for.
+
+    What this remembers instead is a *watermark*, which is a stopping predicate
+    that costs nothing: ``curve`` is the exact fold of every sample up to and
+    including ``covered_through``, so the next read only has to walk the rows
+    above it. The answer stays exactly the unbounded one because
+
+        max(all samples) == max(max(samples <= w), max(samples > w))
+
+    for any ``w`` -- an identity, not an approximation. The same holds for the
+    newest reading, which is selected by ``sequence_number`` and so can only
+    come from the rows above the watermark or from the memo (issue #516).
+
+    It is a memo and never a store: it lives for the life of one process, so a
+    restarted loop starts cold and re-folds the mark from the ledger's own rows
+    rather than resetting to whatever it samples first. That is the same
+    durability :func:`read_equity_curve` had when it re-folded on every tick,
+    at one whole-series fold per *process* instead of one per beat.
+
+    Mutable on purpose, and held by the frozen :class:`PaperTickDeps` the way
+    ``budget`` is: the bundle forbids rebinding the field, not advancing the
+    object, which is what lets the memo span every tick of one deployment.
+
+    Attributes:
+        curve: The fold of every sample at or below ``covered_through``, or
+            ``None`` while nothing has been folded.
+        covered_through: The highest ``sequence_number`` already folded in.
+            Zero on a cold cursor -- below every real sequence number, which
+            start at one -- so a cold read folds the whole series.
+    """
+
+    curve: EquityCurve | None = None
+    covered_through: int = 0
+
+
+def _samples_above_the_watermark(
+    store: ReverseTypeScan, covered_through: int
+) -> Iterator[tuple[int, int]]:
+    """Yield samples newest-first, stopping at ``covered_through``.
+
+    Walks ``EquitySampled`` rows alone, newest first, and stops at the first
+    row whose ``sequence_number`` is at or below the watermark: everything from
+    there down is already folded into the cursor's remembered maximum, so
+    re-reading it could not change the answer. The walk therefore costs
+    O(samples appended since the last read) -- one per tick in the steady state
+    -- rather than O(samples since ledger inception).
+
+    Args:
+        store: The ledger, declaring the reverse-walk capability.
+        covered_through: The highest ``sequence_number`` already folded. Zero
+            means nothing is, and the whole series is walked.
+
+    Yields:
+        One ``(sequence_number, equity_micros)`` pair per row above the
+        watermark.
+    """
+    for record in store.iter_records_of_type_reversed(_EQUITY_SAMPLED_EVENT_TYPE):
+        if record.sequence_number <= covered_through:
+            return
+        _, equity_micros = _equity_sample(record)
+        yield record.sequence_number, equity_micros
+
+
+def _fold_equity_curve(
+    samples: Iterable[tuple[int, int]], into: EquityCurveCursor
+) -> None:
+    """Fold ``samples`` into ``into``, advancing it to cover them.
 
     Order-free: the peak is a maximum and the newest reading is selected by
     ``sequence_number``, so the newest-first walk and the oldest-first fold
-    reach the same pair.
+    reach the same pair. Re-folding a sample already covered is therefore a
+    no-op too, which is what lets the ``read_all`` fallback path resume from a
+    warm cursor without double-counting anything.
 
     Args:
         samples: The ``(sequence_number, equity_micros)`` pairs to fold, in any
             order.
-
-    Returns:
-        The :class:`EquityCurve`, or ``None`` when no sample exists at all.
+        into: The cursor the fold starts from and is written back into. A cold
+            cursor (the default-constructed one) makes this a fold from
+            scratch; a warm one resumes from its remembered maximum.
     """
-    state: tuple[int, int, int] | None = None
+    state: tuple[int, int, int] | None = (
+        None
+        if into.curve is None
+        else (
+            into.curve.high_water_mark.value,
+            into.covered_through,
+            into.curve.latest.value,
+        )
+    )
     for sequence_number, equity_micros in samples:
         if state is None:
             state = (equity_micros, sequence_number, equity_micros)
@@ -982,10 +1065,11 @@ def _fold_equity_curve(samples: Iterable[tuple[int, int]]) -> EquityCurve | None
             latest_sequence_number, latest = sequence_number, equity_micros
         state = (max(peak, equity_micros), latest_sequence_number, latest)
     if state is None:
-        return None
-    return EquityCurve(
+        return
+    into.curve = EquityCurve(
         high_water_mark=MoneyMicros(state[0]), latest=MoneyMicros(state[2])
     )
+    into.covered_through = state[1]
 
 
 def equity_curve_micros(records: Iterable[LedgerRecord]) -> EquityCurve | None:
@@ -1006,40 +1090,56 @@ def equity_curve_micros(records: Iterable[LedgerRecord]) -> EquityCurve | None:
         KeyError: If an ``EquitySampled`` payload is missing the field this
             reads -- a loud shape drift, never a silently zeroed mark.
     """
-    return _fold_equity_curve(_curve_samples(records))
+    folded = EquityCurveCursor()
+    _fold_equity_curve(_curve_samples(records), folded)
+    return folded.curve
 
 
-def read_equity_curve(store: LedgerStore) -> EquityCurve | None:
+def read_equity_curve(
+    store: LedgerStore, *, cursor: EquityCurveCursor | None = None
+) -> EquityCurve | None:
     """Read the account's peak and current equity from ``store``.
 
     The tick's entry point for ``trailing_drawdown_limit``'s two terms, and the
-    one fold in this module that deliberately does **not** stop at a boundary:
-    a maximum over an all-time series has no recency predicate to stop on, and
-    a mark that stopped at one would not be a high-water mark. A store
-    declaring :class:`~windbreak.ledger.store.ReverseTypeScan` therefore pays
-    one indexed pass over the ``EquitySampled`` rows alone -- the same
-    complexity :func:`read_notional_today_micros` already pays over the booked
-    fills, for the same reason (a sum, like a maximum, cannot be truncated
-    safely) -- and every other store falls back to the whole-ledger fold.
+    one fold in this module whose bound is **not** a recency predicate: a
+    maximum over an all-time series has none, and a mark that stopped at one
+    would not be a high-water mark -- it would be a lower number, and so a
+    looser cap, which is the failure #513/#514 were filed for.
 
-    Re-folding from the ledger on each tick is also what makes the mark survive
-    a process restart: it is never held in memory, so a loop that stops and
-    starts recovers exactly the peak its own rows attest to, rather than
-    resetting to whatever the first tick after the restart happens to sample.
+    What bounds it instead is ``cursor``, the caller's per-process
+    :class:`EquityCurveCursor`. Given one, a store declaring
+    :class:`~windbreak.ledger.store.ReverseTypeScan` walks only the
+    ``EquitySampled`` rows appended since the last read -- one per tick in the
+    steady state -- and folds them into the remembered maximum, which is
+    *exactly* the unbounded answer rather than an approximation of it (see the
+    identity on :class:`EquityCurveCursor`). Without one, or on a store lacking
+    the capability, this is PR #515's whole-series fold unchanged: correct,
+    and O(samples since ledger inception) as it always was.
+
+    The mark still survives a process restart, because the cursor is a memo and
+    not a store: a fresh process starts cold and re-folds from the ledger's own
+    rows, recovering exactly the peak they attest to rather than resetting to
+    whatever the first tick after the restart happens to sample. Issue #516
+    moved that fold from once per beat to once per process; it did not move it
+    off the ledger.
 
     Args:
         store: The ledger to read the equity samples out of.
+        cursor: The per-process memo to resume from and advance, or ``None``
+            (the default) to fold the whole series afresh.
 
     Returns:
         The :class:`EquityCurve`, or ``None`` when the ledger holds no sample
         at all.
     """
-    records: Iterable[LedgerRecord] = (
-        store.iter_records_of_type_reversed(_EQUITY_SAMPLED_EVENT_TYPE)
+    resumed = EquityCurveCursor() if cursor is None else cursor
+    samples: Iterable[tuple[int, int]] = (
+        _samples_above_the_watermark(store, resumed.covered_through)
         if isinstance(store, ReverseTypeScan)
-        else store.read_all()
+        else _curve_samples(store.read_all())
     )
-    return _fold_equity_curve(_curve_samples(records))
+    _fold_equity_curve(samples, resumed)
+    return resumed.curve
 
 
 def start_of_day_equity_micros(
@@ -2375,6 +2475,19 @@ class PaperTickDeps:
             have built itself, keeping the cassette path byte-identical; see
             :mod:`windbreak.scheduler.provider_wiring` for why only the live
             path is wrapped.
+        equity_curve_cursor: The per-process memo :func:`read_equity_curve`
+            resumes its high-water fold from (issue #516). The bundle's second
+            deliberately *mutable* member, for the same reason as ``budget``:
+            the frozen dataclass forbids rebinding the field, not advancing the
+            object, and one instance per process is exactly what turns a fold
+            over every ``EquitySampled`` row ever written -- paid on every beat
+            of a loop epic #455 means to run for a week -- into a walk over the
+            rows appended since the previous beat. :func:`dataclasses.replace`
+            shares the same instance by design, so swapping the ``approval``
+            seam cannot silently restore the unbounded cost. It is defaulted
+            rather than required because a cold cursor is always a correct one:
+            the first read through it folds the whole series, exactly as
+            before, and only the reads after that are bounded.
     """
 
     config: WindbreakConfig
@@ -2395,6 +2508,7 @@ class PaperTickDeps:
     budget: ResearchBudget
     provider_gate: ProviderTrackRecordGate
     provider_factory: ProviderFactory
+    equity_curve_cursor: EquityCurveCursor = field(default_factory=EquityCurveCursor)
 
 
 def _default_clock() -> int:
@@ -4190,7 +4304,7 @@ def _approve_stage(
         realized_loss_today=read_realized_loss_today_micros(
             deps.store, now_epoch_s=now_epoch_s
         ),
-        equity_curve=read_equity_curve(deps.store),
+        equity_curve=read_equity_curve(deps.store, cursor=deps.equity_curve_cursor),
         visible_depth=visible_depth_centis(order_book),
         exposure=exposure,
         notional_today=read_notional_today_micros(deps.store, now_epoch_s=now_epoch_s),

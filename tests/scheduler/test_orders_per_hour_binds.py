@@ -45,6 +45,7 @@ from windbreak.scheduler.loop import (
     _ORDER_TRANSITION_EVENT_TYPE,
     _REQUEST_SUBMISSION_EVENT,
     _TRAILING_HOUR_SECONDS,
+    EquityCurveCursor,
     _approve_stage,
     orders_last_hour_count,
     read_orders_last_hour,
@@ -332,6 +333,11 @@ class _StubDeps:
         approval: The capturing approval seam.
         kernel: The kernel double supplying the verification snapshot.
         clock: The injected epoch-second clock.
+        equity_curve_cursor: The per-process memo the real `PaperTickDeps`
+            carries and `_approve_stage` threads into `read_equity_curve`
+            (issue #516). Nothing in this module measures it -- it is here
+            because the stage genuinely reads it, and a double that omitted it
+            would be a double the production call site cannot run against.
     """
 
     config: WindbreakConfig
@@ -339,6 +345,7 @@ class _StubDeps:
     exchange: _StubExchange
     approval: _CapturingApproval
     kernel: _StubKernel
+    equity_curve_cursor: EquityCurveCursor = field(default_factory=EquityCurveCursor)
 
     def clock(self) -> int:
         """Return the tick's fixed instant.
