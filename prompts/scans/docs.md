@@ -15,8 +15,8 @@ skill.
 
 ## Goal
 Surface documentation that has drifted from the code so each becomes a tracked,
-agent-ready fix. Focus on ACCURACY, not presence: `interrogate` already gates
-docstring coverage at ≥85%, so a missing docstring is rarely the finding — a
+agent-ready fix. Focus on ACCURACY, not presence: ruff `D1` already requires a
+docstring on every public symbol, so a missing one is rarely the finding — a
 docstring that describes the wrong parameters, return type, or behavior is. A
 run that finds none is a valid, successful, zero-issue run.
 

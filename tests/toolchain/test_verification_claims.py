@@ -1,4 +1,4 @@
-"""Nothing under `.claude/` verifies a gate with a tool this repo lacks (#543).
+"""No agent brief verifies a gate with a tool this repo lacks (#543, #546).
 
 `.claude/agents/ralph-documentation-specialist.md` named `interrogate >=85%`
 five times as the thing that verifies docstring coverage, and sent the reader to
@@ -21,13 +21,24 @@ deleted from `CLAUDE.md`; the agent definition that helped seed it was left
 behind, and an agent definition is a subagent's operating instructions, loaded
 ahead of anything it might otherwise go and check.
 
-THE CORPUS. `CLAUDE.md` plus every markdown document under `.claude/` --
-`docs/`, `skills/`, `agents/` and `commands/`. PR #544 widened
-`test_live_state_gate_exception`'s corpus from `CLAUDE.md` + `.claude/docs/` to
-include `.claude/skills/`, on the argument that a governing corpus should cover
-where a rule is READ and not only where it is written. The same argument reaches
-`.claude/agents/` with more force, so the corpus here is simply everything: no
-cherry-picking, no per-directory exception.
+THE CORPUS. `CLAUDE.md` plus every markdown document under three ROOTS --
+`.claude/` (docs, skills, agent definitions, commands), `scripts/ralph/` and
+`prompts/`. PR #544 widened `test_live_state_gate_exception`'s corpus from
+`CLAUDE.md` + `.claude/docs/` to include `.claude/skills/`, on the argument that
+a governing corpus should cover where a rule is READ and not only where it is
+written. That argument does not stop at `.claude/`: `scripts/ralph/PROMPT.md` is
+the Ralph WORKER's operating contract, read by every lane before anything else,
+and it carried `≥85% docstring (interrogate)` too (issue #546); `prompts/scans/
+docs.md` told a scanner that `interrogate` "already gates docstring coverage at
+≥85%", which is a claim a scanner would act on by NOT reporting the drift.
+
+Roots, not a file list. Walking a directory covers a document added to it on the
+day it is written; enumerating documents is the hand-maintained inventory this
+module exists to remove, and it would have had to be edited to notice #546 --
+which is exactly the edit nobody makes.
+
+Each root is asserted to contribute documents AND claims of its own, because the
+totals are dominated by `.claude/` and would not notice a root going silent.
 
 THE DISTINCTION THAT MAKES THAT AFFORDABLE, and it is the hard part of this
 issue. A corpus-wide "every tool named must be installed" rule does not hold and
@@ -69,6 +80,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from tests.toolchain.test_skill_gate_model import (
     _installed_tools,
     _named_tools,
@@ -79,10 +92,28 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CLAUDE_DIR = _REPO_ROOT / ".claude"
 _AGENTS_DIR = _CLAUDE_DIR / "agents"
 _SKILLS_DIR = _CLAUDE_DIR / "skills"
+_RALPH_DIR = _REPO_ROOT / "scripts" / "ralph"
+_PROMPTS_DIR = _REPO_ROOT / "prompts"
 _CLAUDE_MD = _REPO_ROOT / "CLAUDE.md"
 _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 _DOC_SPECIALIST = _AGENTS_DIR / "ralph-documentation-specialist.md"
+_WORKER_PROMPT = _RALPH_DIR / "PROMPT.md"
 _EVIDENCE_COLLECTOR = _SKILLS_DIR / "de-slopify" / "scripts" / "collect-evidence.sh"
+
+#: The directories whose markdown instructs an agent. Every `*.md` beneath each
+#: is scanned; the set is walked rather than enumerated, so a document added to
+#: any of them is covered on the day it is written.
+#:
+#: `.claude/` holds the agent definitions, skills and docs. `scripts/ralph/`
+#: holds `PROMPT.md`, the Ralph WORKER's operating contract -- the single
+#: highest-traffic brief in the repository, and the one that carried
+#: `≥85% docstring (interrogate)` (issue #546). `prompts/` holds the scan briefs
+#: a scanner is told to trust, one of which asserted the same gate.
+#:
+#: These are roots, not a file list, and that distinction is the point: a
+#: literal list of documents is the same shape of hand-maintained inventory that
+#: this module exists to remove.
+_CORPUS_ROOTS = (_CLAUDE_DIR, _RALPH_DIR, _PROMPTS_DIR)
 
 #: A threshold a tool is claimed to report: an operator against a number, or a
 #: bare percentage. `>=85%`, `>= 9.0`, `95%`. This is the marker that turns
@@ -122,15 +153,24 @@ _RUNNER_PREFIX = re.compile(
 #: Documents are split into claim blocks on blank lines.
 _BLOCK_SPLIT = re.compile(r"\n\s*\n")
 
-#: Lower bounds. The corpus held 40 documents making 60 verification claims over
-#: 22 distinct tools and naming 26 distinct gate scripts when this was written.
+#: Lower bounds. The corpus held 56 documents making 67 verification claims over
+#: 20 distinct tools and naming 29 distinct gate scripts when this was written.
 #: Floors well under those catch a scan that has stopped scanning -- trap #5, a
 #: corpus walk over zero hits passes forever, which is the exact failure mode
 #: this whole issue is about -- without failing every time a file is deleted.
-_DOCUMENT_FLOOR = 25
-_CLAIM_FLOOR = 25
+_DOCUMENT_FLOOR = 35
+_CLAIM_FLOOR = 35
 _CLAIMED_TOOL_FLOOR = 10
 _GATE_SCRIPT_FLOOR = 10
+
+#: Every root must contribute at least this many documents AND at least this
+#: many verification claims. A global floor cannot see a root that has gone
+#: silent: `.claude/` alone clears every total above, so dropping
+#: `scripts/ralph/` -- two documents, the smaller of which is the Ralph worker's
+#: whole contract -- would be invisible in the aggregate. Per root, it is not.
+#: The smallest root contributes 2 documents and 2 claims today.
+_ROOT_DOCUMENT_FLOOR = 1
+_ROOT_CLAIM_FLOOR = 1
 
 
 @dataclass(frozen=True)
@@ -152,13 +192,28 @@ class _Claim:
     markers: frozenset[str]
 
 
+def _documents_under(root: Path) -> tuple[Path, ...]:
+    """List the markdown documents one corpus root contributes.
+
+    Args:
+        root: The directory to walk.
+
+    Returns:
+        Every `*.md` beneath it, sorted.
+    """
+    return tuple(sorted(root.rglob("*.md")))
+
+
 def _corpus_documents() -> tuple[Path, ...]:
     """List the documents that govern how an agent works in this repository.
 
     Returns:
-        `CLAUDE.md` and every markdown document under `.claude/`, sorted.
+        `CLAUDE.md` and every markdown document under each corpus root, sorted.
     """
-    return (_CLAUDE_MD, *sorted(_CLAUDE_DIR.rglob("*.md")))
+    return (
+        _CLAUDE_MD,
+        *(path for root in _CORPUS_ROOTS for path in _documents_under(root)),
+    )
 
 
 def _strip_suppressions(text: str) -> str:
@@ -517,9 +572,10 @@ def test_the_scanned_corpus_is_non_empty_and_reaches_the_agent_definitions() -> 
     skills = [path for path in documents if _SKILLS_DIR in path.parents]
 
     assert len(documents) >= _DOCUMENT_FLOOR, (
-        f"only {len(documents)} markdown documents found under {_CLAUDE_DIR}, "
-        f"below the floor of {_DOCUMENT_FLOOR}. The walk is not reaching the "
-        "corpus, so every assertion below is about a smaller set than it says."
+        f"only {len(documents)} markdown documents found across "
+        f"{[str(r.relative_to(_REPO_ROOT)) for r in _CORPUS_ROOTS]}, below the "
+        f"floor of {_DOCUMENT_FLOOR}. The walk is not reaching the corpus, so "
+        "every assertion below is about a smaller set than it says."
     )
     assert _CLAUDE_MD in documents
     assert agents, (
@@ -531,6 +587,49 @@ def test_the_scanned_corpus_is_non_empty_and_reaches_the_agent_definitions() -> 
     assert _DOC_SPECIALIST in documents, (
         f"{_DOC_SPECIALIST} is not in the scanned corpus at all, and it is the "
         "document this module exists for."
+    )
+    assert _WORKER_PROMPT in documents, (
+        f"{_WORKER_PROMPT} is not in the scanned corpus, and it is the Ralph "
+        "worker's operating contract -- the brief every lane reads before it "
+        "reads anything else (issue #546)."
+    )
+
+
+@pytest.mark.parametrize("root", _CORPUS_ROOTS, ids=lambda path: path.name)
+def test_every_corpus_root_contributes_documents_and_claims(root: Path) -> None:
+    """No root is silently contributing nothing.
+
+    The totals above are dominated by `.claude/`, which alone clears every one
+    of them. A root that stopped matching -- a moved directory, a widening that
+    was written but never wired -- would therefore be invisible in the
+    aggregate, and "every claimed tool is installed" would go on passing while
+    covering less than it says. Issue #546 widened this corpus specifically
+    because the previously-uncovered `scripts/ralph/PROMPT.md` was still
+    claiming a tool that does not exist; a widening whose new territory is never
+    asserted to be non-empty has not been proven to reach it.
+
+    Args:
+        root: The corpus root being verified.
+    """
+    documents = _documents_under(root)
+    lexicon = _tool_lexicon()
+    claims = [
+        claim
+        for document in documents
+        for claim in _claims_in(document, document.read_text(encoding="utf-8"), lexicon)
+    ]
+
+    assert len(documents) >= _ROOT_DOCUMENT_FLOOR, (
+        f"{root.relative_to(_REPO_ROOT)} contributed {len(documents)} markdown "
+        f"documents, below the floor of {_ROOT_DOCUMENT_FLOOR}. The root is "
+        "listed in the corpus but the walk finds nothing under it."
+    )
+    assert len(claims) >= _ROOT_CLAIM_FLOOR, (
+        f"{root.relative_to(_REPO_ROOT)} contributed {len(documents)} documents "
+        f"but {len(claims)} verification claims, below the floor of "
+        f"{_ROOT_CLAIM_FLOOR}. Its documents are being read and no obligation "
+        "is being found in any of them, so this root is in the corpus without "
+        "being covered by it."
     )
 
 

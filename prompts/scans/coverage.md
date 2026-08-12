@@ -18,7 +18,7 @@ and branches and a concrete test plan to close them — measured against the
 ## Context
 - Title-slug prefix: `[scan:coverage]`. Priority `P2` (passed by the workflow).
 - Tools (read-only):
-  - Backend: `scripts/backend/coverage.sh` (or `pytest --cov=src
+  - Backend: `scripts/coverage.sh` (or `pytest --cov=src
     --cov-report=term-missing --cov-branch`) — parse the term-missing output for
     modules below the gate and their uncovered line/branch ranges.
   - Frontend: `npm test --prefix frontend -- --coverage` — parse the Jest
