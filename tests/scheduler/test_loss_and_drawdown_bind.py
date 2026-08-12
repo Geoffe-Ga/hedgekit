@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from tests.scheduler.conftest import WalkCountingStore
 from windbreak.config.schema import CapitalConfig, RiskConfig, WindbreakConfig
 from windbreak.connector.models import (
     BalanceSnapshot,
@@ -51,13 +52,14 @@ from windbreak.connector.models import (
     Position,
 )
 from windbreak.ledger.events import EquitySampled
-from windbreak.ledger.store import SqliteLedgerStore
+from windbreak.ledger.store import LedgerStore, SqliteLedgerStore
 from windbreak.numeric import ContractCentis, MoneyMicros, PricePips, ProbabilityPpm
 from windbreak.riskkernel.checks import DEFAULT_CHECKS, OrderIntent
 from windbreak.scheduler.loop import (
     _EQUITY_MICROS_KEY,
     _EQUITY_SAMPLED_EVENT_TYPE,
     _SAMPLE_EPOCH_KEY,
+    EquityCurveCursor,
     _approve_stage,
     _equity_and_positions_stage,
     day_equity_micros,
@@ -135,6 +137,19 @@ _COMPONENT = "scheduler"
 #: The configured capital floor: zero, so `floor_invariant` cannot supply a
 #: veto that masks the one under test.
 _FLOOR_MICROS = 0
+
+#: One UTC day, in whole seconds.
+_ONE_DAY_S = 86_400
+
+#: The two history depths issue #516's per-beat cost is measured at: N and 10N
+#: previous-day samples buried under the fixture's own four rows.
+_HISTORY_N = 40
+_HISTORY_TEN_N = 400
+
+#: The highest reading any history sample carries ($300). Below the peak by
+#: $200, so no history row can become the mark, and distinct from every other
+#: figure in this module.
+_HISTORY_MICROS = 300_000_000
 
 
 def _sample(*, equity_micros: int, epoch_s: int) -> EquitySampled:
@@ -405,17 +420,27 @@ class _StubDeps:
 
     Attributes:
         config: The configuration supplying both caps.
-        store: The real hash-chained ledger both folds read.
+        store: The real hash-chained ledger both folds read. Typed as the
+            `LedgerStore` protocol rather than as `SqliteLedgerStore` so a
+            counting delegate can stand in where the *cost* of a read is what
+            is under test (issue #516), without any production code learning
+            that a test is watching.
         exchange: The venue double.
         approval: The capturing approval seam.
         kernel: The kernel double supplying the verification snapshot.
+        equity_curve_cursor: The per-process memo the real `PaperTickDeps`
+            carries and `_approve_stage` threads into `read_equity_curve`. One
+            per bundle, so successive ticks against the same deps share it --
+            which is the whole point of it, and the thing
+            `TestTheHighWaterFoldIsBoundedPerTick` measures.
     """
 
     config: WindbreakConfig
-    store: SqliteLedgerStore
+    store: LedgerStore
     exchange: _StubExchange
     approval: _CapturingApproval
     kernel: _StubKernel
+    equity_curve_cursor: EquityCurveCursor = field(default_factory=EquityCurveCursor)
 
     def clock(self) -> int:
         """Return the tick's fixed instant.
@@ -426,7 +451,7 @@ class _StubDeps:
         return _NOW_EPOCH_S
 
 
-def _deps(store: SqliteLedgerStore, exchange: _StubExchange) -> Any:
+def _deps(store: LedgerStore, exchange: _StubExchange) -> Any:
     """Assemble the dependency double the production stages run against.
 
     Args:
@@ -464,14 +489,27 @@ def _composed_context(
         `_approve_stage` composed for the tick's one intent.
     """
     deps = _deps(store, _StubExchange() if exchange is None else exchange)
+    _run_tick(deps)
+    assert len(deps.approval.contexts) == 1
+    return deps.approval.contexts[0]
+
+
+def _run_tick(deps: Any) -> None:
+    """Drive one real `_approve_stage` pass against `deps`.
+
+    Factored out of `_composed_context` so a test can run several ticks
+    against one bundle -- the only way to observe anything a bundle remembers
+    *between* beats, which is what issue #516's bounded read turns on.
+
+    Args:
+        deps: The dependency double the stage runs against.
+    """
     candidate: Any = _StubCandidate(ticker=_TICKER, order_book=_order_book())
     decision: Any = _StubDecision(intents=(_intent(),))
     forecast: Any = _StubForecast(
         created_at=datetime.fromtimestamp(_NOW_EPOCH_S, tz=UTC)
     )
     _approve_stage(deps, candidate, decision, _NOW_EPOCH_S, forecast, None)
-    assert len(deps.approval.contexts) == 1
-    return deps.approval.contexts[0]
 
 
 def _verdict(context: EvaluationContext, name: str) -> str | None:
@@ -492,6 +530,87 @@ def _verdict(context: EvaluationContext, name: str) -> str | None:
     check = next(c for c in DEFAULT_CHECKS if c.name == name)
     result = check(_intent(), dataclasses.replace(context, fees=fees))
     return result.reason if result.vetoed else None
+
+
+def _history(count: int) -> tuple[tuple[int, int], ...]:
+    """Return `count` samples stamped on a UTC day before the fixture's peak.
+
+    Stands in for the history an always-on loop accumulates. Every reading is
+    distinct and below `_PEAK_MICROS`, and every stamp precedes the peak's, so
+    the history can move neither the mark nor the day's baseline -- only what
+    it costs to find them.
+
+    Args:
+        count: How many history samples to build.
+
+    Returns:
+        The `(epoch_s, equity_micros)` pairs, oldest first.
+    """
+    return tuple(
+        (_YESTERDAY_EVENING_EPOCH_S - _ONE_DAY_S - index, _HISTORY_MICROS - index)
+        for index in range(count)
+    )
+
+
+@dataclass(frozen=True)
+class _BeatRowCounts:
+    """What two beats of one bundle pulled out of the ledger, and decided.
+
+    Attributes:
+        first: Rows the first beat pulled from every bounded walk it made.
+        second: Rows the second beat pulled, after one further sample was
+            appended -- the steady-state per-beat cost.
+        mark: The high-water mark the second beat's composed account carried.
+        veto: The second beat's `trailing_drawdown_limit` reason, or `None`.
+        first_veto: The first beat's reason, so a bounded beat can be compared
+            against an unbounded one rather than against a literal alone.
+    """
+
+    first: int
+    second: int
+    mark: MoneyMicros
+    veto: str | None
+    first_veto: str | None
+
+
+def _beat_row_counts(directory: Path, history_count: int) -> _BeatRowCounts:
+    """Run two real beats against one bundle and measure what each read.
+
+    Args:
+        directory: A fresh directory the ledger database is created in.
+        history_count: How many previous-day samples to bury the fixture under.
+
+    Returns:
+        The measured `_BeatRowCounts`.
+    """
+    directory.mkdir()
+    inner = _store(
+        directory, (*_history(history_count), *_day(_LATEST_AT_LIMIT_MICROS))
+    )
+    store = WalkCountingStore(inner)
+    deps = _deps(store, _StubExchange())
+    try:
+        _run_tick(deps)
+        first = store.records_walked
+        # The sample the next beat's own `_equity_and_positions_stage` would
+        # append: the row a bounded read must still pick up, at the reading
+        # that leaves the drawdown exactly on its threshold.
+        inner.append(
+            _sample(equity_micros=_LATEST_AT_LIMIT_MICROS, epoch_s=_TODAY_LAST_EPOCH_S)
+        )
+        inner.verify_chain()
+        _run_tick(deps)
+        second = store.records_walked - first
+        assert len(deps.approval.contexts) == 2
+        return _BeatRowCounts(
+            first=first,
+            second=second,
+            mark=deps.approval.contexts[1].account.equity_high_water_mark,
+            veto=_verdict(deps.approval.contexts[1], "trailing_drawdown_limit"),
+            first_veto=_verdict(deps.approval.contexts[0], "trailing_drawdown_limit"),
+        )
+    finally:
+        store.close()
 
 
 class TestTheFixturesRestOnTheArithmeticTheyClaim:
@@ -660,10 +779,19 @@ class TestTheLoopFeedsTheEquityHighWaterMark:
     def test_the_mark_survives_a_process_restart(self, tmp_path: Path) -> None:
         """A high-water mark that resets on restart is not a high-water mark.
 
-        It is not held in memory: it is re-folded from the ledger's own rows,
-        so a second store object opened on the same database recovers exactly
-        the same peak. That is the durability the #442 daily-budget lesson asks
-        for, without a second place to keep state.
+        It is never *stored* anywhere but the ledger: it is re-folded from the
+        ledger's own rows, so a second store object opened on the same database
+        recovers exactly the same peak. That is the durability the #442
+        daily-budget lesson asks for, without a second place to keep state.
+
+        Issue #516 memoized the fold per process (`EquityCurveCursor`) so the
+        walk that produces it stops growing; it did not move the mark off the
+        ledger, and the memo a restarted process gets is a cold one. Both
+        halves are pinned: this call passes no cursor at all, and
+        `tests/scheduler/test_equity_curve_bounded_read.py::
+        TestTheBoundedMarkEqualsTheUnboundedFold::
+        test_a_restarted_process_recovers_the_same_mark` reopens the database
+        behind a fresh cursor and asserts the same micros.
         """
         _store(tmp_path, _day(_LATEST_AT_LIMIT_MICROS))
         reopened = SqliteLedgerStore(tmp_path / "ledger.db")
@@ -904,3 +1032,77 @@ class TestTheRowsProductionWritesAreTheRowsFolded:
         written = _sample(equity_micros=_BASELINE_MICROS, epoch_s=_TODAY_FIRST_EPOCH_S)
         assert written.event_type == _EQUITY_SAMPLED_EVENT_TYPE
         assert set(written.payload) >= {_EQUITY_MICROS_KEY, _SAMPLE_EPOCH_KEY}
+
+
+class TestTheHighWaterFoldIsBoundedPerTick:
+    """The mark stays exact while the walk that finds it stops growing (#516).
+
+    PR #515 folded every `EquitySampled` row the ledger held on every tick, so
+    a loop epic #455 means to run unattended for a week paid more for the same
+    answer each beat, without ceiling and without alarm. Issue #516 bounds it
+    with a watermark rather than a window -- see `EquityCurveCursor` for why a
+    window would have *lowered* the mark and so loosened the cap.
+
+    These are the composition tests for that: they measure what
+    `_approve_stage` pulls out of the ledger across two beats of one bundle,
+    and they assert the veto it produces is unchanged, by its exact reason
+    string. Deleting `cursor=deps.equity_curve_cursor` from the call site
+    leaves every other test in this module green and fails
+    `test_the_second_beat_reads_the_same_rows_at_n_and_at_ten_n`.
+    """
+
+    def test_the_second_beat_reads_the_same_rows_at_n_and_at_ten_n(
+        self, tmp_path: Path
+    ) -> None:
+        """Ten times the history, and the second beat walks the same rows.
+
+        The first beat scales -- it is the startup fold, once per process --
+        and the difference between the two first-beat counts is exactly the
+        difference in history, which is what proves the larger corpus is
+        genuinely larger rather than a fixture that happened to agree.
+        """
+        small = _beat_row_counts(tmp_path / "small", _HISTORY_N)
+        large = _beat_row_counts(tmp_path / "large", _HISTORY_TEN_N)
+
+        assert large.first - small.first == _HISTORY_TEN_N - _HISTORY_N
+        assert small.second == large.second
+
+    def test_the_drawdown_veto_is_unchanged_on_the_bounded_beat(
+        self, tmp_path: Path
+    ) -> None:
+        """The cap binds on the second beat with the same reason, on the mark.
+
+        Both figures are asserted, not just the veto: an understated mark of
+        437_500_000 (the newest sample) would put the threshold at 54_687_500,
+        leave the drawdown at zero, and silently approve.
+        """
+        large = _beat_row_counts(tmp_path / "large", _HISTORY_TEN_N)
+
+        assert large.mark == MoneyMicros(_PEAK_MICROS)
+        assert large.veto == _DRAWDOWN_VETO
+        assert large.first_veto == _DRAWDOWN_VETO
+
+    def test_the_history_is_older_than_the_peak_and_never_outranks_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The corpus shape every count above rests on, asserted.
+
+        The buried history is stamped on an earlier UTC day than the peak and
+        every reading in it is below the peak, so it can move neither the mark
+        nor the day's baseline -- only the cost of finding them.
+        """
+        history = _history(_HISTORY_TEN_N)
+
+        assert len(history) == _HISTORY_TEN_N
+        assert len({equity for _, equity in history}) == _HISTORY_TEN_N
+        assert max(equity for _, equity in history) < _PEAK_MICROS
+        assert max(epoch_s for epoch_s, _ in history) < _YESTERDAY_EVENING_EPOCH_S
+        store = _store(tmp_path, (*history, *_day(_LATEST_AT_LIMIT_MICROS)))
+        try:
+            curve = equity_curve_micros(store.read_all())
+
+            assert curve is not None
+            assert curve.high_water_mark == MoneyMicros(_PEAK_MICROS)
+            assert curve.latest == MoneyMicros(_LATEST_AT_LIMIT_MICROS)
+        finally:
+            store.close()
