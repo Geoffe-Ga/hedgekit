@@ -304,7 +304,9 @@ def test_the_open_budget_is_the_value_this_deployment_was_sized_for(
     attempts and a few milliseconds -- or the shipped simultaneous start fails.
     And it must be far shorter than an operator's patience with a service that
     never comes up, because under a restart policy a hang produces no log line
-    at all while a bounded refusal produces one every cycle.
+    at all while a bounded refusal produces one every cycle. The budget is per
+    contended statement and the open issues three, so it is the three-statement
+    worst case that has to stay inside that patience, not this value alone.
 
     Args:
         tmp_path: pytest's per-test temporary directory.

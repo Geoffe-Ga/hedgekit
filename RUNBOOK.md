@@ -26,12 +26,18 @@ activate the always-on PAPER loop, and for what one PAPER tick actually does.
 
 Several processes may share one ledger file, and opening it is itself a write.
 A process starting while a sibling holds SQLite's write lock now **waits** for
-it — ten seconds, chosen to be far beyond anything windbreak itself holds (every
-write is one row in its own transaction) and far below the point at which a
-container that never starts stops looking like a crash. Nothing needs doing:
-simultaneous startup is the normal case, and the wait is invisible.
+it — ten seconds per contended statement, chosen to be far beyond anything
+windbreak itself holds (every write is one row in its own transaction) and far
+below the point at which a container that never starts stops looking like a
+crash. Nothing needs doing: simultaneous startup is the normal case, and the
+wait is invisible.
 
-If the lock is still held after ten seconds the process refuses to start, exits
+The open issues three statements that can contend, so a holder that keeps
+re-taking the lock between them can stretch a failing start toward half a
+minute. It is bounded either way — no start can hang — but do not read the ten
+seconds as a stopwatch on the whole start.
+
+Once a statement's wait is exhausted the process refuses to start, exits
 non-zero, and logs the reason at `CRITICAL`, prefixed `FATAL:`, naming the
 ledger path and SQLite's own wording:
 

@@ -121,6 +121,16 @@ _LOGGER = logging.getLogger(__name__)
 #: How long a process opening the ledger waits for a sibling's SQLite write
 #: lock before failing closed, in milliseconds (issue #328).
 #:
+#: WHAT IT BOUNDS, EXACTLY. Each *contended statement*, not the open as a whole.
+#: SQLite's ``busy_timeout`` is a per-statement budget, and the retry deadline
+#: in :func:`_enter_wal_mode` bounds that one statement's retrying. The open
+#: issues three statements that can contend, so a holder that keeps re-taking
+#: the lock between them can stretch the whole open toward three times this
+#: value before it fails. That is still bounded -- the point of the budget is
+#: that no path can hang -- but "the open gives up after ten seconds" would be
+#: the optimistic reading, and the honest one is "no single contended statement
+#: waits longer than ten seconds".
+#:
 #: WHAT IT MUST SURVIVE. Opening the ledger is a *write*, and
 #: ``deploy/docker-compose.yml`` starts ``pipeline``, ``riskkernel`` and
 #: ``order-gateway`` simultaneously against one shared volume, so the shipped
@@ -137,8 +147,9 @@ _LOGGER = logging.getLogger(__name__)
 #: log. So the budget also has to be short enough that a genuinely wedged
 #: holder -- a stopped process, an abandoned transaction, a stale lock on a
 #: network filesystem -- turns into a *readable* failure quickly. Ten seconds
-#: matches the ten-second grace Docker gives a container that will not stop:
-#: a waiting opener cannot outlive the orchestrator's own patience.
+#: per contended statement keeps even the three-statement worst case inside the
+#: half-minute an operator spends deciding whether a service is slow or stuck,
+#: so the ``FATAL`` line arrives while they are still looking.
 #:
 #: WHEN IT IS EXCEEDED, the open raises :class:`LedgerLockedError` after
 #: logging it as ``FATAL`` at ``CRITICAL``. The capability fails closed; the
@@ -229,6 +240,9 @@ def _wait_out_the_write_lock(conn: sqlite3.Connection) -> None:
     Args:
         conn: The connection to wait on.
     """
+    # Suppression hides nothing: the caller re-checks its deadline immediately
+    # after this returns and either retries or raises loudly, so a lock still
+    # held here becomes a reported failure rather than a silent one.
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute(_TAKE_WRITE_LOCK_SQL)
         conn.execute(_RELEASE_WRITE_LOCK_SQL)
@@ -519,8 +533,9 @@ class SqliteLedgerStore:
 
         Opening is a *write*: the journal mode, the table and the index are all
         set here, so a process opening a ledger a sibling is writing has to wait
-        for the write lock rather than die on it (issue #328). It waits for
-        ``busy_timeout_millis`` and then fails closed, loudly.
+        for the write lock rather than die on it (issue #328). Each of those
+        three statements waits up to ``busy_timeout_millis`` and then fails
+        closed, loudly -- the budget is per contended statement, not per open.
 
         Args:
             db_path: Filesystem path to the SQLite database file.
