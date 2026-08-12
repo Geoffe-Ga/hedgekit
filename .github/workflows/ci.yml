@@ -135,29 +135,38 @@ jobs:
         run: pytest -m chaos --no-cov -v
 
   container:
-    # THE NAME BELOW IS TRUNCATED ON PURPOSE, AND MUST NOT BE "FIXED" ALONE.
+    # THE QUOTES BELOW ARE LOAD-BEARING. DO NOT REMOVE THEM (issue #509).
     #
-    # In YAML a `#` preceded by whitespace opens a comment inside an unquoted
-    # scalar, so `End-to-End Container Tier (epic #465)` parses as
-    # `End-to-End Container Tier (epic`. Measured, not inferred: `gh api
-    # .../actions/runs/<id>/jobs` reports the check run under the truncated
+    # In YAML a `#` preceded by whitespace opens a comment inside an UNQUOTED
+    # scalar. Written bare, `End-to-End Container Tier (epic #465)` parses as
+    # `End-to-End Container Tier (epic` -- dangling paren and all -- and the
+    # rest is discarded. Measured, not inferred: `gh api
+    # .../actions/runs/<id>/jobs` reported the check run under that truncated
     # string, and `job.name` is what GitHub matches required status checks
-    # against. Branch protection therefore requires the truncated context,
-    # because that is the only context this job will ever report.
+    # against. So the truncation did not merely make the log look odd; it set
+    # what the merge gate on `main` means.
     #
-    # Quoting the scalar here -- the obvious tidy-up -- silently renames the
-    # check run. The required context would then be one no job produces, and
-    # EVERY pull request on this repository would block forever on a check
-    # that simply never appears. Both halves have to move together, and the
-    # protection setting is not editable from a pull request, so the only safe
-    # order is: (1) the repo owner drops the container context from branch
-    # protection, (2) the quoting change merges, (3) the owner re-adds the
-    # context under the full quoted name.
+    # This job's name IS a required status check context. Renaming it -- by
+    # editing the string, or by dropping these quotes, which is a rename that
+    # does not look like one -- without renaming the protection entry to match
+    # leaves `main` requiring a context no job will ever report, and EVERY
+    # pull request blocks forever with all checks green and nothing to point
+    # at. That was observed live on PRs #503 and #508. The protection setting
+    # is not editable from a pull request, so the two halves move in this
+    # order and no other: (1) the repo owner drops the stale context from
+    # branch protection, (2) the rename merges, (3) the owner re-adds the
+    # context under the new name. The pull request is BLOCKED between (1) and
+    # (3); that is the sequence working, not a failure.
     #
-    # tests/e2e/test_tier_selection_contract.py reads this name and the live
-    # protection contexts and fails if they ever disagree, in either
-    # direction. That guard is what makes the truncation safe to leave.
-    name: End-to-End Container Tier (epic #465)
+    # Two guards hold this, and they cover different things:
+    #   - tests/toolchain/test_workflow_scalar_truncation.py fails if ANY
+    #     `name:`/`if:` under .github/workflows/ is truncated by a `#` again.
+    #     It runs everywhere, including CI.
+    #   - tests/e2e/test_tier_selection_contract.py compares this name against
+    #     the LIVE required-context list and fails if they disagree in either
+    #     direction. Reading branch protection needs an admin-scoped token, so
+    #     that one asserts locally and skips loudly in CI.
+    name: "End-to-End Container Tier (epic #465)"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -178,7 +187,7 @@ jobs:
           pip install -c constraints-quality.txt -r requirements-dev.txt
           pip install -e . -c constraints-quality.txt
 
-      - name: Build the distribution the wheel tier installs (issue #467)
+      - name: "Build the distribution the wheel tier installs (issue #467)"
         # tests/e2e/test_installed_wheel.py asserts on the WHEEL, in a clean
         # virtualenv -- not on the checkout. It therefore needs `dist/` to hold
         # exactly one wheel before pytest starts. The `build` job below produces
