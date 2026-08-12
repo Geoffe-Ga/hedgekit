@@ -33,41 +33,43 @@ default is ``~/.local/share/windbreak``, and a ``KILL`` file a developer left
 there would silently kill these runs (the hazard
 ``tests/integration/conftest.py``'s ``state_dir`` fixture documents).
 
-What a "decision" is here, and the limit this tier hit
-------------------------------------------------------
+What a "decision" is here, and the limit this tier used to hit
+--------------------------------------------------------------
 
 ``tests/integration/test_paper_real_approval_fill.py`` (issue #450, PR #501)
 defines a decision in-process as the chain ``ForecastCreated`` ->
 ``SelectorDecisionRecorded`` -> ``IntentApproved`` -> ``ApprovalTokenIssued`` ->
-four ``OrderTransitionLedgered`` edges. **That chain is not reachable from the
-shipped CLI in a hermetic environment**, and this module reaches the part that
-is rather than pretending otherwise:
+four ``OrderTransitionLedgered`` edges. When this module was written that chain
+was **not reachable from the shipped CLI in a hermetic environment**, for three
+reasons this docstring recorded and issue #510 carried: the offline research
+tools found nothing, so ``run_pipeline`` abstained on
+``no_verified_citations``; the committed cassette held placeholders; and no
+committed fixture could hold a market horizon that stayed open, because
+``PaperExchange`` re-dated its books onto the replay anchor and assigned its
+markets verbatim.
 
-* ``_resolve_research_tools`` (``windbreak/scheduler/loop.py:1689``) wires
-  ``offline_research_tools`` whenever the forecast transport is the cassette --
-  the only hermetic setting -- and those transports find nothing, so
-  ``run_pipeline`` abstains on ``no_verified_citations`` before any vote is
-  cast. The forecast is therefore always an abstention.
-* The committed cassette ``tests/fixtures/forecast/cassettes.json`` -- the one
-  ``deploy/docker-compose.yml`` names on the pipeline's own command line --
-  holds three placeholder entries (``example canned response 1``), so it could
-  not answer a real vote prompt even if one were reached.
-* An abstaining forecast yields ``intent_count == 0``, so no approval, no
-  token and no gateway transition can follow.
+**PR #522 closed all three**, and the gap was filed rather than papered over
+exactly so that the fix could land in ``windbreak/`` instead of inside a test
+tier. ``forecast.replay_corpus`` selects a committed research/vote corpus from
+configuration and ``_anchor_markets`` re-dates the calendar with the books, so
+the chain now crosses a real process boundary --
+:func:`test_the_whole_intent_chain_crosses_a_process_boundary` is that claim,
+and :mod:`tests.hermetic_demo` names the composition it needs.
 
-Only a product change -- a fixture-backed research/vote transport selectable
-from the CLI -- would let a fill cross a real process boundary, so the gap is
-**filed, not papered over**: issue #510 carries this reproduction and the
-acceptance criteria for closing it, rather than the fix landing inside a
-test-tier change.
+The two runs in this module are therefore deliberately different, and both are
+kept:
 
-What *is* reachable is a genuine decision the pipeline process computed and no
-other process could have: a ``SelectorDecisionRecorded`` naming the market and
-the reason the selector emitted nothing. A second process -- the dashboard,
-started separately, with its own credentials and its own config -- reads it off
-the shared volume and serves it over loopback HTTP.
-:func:`test_a_decision_one_process_recorded_is_served_by_another_over_loopback`
-asserts that page byte-for-byte, and asserts it while the writing process is
+* over the **shipped default** command line -- ``deep_walk`` and the committed
+  cassette, no ``--config`` -- the forecast still abstains and
+  ``intent_count`` is still ``0``. That is what an operator who configures
+  nothing gets, and
+  :func:`test_a_decision_one_process_recorded_is_served_by_another_over_loopback`
+  pins the decision it produces.
+* over the **hermetic demonstration** composition the intent chain completes.
+
+Either way the second process -- the dashboard, started separately, with its
+own credentials and its own config -- reads the decision off the shared volume
+and serves it over loopback HTTP, byte-for-byte, while the writing process is
 already **dead and reaped**, so no shared-memory or same-interpreter
 explanation survives.
 
@@ -98,7 +100,8 @@ test-tier change:
   instead of a bare traceback.
   :func:`test_a_process_opening_a_write_locked_ledger_waits_and_then_starts` is
   the same reproduction inverted, asserting the process survives the wait.
-* **#510** -- the abstention gap above.
+* **#510** -- the abstention gap above. **Fixed** by PR #522; the chain it
+  unblocked is now asserted here rather than only described.
 
 Waiting is bounded and always on a real condition (:func:`wait_until`); there is
 no sleep in this module.
@@ -120,11 +123,20 @@ import pytest
 
 from tests.e2e.harness import (
     free_port,
+    ledger_payloads,
     pid_alive,
     port_is_serving,
     read_ledger_records,
     verify_ledger_chain,
     wait_until,
+)
+from tests.hermetic_demo import (
+    TICKER as DEMO_TICKER,
+)
+from tests.hermetic_demo import (
+    demo_run_args,
+    place_track_records,
+    write_run_config,
 )
 from tests.paper_books import set_close_time
 from windbreak.main import PROCESS_CHOICES
@@ -229,6 +241,20 @@ KERNEL_COMPONENT = "riskkernel"
 #: The component the PAPER tick's own stages stamp. It is not a ``--process``
 #: token: inside the pipeline process the scheduler writes under its own name.
 SCHEDULER_COMPONENT = "scheduler"
+
+#: The rest of the decision chain, now that PR #522 makes it reachable.
+APPROVAL_EVENT = "IntentApproved"
+TOKEN_EVENT = "ApprovalTokenIssued"
+TRANSITION_EVENT = "OrderTransitionLedgered"
+
+#: The four order-state edges one approved intent walks in a beat.
+ORDER_EDGES = ["APPROVE", "REQUEST_SUBMISSION", "SUBMIT", "ACK"]
+
+#: Beats and cadence for the hermetic demonstration run. Two beats because the
+#: first beat of a fresh ledger fails ``daily_loss_limit`` closed; no interval
+#: because nothing has to observe it while it runs.
+HERMETIC_DEMO_BEATS = "2"
+HERMETIC_DEMO_INTERVAL = "0"
 
 
 def _decisions_page(reason: str) -> str:
@@ -542,27 +568,23 @@ def _await_dashboard(spawned: SpawnedProcess, port: int) -> None:
 
 
 def _payloads(
-    ledger_path: Path, event_type: str, component: str
+    ledger_path: Path, event_type: str, component: str | None = None
 ) -> list[dict[str, object]]:
     """Read one component's rows of one event type off a ledger another wrote.
 
-    The store is opened on the live file rather than a copy, so rows still in the
-    write-ahead log are read through SQLite itself; a byte-level read of
-    ``ledger.db`` alone would miss them.
+    A thin positional-argument spelling of
+    :func:`~tests.e2e.harness.ledger_payloads`, which is where the WAL-aware
+    read lives so every module in the tier gets the same one.
 
     Args:
         ledger_path: The ledger to read.
         event_type: The event type wanted.
-        component: The component whose rows are wanted.
+        component: The component whose rows are wanted, or ``None`` for all.
 
     Returns:
         Each matching row's ``data`` payload, in chain order.
     """
-    payloads: list[dict[str, object]] = []
-    for record in read_ledger_records(ledger_path):
-        if record.event_type == event_type and record.component == component:
-            payloads.append(dict(json.loads(record.payload_json)["data"]))
-    return payloads
+    return ledger_payloads(ledger_path, event_type, component=component)
 
 
 def _kernel_heartbeat_count(ledger_path: Path) -> int:
@@ -859,6 +881,76 @@ def test_a_decision_one_process_recorded_is_served_by_another_over_loopback(
     assert body == _decisions_page(SELECTOR_REASON)
     unauthorized_status, _ = _get(port, "/decisions", token=None)
     assert unauthorized_status == 401
+
+
+def test_the_whole_intent_chain_crosses_a_process_boundary(
+    launcher: ProcessLauncher, run_root: RunRoot
+) -> None:
+    """The chain #510 could not reach now completes in a child process (#522).
+
+    Issue #522's own third acceptance criterion, deferred to #473's lane: this
+    module's docstring described the intent path as unreachable from the shipped
+    CLI, and that stopped being true when ``forecast.replay_corpus`` and
+    ``_anchor_markets`` landed. Describing a limit that no longer exists is
+    worse than describing none, so the claim is asserted here instead.
+
+    Nothing about the topology changes. The pipeline is the same shipped entry
+    point in its own operating-system process with its own configuration; the
+    only difference from the run above is which committed fixtures it is pointed
+    at. Two beats, because the risk kernel fails ``daily_loss_limit`` closed on
+    the first beat of a fresh ledger -- ``equity_start_of_day`` does not exist
+    until that beat's own ``EquitySampled`` row does -- so an approval is only
+    observable on the second.
+
+    The whole chain is read back off the shared volume **after the writing
+    process is dead and reaped**, asserted rather than assumed, so no
+    same-interpreter explanation survives: one ``IntentApproved`` with no
+    dissenting reasons, its token, and the four order-state edges that carry it
+    to ``ACK``. Each is asserted as an exact value or an exact list; an
+    ``intent_count >= 1`` would pass for a run that emitted an intent and then
+    lost it.
+
+    Args:
+        launcher: The launcher that reaps every child.
+        run_root: This test's isolated run root.
+    """
+    report_dir = run_root.report_dir / "hermetic"
+    place_track_records(report_dir)
+    config = write_run_config(
+        run_root.root / "hermetic.yaml", state_dir=run_root.state_dir / "hermetic"
+    )
+    pipeline = launcher.spawn(
+        *demo_run_args(
+            config=config,
+            ledger_path=run_root.ledger_path,
+            report_dir=report_dir,
+            max_beats=HERMETIC_DEMO_BEATS,
+            heartbeat_interval=HERMETIC_DEMO_INTERVAL,
+        ),
+        name="hermetic-pipeline",
+    )
+
+    assert pipeline.wait(timeout=EXIT_TIMEOUT_SECONDS) == 0
+
+    assert not pipeline.is_running()
+    assert not pid_alive(pipeline.pid)
+    decisions = _payloads(run_root.ledger_path, DECISION_EVENT, SCHEDULER_COMPONENT)
+    assert [decision["market_ticker"] for decision in decisions] == [DEMO_TICKER] * int(
+        HERMETIC_DEMO_BEATS
+    )
+    assert [decision["intent_count"] for decision in decisions] == [1] * int(
+        HERMETIC_DEMO_BEATS
+    )
+    approvals = _payloads(run_root.ledger_path, APPROVAL_EVENT)
+    assert len(approvals) == 1
+    assert approvals[0]["reasons"] == []
+    assert [
+        token["intent_id"] for token in _payloads(run_root.ledger_path, TOKEN_EVENT)
+    ] == [approvals[0]["intent_id"]]
+    assert [
+        edge["event"] for edge in _payloads(run_root.ledger_path, TRANSITION_EVENT)
+    ] == ORDER_EDGES
+    verify_ledger_chain(run_root.ledger_path)
 
 
 def test_a_dashboard_on_its_own_ledger_cannot_see_that_decision(
