@@ -706,3 +706,103 @@ def test_the_wal_sidecar_is_where_the_fresh_rows_actually_live(
         assert market.ticker.encode() not in ledger_path.read_bytes()
     finally:
         store.close()
+
+
+# --- The whole run is refused, not only each vote (issue #525) -------------------
+#
+# The seam screen above refuses a hostile market *per vote*, so every vote is
+# discarded and the run still returns an abstention `ForecastRecord` carrying the
+# hostile ticker verbatim -- which the scheduler's composition root then appends
+# to the hash chain as `ForecastCreated`. `run_pipeline` therefore screens the
+# market once at entry, before any stage runs, so no record exists to leak.
+
+
+class _RecordingResearchTools:
+    """A `ResearchTools` double that records whether it was ever reached.
+
+    Wired in place of the real sandbox so "the refusal happens before any
+    research" is asserted on evidence rather than on reading the source.
+    """
+
+    def __init__(self) -> None:
+        """Reset the reached flag."""
+        self.reached = False
+
+    def search(self, query: str) -> tuple[str, ...]:
+        """Record the call and find nothing.
+
+        Args:
+            query: The (unused) search query.
+
+        Returns:
+            The empty result tuple.
+        """
+        del query
+        self.reached = True
+        return ()
+
+    def fetch(self, url: str) -> object:
+        """Record the call and refuse, since `search` never yields a URL.
+
+        Args:
+            url: The URL that was asked for.
+
+        Raises:
+            AssertionError: Always; `search` finds nothing, so this is dead.
+        """
+        self.reached = True
+        raise AssertionError(f"fetch reached for {url!r}")
+
+
+def test_run_pipeline_refuses_a_hostile_market_before_any_research(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot, created_at: datetime
+) -> None:
+    """A hostile market is refused at the pipeline's entry, not per vote.
+
+    The refusal is the same typed error the seam raises, carrying the same
+    failure code and the same fingerprint, so a ledger reader cannot tell the
+    two apart -- and the research tools are never touched, so the refusal costs
+    nothing.
+    """
+    from windbreak.forecast.pipeline import run_pipeline
+
+    tools = _RecordingResearchTools()
+
+    with pytest.raises(ProviderMarketMetadataRejectedError) as refusal:
+        run_pipeline(
+            _hostile_market(market),
+            baseline,
+            transport=_CountingTransport(),
+            created_at=created_at,
+            research_tools=tools,
+        )
+
+    assert refusal.value.failure_code == PROVIDER_FAILURE_MARKET_METADATA_REJECTED
+    assert refusal.value.field_name == "ticker"
+    assert refusal.value.screen_failure == RESPONSE_FAILURE_DELIMITER_FORGERY
+    assert refusal.value.field_fingerprint == fingerprint_response(_HOSTILE_TICKER)
+    assert tools.reached is False
+
+
+def test_run_pipeline_still_produces_a_record_for_a_clean_market(
+    market: NormalizedMarket, baseline: BaselineQuoteSnapshot, created_at: datetime
+) -> None:
+    """The positive control: a clean market still runs and still records.
+
+    Without this, the refusal above could be produced by a screen that refuses
+    everything, and the whole engine would be dead rather than guarded.
+    """
+    from windbreak.forecast.pipeline import run_pipeline
+
+    tools = _RecordingResearchTools()
+
+    record = run_pipeline(
+        market,
+        baseline,
+        transport=_CountingTransport(),
+        created_at=created_at,
+        research_tools=tools,
+    )
+
+    assert record.market_ticker == market.ticker
+    assert tools.reached is True

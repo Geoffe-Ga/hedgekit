@@ -10,17 +10,23 @@ probability/money path guarded by ``scripts/lint_no_floats.py``.
 
 :class:`ForecastRecord` validates its range, integrality, non-emptiness, and
 closed-set invariants in ``__post_init__`` so a malformed record fails loudly
-at construction. :func:`forecast_record_to_payload` renders a record into a
+at construction. Since issue #525 that includes screening ``market_ticker``
+through the same untrusted-text screen the provider seam refuses a market on:
+the record is what the scheduler reads a ``ForecastCreated`` row's ticker off,
+and that row lands in an append-only chain, so the invariant belongs on the type
+rather than at each append. :func:`forecast_record_to_payload` renders a record into a
 JSON-safe mapping (datetimes as ISO-8601 ``Z`` strings, tuples of dataclasses
 as lists of dicts, no float leaf anywhere) for ledger/event emission.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from windbreak.forecast.sanitize import screen_single_line_text
 from windbreak.timekeeping import iso_z, require_aware
 
 if TYPE_CHECKING:
@@ -105,6 +111,49 @@ def _require_non_empty(value: str, field_name: str) -> None:
     """
     if not value:
         raise ValueError(f"{field_name} must be non-empty")
+
+
+def _require_screened_ticker(value: str) -> None:
+    """Refuse a ``market_ticker`` the provider seam would refuse (issue #525).
+
+    A market's ticker is upstream-sourced and attacker-influenced;
+    :class:`~windbreak.connector.models.NormalizedMarket` validates enum-shaped
+    and numeric fields only, so nothing between the exchange and here screens it.
+    A :class:`ForecastRecord` is what the scheduler's composition root reads
+    ``market_ticker`` off to build the ``ForecastCreated`` row it appends to an
+    **append-only** hash chain -- and nothing written there can ever be redacted.
+
+    Screening at that append would be coverage by *convention*: one deletable
+    call, re-added by hand for every future consumer of a record. Screening at
+    construction makes it coverage by *construction* -- no record carrying an
+    unscreened ticker exists for a consumer to leak, which is the same argument
+    that moved the metadata screen to the provider seam in issue #462.
+
+    The screen is :func:`~windbreak.forecast.sanitize.screen_single_line_text`,
+    the identical function :func:`
+    ~windbreak.forecast.providers.base.screen_market_metadata` refuses the
+    market's ticker with. Wiring a narrower check here would admit exactly the
+    artifacts the seam already knows are hostile.
+
+    The refusal names the verdict and the field's sha256 digest, never the bytes:
+    an exception message travels into logs, and repeating the ticker there would
+    defeat keeping it off the chain.
+
+    Args:
+        value: The candidate market ticker.
+
+    Raises:
+        ValueError: If the ticker forges an untrusted-data delimiter, embeds a
+            tool-call lure, or carries a line terminator.
+    """
+    verdict = screen_single_line_text(value)
+    if verdict is None:
+        return
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    raise ValueError(
+        f"market_ticker: {verdict} (sha256:{digest}); a ticker the market"
+        " metadata screen refuses is refused here too, never recorded"
+    )
 
 
 def _require_non_negative_count(value: int, field_name: str) -> None:
@@ -308,7 +357,9 @@ class ForecastRecord:
         Raises:
             TypeError: If any ppm field is a ``bool`` or non-``int``.
             ValueError: If any ppm field is out of range, ``forecast_id`` or
-                ``market_ticker`` is empty, ``created_at`` carries no UTC offset
+                ``market_ticker`` is empty, ``market_ticker`` fails the
+                market-metadata screen (see :func:`_require_screened_ticker`,
+                issue #525), ``created_at`` carries no UTC offset
                 (issue #397), ``triage_stage`` is unrecognized,
                 or the record is ``eligible_for_live`` while any
                 live-ineligibility trigger holds. Three independent triggers each
@@ -323,6 +374,7 @@ class ForecastRecord:
             _require_ppm(getattr(self, field_name), field_name)
         _require_non_empty(self.forecast_id, "forecast_id")
         _require_non_empty(self.market_ticker, "market_ticker")
+        _require_screened_ticker(self.market_ticker)
         require_aware(self.created_at, "created_at")
         if self.triage_stage not in _TRIAGE_STAGES:
             allowed = ", ".join(sorted(_TRIAGE_STAGES))
