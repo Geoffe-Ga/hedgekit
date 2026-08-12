@@ -100,6 +100,7 @@ import pytest
 from tests.integration.conftest import FIXED_NOW_EPOCH_S, ledger_path_for
 from windbreak.alerts.dispatch import AlertDispatcher, LoggingLedgerWriter
 from windbreak.alerts.registry import AlertSeverity, AlertType
+from windbreak.forecast.budget import FULL_PIPELINE_RESEARCH_COST_MICROS
 from windbreak.ledger.store import SqliteLedgerStore
 from windbreak.numeric.types import MoneyMicros
 from windbreak.riskkernel.modes import Mode
@@ -175,6 +176,25 @@ _DELIVERIES_AFTER_A_FAILED_SINK = [
 #: The exact key set a ledgered delivery mapping may carry. There is no fourth
 #: key, and in particular no `detail` (issues #274/#413).
 _DELIVERY_KEYS = {"sink", "outcome", "fallback"}
+
+#: What one PAPER beat of this suite's fixture charges the research budget, in
+#: micros. The `deep_walk` books screen exactly one candidate per tick (the
+#: `MarketSnapshotRecorded`/`ForecastCreated` counts the tests below pin), and
+#: the loop drives `run_pipeline`'s *full* stage, which levies exactly the fixed
+#: full-pipeline research charge once. SPEC S8.4's cheap Stage-0 prior is a
+#: different entry point the loop does not call, and this fixture's offline
+#: ensemble abstains without accruing vote cost, so neither term appears.
+#:
+#: Imported rather than transcribed, and written as an exact integer rather than
+#: a bound, because "greater than zero" is precisely the assertion that let this
+#: defect survive: a `PAUSED` beat charged *this same number*, so only comparing
+#: the number itself could tell the two behaviours apart.
+_PAPER_BEAT_RESEARCH_MICROS = FULL_PIPELINE_RESEARCH_COST_MICROS
+
+#: A per-UTC-day ceiling admitting exactly two PAPER beats and no third. Small
+#: enough that a handful of non-trading beats would exhaust it outright, which
+#: is what makes the day-ceiling assertion below falsifiable.
+_TWO_PAPER_BEATS_MICROS = 2 * _PAPER_BEAT_RESEARCH_MICROS
 
 
 @dataclass
@@ -452,6 +472,144 @@ def _ledger_file_bytes(ledger_path: Path) -> bytes:
         path.read_bytes()
         for path in sorted(ledger_path.parent.glob(f"{ledger_path.name}*"))
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _Beat:
+    """One beat as an auditor reading the ledger back off disk would see it.
+
+    Attributes:
+        beat: The 1-based sequence number the `ModeHeartbeat` row carries.
+        mode: The mode token that same row carries.
+        research_micros: Every `ResearchSpendRecorded.cost_micros` appended
+            during this beat, summed. Exact, never a bound: the whole point of
+            issue #526 is *which integer* a non-trading beat charges.
+        event_types: The event types appended during this beat, in ledger
+            order, up to and including its `ModeHeartbeat` row.
+    """
+
+    beat: int
+    mode: str
+    research_micros: int
+    event_types: tuple[str, ...]
+
+
+def _beats_off_disk(ledger_path: Path) -> tuple[_Beat, ...]:
+    """Reopen the ledger *file* and partition its rows into beats.
+
+    Deliberately a second connection to the path rather than `deps.store`: the
+    spend an operator is billed for is the spend on the database, not the spend
+    a live handle happens to remember. The store is WAL-journaled, so the rows
+    a just-finished run appended are in the `ledger.db-wal` sidecar -- a reader
+    that opened `ledger.db` alone would see an older database and report a
+    comfortable zero forever (the false green of PR #474). Opening the *store*
+    reads through the sidecar, which is why this goes through
+    `SqliteLedgerStore` rather than parsing bytes.
+
+    The chain is verified bare before anything is projected, so a row appended
+    out of chain fails here rather than being quietly summed.
+
+    Partitioning is by `ModeHeartbeat`, which `run_single_tick` appends once
+    per tick *after* the universe walk -- so every micro a beat spends is
+    already on the chain when its heartbeat lands, and no beat can borrow the
+    next one's spend. Rows after the last heartbeat (there are none in a
+    completed run) are dropped rather than attributed to a beat that never
+    reported.
+
+    Args:
+        ledger_path: The ledger database the run was given.
+
+    Returns:
+        One `_Beat` per `ModeHeartbeat` row, in ledger order.
+    """
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        store.verify_chain()
+        records = list(store.read_all())
+    finally:
+        store.close()
+    beats: list[_Beat] = []
+    micros = 0
+    types: list[str] = []
+    for record in records:
+        types.append(str(record.event_type))
+        data = json.loads(record.payload_json)["data"]
+        if record.event_type == "ResearchSpendRecorded":
+            micros += int(data["cost_micros"])
+        elif record.event_type == "ModeHeartbeat":
+            beats.append(
+                _Beat(
+                    beat=int(data["beat"]),
+                    mode=str(data["mode"]),
+                    research_micros=micros,
+                    event_types=tuple(types),
+                )
+            )
+            micros = 0
+            types = []
+    return tuple(beats)
+
+
+def _spend_by_beat(ledger_path: Path) -> list[tuple[int, str, int]]:
+    """Return `(beat, mode, research micros)` for every beat on the ledger.
+
+    Args:
+        ledger_path: The ledger database the run was given.
+
+    Returns:
+        One triple per beat, in ledger order.
+    """
+    return [
+        (beat.beat, beat.mode, beat.research_micros)
+        for beat in _beats_off_disk(ledger_path)
+    ]
+
+
+def _rows_off_disk(ledger_path: Path, event_type: str) -> list[dict[str, Any]]:
+    """Reopen the ledger file and return one event type's payloads, in order.
+
+    Args:
+        ledger_path: The ledger database the run was given.
+        event_type: The event type to project.
+
+    Returns:
+        One payload-data mapping per matching row, in ledger order.
+    """
+    store = SqliteLedgerStore(ledger_path)
+    try:
+        store.verify_chain()
+        records = list(store.read_all())
+    finally:
+        store.close()
+    return [
+        dict(json.loads(record.payload_json)["data"])
+        for record in records
+        if record.event_type == event_type
+    ]
+
+
+def _spend_payloads(ledger_path: Path) -> list[dict[str, Any]]:
+    """Return every `ResearchSpendRecorded` payload on the ledger, in order.
+
+    Args:
+        ledger_path: The ledger database the run was given.
+
+    Returns:
+        One whole payload mapping per research charge.
+    """
+    return _rows_off_disk(ledger_path, "ResearchSpendRecorded")
+
+
+def _halt_payloads(ledger_path: Path) -> list[dict[str, Any]]:
+    """Return every `ResearchBudgetHalted` payload on the ledger, in order.
+
+    Args:
+        ledger_path: The ledger database the run was given.
+
+    Returns:
+        One whole payload mapping per fail-closed budget halt.
+    """
+    return _rows_off_disk(ledger_path, "ResearchBudgetHalted")
 
 
 def _count_of(deps: PaperTickDeps, event_type: str) -> int:
@@ -823,6 +981,279 @@ def test_the_operators_rearm_file_returns_the_killed_loop_to_paused(
     assert not state_dir.joinpath(REARM_FILENAME).exists()
 
 
+def _kill_then_rearm(
+    monkeypatch: pytest.MonkeyPatch, state_dir: Path
+) -> Callable[[int], None]:
+    """Build the between-beats hook that kills after beat 1 and re-arms after 2.
+
+    The same operator sequence
+    `test_the_operators_rearm_file_returns_the_killed_loop_to_paused` drives,
+    factored out because three tests need it: a beat in `PAPER`, a beat in
+    `KILLED`, and every beat after the re-arm in `PAUSED`.
+
+    Args:
+        monkeypatch: Used to type the re-arm phrase on the CLI's stdin.
+        state_dir: The kill/re-arm drop-box the running loop polls.
+
+    Returns:
+        A hook taking the just-finished beat's 1-based sequence number.
+    """
+    from windbreak.main import main
+
+    def _operator(seq: int) -> None:
+        """Kill after beat 1, type the re-arm phrase after beat 2.
+
+        Args:
+            seq: The just-finished beat's sequence number.
+        """
+        if seq == 1:
+            assert main(["kill", "--state-dir", str(state_dir)]) == 0
+        if seq == 2:
+            monkeypatch.setattr(
+                "builtins.input",
+                lambda: "RE-ARM KILL 1: I ACCEPT FULL RESPONSIBILITY",
+            )
+            assert main(["rearm", "--state-dir", str(state_dir)]) == 0
+
+    return _operator
+
+
+def test_a_rearmed_loop_charges_no_research_for_forecasts_it_may_not_trade(
+    books_dir: Path,
+    captured_deps: list[PaperTickDeps],
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """A `PAUSED` beat spends exactly zero research micros (issue #526).
+
+    `KillSwitch.rearm` exits `KILLED` into `PAUSED` deliberately, and `PAUSED`
+    is not `KILLED` -- so until this test the tick's walk gate, which named
+    `KILLED` alone, let a re-armed loop screen, snapshot, forecast and pay for
+    every candidate, and then veto every intent it produced on
+    `mode PAUSED may not trade`. The kernel's own approval check has always
+    treated the two modes identically; only the gate that decides whether to
+    *pay* disagreed.
+
+    The exact micros are the assertion, not their absence and not a bound.
+    Before the fix a `PAUSED` beat charged `_PAPER_BEAT_RESEARCH_MICROS` --
+    byte-for-byte what a trading beat charges -- so "some spend" and "no spend"
+    were the only two answers that could tell the two behaviours apart, and any
+    assertion that both satisfy would have passed on the defect.
+
+    The ledger is re-read from the *file*, chain verified, so the figure is the
+    one an auditor gets rather than the one the run's own handle remembers.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        captured_deps: Captures the bundle the composition root builds.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used for `build_sinks` and the typed re-arm phrase.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory.
+        state_dir: The kill/re-arm state directory `paper_config` points at.
+        tmp_path: The per-test scratch directory.
+    """
+    monkeypatch.setattr(
+        "windbreak.main.build_sinks", lambda *_a, **_k: (_RecordingSink(),)
+    )
+    ledger_path = ledger_path_for(tmp_path)
+    args = _paper_args(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path,
+        report_dir=report_dir,
+    )
+
+    modes = _run_beats(
+        args,
+        paper_config,
+        beats=4,
+        between_beats=_kill_then_rearm(monkeypatch, state_dir),
+    )
+
+    assert modes == ["PAPER", "KILLED", "PAUSED", "PAUSED"]
+    assert captured_deps[0].kernel.mode is Mode.PAUSED
+    assert _spend_by_beat(ledger_path) == [
+        (1, "PAPER", _PAPER_BEAT_RESEARCH_MICROS),
+        (2, "KILLED", 0),
+        (3, "PAUSED", 0),
+        (4, "PAUSED", 0),
+    ]
+
+
+def test_a_rearmed_loops_paper_beat_is_unchanged_and_its_paused_beat_is_not(
+    books_dir: Path,
+    captured_deps: list[PaperTickDeps],
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """The gate changes the non-trading beat and nothing else (issue #526).
+
+    Two runs over the same fixture, identical but for the operator's kill and
+    re-arm. The trading beat is compared in **full** -- its whole ledger row
+    sequence and every `ResearchSpendRecorded` payload, not merely a count and
+    not merely the absence of an exception -- against the beat the untouched
+    control run produced, so a gate that quietly narrowed what a PAPER beat does
+    fails here even if the money happened to come out the same.
+
+    The last assertion is the non-coincidence control this suite's own module
+    docstring demands: the `PAUSED` beat's row sequence must *differ* from the
+    `PAPER` beat's. Without it the two comparisons above could both be
+    satisfied by a fixture in which paused and unpaused beats produce one
+    answer, which is exactly how six defects hid in this repository.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        captured_deps: Captures the bundle the composition root builds.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used for `build_sinks` and the typed re-arm phrase.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory.
+        state_dir: The kill/re-arm state directory `paper_config` points at.
+        tmp_path: The per-test scratch directory.
+    """
+    monkeypatch.setattr(
+        "windbreak.main.build_sinks", lambda *_a, **_k: (_RecordingSink(),)
+    )
+    control_path = ledger_path_for(tmp_path, "control.db")
+    rearmed_path = ledger_path_for(tmp_path, "rearmed.db")
+
+    _run_beats(
+        _paper_args(
+            books_dir=books_dir,
+            cassette_path=cassette_path,
+            ledger_path=control_path,
+            report_dir=report_dir,
+        ),
+        paper_config,
+        beats=1,
+    )
+    _run_beats(
+        _paper_args(
+            books_dir=books_dir,
+            cassette_path=cassette_path,
+            ledger_path=rearmed_path,
+            report_dir=report_dir,
+        ),
+        paper_config,
+        beats=4,
+        between_beats=_kill_then_rearm(monkeypatch, state_dir),
+    )
+
+    control = _beats_off_disk(control_path)
+    rearmed = _beats_off_disk(rearmed_path)
+    assert [beat.mode for beat in control] == ["PAPER"]
+    assert [beat.mode for beat in rearmed] == [
+        "PAPER",
+        "KILLED",
+        "PAUSED",
+        "PAUSED",
+    ]
+    assert "ForecastCreated" in control[0].event_types
+    assert control[0].research_micros == _PAPER_BEAT_RESEARCH_MICROS
+    assert rearmed[0].event_types == control[0].event_types
+    assert _spend_payloads(rearmed_path)[: len(_spend_payloads(control_path))] == (
+        _spend_payloads(control_path)
+    )
+    assert rearmed[2].event_types != rearmed[0].event_types
+
+
+def test_paused_beats_leave_the_utc_days_research_ceiling_for_the_next_run(
+    books_dir: Path,
+    captured_deps: list[PaperTickDeps],
+    cassette_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paper_config: WindbreakConfig,
+    report_dir: Path,
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """The day's ceiling survives a re-arm the operator walked away from (#526).
+
+    The property that actually costs an operator money, and the reason issue
+    #526 was re-tiered to P1. Since issues #483/#442 the per-UTC-day ceiling is
+    folded back out of the ledger's own `ResearchSpendRecorded` rows, so spend
+    is **durable**: a `PAUSED` beat that charges does not merely waste that
+    beat's money, it eats the ceiling the *next* run -- the restart that is the
+    only way back to `PAPER` -- has left to trade on.
+
+    Driven end to end rather than per beat. The ceiling admits exactly two
+    PAPER beats. One beat trades, the operator kills and re-arms, three beats
+    run in `PAUSED`, and then the loop is restarted (a second `_run_beats` over
+    the same ledger path, which is what a restart is: a fresh composition
+    replaying the chain). The restarted run must still be able to buy its
+    forecast.
+
+    Before the fix the three paused beats charged `3 x` the beat cost against a
+    `2 x` ceiling, so the restarted run opened on an exhausted day, halted
+    fail-closed, and the assertion that no `ResearchBudgetHalted` row exists
+    fails -- with the restarted beat charging `0` instead of a full beat.
+
+    The UTC day is the bucket key, and nothing here injects a clock, so a run
+    straddling UTC midnight would bucket into two days and the ceiling would
+    not bind. That is why the test asserts the whole ledger holds exactly the
+    two beats' spend on a *single* day key rather than summing across days: a
+    straddle shows up as two keys and fails loudly instead of passing vacuously.
+
+    Args:
+        books_dir: The shared `deep_walk` books fixture.
+        captured_deps: Captures the bundle the composition root builds.
+        cassette_path: The empty offline cassette.
+        monkeypatch: Used for `build_sinks` and the typed re-arm phrase.
+        paper_config: The PAPER-ceilinged configuration.
+        report_dir: The weekly-report output directory.
+        state_dir: The kill/re-arm state directory `paper_config` points at.
+        tmp_path: The per-test scratch directory.
+    """
+    import dataclasses
+
+    monkeypatch.setattr(
+        "windbreak.main.build_sinks", lambda *_a, **_k: (_RecordingSink(),)
+    )
+    config = dataclasses.replace(
+        paper_config,
+        forecast=dataclasses.replace(
+            paper_config.forecast,
+            budget=dataclasses.replace(
+                paper_config.forecast.budget, per_day_micros=_TWO_PAPER_BEATS_MICROS
+            ),
+        ),
+    )
+    ledger_path = ledger_path_for(tmp_path)
+    args = _paper_args(
+        books_dir=books_dir,
+        cassette_path=cassette_path,
+        ledger_path=ledger_path,
+        report_dir=report_dir,
+    )
+
+    _run_beats(
+        args, config, beats=5, between_beats=_kill_then_rearm(monkeypatch, state_dir)
+    )
+    restarted = _run_beats(args, config, beats=1)
+
+    assert restarted == ["PAPER"]
+    assert _spend_by_beat(ledger_path) == [
+        (1, "PAPER", _PAPER_BEAT_RESEARCH_MICROS),
+        (2, "KILLED", 0),
+        (3, "PAUSED", 0),
+        (4, "PAUSED", 0),
+        (5, "PAUSED", 0),
+        (1, "PAPER", _PAPER_BEAT_RESEARCH_MICROS),
+    ]
+    assert _halt_payloads(ledger_path) == []
+    assert {payload["utc_day"] for payload in _spend_payloads(ledger_path)} != set()
+    assert len({payload["utc_day"] for payload in _spend_payloads(ledger_path)}) == 1
+
+
 @pytest.mark.parametrize(
     ("threshold", "expected_modes"),
     [
@@ -1060,7 +1491,12 @@ def test_an_engaged_kill_survives_a_restart_with_the_kill_file_deleted(
     assert restarted == ["KILLED", "PAUSED"]
     assert captured_deps[1].kernel.mode is Mode.PAUSED
     assert _payloads_of(captured_deps[1], "KillReArmed") == [{"kill_sequence": 1}]
-    assert _count_of(captured_deps[1], "MarketSnapshotRecorded") == 2
+    # One snapshot on the whole shared chain, from the one beat that could
+    # trade: run 1 beat 1 (`PAPER`). Run 1 beat 2 and run 2 beat 1 are
+    # `KILLED`; run 2 beat 2 is `PAUSED`, and since issue #526 a mode that may
+    # not trade walks no candidates either -- so this figure was 2 until the
+    # re-armed beat stopped paying for a forecast it would have vetoed.
+    assert _count_of(captured_deps[1], "MarketSnapshotRecorded") == 1
 
 
 def test_a_composed_kill_ledgers_the_same_delivery_evidence_on_both_alert_rows(

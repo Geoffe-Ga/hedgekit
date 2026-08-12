@@ -68,10 +68,12 @@ reconciles against is frozen at startup from the venue's own opening state
 (``LedgerExpectationSource``; see :func:`_build_verifier` for why freezing it
 is what makes the comparison falsifiable at all), and the ledger carries no
 fill amounts that could update it. So the first tick after a fill grades a
-``BREACH``, the kernel transitions to ``HALT``, and every later approval vetoes
-on the halted mode. That is the honest fail-closed reading of "our books cannot
-account for the venue" -- and it is the reason an always-on PAPER deployment
-must watch :attr:`TickOutcome.kernel_halted`.
+``BREACH`` and the kernel transitions to ``HALT``. From that tick onward the
+loop walks no candidates, so it buys no research and mints no intent for an
+approval to veto (issue #526); ``HALT`` has no transition back to a trading
+mode, so only a restart clears it. That is the honest fail-closed reading of
+"our books cannot account for the venue" -- and it is the reason an always-on
+PAPER deployment must watch :attr:`TickOutcome.kernel_halted`.
 
 Money and equity fields are scaled integers (micros/centis/pips), never floats
 (SPEC S6.1); this package is on ``scripts/lint_no_floats.py``'s denylist.
@@ -3486,9 +3488,11 @@ class TickOutcome:
             markets reached before the ceiling bit.
         kernel_halted: Whether the Risk Kernel is in ``HALT`` at the end of this
             tick -- today only a verification ``BREACH`` puts it there (issue
-            #32). A halted kernel vetoes every later intent, so an always-on
-            driver must treat this as "stop and get a human", not as a
-            transient. Reported per tick rather than raised, because the tick
+            #32). A halted kernel cannot trade and cannot transition back to
+            a mode that can, so an always-on driver must treat this as "stop
+            and get a human", not as a transient; since issue #526 it also
+            stops paying for research from the halting tick onward. Reported
+            per tick rather than raised, because the tick
             must still finish ledgering its heartbeat, equity, and positions:
             the halt is exactly when that audit trail matters most.
     """
@@ -4669,29 +4673,57 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
 
     A cycle that grades a ``BREACH`` halts the kernel instead (issue #32); the
     tick still completes and still ledgers its heartbeat, equity sample, and
-    positions snapshot, but every later approval vetoes on the halted mode, and
+    positions snapshot, but it walks no candidates from that tick onward and
     :attr:`TickOutcome.kernel_halted` says so.
 
     Since issue #441 the tick *opens* by polling the operator's kill/re-arm
     files (:func:`_kill_stage`) and walks **no** candidates at all while the
-    kernel is ``KILLED``. Two triggers reach that state and both stop the same
-    tick: the ``KILL`` file ``windbreak kill`` writes, read before anything else
-    happens, and the ``AUTO_RECONCILIATION`` auto-kill that fires inside the
-    verification cycle once ``risk.kill_after_consecutive_mismatches``
-    consecutive breaches have accumulated. The mode is therefore read *after*
-    that cycle, so neither trigger needs its own path.
+    kernel may not trade. Three triggers reach such a mode and all stop the
+    same tick: the ``KILL`` file ``windbreak kill`` writes, read before
+    anything else happens; the ``AUTO_RECONCILIATION`` auto-kill that fires
+    inside the verification cycle once
+    ``risk.kill_after_consecutive_mismatches`` consecutive breaches have
+    accumulated; and that same cycle's single-breach ``HALT``. The mode is
+    therefore read *after* the cycle, so none of them needs its own path.
 
-    A killed tick is not a skipped tick. It still screens (the screen is free
-    and its rows are the honest record of what was examined), still stamps its
-    pipeline heartbeat, still reconciles the venue, still samples equity and
+    Since issue #526 the gate is not the kill switch's alone. What it asks is
+    :meth:`~windbreak.riskkernel.modes.Mode.may_research` -- "may this mode
+    spend research money" -- so ``HALT`` and ``PAUSED`` walk no candidates
+    either. Restating the mode set here is exactly what #526 cost:
+    ``KillSwitch.rearm`` exits ``KILLED`` into ``PAUSED``, so a re-armed loop
+    bought a forecast per market per beat and then vetoed every intent it had
+    paid for on ``mode PAUSED may not trade``, drawing down a per-UTC-day
+    ceiling that is durable since #442/#483 -- so the waste outlived the
+    process, and the next day opened short.
+
+    It is deliberately **not**
+    :meth:`~windbreak.riskkernel.modes.Mode.may_trade`, and the difference is
+    one mode. ``RESEARCH`` may not trade and must research: SPEC S5.1's bottom
+    rung produces forecasts precisely so that promotion out of it can be
+    earned, and ``_research_to_paper_gate``'s ``research_min_forecasts``
+    criterion reads that production. Gating the walk on "may an order be
+    routed" would therefore stop a ``RESEARCH`` loop from ever producing the
+    evidence that promotes it -- research without trading is what the rung is
+    *for*. A ``RESEARCH`` tick walks, snapshots, forecasts, pays, and reaches
+    the approval seam exactly as a ``PAPER`` tick does; only the approval
+    differs, vetoing on ``mode RESEARCH may not trade``.
+
+    ``HALT`` used to be excluded on the grounds that "a halted kernel is
+    expected to recover and its approvals veto individually". It does not
+    recover: ``_ALLOWED_TRANSITIONS[Mode.HALT]`` is ``{PAUSED, KILLED}`` and
+    :meth:`~windbreak.riskkernel.process.RiskKernel.from_events` never replays
+    ``HALT``, so a halt lasts the life of the process exactly as a re-arm's
+    ``PAUSED`` does. Both now cost nothing.
+
+    A non-trading tick is not a skipped tick. It still screens (the screen is
+    free and its rows are the honest record of what was examined), still stamps
+    its pipeline heartbeat, still reconciles the venue, still samples equity and
     positions, and still writes the week's report -- an always-on loop must stay
     observably alive and flat while dead, not fall silent. What it does not do
     is research or route: the walk is where money is spent, and a kernel that
     can approve nothing must not pay for forecasts it cannot act on.
-    ``ModeHeartbeat`` carries ``KILLED``, so the ledger and the heartbeat line
-    both say so. ``HALT`` deliberately does *not* skip the walk -- a halted
-    kernel is expected to recover and its approvals veto individually -- so this
-    is the kill switch's dead hand, not a general mode gate.
+    ``ModeHeartbeat`` carries the real mode, so the ledger and the heartbeat
+    line both say which one stopped the walk.
 
     A market whose per-forecast or per-UTC-day research budget is exhausted
     halts fail-closed (issue #339): it ledgers one ``ResearchBudgetHalted`` row,
@@ -4753,11 +4785,25 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     _verification_stage(deps)
     # Read *after* the verification cycle, so the reconciliation auto-kill that
     # fires inside it stops this tick by the same door the operator's KILL file
-    # does. A killed kernel walks no candidates at all: its `evaluate_intent`
-    # would hard-veto every intent anyway, but the walk is where the loop spends
-    # research money, and a dead kernel paying for forecasts it can never act on
-    # is the one failure a kill switch exists to prevent.
-    tradeable = () if deps.kernel.mode is Mode.KILLED else candidates
+    # does. The question asked is `Mode.may_research` -- "may this mode spend
+    # research money" -- and deliberately **not** `may_trade` (issue #526).
+    # The walk is where forecasts are bought, so the gate must ask whether a
+    # forecast is worth buying, not whether an order may be routed. The two
+    # answers agree on every mode but `RESEARCH`, which may not trade and must
+    # research: it is SPEC S5.1's bottom rung, and gating it on `may_trade`
+    # would stop the very forecast production `_research_to_paper_gate` reads
+    # to promote out of `RESEARCH`. See `Mode.may_research` for both failures.
+    #
+    # Placement is load-bearing and belongs *here*, before `_run_universe`.
+    # Every research charge is levied inside `run_pipeline`, which the walk
+    # reaches through `_forecast_stage`; `ResearchBudget.ensure_day_open` and
+    # `charge_stage` are both downstream of this line. Moving the gate any
+    # later -- into `_run_universe`'s loop body, or into `_run_candidate` after
+    # the forecast -- would charge the day first and refuse afterwards, which
+    # is the defect, not the fix. Gating *before* the screen would be wrong in
+    # the other direction: the screen is free and its rows are the honest
+    # record of what a non-trading loop examined.
+    tradeable = candidates if deps.kernel.mode.may_research() else ()
     universe = _run_universe(deps, tradeable, created_at, heartbeat_epoch_s)
     # The kernel's *real* mode, never a hardcoded PAPER: a verification breach
     # drives it to HALT mid-tick, and a heartbeat still claiming PAPER would be

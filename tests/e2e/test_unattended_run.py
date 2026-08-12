@@ -79,16 +79,30 @@ absence here is checked rather than assumed.
 WHAT RUNNING THIS FOUND
 -----------------------
 
-One product observation, **filed rather than repaired** (this is a test-tier
-change): a re-arm lands the kernel in ``PAUSED``, and no shipped command returns
-it to ``PAPER`` -- only a process restart does. So an operator who re-arms an
-unattended loop and walks away has a loop that beats, forecasts, spends research
-money, and vetoes every intent on ``mode PAUSED may not trade`` -- while
-``docs/RUNBOOK.md:777`` says ``kill``/``rearm`` "do stop and re-arm the PAPER
-loop". Issue **#526** carries the reproduction and the acceptance criteria.
-:func:`test_a_kill_survives_a_restart_that_lost_its_state_directory` pins the
-whole sequence, including that veto, so the behaviour is recorded rather than
-smoothed over; when #526 is decided, that test and this paragraph move together.
+One product observation, filed as issue **#526** and since **repaired** -- this
+paragraph and
+:func:`test_a_kill_survives_a_restart_that_lost_its_state_directory` moved
+together with it, as the paragraph they replace promised they would.
+
+What running this found: a re-arm lands the kernel in ``PAUSED``, and no
+shipped command returns it to ``PAPER`` -- only a process restart does. That
+half is unchanged and is now *documented* rather than merely true: it is a
+deliberate human checkpoint, the mode machine offers no ``PAUSED`` -> trading
+transition at all (``_ALLOWED_TRANSITIONS[Mode.PAUSED] == {HALT, KILLED}``),
+and ``docs/RUNBOOK.md`` says so at the ``kill``/``rearm`` bullet, in the
+kill-switch drill, and in a machine-derived table
+``tests/docs/test_mode_recovery_claims.py`` replays against the state machine
+itself.
+
+What was a defect, and is fixed: that loop also **forecast and spent research
+money** on every one of those paused beats, then vetoed every intent it had
+paid for on ``mode PAUSED may not trade`` -- against a per-UTC-day ceiling that
+is durable since #442/#483, so the waste outlived the process. The tick's walk
+gate now asks ``Mode.may_research`` -- "may this mode spend research money" --
+so a beat that may not research buys nothing. Deliberately *not*
+``Mode.may_trade``: that answers a different question and excludes ``RESEARCH``,
+which may not trade and must research (SPEC S5.1's bottom rung). The test below
+asserts the exact micros on both sides of the re-arm.
 
 ONE PREMISE OF #473 HAS SHIFTED
 -------------------------------
@@ -224,9 +238,14 @@ FRESH_LEDGER_VETO_REASONS = [
     "trailing drawdown limit reached",
 ]
 
-#: The veto an in-place re-arm leaves behind: re-arming exits ``KILLED`` into
-#: ``PAUSED``, never back into ``PAPER`` (``KillSwitch.rearm``).
-PAUSED_VETO_REASON = "mode PAUSED may not trade"
+#: How many of the seven beats
+#: :func:`test_a_kill_survives_a_restart_that_lost_its_state_directory` runs are
+#: in a mode that may research, and therefore how many forecasts that run may
+#: buy: two before the kill and two after the restart. The three in between --
+#: two ``KILLED`` and one ``PAUSED`` -- buy nothing since issue #526. The test
+#: derives the same figure from its own ledger and compares the two, so this
+#: constant cannot drift away from the sequence it describes.
+PAPER_BEATS_IN_THIS_RUN = 4
 
 #: The confirmation phrase template ``KillSwitch.expected_rearm_phrase`` builds.
 #: The sequence it embeds is read off the ledger's own ``KillEngaged`` row, so a
@@ -970,10 +989,23 @@ def test_a_kill_survives_a_restart_that_lost_its_state_directory(
 
     The sequence then runs to the end of #455's DoD item 7. Re-arming in place
     exits ``KILLED`` into ``PAUSED`` -- never back into ``PAPER`` -- so the very
-    next beat still refuses to trade, on ``mode PAUSED may not trade``, and it
-    takes a further restart before approvals resume. That is pinned here rather
-    than papered over: an operator who re-arms an unattended loop and walks away
-    has a loop that beats, forecasts, spends research money, and trades nothing.
+    next beat still refuses to trade, and it takes a further restart before
+    approvals resume. That half is deliberate and is pinned here.
+
+    What changed with issue #526 is what that paused beat *costs*. It used to
+    forecast, charge ``FULL_PIPELINE_RESEARCH_COST_MICROS`` against the durable
+    per-UTC-day ceiling, and only then veto the intent it had paid for on
+    ``mode PAUSED may not trade``. So the assertion that used to read "the
+    paused beat leaves a veto row" now reads "the paused beat leaves **no**
+    veto row and **no** spend row", and the spend is asserted as exact micros
+    across the whole run: one charge per ``PAPER`` beat, none for any other
+    mode. Those two figures -- four charges here, five before the fix -- are
+    the whole difference, which is why they are counted rather than bounded.
+
+    Both directions are load-bearing. A paused beat that bought nothing would
+    also be produced by a loop that had stopped beating altogether, so the mode
+    heartbeats, the surviving ``KillReArmed`` row, and the two approvals the
+    restarted run goes on to make are all still asserted here.
 
     Args:
         run_root: This test's isolated run root.
@@ -1014,10 +1046,14 @@ def test_a_kill_survives_a_restart_that_lost_its_state_directory(
         for rearm in ledger_payloads(run_root.ledger_path, KILL_REARMED_EVENT)
     ] == [int(engagements[0]["kill_sequence"])]
     assert _modes(run_root.ledger_path)[5:] == [(1, MODE_PAPER), (2, MODE_PAPER)]
-    assert _veto_reasons(run_root.ledger_path) == [
-        FRESH_LEDGER_VETO_REASONS,
-        [PAUSED_VETO_REASON],
-    ]
+    assert _veto_reasons(run_root.ledger_path) == [FRESH_LEDGER_VETO_REASONS]
     approvals = ledger_payloads(run_root.ledger_path, INTENT_APPROVED_EVENT)
     assert len(approvals) == approvals_before_the_restart + 2
+    paper_beats = [mode for _, mode in _modes(run_root.ledger_path)].count(MODE_PAPER)
+    spends = ledger_payloads(run_root.ledger_path, RESEARCH_SPEND_EVENT)
+    assert paper_beats == PAPER_BEATS_IN_THIS_RUN
+    assert [int(spend["cost_micros"]) for spend in spends] == (
+        [FULL_PIPELINE_RESEARCH_COST_MICROS] * paper_beats
+    )
+    assert ledger_payloads(run_root.ledger_path, RESEARCH_HALTED_EVENT) == []
     verify_ledger_chain(run_root.ledger_path)
