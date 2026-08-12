@@ -9,6 +9,14 @@ and decision section bodies are rendered by :mod:`windbreak.reports.sections`
 
 from __future__ import annotations
 
-from windbreak.reports.weekly import maybe_write_weekly, write_weekly_stub
+from windbreak.reports.weekly import (
+    WeeklyReportDirectoryError,
+    maybe_write_weekly,
+    write_weekly_stub,
+)
 
-__all__ = ["maybe_write_weekly", "write_weekly_stub"]
+__all__ = [
+    "WeeklyReportDirectoryError",
+    "maybe_write_weekly",
+    "write_weekly_stub",
+]
