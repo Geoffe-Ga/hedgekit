@@ -2029,6 +2029,43 @@ def test_live_seams_with_a_search_endpoint_report_the_live_source(
     assert source == RESEARCH_EVIDENCE_LIVE
 
 
+def test_half_a_live_research_bundle_reports_no_evidence_source(
+    tmp_path: Path,
+) -> None:
+    """One live research seam without the other is starved, and reported so.
+
+    `build_live_research_tools` degrades to the offline bundle when *either*
+    half is absent, so the token has to key on the same disjunction or the two
+    disagree: the run would be told it has live research while holding
+    transports that find nothing. This pins the agreement rather than the
+    choice -- the tools returned are asserted to find nothing, so the token and
+    the bundle are checked against each other, not against a literal.
+
+    Args:
+        tmp_path: The pytest scratch directory, standing in for the ledger's
+            parent.
+    """
+    from windbreak.config.schema import WindbreakConfig
+    from windbreak.forecast.providers.http_cassettes import (
+        ForbiddenLiveHttpTransport,
+    )
+    from windbreak.scheduler.loop import (
+        RESEARCH_EVIDENCE_NONE,
+        _resolve_research_tools,
+    )
+    from windbreak.scheduler.provider_wiring import LiveProviderHttp
+
+    source, tools = _resolve_research_tools(
+        None,
+        tmp_path / "ledger.db",
+        WindbreakConfig(),
+        LiveProviderHttp(llm={}, search=ForbiddenLiveHttpTransport(), fetch=None),
+    )
+
+    assert source == RESEARCH_EVIDENCE_NONE
+    assert tools.search("will this reach the network") == ()
+
+
 def test_only_the_absent_evidence_source_is_warned_about(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
