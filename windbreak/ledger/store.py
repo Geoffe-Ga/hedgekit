@@ -34,7 +34,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
@@ -112,6 +114,159 @@ _SELECT_OF_TYPE_REVERSED_SQL = (
     "payload_json, payload_schema_version, prev_hash, event_hash "
     "FROM ledger WHERE event_type = ? ORDER BY sequence_number DESC"
 )
+
+
+_LOGGER = logging.getLogger(__name__)
+
+#: How long a process opening the ledger waits for a sibling's SQLite write
+#: lock before failing closed, in milliseconds (issue #328).
+#:
+#: WHAT IT MUST SURVIVE. Opening the ledger is a *write*, and
+#: ``deploy/docker-compose.yml`` starts ``pipeline``, ``riskkernel`` and
+#: ``order-gateway`` simultaneously against one shared volume, so the shipped
+#: startup path is several processes racing for the same lock. Every write
+#: windbreak itself holds is one row inside its own ``BEGIN IMMEDIATE`` ...
+#: ``COMMIT`` -- there is no long-running write transaction anywhere in this
+#: package -- and a four-way contended open measured while fixing #328 cleared
+#: in at most two attempts and a few milliseconds. Ten seconds is three orders
+#: of magnitude of headroom over that, which is the point: the budget must not
+#: be a number the shipped deployment can plausibly reach.
+#:
+#: WHAT IT MUST NOT BECOME. Under ``restart: on-failure`` a hang is worse than
+#: a crash, because a container that never exits never gets its cause into the
+#: log. So the budget also has to be short enough that a genuinely wedged
+#: holder -- a stopped process, an abandoned transaction, a stale lock on a
+#: network filesystem -- turns into a *readable* failure quickly. Ten seconds
+#: matches the ten-second grace Docker gives a container that will not stop:
+#: a waiting opener cannot outlive the orchestrator's own patience.
+#:
+#: WHEN IT IS EXCEEDED, the open raises :class:`LedgerLockedError` after
+#: logging it as ``FATAL`` at ``CRITICAL``. The capability fails closed; the
+#: cause is never silent.
+LEDGER_BUSY_TIMEOUT_MILLIS = 10_000
+
+#: Nanoseconds per millisecond. The retry deadline is computed in integer
+#: nanoseconds from :func:`time.monotonic_ns`, because this package is on the
+#: no-float path (SPEC S6.1/S17.3) and a timeout in milliseconds is an integer.
+_NANOS_PER_MILLI = 1_000_000
+
+#: The ``timeout`` handed to :func:`sqlite3.connect`. Zero on purpose: the
+#: standard library otherwise supplies 5.0 seconds of busy timeout that nothing
+#: in windbreak chose, named, or could see. Suppressing it leaves exactly one
+#: source for the value actually in force -- the ``PRAGMA busy_timeout`` set
+#: immediately afterwards.
+_NO_IMPLICIT_BUSY_TIMEOUT = 0
+
+#: Put the connection's database into write-ahead logging.
+_JOURNAL_MODE_WAL_SQL = "PRAGMA journal_mode=WAL"
+
+#: Take and immediately release SQLite's write lock. Used only as a *wait*:
+#: unlike ``PRAGMA journal_mode``, ``BEGIN IMMEDIATE`` is routed through the
+#: busy handler, so blocking on it costs no CPU and honours ``busy_timeout``.
+_TAKE_WRITE_LOCK_SQL = "BEGIN IMMEDIATE"
+_RELEASE_WRITE_LOCK_SQL = "ROLLBACK"
+
+#: The SQLite result codes that mean "another connection holds a lock I need",
+#: and nothing else. Every other ``sqlite3.OperationalError`` -- an unopenable
+#: path, a read-only mount, a full disk -- reaches the caller with its own
+#: message, because a confident wrong diagnosis is worse than a bare one.
+_LOCK_CONTENTION_ERRORCODES = (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+class LedgerLockedError(Exception):
+    """Raised when opening the ledger lost the race for its write lock (#328).
+
+    The failure this replaces was an unhandled ``sqlite3.OperationalError``
+    raised out of a ``PRAGMA`` inside the constructor: exit 1, a traceback
+    naming a pragma, and no ``FATAL`` line -- so an operator watching a
+    ``restart: on-failure`` service saw a crash loop with no cause. This error
+    is logged as ``FATAL`` at ``CRITICAL`` before it is raised, and its message
+    names the ledger, the budget that was exhausted, and SQLite's own wording.
+    """
+
+    def __init__(self, db_path: Path, busy_timeout_millis: int, cause: str) -> None:
+        """Initialize the error with the ledger, the budget, and SQLite's cause.
+
+        Args:
+            db_path: The ledger that could not be opened.
+            busy_timeout_millis: The budget that was exhausted waiting for it.
+            cause: SQLite's own description of the refusal.
+        """
+        super().__init__(
+            f"cannot open the ledger at {db_path}: another process still held "
+            f"the SQLite write lock after {busy_timeout_millis} ms ({cause}). "
+            "Stop whichever windbreak process is using the same --ledger-path, "
+            "or let it finish, then start this one again."
+        )
+
+
+def _is_lock_contention(exc: sqlite3.OperationalError) -> bool:
+    """Report whether ``exc`` is SQLite refusing on a lock someone else holds.
+
+    Args:
+        exc: The error SQLite raised.
+
+    Returns:
+        ``True`` when its result code is ``SQLITE_BUSY`` or ``SQLITE_LOCKED``.
+    """
+    return exc.sqlite_errorcode in _LOCK_CONTENTION_ERRORCODES
+
+
+def _wait_out_the_write_lock(conn: sqlite3.Connection) -> None:
+    """Block until the write lock is free, then release it again.
+
+    The retry in :func:`_enter_wal_mode` must not spin: a hot loop against a
+    genuinely wedged holder would burn a core for the whole budget. Taking and
+    releasing the lock is the wait, because ``BEGIN IMMEDIATE`` *is* routed
+    through SQLite's busy handler and so blocks at ``busy_timeout`` inside
+    SQLite itself.
+
+    Its own failure is not a second failure channel: when the lock is still
+    held at the end of the busy timeout this returns, and the caller re-checks
+    its deadline and either retries or fails loudly. Nothing is swallowed that
+    the caller does not go on to decide about.
+
+    Args:
+        conn: The connection to wait on.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(_TAKE_WRITE_LOCK_SQL)
+        conn.execute(_RELEASE_WRITE_LOCK_SQL)
+
+
+def _enter_wal_mode(conn: sqlite3.Connection, *, deadline_ns: int) -> None:
+    """Put the connection's database into WAL journaling, waiting if contended.
+
+    This is the one statement in the open sequence that ``busy_timeout`` cannot
+    help. ``PRAGMA journal_mode=WAL`` acquires the database's exclusive lock and
+    SQLite does **not** route that acquisition through the busy handler, so with
+    any other connection holding the write lock it is refused at once, at any
+    busy timeout whatsoever. Measured while fixing issue #328: four simultaneous
+    openers of one brand-new database still lost 28 of 160 openers to ``database
+    is locked`` at a 10 000 ms busy timeout, and 123 of 160 at zero. So the wait
+    for this statement is windbreak's to run, and it is bounded by the same
+    budget everything else in the open uses.
+
+    Args:
+        conn: The connection to convert.
+        deadline_ns: The :func:`time.monotonic_ns` reading past which the wait
+            is over and the refusal is final.
+
+    Raises:
+        sqlite3.OperationalError: If the conversion is refused for a reason that
+            is not lock contention, or is still refused at the deadline. The
+            caller translates a contended refusal into
+            :class:`LedgerLockedError`.
+    """
+    while True:
+        try:
+            conn.execute(_JOURNAL_MODE_WAL_SQL)
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_contention(exc) or time.monotonic_ns() >= deadline_ns:
+                raise
+            _wait_out_the_write_lock(conn)
+        else:
+            return
 
 
 def _default_clock() -> datetime:
@@ -358,17 +513,70 @@ class SqliteLedgerStore:
         db_path: Path,
         *,
         now: Callable[[], datetime] = _default_clock,
+        busy_timeout_millis: int = LEDGER_BUSY_TIMEOUT_MILLIS,
     ) -> None:
         """Open (or create) the ledger database at ``db_path``.
+
+        Opening is a *write*: the journal mode, the table and the index are all
+        set here, so a process opening a ledger a sibling is writing has to wait
+        for the write lock rather than die on it (issue #328). It waits for
+        ``busy_timeout_millis`` and then fails closed, loudly.
 
         Args:
             db_path: Filesystem path to the SQLite database file.
             now: Clock returning the timezone-aware datetime stamped as each
                 record's ``created_at``. Injectable for deterministic tests.
+            busy_timeout_millis: How long to wait for a sibling process's write
+                lock before giving up, in milliseconds. Defaults to
+                :data:`LEDGER_BUSY_TIMEOUT_MILLIS`, which is the value the
+                shipped deployment runs on.
+
+        Raises:
+            ValueError: If ``busy_timeout_millis`` is negative. SQLite reads a
+                negative busy timeout as "never time out", and a ledger open
+                that can hang for ever is the failure this parameter exists to
+                stop.
+            LedgerLockedError: If the write lock was still held by another
+                process when the budget ran out.
+            sqlite3.OperationalError: If the database could not be opened for
+                any reason that is *not* lock contention -- an unopenable path,
+                a read-only mount, a full disk -- reported unchanged.
         """
+        if busy_timeout_millis < 0:
+            raise ValueError(
+                f"busy_timeout_millis must not be negative, got "
+                f"{busy_timeout_millis}: a negative SQLite busy timeout means "
+                "waiting for ever, which is not a way to open a ledger"
+            )
         self._now = now
-        self._conn = sqlite3.connect(db_path, isolation_level=None)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = sqlite3.connect(
+            db_path, isolation_level=None, timeout=_NO_IMPLICIT_BUSY_TIMEOUT
+        )
+        try:
+            self._open_schema(busy_timeout_millis)
+        except sqlite3.OperationalError as exc:
+            self._conn.close()
+            if not _is_lock_contention(exc):
+                raise
+            error = LedgerLockedError(db_path, busy_timeout_millis, str(exc))
+            _LOGGER.critical("FATAL: %s", error)
+            raise error from exc
+
+    def _open_schema(self, busy_timeout_millis: int) -> None:
+        """Set the busy timeout, enter WAL journaling, and ensure the schema.
+
+        The order is load-bearing. ``PRAGMA busy_timeout`` comes first because
+        every statement after it can contend, and the two ``CREATE ... IF NOT
+        EXISTS`` statements are routed through SQLite's busy handler and so wait
+        on it. ``PRAGMA journal_mode=WAL`` is not, which is why it gets its own
+        bounded retry rather than trusting the timeout it ignores.
+
+        Args:
+            busy_timeout_millis: The whole open's budget, in milliseconds.
+        """
+        self._conn.execute(f"PRAGMA busy_timeout={busy_timeout_millis}")
+        deadline_ns = time.monotonic_ns() + busy_timeout_millis * _NANOS_PER_MILLI
+        _enter_wal_mode(self._conn, deadline_ns=deadline_ns)
         self._conn.execute(_CREATE_TABLE_SQL)
         self._conn.execute(_CREATE_EVENT_TYPE_INDEX_SQL)
 
