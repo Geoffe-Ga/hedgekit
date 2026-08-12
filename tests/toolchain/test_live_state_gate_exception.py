@@ -30,7 +30,9 @@ WHAT IS ACTUALLY VERIFIED HERE, and nothing beyond it:
   satisfies at least one condition.
 * Exactly one document in the governing corpus states the conditions, and every
   other document that states the Stay Green rule links to the canonical section
-  by its derived anchor.
+  by its derived anchor. That corpus is `CLAUDE.md`, `.claude/docs/` and --
+  since issue #536 -- `.claude/skills/`, which is where an agent actually reads
+  the rule from and where "No exceptions." outlived the exception.
 
 WHAT IS NOT VERIFIED. The detector reads *calls inside functions*: a marker
 held in a module-level constant is attributed to no function, a value merely
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TESTS_ROOT = _REPO_ROOT / "tests"
 _DOCS_DIR = _REPO_ROOT / ".claude" / "docs"
+_SKILLS_DIR = _REPO_ROOT / ".claude" / "skills"
 _WORKFLOW_DOC = _DOCS_DIR / "workflow.md"
 _CLAUDE_MD = _REPO_ROOT / "CLAUDE.md"
 
@@ -536,10 +539,24 @@ def _anchor(heading: str) -> str:
 def _governing_documents() -> tuple[Path, ...]:
     """List the documents that govern how work is done in this repository.
 
+    `.claude/skills/` is in the corpus, and issue #536 is why. A skill is
+    loaded into an agent's context AHEAD of the documents it contradicts, so
+    when the two disagree the skill's answer is the one that gets acted on:
+    `stay-green/SKILL.md` ended its "Work is DONE when" section with "No
+    exceptions." for as long as it was outside this scan. A document that
+    governs behaviour is in scope whatever directory it lives in -- the
+    original `CLAUDE.md` + `.claude/docs/` scoping was where the rule was
+    written, not where it is read.
+
     Returns:
-        `CLAUDE.md` and every document it navigates to under `.claude/docs/`.
+        `CLAUDE.md`, every document it navigates to under `.claude/docs/`, and
+        every skill document under `.claude/skills/`.
     """
-    return (_CLAUDE_MD, *sorted(_DOCS_DIR.glob("*.md")))
+    return (
+        _CLAUDE_MD,
+        *sorted(_DOCS_DIR.glob("*.md")),
+        *sorted(_SKILLS_DIR.rglob("*.md")),
+    )
 
 
 def _stay_green_documents() -> tuple[Path, ...]:
@@ -1036,8 +1053,13 @@ def test_the_governing_document_corpus_is_non_empty() -> None:
     Both scans above iterate over `_governing_documents()`. A glob that stops
     matching would make "exactly one document states the conditions" fail
     loudly, but "every other document points at it" pass over nothing.
+
+    The `.claude/skills/` half is asserted separately (issue #536): a widening
+    that silently matches nothing is indistinguishable from never having
+    widened, and the skill is the document an agent reads the rule FROM.
     """
     documents = _governing_documents()
+    skills = [path for path in documents if _SKILLS_DIR in path.parents]
 
     assert len(documents) >= 5, (
         f"only {_document_names(documents)} found as governing documents; "
@@ -1045,3 +1067,8 @@ def test_the_governing_document_corpus_is_non_empty() -> None:
     )
     assert _CLAUDE_MD in documents
     assert _WORKFLOW_DOC in documents
+    assert skills, (
+        f"no document under {_SKILLS_DIR} reached the governing corpus, so the "
+        "pointer scan is back to covering only the documents the rule is "
+        "written in and not the one it is read from (issue #536)."
+    )
