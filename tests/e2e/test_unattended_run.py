@@ -98,8 +98,10 @@ What was a defect, and is fixed: that loop also **forecast and spent research
 money** on every one of those paused beats, then vetoed every intent it had
 paid for on ``mode PAUSED may not trade`` -- against a per-UTC-day ceiling that
 is durable since #442/#483, so the waste outlived the process. The tick's walk
-gate now asks ``Mode.may_trade``, the same predicate the kernel's own approval
-check vetoes on, so a beat that may not trade buys nothing. The test below
+gate now asks ``Mode.may_research`` -- "may this mode spend research money" --
+so a beat that may not research buys nothing. Deliberately *not*
+``Mode.may_trade``: that answers a different question and excludes ``RESEARCH``,
+which may not trade and must research (SPEC S5.1's bottom rung). The test below
 asserts the exact micros on both sides of the re-arm.
 
 ONE PREMISE OF #473 HAS SHIFTED
@@ -238,7 +240,7 @@ FRESH_LEDGER_VETO_REASONS = [
 
 #: How many of the seven beats
 #: :func:`test_a_kill_survives_a_restart_that_lost_its_state_directory` runs are
-#: in a mode that may trade, and therefore how many forecasts that whole run may
+#: in a mode that may research, and therefore how many forecasts that run may
 #: buy: two before the kill and two after the restart. The three in between --
 #: two ``KILLED`` and one ``PAUSED`` -- buy nothing since issue #526. The test
 #: derives the same figure from its own ledger and compares the two, so this

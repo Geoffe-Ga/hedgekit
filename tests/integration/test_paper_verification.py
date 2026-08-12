@@ -543,9 +543,10 @@ def test_a_halted_kernel_buys_no_research_on_the_tick_that_halted_it(
     kept buying a forecast per market per beat and vetoing every intent those
     forecasts produced on `mode HALT may not trade` -- the identical waste the
     kill switch's own gate exists to prevent, differing only in which mode
-    reached it. The gate now asks `Mode.may_trade`, the same predicate the
-    kernel's `mode_permission_ceiling` check vetoes on, so the two cannot
-    disagree about a mode again.
+    reached it. The gate now asks `Mode.may_research` -- "may this mode spend
+    research money" -- which `HALT` fails just as `PAUSED` and `KILLED` do. It
+    is deliberately not `may_trade`: that answers whether an *order* may be
+    routed, and excludes `RESEARCH`, which may not trade and must research.
 
     The stated reason `HALT` was excluded -- "a halted kernel is expected to
     recover" -- does not hold: `_ALLOWED_TRANSITIONS[Mode.HALT]` is

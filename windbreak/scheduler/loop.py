@@ -4687,15 +4687,26 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     therefore read *after* the cycle, so none of them needs its own path.
 
     Since issue #526 the gate is not the kill switch's alone. What it asks is
-    :meth:`~windbreak.riskkernel.modes.Mode.may_trade` -- the *same* predicate
-    the kernel's own ``mode_permission_ceiling`` check vetoes on -- so ``HALT``
-    and ``PAUSED`` walk no candidates either, and the two questions cannot
-    disagree about a mode again. Restating the set here is exactly what #526
-    cost: ``KillSwitch.rearm`` exits ``KILLED`` into ``PAUSED``, so a re-armed
-    loop bought a forecast per market per beat and then vetoed every intent it
-    had paid for on ``mode PAUSED may not trade``, drawing down a per-UTC-day
+    :meth:`~windbreak.riskkernel.modes.Mode.may_research` -- "may this mode
+    spend research money" -- so ``HALT`` and ``PAUSED`` walk no candidates
+    either. Restating the mode set here is exactly what #526 cost:
+    ``KillSwitch.rearm`` exits ``KILLED`` into ``PAUSED``, so a re-armed loop
+    bought a forecast per market per beat and then vetoed every intent it had
+    paid for on ``mode PAUSED may not trade``, drawing down a per-UTC-day
     ceiling that is durable since #442/#483 -- so the waste outlived the
     process, and the next day opened short.
+
+    It is deliberately **not**
+    :meth:`~windbreak.riskkernel.modes.Mode.may_trade`, and the difference is
+    one mode. ``RESEARCH`` may not trade and must research: SPEC S5.1's bottom
+    rung produces forecasts precisely so that promotion out of it can be
+    earned, and ``_research_to_paper_gate``'s ``research_min_forecasts``
+    criterion reads that production. Gating the walk on "may an order be
+    routed" would therefore stop a ``RESEARCH`` loop from ever producing the
+    evidence that promotes it -- research without trading is what the rung is
+    *for*. A ``RESEARCH`` tick walks, snapshots, forecasts, pays, and reaches
+    the approval seam exactly as a ``PAPER`` tick does; only the approval
+    differs, vetoing on ``mode RESEARCH may not trade``.
 
     ``HALT`` used to be excluded on the grounds that "a halted kernel is
     expected to recover and its approvals veto individually". It does not
@@ -4774,12 +4785,14 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     _verification_stage(deps)
     # Read *after* the verification cycle, so the reconciliation auto-kill that
     # fires inside it stops this tick by the same door the operator's KILL file
-    # does. The question asked is `Mode.may_trade` -- the *same* predicate the
-    # kernel's own `mode_permission_ceiling` check vetoes on, never a second
-    # list of modes restated here (issue #526). A mode that cannot trade walks
-    # no candidates at all: its `evaluate_intent` would hard-veto every intent
-    # anyway, but the walk is where the loop spends research money, and paying
-    # for forecasts no approval can act on is pure waste.
+    # does. The question asked is `Mode.may_research` -- "may this mode spend
+    # research money" -- and deliberately **not** `may_trade` (issue #526).
+    # The walk is where forecasts are bought, so the gate must ask whether a
+    # forecast is worth buying, not whether an order may be routed. The two
+    # answers agree on every mode but `RESEARCH`, which may not trade and must
+    # research: it is SPEC S5.1's bottom rung, and gating it on `may_trade`
+    # would stop the very forecast production `_research_to_paper_gate` reads
+    # to promote out of `RESEARCH`. See `Mode.may_research` for both failures.
     #
     # Placement is load-bearing and belongs *here*, before `_run_universe`.
     # Every research charge is levied inside `run_pipeline`, which the walk
@@ -4790,7 +4803,7 @@ def run_single_tick(deps: PaperTickDeps, *, beat: int) -> TickOutcome:
     # is the defect, not the fix. Gating *before* the screen would be wrong in
     # the other direction: the screen is free and its rows are the honest
     # record of what a non-trading loop examined.
-    tradeable = candidates if deps.kernel.mode.may_trade() else ()
+    tradeable = candidates if deps.kernel.mode.may_research() else ()
     universe = _run_universe(deps, tradeable, created_at, heartbeat_epoch_s)
     # The kernel's *real* mode, never a hardcoded PAPER: a verification breach
     # drives it to HALT mid-tick, and a heartbeat still claiming PAPER would be

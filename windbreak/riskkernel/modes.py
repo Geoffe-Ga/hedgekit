@@ -81,28 +81,17 @@ class Mode(enum.Enum):
             raise ValueError(f"not a valid mode_ceiling token: {token!r}") from None
 
     def may_trade(self) -> bool:
-        """Return whether an order may be routed while the kernel is in this mode.
+        """Return whether an **order may be routed** while the kernel is in this mode.
 
         The single definition of "this mode can trade", so no caller has to
-        restate the set (issue #526). Two of them ask the question for very
-        different reasons and must never be able to disagree:
+        restate the set. Its one consumer is
+        :class:`~windbreak.riskkernel.checks._ModePermissionCeiling`, which
+        vetoes an intent minted in a non-trading mode.
 
-        * :class:`~windbreak.riskkernel.checks._ModePermissionCeiling` vetoes
-          an intent minted in a non-trading mode.
-        * :func:`~windbreak.scheduler.loop.run_single_tick` decides whether to
-          walk the screened universe at all -- which is where the loop *spends
-          research money*.
-
-        Restating the set at the second site is what issue #526 cost: the walk
-        gate named ``KILLED`` alone, so a re-armed loop sitting in ``PAUSED``
-        bought a forecast per market per beat and then vetoed every intent
-        those forecasts produced, drawing the whole day down against the
-        durable per-UTC-day research ceiling (issues #442/#483) for a day in
-        which nothing could be traded.
-
-        ``RESEARCH`` is a non-trading mode by the same rule and needs no
-        special case: SPEC S5.1's bottom rung researches, and the ladder exists
-        so that trading is *earned*.
+        **Do not reuse this for spend decisions.** It answers "may an order be
+        routed", not "is a forecast worth buying", and those two questions have
+        different answers -- see :meth:`may_research`, which is the predicate
+        the tick's walk gate asks.
 
         Returns:
             True for the three trading modes (``PAPER``, ``LIVE_MICRO``,
@@ -110,10 +99,59 @@ class Mode(enum.Enum):
         """
         return self in TRADING_MODES
 
+    def may_research(self) -> bool:
+        """Return whether **research money may be spent** in this mode (issue #526).
+
+        The predicate :func:`~windbreak.scheduler.loop.run_single_tick`'s walk
+        gate asks before it walks the screened universe -- the walk being where
+        the loop pays for forecasts. Derived from :data:`_SAFETY_MODES` rather
+        than listed, so it is exactly "this mode is on the promotable ladder":
+        a safety mode is one the system entered in order to *stop* doing
+        something, and a new safety mode added later is excluded automatically
+        rather than by remembering to edit a set here.
+
+        Two failures shaped this, one in each direction, and both are worth
+        having in front of you before you touch this:
+
+        * **Restating the trading set at the walk gate cost real money.** The
+          gate named ``KILLED`` alone, so a re-armed loop sitting in ``PAUSED``
+          bought a forecast per market per beat and then vetoed every intent
+          those forecasts produced, drawing the whole day down against the
+          durable per-UTC-day research ceiling (issues #442/#483) for a day in
+          which nothing could be traded. That is issue #526.
+
+        * **Answering it with :meth:`may_trade` is the opposite error, and the
+          counterexample is ``RESEARCH``.** The two predicates agree on
+          ``PAPER``, ``LIVE_MICRO``, ``LIVE``, ``PAUSED``, ``HALT`` and
+          ``KILLED``, and disagree on exactly one mode -- ``RESEARCH``, which
+          may **not** trade and **must** research. It is SPEC S5.1's bottom
+          rung: its entire purpose is to produce forecasts without routing
+          them, so that promotion is earned rather than granted, and
+          ``_research_to_paper_gate``'s ``research_min_forecasts`` criterion
+          reads that production. A ``RESEARCH`` loop that bought no forecasts
+          could never satisfy the gate that promotes it out of ``RESEARCH``.
+          ``tests/riskkernel/test_modes.py`` pins the divergence set to
+          ``{RESEARCH}`` so this paragraph cannot quietly stop being true.
+
+        The safety modes are the agreement: ``PAUSED``, ``HALT`` and ``KILLED``
+        neither trade nor research, and none of them is a source for any
+        promotion gate -- ``_ALLOWED_TRANSITIONS`` gives all three no path to a
+        trading mode at all, so no forecast bought in one of them could ever be
+        acted on or counted toward leaving it.
+
+        Returns:
+            True for the four promotable ladder modes (``RESEARCH``, ``PAPER``,
+            ``LIVE_MICRO``, ``LIVE``); False for ``PAUSED``, ``HALT`` and
+            ``KILLED``.
+        """
+        return self not in _SAFETY_MODES
+
 
 #: The modes an order may be routed in. The one definition of that set; read it
 #: through :meth:`Mode.may_trade` rather than by membership, so the question is
-#: asked the same way everywhere (issue #526).
+#: asked the same way everywhere (issue #526). This is deliberately *not* the
+#: set of modes that may spend research money -- see :meth:`Mode.may_research`,
+#: which differs at ``RESEARCH`` and is what a spend decision must ask.
 TRADING_MODES: frozenset[Mode] = frozenset({Mode.PAPER, Mode.LIVE_MICRO, Mode.LIVE})
 
 #: The promotable ladder, low to high. Position is the promotion rank used for

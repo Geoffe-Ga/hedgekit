@@ -441,9 +441,11 @@ On the next beat the loop:
   row and the heartbeat log line, so a killed loop is never reported healthy;
 - walks no markets at all -- no forecast is run and no research money is spent,
   which is stronger than vetoing the intents afterwards. Since issue #526 that
-  is not special to `KILLED`: the tick asks whether the current mode *may
-  trade*, the same question the kernel's own approval check asks, so `PAUSED`
-  and `HALT` buy nothing either;
+  is not special to `KILLED`: the tick asks whether the current mode *may spend
+  research money*, so the three safety modes -- `KILLED`, `PAUSED` and `HALT`
+  -- all buy nothing. It is deliberately **not** the same question the approval
+  check asks: `RESEARCH` may not trade and *must* research, since producing
+  forecasts without routing them is what that rung is for;
 - **holds every position**, cancelling only resting orders (ledgered as one
   `CancelAllDirective`; see the caveat below) and releasing its capital
   reservations;
