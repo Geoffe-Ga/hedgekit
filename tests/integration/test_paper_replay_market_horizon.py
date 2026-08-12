@@ -40,6 +40,7 @@ transcribed:
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -65,6 +66,9 @@ ANCHOR = datetime(2027, 1, 15, 8, 0, 0, tzinfo=UTC)
 
 #: The format every committed fixture writes its instants in.
 FIXTURE_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+#: The settlement lag written onto a market for the resolution-instant test.
+RESOLUTION_LAG = timedelta(days=7)
 
 
 def _fixture_instant(raw: str) -> datetime:
@@ -219,6 +223,47 @@ def test_local_midnight_does_not_move_the_re_enacted_horizon(
     assert market.close_time == anchor + recorded_horizon
     assert verdict.measured == recorded_horizon.days
     assert verdict.measured == 151
+
+
+def test_the_expected_resolution_time_moves_by_the_same_offset(
+    tmp_path: Path,
+) -> None:
+    """A market's resolution instant shifts with its close, by the one offset.
+
+    ``expected_resolution_time`` is the market's *other* recorded instant, and
+    :class:`~windbreak.connector.models.NormalizedMarket` enforces that it is
+    never before the close. Shifting one and not the other would either newly
+    violate that invariant or silently invent a settlement lag the recording
+    never had, so the two are asserted to move by an identical delta and the
+    recorded gap between them to survive exactly.
+
+    No committed fixture carries one today, which is precisely why this is
+    written: an unexercised branch is indistinguishable from a wrong one.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    books = tmp_path / "books"
+    shutil.copytree(SHIPPED_BOOKS, books)
+    path = books / "markets.json"
+    markets = json.loads(path.read_text(encoding="utf-8"))
+    recorded_close = _fixture_instant(str(markets[0]["close_time"]))
+    recorded_resolution = recorded_close + RESOLUTION_LAG
+    markets[0]["expected_resolution_time"] = (
+        recorded_resolution.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    )
+    path.write_text(json.dumps(markets, indent=2), encoding="utf-8")
+
+    market = PaperExchange.from_fixture_dir(books, replay_anchor=ANCHOR).get_market(
+        TICKER
+    )
+
+    assert market.expected_resolution_time is not None
+    assert market.expected_resolution_time != recorded_resolution
+    assert market.expected_resolution_time - recorded_resolution == (
+        market.close_time - recorded_close
+    )
+    assert market.expected_resolution_time - market.close_time == RESOLUTION_LAG
 
 
 def test_a_verbatim_replay_leaves_every_market_instant_untouched() -> None:

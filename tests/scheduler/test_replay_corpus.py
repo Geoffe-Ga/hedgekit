@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import shutil
 from pathlib import Path
 
@@ -58,7 +59,7 @@ from windbreak.forecast.providers.base import (
     ProviderVoteError,
 )
 from windbreak.forecast.sandbox import EgressDeniedError
-from windbreak.scheduler.loop import _resolve_replay_corpus
+from windbreak.scheduler.loop import _resolve_replay_corpus, build_paper_deps
 from windbreak.scheduler.provider_wiring import (
     REPLAY_CORPUS_SOURCE_CONFIGURED,
     REPLAY_CORPUS_SOURCE_DEFAULT,
@@ -74,6 +75,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: The committed corpus the shipped hermetic demonstration replays.
 DEMO_CORPUS = REPO_ROOT / "tests" / "fixtures" / "forecast" / "hermetic_corpus"
+
+#: The committed books fixture the composition-root tests below replay.
+DEMO_BOOKS = REPO_ROOT / "tests" / "fixtures" / "books" / "hermetic_demo"
+
+#: The committed vote cassette every shipped command line names.
+SHIPPED_CASSETTE = REPO_ROOT / "tests" / "fixtures" / "forecast" / "cassettes.json"
 
 #: The demonstration market's title, and therefore the tail of every recorded
 #: subquestion `decompose_subquestions` builds for it.
@@ -391,6 +398,131 @@ def test_a_corpus_recording_no_vote_at_all_refuses(tmp_path: Path) -> None:
         load_replay_corpus(corpus)
 
     assert str(caught.value) == f"{votes} records no vote for any ensemble member"
+
+
+def test_a_missing_research_file_refuses_by_name(tmp_path: Path) -> None:
+    """A directory with no ``research.json`` refuses, naming the missing file.
+
+    The sibling of the ``votes.json`` case, and separately worth having: the
+    research file is read first, so a check that had quietly stopped guarding it
+    would surface as a :class:`FileNotFoundError` escaping composition rather
+    than as the named refusal an operator can act on.
+    """
+    corpus = _corpus_copy(tmp_path)
+    research = corpus / CORPUS_RESEARCH_FILENAME
+    research.unlink()
+
+    with pytest.raises(CorpusFormatError) as caught:
+        load_replay_corpus(corpus)
+
+    assert str(caught.value) == (
+        f"replay corpus is missing its {CORPUS_RESEARCH_FILENAME!r} file at {research}"
+    )
+
+
+def test_a_vote_entry_with_no_response_text_refuses_to_load(tmp_path: Path) -> None:
+    """An entry whose ``response`` is not a string refuses, naming the key.
+
+    Without the check the entry would load with a non-string ``text``, and the
+    failure would surface later inside the vote screen as a fingerprint of
+    something that is not a response -- a discarded vote whose ledgered cause
+    names the wrong thing entirely.
+    """
+    corpus = _corpus_copy(tmp_path)
+    votes = corpus / CORPUS_VOTES_FILENAME
+    recorded = json.loads(votes.read_text(encoding="utf-8"))
+    recorded["openai:gpt-5-2025-08-07"]["response"] = {"probability_ppm": 990000}
+    votes.write_text(json.dumps(recorded, indent=2), encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        load_replay_corpus(corpus)
+
+    assert str(caught.value) == (
+        "recorded entry 'openai:gpt-5-2025-08-07' has no string 'response' leaf"
+    )
+
+
+def test_the_composition_root_logs_the_corpus_in_force_and_its_source(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`build_paper_deps` reports the effective corpus, its source, and its size.
+
+    Driven through the composition root rather than through the logging helper,
+    because the defect this guards against is the call being dropped rather than
+    the message being wrong -- an operator reading the log of a run that traded
+    has to be able to tell that the run's evidence was recorded.
+
+    It is a **warning**, not information: a replaying run's forecasts are
+    recorded material, and that must not be discoverable only by reading a
+    configuration file. The counts are asserted because a mode name alone would
+    not distinguish a corpus that covers the ensemble from one that covers
+    nothing.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        caplog: pytest's log capture.
+    """
+    caplog.set_level(logging.INFO, logger="windbreak.scheduler")
+
+    deps = build_paper_deps(
+        books_dir=DEMO_BOOKS,
+        cassette_path=SHIPPED_CASSETTE,
+        ledger_path=tmp_path / "ledger.db",
+        report_dir=tmp_path,
+        config=_replaying_config(DEMO_CORPUS),
+    )
+    deps.store.close()
+
+    corpus_lines = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("forecast replay corpus")
+    ]
+    assert len(corpus_lines) == 1
+    assert corpus_lines[0].levelno == logging.WARNING
+    assert corpus_lines[0].getMessage() == (
+        f"forecast replay corpus mode={REPLAY_CORPUS_REPLAY} dir={DEMO_CORPUS} "
+        f"source={REPLAY_CORPUS_SOURCE_CONFIGURED} documents=3 votes=3; "
+        "forecasts on this run replay recorded material and measure nothing"
+    )
+
+
+def test_the_composition_root_logs_the_default_as_the_default(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The shipped default logs at INFO, naming the mode and the default source.
+
+    The other branch of the same line, and the control for the warning above: a
+    run that cannot trade must not be announced with the same severity as one
+    that can, and a source of ``default`` is how an operator tells "I selected
+    the offline path" from "I never selected anything".
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        caplog: pytest's log capture.
+    """
+    caplog.set_level(logging.INFO, logger="windbreak.scheduler")
+
+    deps = build_paper_deps(
+        books_dir=DEMO_BOOKS,
+        cassette_path=SHIPPED_CASSETTE,
+        ledger_path=tmp_path / "ledger.db",
+        report_dir=tmp_path,
+        config=WindbreakConfig(),
+    )
+    deps.store.close()
+
+    corpus_lines = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("forecast replay corpus")
+    ]
+    assert len(corpus_lines) == 1
+    assert corpus_lines[0].levelno == logging.INFO
+    assert corpus_lines[0].getMessage() == (
+        f"forecast replay corpus mode={REPLAY_CORPUS_DISABLED} "
+        f"source={REPLAY_CORPUS_SOURCE_DEFAULT}"
+    )
 
 
 def test_the_default_configuration_selects_no_corpus() -> None:
